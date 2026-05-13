@@ -24,12 +24,29 @@ license = "Apache-2.0"
 
 [mind]
 # Pinned to the toolchain surface that compiles the current source tree.
-# mindc 0.2.5 ships the Pratt expression parser + stable IR contract.
+#
+# mindc 0.2.5 ships the Pratt expression parser + Phase 10.5 surface
+# (module / const / type / struct / enum / use / export / [attribute] /
+# assert / as / && || / bitwise) — exactly what mind-nerve's source
+# tree consumes. Earlier versions reject `use crate::foo::bar` paths.
+#
+# mindc 0.2.6 (Unreleased) adds native BitNet + first-class Q16.16
+# dtype (RFC 0001) plus the content-addressed compile cache that
+# locks in the 1.8–15.5 µs frontend baseline. mind-nerve adopts it
+# as soon as it releases — Q16.16 stops being emulation and becomes
+# a typed primitive.
+#
 # mindc 0.3.0 introduces breaking IR changes and is gated until the
 # Phase 2 IR-load migration of the inference path lands.
-mindc-min    = "0.2.4"
+mindc-min    = "0.2.5"
 mindc-max    = "0.3.0"
 spec-version = "1.0"
+
+# IR contract — mind-nerve compiles to mic@1 textual IR and is consumed
+# by mind-runtime via `libmind::ir::load`. The IR surface is stable
+# per docs/ir-stability.md upstream.
+ir-format     = "mic@1"
+ir-consumer   = "mind-runtime >= 0.2.4"
 
 [determinism]
 # mind-nerve's load-bearing guarantee is bit-identical top-K outputs
@@ -58,6 +75,11 @@ backend = "cpu"
 sources = [
     "cli/main.mind",
     "src/lib.mind",
+    "src/runtime_ffi.mind",
+    "src/clock.mind",
+    "src/chain_log.mind",
+    "src/tokenizer.mind",
+    "src/loader.mind",
     "src/model.mind",
     "src/encoder_kernels.mind",
     "src/inference.mind",
@@ -73,6 +95,11 @@ backend = "cuda"
 sources = [
     "cli/main.mind",
     "src/lib.mind",
+    "src/runtime_ffi.mind",
+    "src/clock.mind",
+    "src/chain_log.mind",
+    "src/tokenizer.mind",
+    "src/loader.mind",
     "src/model.mind",
     "src/encoder_kernels.mind",
     "src/inference.mind",
@@ -92,6 +119,7 @@ sources = [
     "tests/unit/test_evidence.mind",
     "tests/unit/test_inference.mind",
     "tests/unit/test_encoder.mind",
+    "tests/unit/test_tokenizer.mind",
 ]
 
 [bit-identity]

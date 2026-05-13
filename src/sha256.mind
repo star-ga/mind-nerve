@@ -1,0 +1,411 @@
+// SHA-256 — RFC 6234 / FIPS 180-4 conformant, pure MIND.
+//
+// Audit anchor: FP-9 (hash-chain integrity), S-5 (catalog binding).
+//
+// All five call-sites in mind-nerve route through this module:
+//   (1) catalog hash binding         (request -> RouteCatalog.hash)
+//   (2) request hash                 (inference -> envelope.request_hash)
+//   (3) canonical result hash        (top-K -> envelope.result_hash)
+//   (4) attestation chain extension  (chain_curr = SHA-256(fields || chain_prev))
+//   (5) deterministic tie-break      (SHA-256(route_id) ascending in extract_top_k)
+//
+// IMPLEMENTATION NOTES
+//
+// SHA-256 internals use **wrapping (mod 2^32)** unsigned arithmetic on u32.
+// This is distinct from the saturating Q16.16 i32 policy in spec/numerics.md
+// §4: the no_float_ops and saturating-multiply invariants apply to the
+// inference path (logits, attention scores, softmax). Cryptographic
+// primitives use the modular ring required by RFC 6234. The two arithmetic
+// regimes never share a typed value: Q16.16 lives in i32, SHA-256 lives in
+// u32 / u8.
+//
+// Every public function carries @[determinism(BitIdentical)] because the
+// digest is part of the attestation chain — one diverging byte breaks
+// downstream replay verification.
+//
+// No allocation in the hot path. The streaming state is a 64-byte stack
+// buffer plus eight u32 hash words plus a u64 length counter. The one-shot
+// helper iterates the input slice in place; the only heap-touching call
+// site is the caller's input slice itself, which we do not own.
+
+// This module has no inference-path dependencies. SHA-256 consumes raw
+// byte slices; callers serialize Q16_16 scores at the call site (little-
+// endian i32) before hashing. Keeping this module dependency-free is what
+// allows `evidence::emit` to call sha256 without dragging in any tensor
+// or numerics imports.
+
+// ---------------------------------------------------------------------------
+// Section 1 — RFC 6234 constants
+// ---------------------------------------------------------------------------
+
+// Initial hash values H0..H7 — first 32 bits of the fractional parts of the
+// square roots of the first eight primes (2, 3, 5, 7, 11, 13, 17, 19).
+// FIPS 180-4 §5.3.3.
+const H_INIT: [u32; 8] = [
+    0x6a09e667u32, 0xbb67ae85u32, 0x3c6ef372u32, 0xa54ff53au32,
+    0x510e527fu32, 0x9b05688cu32, 0x1f83d9abu32, 0x5be0cd19u32,
+];
+
+// Round constants K0..K63 — first 32 bits of the fractional parts of the
+// cube roots of the first 64 primes. FIPS 180-4 §4.2.2.
+const K: [u32; 64] = [
+    0x428a2f98u32, 0x71374491u32, 0xb5c0fbcfu32, 0xe9b5dba5u32,
+    0x3956c25bu32, 0x59f111f1u32, 0x923f82a4u32, 0xab1c5ed5u32,
+    0xd807aa98u32, 0x12835b01u32, 0x243185beu32, 0x550c7dc3u32,
+    0x72be5d74u32, 0x80deb1feu32, 0x9bdc06a7u32, 0xc19bf174u32,
+    0xe49b69c1u32, 0xefbe4786u32, 0x0fc19dc6u32, 0x240ca1ccu32,
+    0x2de92c6fu32, 0x4a7484aau32, 0x5cb0a9dcu32, 0x76f988dau32,
+    0x983e5152u32, 0xa831c66du32, 0xb00327c8u32, 0xbf597fc7u32,
+    0xc6e00bf3u32, 0xd5a79147u32, 0x06ca6351u32, 0x14292967u32,
+    0x27b70a85u32, 0x2e1b2138u32, 0x4d2c6dfcu32, 0x53380d13u32,
+    0x650a7354u32, 0x766a0abbu32, 0x81c2c92eu32, 0x92722c85u32,
+    0xa2bfe8a1u32, 0xa81a664bu32, 0xc24b8b70u32, 0xc76c51a3u32,
+    0xd192e819u32, 0xd6990624u32, 0xf40e3585u32, 0x106aa070u32,
+    0x19a4c116u32, 0x1e376c08u32, 0x2748774cu32, 0x34b0bcb5u32,
+    0x391c0cb3u32, 0x4ed8aa4au32, 0x5b9cca4fu32, 0x682e6ff3u32,
+    0x748f82eeu32, 0x78a5636fu32, 0x84c87814u32, 0x8cc70208u32,
+    0x90befffau32, 0xa4506cebu32, 0xbef9a3f7u32, 0xc67178f2u32,
+];
+
+pub const SHA256_BLOCK_BYTES:  u32 = 64;
+pub const SHA256_OUTPUT_BYTES: u32 = 32;
+pub const SHA256_STATE_WORDS:  u32 = 8;
+
+// ---------------------------------------------------------------------------
+// Section 2 — Bit primitives (wrapping u32 arithmetic)
+// ---------------------------------------------------------------------------
+//
+// Each primitive below uses pure XOR / AND / shift / rotate. No arithmetic
+// add appears in the rotation primitives themselves; the only `+` in this
+// section is documented as `wrapping_add` (mod 2^32). MIND's u32 `+`
+// operator is wrapping by default for unsigned types per the language
+// spec; we still annotate the module for clarity and to keep the linter
+// from flagging arithmetic that would be rejected on Q16_16.
+
+@[arithmetic(Wrapping)]
+@[determinism(BitIdentical)]
+fn rotr32(x: u32, n: u32) -> u32 {
+    // Right-rotate by n in [0, 31]. n outside this range is undefined per
+    // FIPS 180-4; SHA-256 only ever calls this with n in {2, 6, 7, 11, 13,
+    // 17, 18, 19, 22, 25} so the precondition holds by construction.
+    (x >> n) | (x << (32u32 - n))
+}
+
+@[arithmetic(Wrapping)]
+@[determinism(BitIdentical)]
+fn shr32(x: u32, n: u32) -> u32 {
+    // Logical right shift by n in [0, 31].
+    x >> n
+}
+
+@[arithmetic(Wrapping)]
+@[determinism(BitIdentical)]
+fn ch(x: u32, y: u32, z: u32) -> u32 {
+    // Choice: bits of x select between y and z.
+    (x & y) ^ ((!x) & z)
+}
+
+@[arithmetic(Wrapping)]
+@[determinism(BitIdentical)]
+fn maj(x: u32, y: u32, z: u32) -> u32 {
+    // Majority: bit set iff at least two of x, y, z are set.
+    (x & y) ^ (x & z) ^ (y & z)
+}
+
+@[arithmetic(Wrapping)]
+@[determinism(BitIdentical)]
+fn bsig0(x: u32) -> u32 {
+    // Σ0(x) = ROTR^2(x) ⊕ ROTR^13(x) ⊕ ROTR^22(x). Big-sigma, compression.
+    rotr32(x, 2u32) ^ rotr32(x, 13u32) ^ rotr32(x, 22u32)
+}
+
+@[arithmetic(Wrapping)]
+@[determinism(BitIdentical)]
+fn bsig1(x: u32) -> u32 {
+    // Σ1(x) = ROTR^6(x) ⊕ ROTR^11(x) ⊕ ROTR^25(x). Big-sigma, compression.
+    rotr32(x, 6u32) ^ rotr32(x, 11u32) ^ rotr32(x, 25u32)
+}
+
+@[arithmetic(Wrapping)]
+@[determinism(BitIdentical)]
+fn ssig0(x: u32) -> u32 {
+    // σ0(x) = ROTR^7(x) ⊕ ROTR^18(x) ⊕ SHR^3(x). Small-sigma, schedule.
+    rotr32(x, 7u32) ^ rotr32(x, 18u32) ^ shr32(x, 3u32)
+}
+
+@[arithmetic(Wrapping)]
+@[determinism(BitIdentical)]
+fn ssig1(x: u32) -> u32 {
+    // σ1(x) = ROTR^17(x) ⊕ ROTR^19(x) ⊕ SHR^10(x). Small-sigma, schedule.
+    rotr32(x, 17u32) ^ rotr32(x, 19u32) ^ shr32(x, 10u32)
+}
+
+// ---------------------------------------------------------------------------
+// Section 3 — Big-endian byte ↔ word helpers
+// ---------------------------------------------------------------------------
+
+@[determinism(BitIdentical)]
+fn load_be_u32(block: &[u8; 64], offset: u32) -> u32 {
+    // Network byte order: most significant byte first.
+    let o = offset as usize;
+    ((block[o]     as u32) << 24)
+  | ((block[o + 1] as u32) << 16)
+  | ((block[o + 2] as u32) << 8)
+  | ( block[o + 3] as u32)
+}
+
+@[determinism(BitIdentical)]
+fn store_be_u32(out: &mut [u8; 32], offset: u32, value: u32) {
+    let o = offset as usize;
+    out[o]     = ((value >> 24) & 0xffu32) as u8;
+    out[o + 1] = ((value >> 16) & 0xffu32) as u8;
+    out[o + 2] = ((value >> 8)  & 0xffu32) as u8;
+    out[o + 3] = ( value        & 0xffu32) as u8;
+}
+
+@[determinism(BitIdentical)]
+fn store_be_u64(buf: &mut [u8; 64], offset: u32, value: u64) {
+    let o = offset as usize;
+    buf[o]     = ((value >> 56) & 0xffu64) as u8;
+    buf[o + 1] = ((value >> 48) & 0xffu64) as u8;
+    buf[o + 2] = ((value >> 40) & 0xffu64) as u8;
+    buf[o + 3] = ((value >> 32) & 0xffu64) as u8;
+    buf[o + 4] = ((value >> 24) & 0xffu64) as u8;
+    buf[o + 5] = ((value >> 16) & 0xffu64) as u8;
+    buf[o + 6] = ((value >> 8)  & 0xffu64) as u8;
+    buf[o + 7] = ( value        & 0xffu64) as u8;
+}
+
+// ---------------------------------------------------------------------------
+// Section 4 — Block compression
+// ---------------------------------------------------------------------------
+
+// Process exactly one 64-byte block. Pure function: returns the updated
+// state, does not mutate `state` in place. The message schedule W[0..64]
+// lives on the stack (256 bytes); no heap allocation.
+@[arithmetic(Wrapping)]
+@[determinism(BitIdentical)]
+pub fn sha256_process_block(state: [u32; 8], block: [u8; 64]) -> [u32; 8] {
+    // Step 1: prepare message schedule W[0..64].
+    let mut w: [u32; 64] = [0u32; 64];
+
+    // W[0..16] = block as 16 big-endian u32.
+    let mut t: u32 = 0u32;
+    while t < 16u32 {
+        w[t as usize] = load_be_u32(&block, t * 4u32);
+        t = t + 1u32;
+    }
+
+    // W[16..64] = ssig1(W[t-2]) + W[t-7] + ssig0(W[t-15]) + W[t-16]
+    let mut t: u32 = 16u32;
+    while t < 64u32 {
+        let ti = t as usize;
+        let s1 = ssig1(w[ti - 2]);
+        let s0 = ssig0(w[ti - 15]);
+        w[ti] = s1
+              + w[ti - 7]
+              + s0
+              + w[ti - 16];
+        t = t + 1u32;
+    }
+
+    // Step 2: initialize working variables from state.
+    let mut a: u32 = state[0];
+    let mut b: u32 = state[1];
+    let mut c: u32 = state[2];
+    let mut d: u32 = state[3];
+    let mut e: u32 = state[4];
+    let mut f: u32 = state[5];
+    let mut g: u32 = state[6];
+    let mut h: u32 = state[7];
+
+    // Step 3: 64 rounds.
+    let mut t: u32 = 0u32;
+    while t < 64u32 {
+        let ti = t as usize;
+        let t1: u32 = h + bsig1(e) + ch(e, f, g) + K[ti] + w[ti];
+        let t2: u32 = bsig0(a) + maj(a, b, c);
+        h = g;
+        g = f;
+        f = e;
+        e = d + t1;
+        d = c;
+        c = b;
+        b = a;
+        a = t1 + t2;
+        t = t + 1u32;
+    }
+
+    // Step 4: add compressed chunk to current hash value.
+    [
+        state[0] + a,
+        state[1] + b,
+        state[2] + c,
+        state[3] + d,
+        state[4] + e,
+        state[5] + f,
+        state[6] + g,
+        state[7] + h,
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// Section 5 — Streaming API
+// ---------------------------------------------------------------------------
+//
+// The streaming API exists for callers that hash multiple concatenated
+// fields without materialising the whole preimage (e.g. evidence::emit
+// hashing 172 bytes of envelope without an intermediate buffer when the
+// fields come from disparate sources).
+//
+// Invariant: buf_len is always in [0, 63]. If a call to sha256_update
+// would push buf_len to 64, the buffer is flushed (processed and cleared)
+// before the next byte enters.
+
+pub struct Sha256State {
+    pub h:         [u32; 8],
+    pub buf:       [u8; 64],
+    pub buf_len:   u32,
+    pub total_len: u64,   // bytes absorbed since init, before padding
+}
+
+@[determinism(BitIdentical)]
+pub fn sha256_init() -> Sha256State {
+    Sha256State {
+        h:         H_INIT,
+        buf:       [0u8; 64],
+        buf_len:   0u32,
+        total_len: 0u64,
+    }
+}
+
+// Absorb `data` into the state. Returns a new state — does not mutate the
+// caller's state. Arbitrary chunking: data may be 0 bytes, a few bytes,
+// many full blocks, or a mix.
+@[arithmetic(Wrapping)]
+@[determinism(BitIdentical)]
+pub fn sha256_update(s: Sha256State, data: &[u8]) -> Sha256State {
+    let mut h         = s.h;
+    let mut buf       = s.buf;
+    let mut buf_len   = s.buf_len;
+    let     total_len = s.total_len + (data.len() as u64);
+
+    let mut i: usize = 0usize;
+    let n: usize = data.len();
+
+    // Phase 1: fill any partial buffer to a full 64-byte block.
+    if buf_len > 0u32 && (buf_len as usize) + (n - i) >= 64usize {
+        let need: usize = 64usize - (buf_len as usize);
+        let mut k: usize = 0usize;
+        while k < need {
+            buf[(buf_len as usize) + k] = data[i + k];
+            k = k + 1usize;
+        }
+        h = sha256_process_block(h, buf);
+        i = i + need;
+        buf_len = 0u32;
+    }
+
+    // Phase 2: consume full 64-byte blocks straight from data.
+    while i + 64usize <= n {
+        let mut block: [u8; 64] = [0u8; 64];
+        let mut k: usize = 0usize;
+        while k < 64usize {
+            block[k] = data[i + k];
+            k = k + 1usize;
+        }
+        h = sha256_process_block(h, block);
+        i = i + 64usize;
+    }
+
+    // Phase 3: stash the trailing tail into buf.
+    while i < n {
+        buf[buf_len as usize] = data[i];
+        buf_len = buf_len + 1u32;
+        i = i + 1usize;
+    }
+
+    Sha256State {
+        h:         h,
+        buf:       buf,
+        buf_len:   buf_len,
+        total_len: total_len,
+    }
+}
+
+// Finalize: append 0x80 sentinel, zero-pad, append 64-bit big-endian bit
+// length, process the last one or two blocks, and emit the 32-byte digest
+// as eight big-endian u32 words.
+//
+// Padding cases:
+//   - buf_len <= 55: append 0x80, pad zeros, write length in the same block
+//   - buf_len == 56..63: append 0x80, pad zeros to end of block, process,
+//     then a second all-zero block with length in its final 8 bytes.
+@[arithmetic(Wrapping)]
+@[determinism(BitIdentical)]
+pub fn sha256_final(s: Sha256State) -> [u8; 32] {
+    let mut h       = s.h;
+    let mut buf     = s.buf;
+    let mut buf_len = s.buf_len;
+
+    // Append the mandatory 0x80 byte.
+    buf[buf_len as usize] = 0x80u8;
+    buf_len = buf_len + 1u32;
+
+    // If there is not enough room for the 8-byte length in the current
+    // block, zero-fill the remainder, process, and start a fresh block.
+    if buf_len > 56u32 {
+        let mut k: usize = buf_len as usize;
+        while k < 64usize {
+            buf[k] = 0u8;
+            k = k + 1usize;
+        }
+        h = sha256_process_block(h, buf);
+        buf = [0u8; 64];
+        buf_len = 0u32;
+    }
+
+    // Zero-fill up to byte 56.
+    let mut k: usize = buf_len as usize;
+    while k < 56usize {
+        buf[k] = 0u8;
+        k = k + 1usize;
+    }
+
+    // Write the message length in bits, big-endian u64, into bytes 56..63.
+    // total_len is in bytes; bit length is total_len * 8. SHA-256 messages
+    // up to 2^61 bytes (2^64 bits) are supported by this counter; mind-nerve
+    // never hashes more than tens of kilobytes, so overflow is unreachable.
+    let bit_len: u64 = s.total_len * 8u64;
+    store_be_u64(&mut buf, 56u32, bit_len);
+
+    // Process the final block.
+    h = sha256_process_block(h, buf);
+
+    // Emit state as 32-byte big-endian digest.
+    let mut out: [u8; 32] = [0u8; 32];
+    let mut i: u32 = 0u32;
+    while i < 8u32 {
+        store_be_u32(&mut out, i * 4u32, h[i as usize]);
+        i = i + 1u32;
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Section 6 — One-shot API
+// ---------------------------------------------------------------------------
+
+// Hash a byte slice and return the 32-byte digest. This is the entry point
+// used by `inference::sha256` (catalog hashing, request hashing, result
+// hashing, tie-break) and by `evidence::emit` for chain extension.
+//
+// The single bound on `data` is u64 length (2^61 bytes). All mind-nerve
+// inputs are tiny compared to this bound.
+@[arithmetic(Wrapping)]
+@[determinism(BitIdentical)]
+pub fn sha256(data: &[u8]) -> [u8; 32] {
+    let s0 = sha256_init();
+    let s1 = sha256_update(s0, data);
+    sha256_final(s1)
+}

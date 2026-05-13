@@ -49,7 +49,8 @@ module mind_nerve {
     pub const MAX_TOP_K:             u32 = 64;
 
     // Attestation envelope: v2 layout, 212 bytes packed.
-    // See spec/architecture.md and spec/numerics.md for the byte-level layout.
+    // The authoritative byte-level contract is tests/unit/test_evidence.mind
+    // §1; spec/architecture.md and spec/numerics.md summarise it.
     pub const ATTESTATION_BYTES:     u32 = 212;
     pub const ATTESTATION_VERSION:   u8  = 2;
 
@@ -57,16 +58,28 @@ module mind_nerve {
     // per-op reduction order table emitted by mindc changes shape.
     pub const NUMERICS_WIRE_VERSION: u8  = 2;
 
-    // Entry-kind discriminant in the envelope. 1=inference, 2=chain_reset.
-    pub const ENTRY_KIND_INFERENCE:   u8 = 1;
-    pub const ENTRY_KIND_CHAIN_RESET: u8 = 2;
+    // Entry-kind discriminant in the envelope. 1-based so an uninitialised
+    // zero byte is unambiguously invalid. Three variants in v2:
+    //   1 = inference     (normal classifier emission)
+    //   2 = model_load    (anchors model_hash binding at startup)
+    //   3 = catalog_load  (anchors catalog_hash binding at load time)
+    pub const ENTRY_KIND_INFERENCE:    u8 = 1;
+    pub const ENTRY_KIND_MODEL_LOAD:   u8 = 2;
+    pub const ENTRY_KIND_CATALOG_LOAD: u8 = 3;
 
     // Architecture enum starts at 1 so uninitialised zero byte is invalid.
-    pub const ARCH_CPU_X86:           u8 = 1;
-    pub const ARCH_CPU_ARM:           u8 = 2;
+    // v2 covers the three backends that ship in Phase 1; WebGPU and NPU
+    // enter the enum at the v3 envelope spec, after bit-identity gates land
+    // on those backends.
+    pub const ARCH_X86_64:            u8 = 1;
+    pub const ARCH_AARCH64:           u8 = 2;
     pub const ARCH_CUDA:              u8 = 3;
-    pub const ARCH_WEBGPU:            u8 = 4;
-    pub const ARCH_NPU:               u8 = 5;
+
+    // chain_reset_reason discriminants (u16 field in the envelope).
+    pub const CHAIN_RESET_CONTINUATION:    u16 = 0;
+    pub const CHAIN_RESET_MODEL_SWAP:      u16 = 1;
+    pub const CHAIN_RESET_CATALOG_CHANGED: u16 = 2;
+    pub const CHAIN_RESET_CLOCK_RESET:     u16 = 3;
 
     pub mod q16_16;
     pub mod sha256;

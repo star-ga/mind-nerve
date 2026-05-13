@@ -1,20 +1,31 @@
-// Model: encoder, decoder, classifier head.
+// Model: encoder + scoring head. No decoder.
 //
 // Phase 0 — typed signatures with bit-identity annotations. Bodies are
 // `unimplemented!()` pending Phase 1 implementation. The signatures are the
 // contract; implementations that change shapes here are architecture changes,
 // not bug fixes.
+//
+// Architectural decision (see spec/architecture.md):
+// A decoder cross-attending to a fixed route table has identical expressive
+// power to a single matmul between a pooled query vector and the route table,
+// at a fraction of the FLOPs. The decoder is therefore omitted; the scoring
+// head is a mean-pool plus direct dot-product against the route embeddings.
 
 use crate::mind_nerve::{
     Q16_16,
-    ENCODER_LAYERS, ENCODER_HIDDEN, ENCODER_HEADS,
-    DECODER_LAYERS, DECODER_HIDDEN, DECODER_HEADS, DECODER_FFN_HIDDEN,
+    ENCODER_LAYERS, ENCODER_HIDDEN, ENCODER_HEADS, ENCODER_HEAD_DIM,
+    ATTN_WINDOW_SIZE, ATTN_WINDOW_STRIDE,
     VOCAB_SIZE, MAX_REQUEST_TOKENS, ROUTE_EMBEDDING_DIM,
 };
 
-// Encoder: 12 layers, no FFN sublayer, gated residual.
+// Encoder: 12 layers, sliding-window self-attention (window=256, stride=192),
+// gated residual, no FFN sublayer.
+//
+// Determinism is enforced by mindc lint codes E_NERVE_001 (reduction order)
+// and E_NERVE_004 (window overlap-add summation order).
 @[determinism(BitIdentical)]
 @[reduction_order(Pinned)]
+@[attention_kind(SlidingWindow(window = ATTN_WINDOW_SIZE, stride = ATTN_WINDOW_STRIDE))]
 pub fn encoder(
     token_ids:   tensor<u32, [batch, seq_len]>,
     weights:     EncoderWeights,
@@ -22,36 +33,65 @@ pub fn encoder(
 where
     seq_len <= MAX_REQUEST_TOKENS,
 {
-    unimplemented!("Phase 1: 12-layer attention + gated residual, no FFN")
+    unimplemented!("Phase 1: 12-layer sliding-window attention + gated residual, no FFN")
 }
 
-// Decoder: 8 layers, self-attention + cross-attention to encoder + route
-// embedding table, feed-forward sublayer present.
+// Mean-pool over the sequence axis. Pinned reduction order; bit-identical
+// across architectures because the summation tree is determined at compile
+// time by mindc, not by the runtime tensor shape.
 @[determinism(BitIdentical)]
 @[reduction_order(Pinned)]
-pub fn decoder(
-    encoder_out:        tensor<Q16_16, [batch, seq_len, ENCODER_HIDDEN]>,
-    route_embeddings:   tensor<Q16_16, [num_routes, ROUTE_EMBEDDING_DIM]>,
-    weights:            DecoderWeights,
-) -> tensor<Q16_16, [batch, num_routes, DECODER_HIDDEN]>
+pub fn mean_pool_seq(
+    encoder_out: tensor<Q16_16, [batch, seq_len, ENCODER_HIDDEN]>,
+) -> tensor<Q16_16, [batch, ENCODER_HIDDEN]>
 where
     seq_len <= MAX_REQUEST_TOKENS,
 {
-    unimplemented!("Phase 1: 8-layer self-attn + cross-attn + FFN")
+    unimplemented!("Phase 1: pinned-order sum along seq_len, divide by seq_len")
 }
 
-// Classifier head: linear projection to per-route logits.
-// Embedding table tie: shares parameters with `decoder`'s cross-attention
-// route embedding input.
+// Scoring head: a single matmul between the pooled query vector and the
+// route embedding table.
+//
+// This replaces the prior decoder + classifier_head pair. Score for route i
+// is `dot(query, route_embeddings[i])` in Q16.16 with i64 accumulator,
+// shifted >> 16, saturated to i32.
+//
+// The route_embeddings tensor is the only `|RouteCatalog|`-dependent
+// parameter block. Adding routes is appending rows; it does not retrain
+// the encoder.
 @[determinism(BitIdentical)]
-pub fn classifier_head(
-    decoder_out:        tensor<Q16_16, [batch, num_routes, DECODER_HIDDEN]>,
-    route_embeddings:   tensor<Q16_16, [num_routes, ROUTE_EMBEDDING_DIM]>,
+@[reduction_order(Pinned)]
+pub fn score_against_routes(
+    pooled_query:     tensor<Q16_16, [batch, ENCODER_HIDDEN]>,
+    route_embeddings: tensor<Q16_16, [num_routes, ROUTE_EMBEDDING_DIM]>,
 ) -> tensor<Q16_16, [batch, num_routes]>
 {
-    unimplemented!("Phase 1: linear projection with tied embedding parameters")
+    unimplemented!("Phase 1: query @ route_embeddings.T, Q16.16 saturating mac")
 }
 
 // Weight containers. Sizes derived from compile-time parameters in `lib.mind`.
-pub struct EncoderWeights { /* 12 layer blocks */ }
-pub struct DecoderWeights { /* 8 layer blocks */ }
+// Per-layer contents:
+//   - Wq, Wk, Wv, Wo:    (ENCODER_HIDDEN, ENCODER_HIDDEN) each
+//   - layer_norm_gain:   (ENCODER_HIDDEN,)
+//   - layer_norm_bias:   (ENCODER_HIDDEN,)
+//   - residual_gate:     (ENCODER_HIDDEN,)   // gated residual scalar per dim
+//
+// Total per layer: 4 * H^2 + 3 * H weights.
+// At H=384, L=12: ≈ 7.1M weights + ≈ 14K residual/norm params per encoder.
+pub struct EncoderLayerWeights {
+    pub wq:              tensor<Q16_16, [ENCODER_HIDDEN, ENCODER_HIDDEN]>,
+    pub wk:              tensor<Q16_16, [ENCODER_HIDDEN, ENCODER_HIDDEN]>,
+    pub wv:              tensor<Q16_16, [ENCODER_HIDDEN, ENCODER_HIDDEN]>,
+    pub wo:              tensor<Q16_16, [ENCODER_HIDDEN, ENCODER_HIDDEN]>,
+    pub ln_gain:         tensor<Q16_16, [ENCODER_HIDDEN]>,
+    pub ln_bias:         tensor<Q16_16, [ENCODER_HIDDEN]>,
+    pub residual_gate:   tensor<Q16_16, [ENCODER_HIDDEN]>,
+}
+
+pub struct EncoderWeights {
+    pub token_embedding: tensor<Q16_16, [VOCAB_SIZE, ENCODER_HIDDEN]>,
+    pub layers:          [EncoderLayerWeights; ENCODER_LAYERS],
+    pub final_ln_gain:   tensor<Q16_16, [ENCODER_HIDDEN]>,
+    pub final_ln_bias:   tensor<Q16_16, [ENCODER_HIDDEN]>,
+}

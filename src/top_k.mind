@@ -1,0 +1,478 @@
+// Deterministic top-K extraction with SHA-256 tie-break.
+//
+// Phase 1 contract (see spec/architecture.md §"Top-K extraction" and
+// tests/unit/test_top_k.mind):
+//
+//   For every (logits, RouteCatalog, k) the produced TopK ordering MUST be
+//   bit-identical across runs, hosts, architectures, and vectorization
+//   strategies. Ordering is by `score DESC, route_id ASC` (lex over the
+//   32 raw bytes). RouteId IS the SHA-256 of the external string id (set
+//   at catalog load time, never re-hashed), so the comparator is
+//   functionally "score DESC, SHA-256(external_id) ASC" — matching the
+//   spec language "SHA-256(route_id) ascending" where route_id refers to
+//   the operator-visible external string. Implementation never re-hashes
+//   the 32-byte route handle; lex compare on the raw RouteId bytes is the
+//   primitive operation. See test_top_k.mind §"SHA-256 oracle values" —
+//   the cited digests are the route_id bytes themselves.
+//
+// Algorithm: bounded heap of size K (O(N log K)). RouteId is already the
+// 32-byte SHA-256 of the external id (computed at catalog load), so the
+// tie-break key is the raw RouteId bytes — no re-hashing inside extract_top_k.
+//
+//   for i in 0..num_routes (sequential, ascending index, pinned order):
+//       entry = HeapEntry { score: logits[0, i], route_id: catalog.ids[i] }
+//       if heap.len() < k:
+//           heap.push(entry)                      // O(log k)
+//       else if better(entry, heap.peek_worst()): // strictly beats current worst
+//           heap.replace_worst(entry)             // O(log k)
+//
+//   Then drain heap.pop_worst() repeatedly into a tail-emit buffer and reverse.
+//   The reversal step is the only place ordering is materialised; the heap
+//   itself only needs to expose `worst` consistently.
+//
+// "better" semantics — a candidate `a` is BETTER than `b` if:
+//     a.score >  b.score                                        (higher score)
+//  OR a.score == b.score AND a.route_id lex < b.route_id        (lower sha)
+//
+// The heap stores entries by `worse-is-on-top` so peek_worst is O(1) and so
+// the eviction test is a single `better(candidate, worst)` call. Reduction
+// order: candidate-vs-worst at index i is a left-to-right scalar comparison;
+// no vectorised partial reduction across the catalog. Pinned by the loop.
+//
+// Why bounded-heap and not argpartition+sort:
+//   - argpartition over Q16.16 logits requires picking pivots; deterministic
+//     pivots (median-of-medians) are O(N), but the implementation surface is
+//     larger and the partitioning swap order materially affects which index
+//     of two equal-score routes ends up on which side of the pivot. The
+//     downstream re-sort fixes ordering but only after a non-trivial proof.
+//     A bounded heap has a single, easily-pinned invariant restoration
+//     order, which is the property we need for the bit-identity contract.
+//   - At Phase 1 catalog sizes (≤ 10 000 routes) and K ≤ 64, O(N log K) with
+//     small constants is faster than any selection variant we measured.
+//
+// Numerical contract:
+//   - Score comparison is raw i32 (`<`, `>`, `==`). Never cast to f32 — see
+//     `test_top_k_ulp_precision_k1`: two scores differing by 1 ULP must be
+//     ordered, and f32 collapses adjacent Q16.16 values.
+//   - RouteId tie-break comparison is lexicographic over the 32-byte digest,
+//     byte[0] is most significant.
+//
+// batch dimension handling (Phase 1):
+//   Only batch == 1 is supported semantically. batch > 1 reads only the
+//   first row (logits[0, :]); this matches the preselect single-request
+//   path. Phase 2 will introduce a batched variant — tracked as a separate
+//   audit item (P2.batch_top_k).
+
+use crate::mind_nerve::{Q16_16, MAX_TOP_K, ROUTE_EMBEDDING_DIM};
+use crate::mind_nerve::sha256::sha256;
+
+// ---------------------------------------------------------------------------
+// Public types
+// ---------------------------------------------------------------------------
+
+// 32-byte opaque route handle = SHA-256(external_string_id), computed at
+// catalog load time. The comparator never inspects the external string.
+pub type RouteId = [u8; 32];
+
+// Variable-length top-K result. `ids[i]` corresponds to `scores[i]`. Length
+// of both arrays is identical and ≤ MAX_TOP_K. Empty TopK is valid (returned
+// for k == 0 or empty catalog).
+pub struct TopK {
+    pub ids:    [RouteId; ?],
+    pub scores: [Q16_16; ?],
+}
+
+// Plain catalog — accepted by extract_top_k. Uniqueness of route_ids is the
+// caller's responsibility; use UniqueRouteCatalog at load time to enforce it.
+pub struct RouteCatalog {
+    pub ids:         [RouteId],
+    pub embeddings:  tensor<Q16_16, [num_routes, ROUTE_EMBEDDING_DIM]>,
+    pub hash:        [u8; 32],
+}
+
+// Typed wrapper that proves at construction time that all route_ids are
+// distinct. Audit A3 (catalog uniqueness): a duplicate route_id is a
+// validation error, not a runtime degradation — silent routing ambiguity is
+// unacceptable for governance.
+pub struct UniqueRouteCatalog {
+    inner: RouteCatalog,
+}
+
+pub enum CatalogError {
+    DuplicateRouteId(RouteId),
+}
+
+// ---------------------------------------------------------------------------
+// UniqueRouteCatalog::new — catalog validation entry point
+// ---------------------------------------------------------------------------
+//
+// Constructs a UniqueRouteCatalog from external string ids and Q16.16
+// scores. Computes RouteId = SHA-256(external_id) for each entry, then
+// rejects construction if any RouteId appears more than once.
+//
+// First-duplicate-wins reporting: scan in input order; the first index `i`
+// whose RouteId was already seen at some j < i triggers the Err. The
+// duplicate route_id carried in the error is the SHA-256 of the offending
+// external id, not the external string itself — error consumers should not
+// learn the operator-visible string from this error path; they should look
+// it up in the catalog manifest.
+impl UniqueRouteCatalog {
+
+    @[determinism(BitIdentical)]
+    pub fn new(
+        external_ids: [str],
+        scores:       [Q16_16],
+    ) -> Result<UniqueRouteCatalog, CatalogError>
+    {
+        let n = external_ids.len();
+
+        // Empty catalog is valid — used by the k == 0 / low-confidence
+        // passthrough path at the integration layer.
+        if n == 0 {
+            let empty_ids: [RouteId; 0] = [];
+            return Ok(UniqueRouteCatalog {
+                inner: RouteCatalog {
+                    ids:        empty_ids,
+                    embeddings: tensor::zeros::<Q16_16, [0, ROUTE_EMBEDDING_DIM]>(),
+                    hash:       sha256(b""),
+                },
+            });
+        }
+
+        // Compute route_ids. Reduction order: left-to-right, index 0..n.
+        let route_ids: [RouteId; n] = external_ids.map(|s| sha256(s.as_bytes()));
+
+        // Duplicate scan. O(n²) is fine here — catalog load is a one-shot
+        // cost, not a hot path. A linear-time variant would require a sorted
+        // copy or a hash set, both of which add nondeterminism if the
+        // insertion order leaks through error reporting. The double loop
+        // visits pairs in a fixed (i, j with j < i) order, which is the
+        // canonical "first duplicate wins" semantics the tests require.
+        for i in 0..n {
+            for j in 0..i {
+                if route_ids[i] == route_ids[j] {
+                    return Err(CatalogError::DuplicateRouteId(route_ids[i]));
+                }
+            }
+        }
+
+        let canonical_hash = sha256(route_ids.as_bytes());
+
+        Ok(UniqueRouteCatalog {
+            inner: RouteCatalog {
+                ids:        route_ids,
+                embeddings: tensor::zeros::<Q16_16, [n, ROUTE_EMBEDDING_DIM]>(),
+                hash:       canonical_hash,
+            },
+        })
+    }
+
+    @[determinism(BitIdentical)]
+    pub fn as_catalog(&self) -> RouteCatalog {
+        self.inner.clone()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HeapEntry — internal carrier for the bounded-K heap
+// ---------------------------------------------------------------------------
+
+struct HeapEntry {
+    score:    Q16_16,
+    route_id: RouteId,   // doubles as tie-break key (RouteId = SHA-256(extid))
+}
+
+// `a` is strictly BETTER than `b` under the contract ordering.
+//   1. Higher Q16.16 score wins.
+//   2. Equal score: lexicographically lower route_id wins.
+//   3. Equal route_id (which UniqueRouteCatalog forbids) returns false —
+//      neither is "better"; this branch is unreachable in well-formed
+//      inputs but is defined to avoid undefined ordering.
+@[determinism(BitIdentical)]
+fn entry_better(a: HeapEntry, b: HeapEntry) -> bool {
+    if a.score > b.score {
+        return true;
+    }
+    if a.score < b.score {
+        return false;
+    }
+    // Scores equal — fall through to route_id tie-break (lex ascending).
+    lex_lt(a.route_id, b.route_id)
+}
+
+// Lexicographic less-than over 32-byte digests, byte[0] most significant.
+@[determinism(BitIdentical)]
+fn lex_lt(a: [u8; 32], b: [u8; 32]) -> bool {
+    for i in 0..32 {
+        if a[i] < b[i] { return true; }
+        if a[i] > b[i] { return false; }
+    }
+    false  // a == b
+}
+
+// ---------------------------------------------------------------------------
+// Bounded "worst-on-top" heap
+// ---------------------------------------------------------------------------
+//
+// Standard binary heap with the WORST entry at index 0. `worst` here means
+// the entry that should be evicted first under the contract ordering:
+// lowest score, or equal score with highest sha.
+//
+// Invariant: for every index i with children 2i+1 and 2i+2 that exist,
+//   entry_better(heap[i], heap[2i+1]) == false  AND
+//   entry_better(heap[i], heap[2i+2]) == false
+// i.e. the parent is no better than either child.
+//
+// All sift operations swap on a strict comparison only; ties on the
+// comparator key do NOT swap. Combined with the parent-vs-child evaluation
+// order (left child before right child), this pins the heap shape across
+// runs even for inputs that contain logically-equivalent entries (which
+// only happens on duplicate sha — forbidden by UniqueRouteCatalog).
+
+struct BoundedHeap {
+    data: [HeapEntry; ?],
+    cap:  u32,
+}
+
+@[determinism(BitIdentical)]
+fn heap_new(cap: u32) -> BoundedHeap {
+    BoundedHeap { data: [], cap: cap }
+}
+
+@[determinism(BitIdentical)]
+fn heap_len(h: BoundedHeap) -> u32 {
+    h.data.len() as u32
+}
+
+@[determinism(BitIdentical)]
+fn heap_peek_worst(h: BoundedHeap) -> HeapEntry {
+    h.data[0]
+}
+
+// Push when not at capacity. Caller must have checked heap_len < cap.
+@[determinism(BitIdentical)]
+fn heap_push(h: &mut BoundedHeap, entry: HeapEntry) {
+    h.data.push(entry);
+    sift_up(h, h.data.len() - 1);
+}
+
+// Replace the current worst with a new candidate that has already been
+// proven strictly better than the worst. Restores heap invariant by
+// sifting down from the root.
+@[determinism(BitIdentical)]
+fn heap_replace_worst(h: &mut BoundedHeap, entry: HeapEntry) {
+    h.data[0] = entry;
+    sift_down(h, 0);
+}
+
+// Pop the worst entry. Used during drain.
+@[determinism(BitIdentical)]
+fn heap_pop_worst(h: &mut BoundedHeap) -> HeapEntry {
+    let worst = h.data[0];
+    let n = h.data.len();
+    if n == 1 {
+        h.data = [];
+        return worst;
+    }
+    h.data[0] = h.data[n - 1];
+    h.data.truncate(n - 1);
+    sift_down(h, 0);
+    worst
+}
+
+// Sift up: child should never be WORSE than parent. We swap iff the child
+// is strictly worse than its parent under the worst-on-top invariant —
+// equivalently, the parent is strictly better than the child.
+//
+// "Strictly" matters: equal entries (same score, same sha) do NOT swap.
+// This pins the heap shape; no equal-key sift drift across runs.
+@[determinism(BitIdentical)]
+fn sift_up(h: &mut BoundedHeap, mut idx: u32) {
+    while idx > 0 {
+        let parent = (idx - 1) / 2;
+        // If parent is BETTER than child, child is in the wrong place
+        // (we want worst-on-top, i.e. better entries deeper). Swap down
+        // the better parent.
+        if entry_better(h.data[parent], h.data[idx]) {
+            let tmp = h.data[parent];
+            h.data[parent] = h.data[idx];
+            h.data[idx]    = tmp;
+            idx = parent;
+        } else {
+            break;
+        }
+    }
+}
+
+// Sift down: parent should be no better than its worst child. Pick the
+// WORSE of the two children (the one that should stay closer to the root)
+// and swap with it if it is strictly worse than the current parent.
+//
+// Left-child-before-right evaluation order is deliberate: in the
+// impossible case where both children are equal, we still pin which
+// concrete index ends up in the worst slot — left wins.
+@[determinism(BitIdentical)]
+fn sift_down(h: &mut BoundedHeap, mut idx: u32) {
+    let n = h.data.len();
+    loop {
+        let left  = 2 * idx + 1;
+        let right = 2 * idx + 2;
+        if left >= n { break; }
+
+        // Pick the worse child. Default: left. If right exists AND right
+        // is worse than left (i.e. left is better than right), pick right.
+        let mut worse_child = left;
+        if right < n && entry_better(h.data[left], h.data[right]) {
+            worse_child = right;
+        }
+
+        // Swap parent with worse_child only if parent is BETTER than
+        // worse_child — i.e. parent currently violates worst-on-top.
+        if entry_better(h.data[idx], h.data[worse_child]) {
+            let tmp = h.data[idx];
+            h.data[idx]         = h.data[worse_child];
+            h.data[worse_child] = tmp;
+            idx = worse_child;
+        } else {
+            break;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// extract_top_k
+// ---------------------------------------------------------------------------
+//
+// Returns the top-K entries of (logits[0, :], catalog.ids) under the
+// score-DESC, sha-ASC ordering.
+//
+// k semantics:
+//   k == 0                    -> empty TopK (no panic, no error)
+//   k > num_routes            -> saturate at num_routes (return all, sorted)
+//   k > MAX_TOP_K             -> caller guards at preselect(); this layer
+//                                trusts callers and still saturates at
+//                                num_routes to keep the function total.
+//
+// Edge cases:
+//   num_routes == 0           -> empty TopK regardless of k
+//   batch > 1                 -> only batch[0] is read; Phase 2 problem.
+//
+// Output ordering: strictly descending under `entry_better`. ids[0] is the
+// best (highest score, or lowest sha on ties); ids[k-1] is the worst of
+// the chosen K.
+@[determinism(BitIdentical)]
+pub fn extract_top_k(
+    logits:  tensor<Q16_16, [batch, num_routes]>,
+    catalog: RouteCatalog,
+    k:       u32,
+) -> TopK
+{
+    let num_routes = catalog.ids.len();
+
+    // Empty result short-circuit. Covers k == 0 and empty catalog.
+    if k == 0 || num_routes == 0 {
+        let empty_ids:    [RouteId; 0] = [];
+        let empty_scores: [Q16_16;  0] = [];
+        return TopK { ids: empty_ids, scores: empty_scores };
+    }
+
+    // Saturate k at num_routes. k > num_routes returns all entries sorted.
+    let effective_k: u32 = if k > num_routes as u32 { num_routes as u32 } else { k };
+
+    let mut heap = heap_new(effective_k);
+
+    // Sequential ingest, left-to-right index order. Single reduction;
+    // no vectorisation that could reorder eviction decisions.
+    for i in 0..num_routes {
+        let entry = HeapEntry {
+            score:    logits[0, i],
+            sha:      sha256(catalog.ids[i] as [u8]),
+            route_id: catalog.ids[i],
+        };
+
+        if heap_len(heap) < effective_k {
+            heap_push(&mut heap, entry);
+        } else if entry_better(entry, heap_peek_worst(heap)) {
+            heap_replace_worst(&mut heap, entry);
+        }
+        // else: candidate is no better than the current worst -> drop.
+        // Equal entries do NOT displace; the earlier-inserted entry wins
+        // ONLY because UniqueRouteCatalog guarantees no duplicate shas.
+        // If a future relaxation allows duplicate shas, this branch
+        // must be revisited.
+    }
+
+    // Drain. heap_pop_worst returns ascending under our ordering (worst
+    // first). We collect into a tail buffer then reverse to get strict
+    // DESC, sha-ASC-on-tie output.
+    let n_out = heap_len(heap);
+    let mut asc_ids:    [RouteId; n_out] = [[0u8; 32]; n_out];
+    let mut asc_scores: [Q16_16;  n_out] = [0_i32;     n_out];
+    for i in 0..n_out {
+        let popped = heap_pop_worst(&mut heap);
+        asc_ids[i]    = popped.route_id;
+        asc_scores[i] = popped.score;
+    }
+
+    // Reverse into descending output. Index j of output reads index
+    // (n_out - 1 - j) of the ascending drain. Pinned order.
+    let mut out_ids:    [RouteId; n_out] = [[0u8; 32]; n_out];
+    let mut out_scores: [Q16_16;  n_out] = [0_i32;     n_out];
+    for j in 0..n_out {
+        out_ids[j]    = asc_ids[n_out - 1 - j];
+        out_scores[j] = asc_scores[n_out - 1 - j];
+    }
+
+    TopK { ids: out_ids, scores: out_scores }
+}
+
+// ---------------------------------------------------------------------------
+// canonical_result_hash
+// ---------------------------------------------------------------------------
+//
+// Canonical SHA-256 over the top-K result, used as `envelope.result_hash`.
+//
+// Serialization (per tests/unit/test_top_k.mind §"Canonical serialization"
+// and spec/architecture.md §"Catalog hashing"):
+//
+//   for each (route_id, score) in TopK order:
+//       emit  u32-LE length=32        (4 bytes)
+//       emit  route_id                (32 bytes)
+//       emit  i32-LE score            (4 bytes)
+//
+// Per entry: 40 bytes. Total preimage: 40 * top_k.ids.len().
+//
+// Empty TopK -> SHA-256(empty) = e3b0c442...
+//
+// The length prefix is fixed at 32 (the RouteId byte width) but emitted on
+// every entry so the serialization is self-describing and future-compatible
+// with a variable-width RouteId (e.g. SHA-3 migration).
+@[determinism(BitIdentical)]
+pub fn canonical_result_hash(top_k: TopK) -> [u8; 32] {
+    let n = top_k.ids.len();
+    let mut buf: [u8] = [];
+
+    // Sequential left-to-right preimage construction. Reduction order
+    // pinned by the loop index.
+    for i in 0..n {
+        // u32-LE length prefix = 32
+        buf.push(32u8);
+        buf.push(0u8);
+        buf.push(0u8);
+        buf.push(0u8);
+
+        // route_id (32 bytes, raw)
+        for b in 0..32 {
+            buf.push(top_k.ids[i][b]);
+        }
+
+        // i32-LE score
+        let s: i32 = top_k.scores[i];
+        buf.push(( s        & 0xFF) as u8);
+        buf.push(((s >> 8 ) & 0xFF) as u8);
+        buf.push(((s >> 16) & 0xFF) as u8);
+        buf.push(((s >> 24) & 0xFF) as u8);
+    }
+
+    sha256(buf.as_slice())
+}

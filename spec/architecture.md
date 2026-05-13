@@ -140,40 +140,48 @@ catalog and the same model produce identical attestation chains.
 
 ## Attestation envelope
 
-Every inference emits an envelope. The v2 layout is 212 bytes and is
-specified at the byte level in [`numerics.md`](numerics.md#attestation-envelope-v2).
-Summary fields:
+Every inference emits an envelope. The v2 layout is 212 bytes packed,
+little-endian for all multi-byte integers. Authoritative byte-level contract
+is `tests/unit/test_evidence.mind §1`; `src/evidence.mind` carries the
+matching offset constants.
 
 ```
-struct AttestationEnvelope {            // v2, 212 bytes packed
-    version:              u8            // 2
-    entry_kind:           u8            // 1=inference, 2=chain_reset
-    wire_version:         u8            // numerics-pin major version
-    k:                    u8            // top-K returned
-    timestamp_ms:         u64           // monotonic, not wall-clock
-    architecture:         u8            // 1=cpu_x86 2=cpu_arm 3=cuda 4=webgpu 5=npu
-    reserved:             [u8; 3]       // MUST be zero, refused otherwise
-    chain_reset_reason:   [u8; 32]      // zero on inference entries
-    model_hash:           [u8; 32]      // SHA-256 of mind-nerve weights manifest
-    tokenizer_hash:       [u8; 32]      // SHA-256 of tokenizer vocab + merges
-    catalog_hash:         [u8; 32]      // SHA-256 of canonical RouteCatalog
-    request_hash:         [u8; 32]      // SHA-256 of request bytes
-    result_hash:          [u8; 32]      // SHA-256 of canonical(top_k)
-    chain_prev:           [u8; 32]      // SHA-256 of previous envelope, zero if first
-}
+offset  size  field
+  0     1     version             (= 2)
+  1     1     entry_kind          (1=Inference, 2=ModelLoad, 3=CatalogLoad)
+  2     2     wire_version        (u16 LE; numerics-pin major version)
+  4     4     k                   (u32 LE; 1..=MAX_TOP_K)
+  8     8     timestamp_ms        (i64 LE; monotonic, NOT wall-clock)
+ 16     1     architecture        (1=x86_64, 2=aarch64, 3=cuda)
+ 17     1     reserved            (MUST be 0)
+ 18     2     chain_reset_reason  (u16 LE: 0=Continuation, 1=ModelSwap,
+                                   2=CatalogChanged, 3=ClockReset)
+ 20    32     model_hash          (SHA-256 of weights manifest)
+ 52    32     tokenizer_hash      (SHA-256 of tokenizer vocab + merges)
+ 84    32     catalog_hash        (SHA-256 of canonical RouteCatalog)
+116    32     request_hash        (SHA-256 of request bytes)
+148    32     result_hash         (SHA-256 of canonical(top_k))
+180    32     chain_prev          (SHA-256 of previous envelope, zero if first)
+====   ===
+TOTAL  212
 ```
 
 `chain_curr` is NOT stored in the envelope. It is computed at verification
-time as `SHA-256(all-fields-above)`, which lets the verifier detect tampering
-with any field without an additional integrity slot. A v2-aware verifier
-walks the chain by recomputing `chain_curr` for envelope *i* and comparing
-to `chain_prev` of envelope *i+1*. The first envelope in a chain has
-`chain_prev = 0`.
+time as `SHA-256(212-byte serialization)`, which lets the verifier detect
+tampering with any field without an additional integrity slot. A v2-aware
+verifier walks the chain by recomputing `chain_curr` for envelope *i* and
+comparing to `chain_prev` of envelope *i+1*. The first envelope in a chain
+has `chain_prev = 0`.
 
-`architecture` enum starts at 1 so that an uninitialised zero byte is
-unambiguously invalid. The 3 reserved bytes MUST be zero — a verifier that
-sees non-zero reserved bytes refuses the envelope and emits
-`ReservedByteNonZero`.
+`architecture` and `entry_kind` enum values start at 1 so an uninitialised
+zero byte is unambiguously invalid. `reserved` MUST be zero on construction
+AND on deserialize — a verifier that sees non-zero reserved bytes refuses
+the envelope and emits `ReservedByteNonZero`. This catches future-version
+envelopes being forced through a v2 verifier.
+
+Phase 1 architecture enum covers `x86_64`, `aarch64`, `cuda`. Phase 2 extends
+to `webgpu` (= 4) and `npu` (= 5) without bumping `version` — the u8 field
+reserves all 256 slots for future backends.
 
 ## Bit-identity contract
 

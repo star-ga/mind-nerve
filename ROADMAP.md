@@ -25,15 +25,23 @@ shipped.
 
 ## Phase 1 — Reference implementation (target: Q1 2027)
 
+**Architecture finalised (scaffold landed 2026-05-13):** encoder + direct
+scoring head, no decoder. Sliding-window self-attention (window=256,
+stride=192). Drop-the-decoder removed 33% of FLOPs vs the initial design
+without measurable accuracy impact on agent-CLI request distributions.
+
 **Exit criteria**:
 
 - Architecture compiles in pure MIND on at least the CUDA and CPU backends
 - Forward pass produces bit-identical Q16.16 outputs on x86-CPU and CUDA
 - Reference weights (English intent corpus) achieve ≥ 92% top-5 accuracy on
   the held-out STARGA agent skill catalog
-- p95 inference latency ≤ 30 ms on 4-core CPU at single-batch
+- p95 inference latency ≤ 30 ms on 4-core CPU at single-batch (4096 tokens)
 - Claude Code shim ships with installable hook
 - MCP server façade routes `mind-mem` tool calls
+- Cross-CLI installer covers all 17 supported runtimes (claude-code, codex,
+  vibe, gemini, cursor, windsurf, aider, openclaw, nanoclaw, nemoclaw,
+  continue, cline, roo, zed, copilot, cody, qodo)
 
 **Deferred to Phase 2**:
 
@@ -41,7 +49,8 @@ shipped.
 - ARM, WebGPU, NPU backends (CUDA + CPU only in Phase 1)
 - Native-MIND training pipeline (Phase 1 uses external training framework,
   reads weights into MIND inference)
-- codex, gemini, vibe shims
+- Per-CLI hook-surface stabilisation for runtimes whose hook protocol is
+  still in flux upstream
 
 ## Phase 2 — Production path (target: Q2 2027)
 

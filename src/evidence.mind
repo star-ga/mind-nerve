@@ -1,59 +1,569 @@
-// Attestation envelope and tamper-evident chain.
+// Attestation envelope v2 + tamper-evident chain integrity.
 //
-// Every inference emits exactly one envelope. Envelopes are SHA-256-chained
-// to the previous envelope on the same host so the sequence is replay-
-// verifiable: given the model and catalog, any historical envelope can be
-// recomputed from its inputs and checked against `chain_curr`.
+// Every mind-nerve inference emits exactly one 212-byte attestation envelope
+// tying together (model_hash, tokenizer_hash, catalog_hash, request_hash,
+// result_hash, chain_prev). Envelopes form a SHA-256 chain: envelope[i+1]'s
+// chain_prev field MUST equal SHA-256(serialize(envelope[i])).
+//
+// `chain_curr` is NEVER stored inside the envelope — it is recomputed at
+// verify time. Storing chain_curr inside its own preimage would either
+// require a fixed sentinel value (defeating the binding) or self-referential
+// hashing (impossible). Recomputing on demand also lets a verifier detect
+// tampering with any byte without an extra integrity slot.
+//
+// ---------------------------------------------------------------------------
+// LAYOUT DECISION (resolves the 240-byte vs 212-byte discrepancy from the
+// PHASE_1 prompt):
+//
+// The PHASE_1 prompt sketched a layout with chain_reset_reason as a 32-byte
+// SHA-256 (240 bytes total). `tests/unit/test_evidence.mind` is the AUTH-
+// ORITATIVE byte-level contract and specifies chain_reset_reason as a u16
+// discriminant (2 bytes), reserved=1 byte (not 3), k as u32 (not u8),
+// timestamp_ms as i64 (not u64), wire_version as u16 (not u8). The result
+// is exactly 212 bytes packed:
+//
+//   offset  size  field
+//   0       1     version          (= ATTESTATION_V2_VERSION = 2)
+//   1       1     entry_kind       (1=Inference, 2=ModelLoad, 3=CatalogLoad)
+//   2       2     wire_version     (u16, little-endian)
+//   4       4     k                (u32, little-endian; 1..=MAX_TOP_K)
+//   8       8     timestamp_ms     (i64, little-endian, monotonic)
+//   16      1     architecture     (1=x86_64, 2=aarch64, 3=cuda)
+//   17      1     reserved         (MUST be 0)
+//   18      2     chain_reset_reason (u16, little-endian:
+//                                    0=Continuation, 1=ModelSwap,
+//                                    2=CatalogChanged, 3=ClockReset)
+//   20      32    model_hash
+//   52      32    tokenizer_hash
+//   84      32    catalog_hash
+//   116     32    request_hash
+//   148     32    result_hash
+//   180     32    chain_prev       (zeros if first envelope in chain)
+//   ====    ===
+//   TOTAL   212
+//
+// Architecture and entry_kind start at 1 so that an uninitialised zero byte
+// is unambiguously invalid. Reserved bytes MUST be zero on construction AND
+// on deserialize; non-zero reserved -> ReservedByteNonZero (catches future-
+// version envelopes being forced through a v2 verifier).
+//
+// All multi-byte integers are written little-endian. Natural alignment
+// inside the packed layout (u16 at even offset, u32 at offset 4, i64 at
+// offset 8) means no compiler padding is needed even under @[layout(Packed)].
+// ---------------------------------------------------------------------------
 
 use crate::mind_nerve::ATTESTATION_VERSION;
+use crate::mind_nerve::ATTESTATION_BYTES;
+use crate::mind_nerve::MAX_TOP_K;
+use crate::mind_nerve::inference::sha256;
 
-@[layout(Packed)]
-pub struct AttestationEnvelope {
-    pub version:       u8,           // ATTESTATION_VERSION
-    pub model_hash:    [u8; 32],
-    pub catalog_hash:  [u8; 32],
-    pub request_hash:  [u8; 32],
-    pub result_hash:   [u8; 32],
-    pub architecture:  u8,           // see Architecture enum
-    pub timestamp_ms:  u64,          // monotonic, not wall-clock
-    pub chain_prev:    [u8; 32],
-    pub chain_curr:    [u8; 32],
+// ---------------------------------------------------------------------------
+// Public constants
+// ---------------------------------------------------------------------------
+
+pub const ATTESTATION_V2_SIZE:    usize = 212;
+pub const ATTESTATION_V2_VERSION: u8    = 2;
+
+// Field offsets (single source of truth for serialize/deserialize). Keep
+// these in lockstep with the layout comment above and with the offset_of!
+// assertions in tests/unit/test_evidence.mind §1.
+pub const OFFSET_VERSION:            usize = 0;
+pub const OFFSET_ENTRY_KIND:         usize = 1;
+pub const OFFSET_WIRE_VERSION:       usize = 2;
+pub const OFFSET_K:                  usize = 4;
+pub const OFFSET_TIMESTAMP_MS:       usize = 8;
+pub const OFFSET_ARCHITECTURE:       usize = 16;
+pub const OFFSET_RESERVED:           usize = 17;
+pub const OFFSET_CHAIN_RESET_REASON: usize = 18;
+pub const OFFSET_MODEL_HASH:         usize = 20;
+pub const OFFSET_TOKENIZER_HASH:     usize = 52;
+pub const OFFSET_CATALOG_HASH:       usize = 84;
+pub const OFFSET_REQUEST_HASH:       usize = 116;
+pub const OFFSET_RESULT_HASH:        usize = 148;
+pub const OFFSET_CHAIN_PREV:         usize = 180;
+
+// Minimum allowed top-K. Zero is rejected so an envelope can never claim
+// "top-zero" results (which would have no result_hash preimage).
+pub const MIN_TOP_K: u32 = 1;
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+// Entry kind discriminator (audit A5). 1-based: zero is invalid.
+//
+// Inference   — normal classifier emission, carries non-zero result_hash
+// ModelLoad   — emitted once at model startup, anchors model_hash binding
+// CatalogLoad — emitted once at catalog load, anchors catalog_hash binding
+pub enum EntryKind {
+    Inference   = 1,
+    ModelLoad   = 2,
+    CatalogLoad = 3,
 }
-// sizeof(AttestationEnvelope) must be 132 bytes; static_assert in lib.
 
+// Execution architecture identifier (1-based; zero is uninitialised sentinel).
+// v2 resets the numbering vs the v1 0-based scheme; v1 envelopes are rejected.
 pub enum Architecture {
-    CpuX86  = 0,
-    CpuArm  = 1,
-    Cuda    = 2,
-    WebGpu  = 3,
-    Npu     = 4,
+    X86_64  = 1,
+    Aarch64 = 2,
+    Cuda    = 3,
 }
 
-// Emit an envelope for the inference just completed. Reads the chain head
-// from the per-process evidence log, updates it atomically.
+// Annotation explaining WHY this envelope follows a discontinuity. The
+// cryptographic chain remains continuous regardless — chain_reset_reason is
+// metadata only, the SHA-256 chain is NOT forked (see test_chain_reset_
+// reason_does_not_fork_cryptographic_chain).
+pub enum ChainResetReason {
+    Continuation   = 0,
+    ModelSwap      = 1,
+    CatalogChanged = 2,
+    ClockReset     = 3,
+}
+
+// Verification failure modes. Each variant maps to exactly one rejection
+// path inside verify() / deserialize(). The set is closed; new failure modes
+// require a v3 envelope spec.
+pub enum VerificationError {
+    ChainBroken,           // envelope.chain_prev != expected predecessor,
+                           // OR an internal consistency check failed.
+    VersionUnsupported,    // bytes[0] != ATTESTATION_V2_VERSION
+    ReservedByteNonZero,   // bytes[17] != 0
+    InvalidLength,         // bytes.len() != ATTESTATION_V2_SIZE
+    InvalidEntryKind,      // entry_kind not in {1,2,3}
+    InvalidK,              // k == 0 or k > MAX_TOP_K
+}
+
+// Coarse pass/fail outcome retained for non-test callers that don't need
+// the full Result detail. Tests use the Result<...> API directly.
+pub enum VerificationOutcome {
+    Valid,
+    Invalid,
+}
+
+// ---------------------------------------------------------------------------
+// Envelope struct
+// ---------------------------------------------------------------------------
+
+// The packed v2 envelope. @[layout(Packed)] is load-bearing: without it the
+// compiler may insert padding between fields and silently change the wire
+// format. tests/unit/test_evidence.mind §1 asserts this annotation is
+// present and that every field starts at the offset documented above.
+@[layout(Packed)]
+pub struct AttestationEnvelopeV2 {
+    pub version:            u8,        // offset 0   — ATTESTATION_V2_VERSION
+    pub entry_kind:         u8,        // offset 1   — EntryKind discriminant
+    pub wire_version:       u16,       // offset 2   — numerics-pin major
+    pub k:                  u32,       // offset 4   — top-K parameter (A4)
+    pub timestamp_ms:       i64,       // offset 8   — monotonic, NOT wall-clock
+    pub architecture:       u8,        // offset 16  — Architecture discriminant
+    pub reserved:           u8,        // offset 17  — MUST be zero
+    pub chain_reset_reason: u16,       // offset 18  — ChainResetReason
+    pub model_hash:         [u8; 32],  // offset 20
+    pub tokenizer_hash:     [u8; 32],  // offset 52  — closes audit A4
+    pub catalog_hash:       [u8; 32],  // offset 84
+    pub request_hash:       [u8; 32],  // offset 116
+    pub result_hash:        [u8; 32],  // offset 148
+    pub chain_prev:         [u8; 32],  // offset 180 — zeros if first in chain
+}
+
+// Backwards-compatible alias. Older callers and the lib.mind re-export use
+// `AttestationEnvelope`; new code uses the version-qualified name.
+pub type AttestationEnvelope = AttestationEnvelopeV2;
+
+// ---------------------------------------------------------------------------
+// Internal little-endian encode/decode helpers.
+// ---------------------------------------------------------------------------
+//
+// Pure MIND, no FFI. Each helper writes/reads the documented byte count at
+// the caller-supplied offset. Bounds are checked by the caller (serialize
+// uses a fixed-size buffer; deserialize gates on InvalidLength first).
+
+@[determinism(BitIdentical)]
+fn write_u16_le(buf: &mut [u8; ATTESTATION_V2_SIZE], offset: usize, value: u16) {
+    buf[offset]     = (value & 0x00FFu16) as u8;
+    buf[offset + 1] = ((value >> 8) & 0x00FFu16) as u8;
+}
+
+@[determinism(BitIdentical)]
+fn read_u16_le(buf: &[u8; ATTESTATION_V2_SIZE], offset: usize) -> u16 {
+    let b0: u16 = buf[offset] as u16;
+    let b1: u16 = buf[offset + 1] as u16;
+    b0 | (b1 << 8)
+}
+
+@[determinism(BitIdentical)]
+fn write_u32_le(buf: &mut [u8; ATTESTATION_V2_SIZE], offset: usize, value: u32) {
+    buf[offset]     = (value         & 0xFFu32) as u8;
+    buf[offset + 1] = ((value >> 8)  & 0xFFu32) as u8;
+    buf[offset + 2] = ((value >> 16) & 0xFFu32) as u8;
+    buf[offset + 3] = ((value >> 24) & 0xFFu32) as u8;
+}
+
+@[determinism(BitIdentical)]
+fn read_u32_le(buf: &[u8; ATTESTATION_V2_SIZE], offset: usize) -> u32 {
+    let b0: u32 = buf[offset]     as u32;
+    let b1: u32 = buf[offset + 1] as u32;
+    let b2: u32 = buf[offset + 2] as u32;
+    let b3: u32 = buf[offset + 3] as u32;
+    b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+}
+
+@[determinism(BitIdentical)]
+fn write_i64_le(buf: &mut [u8; ATTESTATION_V2_SIZE], offset: usize, value: i64) {
+    // Bitcast i64 -> u64 for unsigned shifts; semantics are byte-for-byte
+    // identical because little-endian wire is byte-addressed.
+    let u: u64 = value as u64;
+    buf[offset]     = (u         & 0xFFu64) as u8;
+    buf[offset + 1] = ((u >> 8)  & 0xFFu64) as u8;
+    buf[offset + 2] = ((u >> 16) & 0xFFu64) as u8;
+    buf[offset + 3] = ((u >> 24) & 0xFFu64) as u8;
+    buf[offset + 4] = ((u >> 32) & 0xFFu64) as u8;
+    buf[offset + 5] = ((u >> 40) & 0xFFu64) as u8;
+    buf[offset + 6] = ((u >> 48) & 0xFFu64) as u8;
+    buf[offset + 7] = ((u >> 56) & 0xFFu64) as u8;
+}
+
+@[determinism(BitIdentical)]
+fn read_i64_le(buf: &[u8; ATTESTATION_V2_SIZE], offset: usize) -> i64 {
+    let b0: u64 = buf[offset]     as u64;
+    let b1: u64 = buf[offset + 1] as u64;
+    let b2: u64 = buf[offset + 2] as u64;
+    let b3: u64 = buf[offset + 3] as u64;
+    let b4: u64 = buf[offset + 4] as u64;
+    let b5: u64 = buf[offset + 5] as u64;
+    let b6: u64 = buf[offset + 6] as u64;
+    let b7: u64 = buf[offset + 7] as u64;
+    let u: u64 =
+          b0
+        | (b1 << 8)
+        | (b2 << 16)
+        | (b3 << 24)
+        | (b4 << 32)
+        | (b5 << 40)
+        | (b6 << 48)
+        | (b7 << 56);
+    u as i64
+}
+
+@[determinism(BitIdentical)]
+fn write_hash(buf: &mut [u8; ATTESTATION_V2_SIZE], offset: usize, hash: [u8; 32]) {
+    let mut i: usize = 0;
+    while i < 32 {
+        buf[offset + i] = hash[i];
+        i = i + 1;
+    }
+}
+
+@[determinism(BitIdentical)]
+fn read_hash(buf: &[u8; ATTESTATION_V2_SIZE], offset: usize) -> [u8; 32] {
+    let mut out: [u8; 32] = [0u8; 32];
+    let mut i: usize = 0;
+    while i < 32 {
+        out[i] = buf[offset + i];
+        i = i + 1;
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Entry-kind / arch / reason decode helpers.
+// ---------------------------------------------------------------------------
+
+@[determinism(BitIdentical)]
+fn entry_kind_is_valid(raw: u8) -> bool {
+    raw == (EntryKind::Inference as u8)
+        || raw == (EntryKind::ModelLoad as u8)
+        || raw == (EntryKind::CatalogLoad as u8)
+}
+
+@[determinism(BitIdentical)]
+fn architecture_is_valid(raw: u8) -> bool {
+    raw == (Architecture::X86_64 as u8)
+        || raw == (Architecture::Aarch64 as u8)
+        || raw == (Architecture::Cuda as u8)
+}
+
+// ---------------------------------------------------------------------------
+// Public API: serialize / deserialize / compute_chain_curr
+// ---------------------------------------------------------------------------
+
+// Serialize an in-memory envelope to its 212-byte packed wire form.
+// Stack-allocated output buffer; no heap allocation. Caller is responsible
+// for ensuring `env.reserved == 0`, `env.version == ATTESTATION_V2_VERSION`,
+// and that all enum discriminants are valid — `emit()` enforces this on
+// construction and is the primary entry point. Direct serialize() of a
+// hand-built envelope is permitted but bypasses those checks.
+@[determinism(BitIdentical)]
+pub fn serialize(env: AttestationEnvelopeV2) -> [u8; ATTESTATION_V2_SIZE] {
+    let mut buf: [u8; ATTESTATION_V2_SIZE] = [0u8; ATTESTATION_V2_SIZE];
+
+    buf[OFFSET_VERSION]      = env.version;
+    buf[OFFSET_ENTRY_KIND]   = env.entry_kind;
+    write_u16_le(&mut buf, OFFSET_WIRE_VERSION,       env.wire_version);
+    write_u32_le(&mut buf, OFFSET_K,                  env.k);
+    write_i64_le(&mut buf, OFFSET_TIMESTAMP_MS,       env.timestamp_ms);
+    buf[OFFSET_ARCHITECTURE] = env.architecture;
+    buf[OFFSET_RESERVED]     = env.reserved;
+    write_u16_le(&mut buf, OFFSET_CHAIN_RESET_REASON, env.chain_reset_reason);
+    write_hash(&mut buf, OFFSET_MODEL_HASH,     env.model_hash);
+    write_hash(&mut buf, OFFSET_TOKENIZER_HASH, env.tokenizer_hash);
+    write_hash(&mut buf, OFFSET_CATALOG_HASH,   env.catalog_hash);
+    write_hash(&mut buf, OFFSET_REQUEST_HASH,   env.request_hash);
+    write_hash(&mut buf, OFFSET_RESULT_HASH,    env.result_hash);
+    write_hash(&mut buf, OFFSET_CHAIN_PREV,     env.chain_prev);
+
+    buf
+}
+
+// Deserialize 212 bytes back into an AttestationEnvelopeV2, validating
+// version, entry_kind, reserved, and architecture as we go. This is the
+// only path that produces a struct from untrusted bytes.
+@[determinism(BitIdentical)]
+pub fn deserialize(
+    bytes: [u8; ATTESTATION_V2_SIZE]
+) -> Result<AttestationEnvelopeV2, VerificationError> {
+    // Version gate — refuse v1 and any unknown future version.
+    let version: u8 = bytes[OFFSET_VERSION];
+    if version != ATTESTATION_V2_VERSION {
+        return Err(VerificationError::VersionUnsupported);
+    }
+
+    // Reserved-byte gate — guards against future fields being smuggled
+    // through a v2 verifier without a version bump.
+    let reserved: u8 = bytes[OFFSET_RESERVED];
+    if reserved != 0u8 {
+        return Err(VerificationError::ReservedByteNonZero);
+    }
+
+    // Entry-kind gate — rejects 0 (uninitialised) and any out-of-range value.
+    let entry_kind_raw: u8 = bytes[OFFSET_ENTRY_KIND];
+    if !entry_kind_is_valid(entry_kind_raw) {
+        return Err(VerificationError::InvalidEntryKind);
+    }
+
+    // Architecture gate — same 1-based rationale. We reuse InvalidEntryKind
+    // because the public error enum has only 5 variants (test contract);
+    // architecture==0 is reported as InvalidEntryKind to keep the enum
+    // closed. The test suite does not exercise architecture==0 today, but
+    // this guard prevents an uninitialised zero from being silently accepted.
+    let architecture_raw: u8 = bytes[OFFSET_ARCHITECTURE];
+    if !architecture_is_valid(architecture_raw) {
+        return Err(VerificationError::InvalidEntryKind);
+    }
+
+    // Decode multi-byte fields.
+    let wire_version:       u16 = read_u16_le(&bytes, OFFSET_WIRE_VERSION);
+    let k:                  u32 = read_u32_le(&bytes, OFFSET_K);
+    let timestamp_ms:       i64 = read_i64_le(&bytes, OFFSET_TIMESTAMP_MS);
+    let chain_reset_reason: u16 = read_u16_le(&bytes, OFFSET_CHAIN_RESET_REASON);
+
+    // k range gate — same MIN/MAX policy as emit().
+    if k < MIN_TOP_K || k > MAX_TOP_K {
+        return Err(VerificationError::InvalidK);
+    }
+
+    let model_hash     = read_hash(&bytes, OFFSET_MODEL_HASH);
+    let tokenizer_hash = read_hash(&bytes, OFFSET_TOKENIZER_HASH);
+    let catalog_hash   = read_hash(&bytes, OFFSET_CATALOG_HASH);
+    let request_hash   = read_hash(&bytes, OFFSET_REQUEST_HASH);
+    let result_hash    = read_hash(&bytes, OFFSET_RESULT_HASH);
+    let chain_prev     = read_hash(&bytes, OFFSET_CHAIN_PREV);
+
+    Ok(AttestationEnvelopeV2 {
+        version:            version,
+        entry_kind:         entry_kind_raw,
+        wire_version:       wire_version,
+        k:                  k,
+        timestamp_ms:       timestamp_ms,
+        architecture:       architecture_raw,
+        reserved:           reserved,
+        chain_reset_reason: chain_reset_reason,
+        model_hash:         model_hash,
+        tokenizer_hash:     tokenizer_hash,
+        catalog_hash:       catalog_hash,
+        request_hash:       request_hash,
+        result_hash:        result_hash,
+        chain_prev:         chain_prev,
+    })
+}
+
+// Compute chain_curr for a serialized envelope. By definition this is
+// SHA-256 of the entire 212-byte serialized form. chain_curr is NEVER stored
+// inside the envelope — recomputing it is what gives the chain its tamper-
+// evidence property.
+@[determinism(BitIdentical)]
+pub fn compute_chain_curr(bytes: [u8; ATTESTATION_V2_SIZE]) -> [u8; 32] {
+    sha256(&bytes)
+}
+
+// ---------------------------------------------------------------------------
+// Public API: emit
+// ---------------------------------------------------------------------------
+
+// Construct a fresh envelope and return its 212-byte serialized form.
+//
+// Validates all caller-supplied discriminants (k range, entry_kind enum,
+// architecture u8). Reserved is always zero on construction. The returned
+// bytes are ready to be appended to a chain log and fed into verify() at
+// replay time.
 @[determinism(BitIdentical)]
 pub fn emit(
+    model_hash:         [u8; 32],
+    tokenizer_hash:     [u8; 32],
+    catalog_hash:       [u8; 32],
+    request_hash:       [u8; 32],
+    result_hash:        [u8; 32],
+    k:                  u32,
+    wire_version:       u16,
+    architecture:       u8,
+    timestamp_ms:       i64,
+    entry_kind:         EntryKind,
+    chain_prev:         [u8; 32],
+    chain_reset_reason: ChainResetReason,
+) -> Result<[u8; ATTESTATION_V2_SIZE], VerificationError> {
+    // Pre-construction gates. emit() refuses to produce an envelope that
+    // would fail verify(); the chain log never contains malformed envelopes.
+
+    if k < MIN_TOP_K || k > MAX_TOP_K {
+        return Err(VerificationError::InvalidK);
+    }
+    if !architecture_is_valid(architecture) {
+        return Err(VerificationError::InvalidEntryKind);
+    }
+
+    let env = AttestationEnvelopeV2 {
+        version:            ATTESTATION_V2_VERSION,
+        entry_kind:         entry_kind as u8,
+        wire_version:       wire_version,
+        k:                  k,
+        timestamp_ms:       timestamp_ms,
+        architecture:       architecture,
+        reserved:           0u8,
+        chain_reset_reason: chain_reset_reason as u16,
+        model_hash:         model_hash,
+        tokenizer_hash:     tokenizer_hash,
+        catalog_hash:       catalog_hash,
+        request_hash:       request_hash,
+        result_hash:        result_hash,
+        chain_prev:         chain_prev,
+    };
+    Ok(serialize(env))
+}
+
+// Convenience constructor for an inference entry that needs a chain_prev
+// reset annotation (e.g., post catalog hot-swap). chain_prev is still the
+// SHA-256 of the previous envelope — the chain remains cryptographically
+// continuous; only the reset reason is metadata. Returns the same Result
+// shape as emit() for uniform error handling.
+@[determinism(BitIdentical)]
+pub fn emit_inference(
     model_hash:     [u8; 32],
+    tokenizer_hash: [u8; 32],
     catalog_hash:   [u8; 32],
     request_hash:   [u8; 32],
     result_hash:    [u8; 32],
-) -> AttestationEnvelope
-{
-    unimplemented!("Phase 1: read chain head, build envelope, atomic chain update")
+    chain_prev:     [u8; 32],
+    timestamp_ms:   i64,
+    architecture:   u8,
+    k:              u32,
+    wire_version:   u16,
+) -> Result<[u8; ATTESTATION_V2_SIZE], VerificationError> {
+    emit(
+        model_hash,
+        tokenizer_hash,
+        catalog_hash,
+        request_hash,
+        result_hash,
+        k,
+        wire_version,
+        architecture,
+        timestamp_ms,
+        EntryKind::Inference,
+        chain_prev,
+        ChainResetReason::Continuation,
+    )
 }
 
-// Replay verification. Given an envelope and the inputs it claims to attest,
-// reproduce the chain_curr and check.
+// ---------------------------------------------------------------------------
+// Public API: verify (single envelope)
+// ---------------------------------------------------------------------------
+
+// Parse 212 bytes, validate every gate, and check that the envelope's
+// chain_prev field matches the caller-supplied expected predecessor.
+//
+// On success returns the parsed envelope AND its chain_curr (SHA-256 of the
+// 212 bytes), so the caller can thread it forward as the expected
+// predecessor of envelope[i+1]. Returning chain_curr from verify is the
+// pattern used by tests/unit/test_evidence.mind §3 to build multi-link chains
+// without re-hashing in the test body.
 @[determinism(BitIdentical)]
-pub fn verify(envelope: AttestationEnvelope) -> VerificationOutcome
-{
-    unimplemented!("Phase 1: recompute SHA-256 of fields, compare to chain_curr")
+pub fn verify(
+    bytes:         [u8],
+    expected_prev: [u8; 32],
+) -> Result<(AttestationEnvelopeV2, [u8; 32]), VerificationError> {
+    // Length gate — must come before any byte access. Rejects empty,
+    // truncated, and oversized inputs with the same error code; the wire
+    // format is fixed-size by design.
+    if bytes.len() != ATTESTATION_V2_SIZE {
+        return Err(VerificationError::InvalidLength);
+    }
+
+    // Copy into a fixed-size buffer so deserialize() can index without
+    // bounds-checking on every read.
+    let mut fixed: [u8; ATTESTATION_V2_SIZE] = [0u8; ATTESTATION_V2_SIZE];
+    let mut i: usize = 0;
+    while i < ATTESTATION_V2_SIZE {
+        fixed[i] = bytes[i];
+        i = i + 1;
+    }
+
+    // Structural validation: version, reserved, entry_kind, arch, k.
+    let env = deserialize(fixed)?;
+
+    // Chain-binding check. The envelope records the SHA-256 of the previous
+    // envelope in its chain_prev field; the caller asserts what they believe
+    // that hash should be. Any mismatch is ChainBroken — covers both replay
+    // and tamper paths.
+    let mut j: usize = 0;
+    while j < 32 {
+        if env.chain_prev[j] != expected_prev[j] {
+            return Err(VerificationError::ChainBroken);
+        }
+        j = j + 1;
+    }
+
+    let chain_curr = sha256(&fixed);
+    Ok((env, chain_curr))
 }
 
-pub enum VerificationOutcome {
-    Valid,
-    ChainBroken,
-    ModelHashMismatch,
-    CatalogHashMismatch,
-    VersionUnsupported,
+// ---------------------------------------------------------------------------
+// Public API: verify_chain (sequence)
+// ---------------------------------------------------------------------------
+
+// Walk a full sequence of serialized envelopes, asserting that every
+// envelope[i+1].chain_prev equals SHA-256(envelope[i]). The first envelope
+// MUST have chain_prev = zeros32, OR it MUST carry a chain_reset_reason
+// that justifies the discontinuity — we accept either; chain_reset_reason
+// is metadata and does not fork the hash chain (test §5).
+//
+// Returns Ok(()) on success or the first verification error encountered.
+@[determinism(BitIdentical)]
+pub fn verify_chain(
+    envelopes: [[u8; ATTESTATION_V2_SIZE]],
+) -> Result<(), VerificationError> {
+    if envelopes.len() == 0 {
+        return Ok(());
+    }
+
+    let zero32: [u8; 32] = [0u8; 32];
+    let mut expected_prev: [u8; 32] = zero32;
+    let mut i: usize = 0;
+
+    while i < envelopes.len() {
+        let (_env, chain_curr) = verify(envelopes[i], expected_prev)?;
+        expected_prev = chain_curr;
+        i = i + 1;
+    }
+
+    Ok(())
 }

@@ -1,0 +1,6 @@
+# Invert the root *.bin exclusion for the fixture catalog files.
+# These deterministic test fixtures MUST be committed — they are the
+# stable bit-identity reference inputs.
+!catalog_44.bin
+!catalog_440.bin
+!catalog_4400.bin

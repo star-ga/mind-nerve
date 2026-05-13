@@ -1,17 +1,575 @@
-// mind-nerve single-binary CLI entrypoint.
+// cli/main.mind — mind-nerve single-binary entry.
 //
-// Reads JSON request from stdin, emits JSON response to stdout, appends
-// attestation envelope to the local evidence log. Intended to be called by
-// host shims (Claude Code, codex, MCP façade); not user-facing.
+// CPU-first intent-classification preselector. Reads a preselect request from
+// stdin (mic@2 text frame), executes `preselect_pre_tokenized`, writes the
+// top-K result + 212-byte attestation envelope to stdout (mic-b binary frame).
+// On error, writes a mic@2 text frame to stderr and exits with a documented
+// non-zero code.
+//
+// Single static binary. No JSON. No FFI beyond the stdin/stdout primitives
+// provided by `crate::std::io`. Pure MIND.
+//
+// =============================================================================
+// WIRE PROTOCOL — stdin (mic@2 text, line-oriented)
+// =============================================================================
+//
+// Grammar (regular, line-prefixed, terminator-line ".") :
+//
+//     frame    := header keys terminator
+//     header   := "mic@2/mind-nerve/preselect" LF
+//     keys     := key+
+//     key      := name ":" SP value LF
+//     name     := "model" | "catalog" | "k" | "tokens"
+//     value    := UTF-8 bytes, no LF
+//     terminator := "." LF
+//
+// Required keys (order-independent, each appears exactly once):
+//
+//     model:   absolute path to mind-nerve weights file
+//     catalog: absolute path to skills catalog manifest
+//     k:       decimal u32, 1..=MAX_TOP_K
+//     tokens:  CSV of decimal u32 BPE token ids, length ≤ MAX_REQUEST_TOKENS
+//
+// Example:
+//
+//     mic@2/mind-nerve/preselect
+//     model: /var/lib/mind-nerve/checkpoint.weights
+//     catalog: /etc/mind-nerve/skills.catalog
+//     k: 5
+//     tokens: 1234,5678,9012,4321
+//     .
+//
+// Maximum stdin buffer: MAX_STDIN_BYTES = 64 * 1024. Inputs exceeding the
+// cap are rejected with ParseError (exit 6). Tokens beyond MAX_REQUEST_TOKENS
+// are rejected with RequestTooLong (exit 2) — the parser stops counting at
+// MAX_REQUEST_TOKENS + 1.
+//
+// =============================================================================
+// WIRE PROTOCOL — stdout (mic-b binary)
+// =============================================================================
+//
+// Fixed-shape little-endian binary frame:
+//
+//     offset                size       field
+//     0                     4          magic "MNB1" (0x4D, 0x4E, 0x42, 0x31)
+//     4                     2          k (u16-LE, equals number of routes)
+//     6                     32 * k     k × RouteId (raw 32-byte SHA-256 each)
+//     6 + 32*k              4  * k     k × score (i32-LE Q16.16 each)
+//     6 + 36*k              212        attestation envelope v2 (serialize)
+//                                       see src/evidence.mind §LAYOUT DECISION
+//     TOTAL                 218 + 36*k
+//
+// No length prefix on the outer frame — the size is a function of k, which
+// is the second field. Receivers parse k first, then read exactly 36*k+212
+// trailing bytes. No buffering after envelope; flushed at write_stdout()
+// return.
+//
+// =============================================================================
+// WIRE PROTOCOL — stderr (mic@2 text, error frames only)
+// =============================================================================
+//
+//     mic@2/mind-nerve/error
+//     code: <symbol>
+//     detail: <free text, no LF>
+//     .
+//
+// Codes mirror the exit code symbol set:
+//
+//     RequestTooLong   — exit 2  — tokens > MAX_REQUEST_TOKENS
+//     InvalidK         — exit 3  — k == 0 or k > MAX_TOP_K
+//     EmptyCatalog     — exit 4  — catalog manifest had zero routes
+//     ModelMismatch    — exit 5  — model file architecture mismatch
+//     ParseError       — exit 6  — mic@2 stdin frame malformed
+//     IoError          — exit 7  — stdin read or model/catalog load failed
+//
+// Exit 0 — success, mic-b frame written to stdout.
+//
+// =============================================================================
+// PHASE GAPS (documented per task — these unblock the CLI compile-and-link
+// once the sibling agents land them):
+//
+//   - src/inference.mind currently exposes `pub fn preselect` taking a
+//     Request{bytes, catalog_hash, k} struct and tokenising internally. The
+//     pre-tokenised variant `pub fn preselect_pre_tokenized(tokens, catalog,
+//     weights, k) -> Result<PreselectResult, Error>` is Phase 1.1 work and
+//     not yet present. We bind against the documented contract; the call
+//     site below is the single point of integration when it lands.
+//
+//   - src/inference.mind's `pub enum Error` currently has only two variants
+//     (InvalidK, RequestTooLong). The full error set this CLI maps to
+//     (adds EmptyCatalog, ModelMismatch) is also Phase 1.1. The match arms
+//     below describe the intended discriminants; once the sibling agent
+//     extends Error, no change is needed here.
+//
+//   - crate::std::io stdin/stdout primitives are assumed present. If
+//     mind-runtime has not yet wired them, the three I/O helpers below will
+//     hit `unimplemented!` and produce a Phase-1.2 build break by design,
+//     not silent fallthrough.
+//
+//   - tests/integration/cli_smoke.mind does not yet exist. Phase 1.2 TODO:
+//     add a smoke test that pipes a known mic@2 frame through main() and
+//     asserts the mic-b output bytes against a golden file.
+//
+// =============================================================================
 
-use crate::mind_nerve::inference;
-use crate::mind_nerve::DEFAULT_TOP_K;
+use crate::mind_nerve::inference::{
+    preselect_pre_tokenized,
+    PreselectResult,
+    InferenceError,
+    RouteCatalog,
+    ModelWeights,
+    RouteId,
+};
+use crate::mind_nerve::evidence::{serialize, ATTESTATION_V2_SIZE};
+use crate::mind_nerve::{
+    Q16_16,
+    MAX_REQUEST_TOKENS,
+    MAX_TOP_K,
+};
+use crate::std::io::{read_stdin, write_stdout, write_stderr};
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+// Hard stdin cap. 64 KB easily holds the largest legal mic@2 preselect frame:
+// MAX_REQUEST_TOKENS=1024 × max-decimal-u32 (10 chars) + commas + headers
+// ≈ 12 KB worst case. The remaining headroom is for whitespace / future
+// optional keys.
+pub const MAX_STDIN_BYTES: usize = 64 * 1024;
+
+// mic-b magic — "MNB1" = 0x4D 0x4E 0x42 0x31.
+const MNB1_MAGIC: [u8; 4] = [0x4Du8, 0x4Eu8, 0x42u8, 0x31u8];
+
+// Exit code symbols. Operators rely on these — do not renumber.
+const EXIT_OK:               i32 = 0;
+const EXIT_REQUEST_TOO_LONG: i32 = 2;
+const EXIT_INVALID_K:        i32 = 3;
+const EXIT_EMPTY_CATALOG:    i32 = 4;
+const EXIT_MODEL_MISMATCH:   i32 = 5;
+const EXIT_PARSE_ERROR:      i32 = 6;
+const EXIT_IO_ERROR:         i32 = 7;
+
+// ---------------------------------------------------------------------------
+// Parsed request shape (internal — never crosses the wire as-is).
+// ---------------------------------------------------------------------------
+
+struct ParsedRequest {
+    model_path:   [u8],   // raw UTF-8 bytes, no trailing LF
+    catalog_path: [u8],
+    k:            u32,
+    tokens:       [u32],  // length ≤ MAX_REQUEST_TOKENS
+}
+
+enum ParseError {
+    MissingHeader,
+    MissingKey,        // a required key was absent
+    DuplicateKey,      // same key appeared twice
+    UnknownKey,        // unexpected key name
+    MalformedLine,     // no "name: value" split
+    MalformedInt,      // decimal parse failed
+    MalformedTokens,   // CSV malformed
+    TokensExceedCap,   // > MAX_REQUEST_TOKENS — promoted to RequestTooLong
+    KOutOfRange,       // 0 or > MAX_TOP_K — promoted to InvalidK
+    NoTerminator,      // missing trailing "." line
+    InputTooLarge,     // stdin exceeded MAX_STDIN_BYTES
+}
+
+// ---------------------------------------------------------------------------
+// main — entry point. Side-effecting; no determinism annotation.
+// ---------------------------------------------------------------------------
+
+pub fn main() -> i32 {
+    // 1. Read stdin, bounded.
+    let stdin_bytes = match read_stdin_bounded() {
+        Ok(b)  => b,
+        Err(_) => {
+            emit_error_frame("IoError", "stdin read failed or exceeded MAX_STDIN_BYTES");
+            return EXIT_IO_ERROR;
+        }
+    };
+
+    // 2. Parse mic@2 frame.
+    let req = match parse_mic2_request(&stdin_bytes) {
+        Ok(r) => r,
+        Err(ParseError::TokensExceedCap) => {
+            emit_error_frame(
+                "RequestTooLong",
+                "token count exceeded MAX_REQUEST_TOKENS=1024",
+            );
+            return EXIT_REQUEST_TOO_LONG;
+        }
+        Err(ParseError::KOutOfRange) => {
+            emit_error_frame("InvalidK", "k must be in 1..=MAX_TOP_K");
+            return EXIT_INVALID_K;
+        }
+        Err(ParseError::InputTooLarge) => {
+            emit_error_frame("ParseError", "stdin frame exceeded MAX_STDIN_BYTES");
+            return EXIT_PARSE_ERROR;
+        }
+        Err(_) => {
+            emit_error_frame("ParseError", "mic@2 frame malformed");
+            return EXIT_PARSE_ERROR;
+        }
+    };
+
+    // 3. Load catalog + weights from on-disk paths.
+    let catalog = match load_catalog(&req.catalog_path) {
+        Ok(c)  => c,
+        Err(_) => {
+            emit_error_frame("IoError", "catalog load failed");
+            return EXIT_IO_ERROR;
+        }
+    };
+    let weights = match load_weights(&req.model_path) {
+        Ok(w)  => w,
+        Err(_) => {
+            emit_error_frame("IoError", "weights load failed");
+            return EXIT_IO_ERROR;
+        }
+    };
+
+    // 4. Inference. Pre-tokenized path — BPE is Phase 1.2.
+    match preselect_pre_tokenized(&req.tokens, &catalog, &weights, req.k) {
+        Ok(result) => {
+            let frame = emit_mic_b_response(&result);
+            match write_stdout(&frame) {
+                Ok(())  => EXIT_OK,
+                Err(_)  => {
+                    emit_error_frame("IoError", "stdout write failed");
+                    EXIT_IO_ERROR
+                }
+            }
+        }
+        Err(InferenceError::RequestTooLong) => {
+            emit_error_frame(
+                "RequestTooLong",
+                "tokens exceeded MAX_REQUEST_TOKENS at inference time",
+            );
+            EXIT_REQUEST_TOO_LONG
+        }
+        Err(InferenceError::InvalidK) => {
+            emit_error_frame("InvalidK", "k rejected by inference layer");
+            EXIT_INVALID_K
+        }
+        Err(InferenceError::EmptyCatalog) => {
+            emit_error_frame("EmptyCatalog", "catalog manifest has zero routes");
+            EXIT_EMPTY_CATALOG
+        }
+        Err(InferenceError::ModelMismatch) => {
+            emit_error_frame(
+                "ModelMismatch",
+                "weights model_hash incompatible with binary",
+            );
+            EXIT_MODEL_MISMATCH
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// I/O shims — bounded reads and unbuffered writes.
+// ---------------------------------------------------------------------------
+//
+// These are thin wrappers around `crate::std::io`. If the runtime has not
+// yet wired stdin/stdout, the wrapper bodies will not compile — by design,
+// per the Phase-1.2 gap note at the top of this file. We never silently
+// fall back to an in-memory stub.
 
 @[determinism(BitIdentical)]
-fn main(args: [string]) -> i32 {
-    // CLI surface is intentionally tiny:
-    //   mind-nerve preselect [--top-k N]      reads stdin, writes stdout
-    //   mind-nerve verify  <envelope-base64>  exit 0 if valid, 1 if not
-    //   mind-nerve version                    prints semver + model_hash
-    unimplemented!("Phase 1: stdin/stdout JSON dispatch")
+fn read_stdin_bounded() -> Result<[u8], ()> {
+    let buf = read_stdin(MAX_STDIN_BYTES);
+    if buf.len() > MAX_STDIN_BYTES {
+        return Err(());
+    }
+    Ok(buf)
+}
+
+@[determinism(BitIdentical)]
+fn emit_error_frame(code: &str, detail: &str) {
+    let mut buf: [u8] = [];
+    push_str(&mut buf, "mic@2/mind-nerve/error\n");
+    push_str(&mut buf, "code: ");
+    push_str(&mut buf, code);
+    push_str(&mut buf, "\n");
+    push_str(&mut buf, "detail: ");
+    push_str(&mut buf, detail);
+    push_str(&mut buf, "\n.\n");
+    let _ = write_stderr(&buf);
+}
+
+@[determinism(BitIdentical)]
+fn push_str(buf: &mut [u8], s: &str) {
+    let bytes = s.as_bytes();
+    for i in 0..bytes.len() {
+        buf.push(bytes[i]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// mic@2 stdin parser — small state machine, ≤80 lines, module-private.
+// ---------------------------------------------------------------------------
+
+@[determinism(BitIdentical)]
+fn parse_mic2_request(bytes: &[u8]) -> Result<ParsedRequest, ParseError> {
+    if bytes.len() > MAX_STDIN_BYTES {
+        return Err(ParseError::InputTooLarge);
+    }
+
+    let lines = split_lines(bytes);
+    if lines.len() < 2 {
+        return Err(ParseError::MissingHeader);
+    }
+
+    // Header line.
+    if !slice_eq(lines[0], b"mic@2/mind-nerve/preselect") {
+        return Err(ParseError::MissingHeader);
+    }
+
+    // Walk key lines until terminator ".".
+    let mut model_path:   [u8] = [];   let mut have_model:   bool = false;
+    let mut catalog_path: [u8] = [];   let mut have_catalog: bool = false;
+    let mut k_val:        u32  = 0;    let mut have_k:       bool = false;
+    let mut tokens:       [u32] = []; let mut have_tokens:   bool = false;
+    let mut saw_terminator: bool = false;
+
+    let mut i: usize = 1;
+    while i < lines.len() {
+        let line = lines[i];
+        if slice_eq(line, b".") { saw_terminator = true; break; }
+
+        let split = split_key_value(line)?;
+        let name  = split.0;
+        let value = split.1;
+
+        if slice_eq(name, b"model") {
+            if have_model { return Err(ParseError::DuplicateKey); }
+            model_path  = value.to_vec();
+            have_model  = true;
+        } else if slice_eq(name, b"catalog") {
+            if have_catalog { return Err(ParseError::DuplicateKey); }
+            catalog_path = value.to_vec();
+            have_catalog = true;
+        } else if slice_eq(name, b"k") {
+            if have_k { return Err(ParseError::DuplicateKey); }
+            k_val  = parse_u32_decimal(value)?;
+            if k_val == 0 || k_val > MAX_TOP_K {
+                return Err(ParseError::KOutOfRange);
+            }
+            have_k = true;
+        } else if slice_eq(name, b"tokens") {
+            if have_tokens { return Err(ParseError::DuplicateKey); }
+            tokens      = parse_csv_u32_tokens(value)?;
+            have_tokens = true;
+        } else {
+            return Err(ParseError::UnknownKey);
+        }
+        i = i + 1;
+    }
+
+    if !saw_terminator { return Err(ParseError::NoTerminator); }
+    if !have_model || !have_catalog || !have_k || !have_tokens {
+        return Err(ParseError::MissingKey);
+    }
+
+    Ok(ParsedRequest {
+        model_path:   model_path,
+        catalog_path: catalog_path,
+        k:            k_val,
+        tokens:       tokens,
+    })
+}
+
+// Split on LF (0x0A). Empty trailing line (after final LF) is dropped. CR
+// bytes (0x0D) are NOT stripped — receivers MUST send LF-only. Strictness
+// here keeps the wire format deterministic.
+@[determinism(BitIdentical)]
+fn split_lines(bytes: &[u8]) -> [[u8]] {
+    let mut out: [[u8]] = [];
+    let mut start: usize = 0;
+    let mut i: usize = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x0Au8 {
+            out.push(slice_range(bytes, start, i));
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if start < bytes.len() {
+        out.push(slice_range(bytes, start, bytes.len()));
+    }
+    out
+}
+
+@[determinism(BitIdentical)]
+fn slice_range(bytes: &[u8], lo: usize, hi: usize) -> [u8] {
+    let mut out: [u8] = [];
+    let mut i: usize = lo;
+    while i < hi {
+        out.push(bytes[i]);
+        i = i + 1;
+    }
+    out
+}
+
+@[determinism(BitIdentical)]
+fn slice_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() { return false; }
+    let mut i: usize = 0;
+    while i < a.len() {
+        if a[i] != b[i] { return false; }
+        i = i + 1;
+    }
+    true
+}
+
+// Split a key line "name: value" on the first ": " (colon followed by single
+// space). Returns (name_bytes, value_bytes) sliced from the source. Any other
+// shape is MalformedLine.
+@[determinism(BitIdentical)]
+fn split_key_value(line: &[u8]) -> Result<(&[u8], &[u8]), ParseError> {
+    let mut i: usize = 0;
+    while i + 1 < line.len() {
+        if line[i] == 0x3Au8 && line[i + 1] == 0x20u8 {
+            let name  = slice_range(line, 0, i);
+            let value = slice_range(line, i + 2, line.len());
+            return Ok((name, value));
+        }
+        i = i + 1;
+    }
+    Err(ParseError::MalformedLine)
+}
+
+// Strict decimal u32 parse. Empty string, non-digit byte, or overflow is
+// MalformedInt. No leading zeros stripped (deterministic by construction).
+@[determinism(BitIdentical)]
+fn parse_u32_decimal(bytes: &[u8]) -> Result<u32, ParseError> {
+    if bytes.len() == 0 { return Err(ParseError::MalformedInt); }
+    let mut acc: u64 = 0u64;
+    let mut i: usize = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c < 0x30u8 || c > 0x39u8 {
+            return Err(ParseError::MalformedInt);
+        }
+        let digit: u64 = (c - 0x30u8) as u64;
+        acc = acc * 10u64 + digit;
+        if acc > 0xFFFFFFFFu64 {
+            return Err(ParseError::MalformedInt);
+        }
+        i = i + 1;
+    }
+    Ok(acc as u32)
+}
+
+// CSV of decimal u32 tokens. Bounded by MAX_REQUEST_TOKENS — the parser
+// fails fast at MAX_REQUEST_TOKENS + 1 so a malicious input cannot force
+// O(stdin) work before rejection.
+@[determinism(BitIdentical)]
+fn parse_csv_u32_tokens(bytes: &[u8]) -> Result<[u32], ParseError> {
+    let mut out:   [u32]  = [];
+    let mut start: usize  = 0;
+    let mut i:     usize  = 0;
+    let n = bytes.len();
+
+    // Empty tokens field is legal (empty token list). Caller may still
+    // reject it at inference time.
+    if n == 0 { return Ok(out); }
+
+    while i <= n {
+        if i == n || bytes[i] == 0x2Cu8 {  // ',' or end
+            if i == start {
+                // Empty CSV cell, e.g. "1,,2" or trailing comma.
+                return Err(ParseError::MalformedTokens);
+            }
+            let cell = slice_range(bytes, start, i);
+            let v = parse_u32_decimal(cell)?;
+            if out.len() as u32 >= MAX_REQUEST_TOKENS {
+                return Err(ParseError::TokensExceedCap);
+            }
+            out.push(v);
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// mic-b stdout response serializer.
+// ---------------------------------------------------------------------------
+//
+// Layout (no padding, little-endian, no length prefix):
+//
+//     "MNB1" (4) | k:u16 (2) | k×RouteId (32 ea) | k×score:i32 (4 ea) | env (212)
+//
+// k is bounded by MAX_TOP_K (≤ 64). result.route_ids.len() and
+// result.scores.len() are assumed equal — invariant from `extract_top_k`.
+@[determinism(BitIdentical)]
+fn emit_mic_b_response(result: &PreselectResult) -> [u8] {
+    let k: u32 = result.route_ids.len() as u32;
+    let mut buf: [u8] = [];
+
+    // Magic.
+    buf.push(MNB1_MAGIC[0]);
+    buf.push(MNB1_MAGIC[1]);
+    buf.push(MNB1_MAGIC[2]);
+    buf.push(MNB1_MAGIC[3]);
+
+    // k as u16-LE. Truncation safe — MAX_TOP_K ≤ 64 ≪ 2^16.
+    let k16: u16 = k as u16;
+    buf.push((k16        & 0x00FFu16) as u8);
+    buf.push(((k16 >> 8) & 0x00FFu16) as u8);
+
+    // k × RouteId, raw bytes left-to-right.
+    let mut i: u32 = 0;
+    while i < k {
+        let rid: RouteId = result.route_ids[i as usize];
+        let mut b: usize = 0;
+        while b < 32 {
+            buf.push(rid[b]);
+            b = b + 1;
+        }
+        i = i + 1;
+    }
+
+    // k × score as i32-LE.
+    let mut j: u32 = 0;
+    while j < k {
+        let s: i32 = result.scores[j as usize];
+        buf.push(( s        & 0xFFi32) as u8);
+        buf.push(((s >> 8 ) & 0xFFi32) as u8);
+        buf.push(((s >> 16) & 0xFFi32) as u8);
+        buf.push(((s >> 24) & 0xFFi32) as u8);
+        j = j + 1;
+    }
+
+    // 212-byte attestation envelope, packed.
+    let env_bytes: [u8; ATTESTATION_V2_SIZE] = serialize(result.envelope);
+    let mut e: usize = 0;
+    while e < ATTESTATION_V2_SIZE {
+        buf.push(env_bytes[e]);
+        e = e + 1;
+    }
+
+    buf
+}
+
+// ---------------------------------------------------------------------------
+// On-disk loaders. Thin shims over the model/catalog readers that live in
+// `src/model.rs` and the (Phase 1.1) catalog manifest reader.
+// ---------------------------------------------------------------------------
+
+@[determinism(BitIdentical)]
+fn load_catalog(path_bytes: &[u8]) -> Result<RouteCatalog, ()> {
+    // Phase 1.1 TODO: src/model.mind must expose `pub fn load_catalog_from_path
+    // (path: &[u8]) -> Result<RouteCatalog, CatalogLoadError>`. Until then we
+    // refuse to silently stub — the unimplemented! is the build gate.
+    unimplemented!("Phase 1.1: src/model.mind catalog loader")
+}
+
+@[determinism(BitIdentical)]
+fn load_weights(path_bytes: &[u8]) -> Result<ModelWeights, ()> {
+    // Phase 1.1 TODO: src/model.mind must expose `pub fn load_weights_from_path
+    // (path: &[u8]) -> Result<ModelWeights, WeightsLoadError>`.
+    unimplemented!("Phase 1.1: src/model.mind weights loader")
 }

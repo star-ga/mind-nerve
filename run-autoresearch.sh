@@ -6,11 +6,14 @@
 #   ./run-autoresearch.sh codex      # use codex CLI
 #   ./run-autoresearch.sh gemini     # use gemini CLI
 #
-# Each CLI authenticates differently:
-#   - claude needs ANTHROPIC_API_KEY (loaded from ~/.claude-ultimate/.env)
-#   - codex uses local CLI auth (no env var needed) — spawned with
-#     -s workspace-write so the agent can apply edits to target_files
-#   - gemini uses local CLI auth (no env var needed)
+# Each CLI authenticates via its local CLI auth (subscription / OAuth):
+#   - claude uses ~/.claude credentials (Claude Code subscription) — we
+#     EXPLICITLY UNSET ANTHROPIC_API_KEY so the CLI doesn't accidentally
+#     fall back to a pay-per-token API key with a separate (smaller) budget
+#   - codex uses local CLI auth — spawned with
+#     --dangerously-bypass-approvals-and-sandbox to skip bwrap (broken on host)
+#   - gemini uses local CLI auth (--yolo)
+#   - vibe uses local CLI auth
 #
 # When one CLI hits its rate / quota limit, restart with the next:
 #   ./run-autoresearch.sh codex
@@ -21,26 +24,19 @@ set -e
 CLI="${1:-claude}"
 TAG="$(date +%b%d | tr A-Z a-z)$(printf %s "$CLI" | head -c1)"
 
-# Load .env keys without echoing them.
-if [ -f "$HOME/.claude-ultimate/.env" ]; then
-    set -a
-    . "$HOME/.claude-ultimate/.env"
-    set +a
-fi
-
-# Sanity: required key for chosen CLI.
+# Sanity: chosen CLI is in the supported set.
 case "$CLI" in
     claude)
-        if [ -z "$ANTHROPIC_API_KEY" ]; then
-            echo "error: ANTHROPIC_API_KEY not set after sourcing ~/.claude-ultimate/.env" >&2
-            exit 2
-        fi
+        # Use the user's Claude Code subscription auth, NOT a pay-per-token
+        # API key. Unset ANTHROPIC_API_KEY explicitly so the CLI falls
+        # back to its stored OAuth credentials (~/.claude/.credentials.json).
+        unset ANTHROPIC_API_KEY
         ;;
-    codex|gemini)
+    codex|gemini|vibe)
         # local CLI auth; no env var probe.
         ;;
     *)
-        echo "error: unknown CLI '$CLI' (expected: claude | codex | gemini)" >&2
+        echo "error: unknown CLI '$CLI' (expected: claude | codex | gemini | vibe)" >&2
         exit 2
         ;;
 esac

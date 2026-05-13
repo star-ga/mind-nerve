@@ -1,0 +1,102 @@
+[package]
+name = "mind-nerve"
+version = "0.1.0-alpha.1"
+authors = ["STARGA, Inc. <info@star.ga>"]
+description = "CPU-first intent-classification preselector for agent runtimes"
+license = "Apache-2.0"
+
+# mind-nerve is a single static binary that sits in front of any agent
+# host (Claude Code, codex, vibe, gemini, MCP servers) and returns top-K
+# relevant routes per turn in ≤30 ms p95 on commodity 4-core x86 CPU.
+#
+# Phase 1 architecture (FROZEN 2026-05-13):
+#   - Sliding-window encoder: 2 layers, hidden=256, window=256/stride=192
+#   - INT8 weights × Q16.16 activations (per-channel quantization)
+#   - K/V overlap cache across windows
+#   - Fused QKV+O projection
+#   - Mean pool → direct dot-product against route embedding table
+#   - Deterministic top-K with SHA-256(route_id) ASC tie-break
+#   - 212-byte tamper-evident attestation envelope
+#   - 1024-token hard wire cap
+#
+# See spec/architecture.md for the authoritative design and
+# spec/numerics.md for the per-op reduction-order contract.
+
+[mind]
+# Pinned to the toolchain surface that compiles the current source tree.
+# mindc 0.2.5 ships the Pratt expression parser + stable IR contract.
+# mindc 0.3.0 introduces breaking IR changes and is gated until the
+# Phase 2 IR-load migration of the inference path lands.
+mindc-min    = "0.2.4"
+mindc-max    = "0.3.0"
+spec-version = "1.0"
+
+[determinism]
+# mind-nerve's load-bearing guarantee is bit-identical top-K outputs
+# across runs and across architectures (x86, ARM, CUDA, WebGPU, NPU).
+# Anything that breaks this is a Phase 1 ship-blocker.
+fixed-point         = "Q16.16"
+weight-quantization = "INT8 (per-output-channel, Q16.16 scales)"
+reduction-order     = "Pinned at compile time by mindc lowering passes"
+softmax-strategy    = "Lookup table, no polynomial approximation"
+tie-break           = "SHA-256(route_id) ascending"
+envelope-version    = "v2 (212 bytes packed)"
+
+# E_NERVE_001..005 lint codes enforce these at compile time; see
+# spec/numerics.md §"mindc lint rules".
+
+[build]
+entry         = "cli/main.mind"
+output        = "mind-nerve"
+optimization  = "aggressive"
+
+[targets.cpu]
+backend = "cpu"
+# Lowering target: AVX2 (x86) + NEON (ARM). The INT8×i32 saturating MAC
+# primitive lowers to VPDPBUSD on x86 and SDOT on ARM. Cross-arch
+# bit-identity is enforced by a final scalar saturation step.
+sources = [
+    "cli/main.mind",
+    "src/lib.mind",
+    "src/model.mind",
+    "src/encoder_kernels.mind",
+    "src/inference.mind",
+    "src/evidence.mind",
+    "src/sha256.mind",
+    "src/top_k.mind",
+    "src/q16_16.mind",
+]
+
+[targets.cuda]
+backend = "cuda"
+# Phase 1: throughput-mode batch ≥ 32 only; not budgeted for p95 latency.
+sources = [
+    "cli/main.mind",
+    "src/lib.mind",
+    "src/model.mind",
+    "src/encoder_kernels.mind",
+    "src/inference.mind",
+    "src/evidence.mind",
+    "src/sha256.mind",
+    "src/top_k.mind",
+    "src/q16_16.mind",
+]
+
+[test]
+# Unit tests live under tests/unit/. Bit-identity gate lives under
+# tests/bit_identity/.
+sources = [
+    "tests/unit/test_q16_16.mind",
+    "tests/unit/test_sha256.mind",
+    "tests/unit/test_top_k.mind",
+    "tests/unit/test_evidence.mind",
+    "tests/unit/test_inference.mind",
+    "tests/unit/test_encoder.mind",
+]
+
+[bit-identity]
+# CI gate: same model_hash + same catalog_hash + same request_hash
+# MUST produce the same result_hash on every backend. Zero divergence
+# tolerated.
+backends-phase1 = ["cpu_x86", "cpu_arm", "cuda"]
+backends-phase2 = ["webgpu", "npu"]

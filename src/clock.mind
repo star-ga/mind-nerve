@@ -1,0 +1,120 @@
+// Monotonic clock provider for evidence-chain timestamping.
+//
+// Audit anchor: Phase 1.3 — eliminates `timestamp_ms = 0` placeholder
+// in evidence::emit_inference and unblocks the chain-prev integrity
+// gate (FP-9 in the threat model).
+//
+// CONTRACT
+//
+// `monotonic_now_ms` returns a monotonically non-decreasing i64
+// timestamp measured in milliseconds since process start. The value
+// is NOT wall-clock; it MUST NOT be derived from system clock state
+// that can be set backward by the operator. Replays of the same
+// envelope chain compare timestamps for monotonicity only — wall-
+// clock drift between hosts is irrelevant.
+//
+// Implementation strategy (Phase 1.3):
+//
+// - mind-runtime exposes `crate::std::time::monotonic_steady_ns()`
+//   which lowers to `clock_gettime(CLOCK_MONOTONIC_RAW, ...)` on
+//   Linux and `mach_continuous_time()` on Darwin. Both return ns
+//   since an arbitrary epoch, are immune to operator clock
+//   adjustments, and survive process suspend/resume.
+//
+// - We divide by 1_000_000 to convert ns → ms. The resulting i64
+//   represents up to ≈292 million years, so saturation is
+//   unreachable in any practical process lifetime.
+//
+// - On a backend where mind-runtime has not wired the monotonic
+//   primitive yet (e.g. WebGPU's compute shader has no clock), the
+//   function falls through to a per-inference counter pinned in a
+//   thread-local cell. The counter is initialised to 0 at process
+//   start and increments by 1 per call. This still satisfies the
+//   monotonicity contract (each envelope's timestamp_ms > the
+//   previous), but loses the "human time" interpretation.
+//
+// CROSS-ARCH BIT-IDENTITY
+//
+// The clock value is recorded in the envelope and contributes to
+// chain_curr via the envelope preimage. Two replays of the same
+// inference on the same host will see the SAME ms value only if
+// the host's monotonic clock has not advanced between replays.
+// In the general case, two replays produce DIFFERENT envelopes
+// (different timestamp_ms → different chain_curr). This is the
+// intended behaviour: each inference is anchored to its own
+// moment in time. Bit-identity of `result_hash` (the route_id
+// ordering) is preserved regardless; only the envelope wrapper
+// differs.
+//
+// For the cross-arch bit-identity test harness in
+// `tests/bit_identity/`, the test runner passes a fixed `inject_ms`
+// parameter (via `monotonic_now_ms_with_injection`) so that
+// envelopes produced by x86, ARM, and CUDA replays compare byte-
+// for-byte.
+
+use crate::mind_nerve::Q16_16;
+
+// ---------------------------------------------------------------------------
+// Public surface
+// ---------------------------------------------------------------------------
+
+// Read the host's monotonic millisecond clock. Returns ms since an
+// implementation-defined epoch (typically process start).
+//
+// Determinism note: this function is one of the few in the inference
+// path that is intentionally NOT bit-identical across runs — each
+// call returns a fresh, advancing value. Determinism of `result_hash`
+// is preserved because the timestamp goes into the envelope wrapper,
+// not the score computation.
+@[determinism(NotBitIdentical)]
+pub fn monotonic_now_ms() -> i64 {
+    // Probe order:
+    //   1. mind-runtime steady clock primitive (preferred).
+    //   2. Fall through to per-inference counter (tests, WebGPU).
+    //
+    // The compile-time `cfg(has_runtime_clock)` switch is set by
+    // `mindc` based on the active backend manifest. CPU and CUDA
+    // backends have a runtime clock; WebGPU does not.
+    #[cfg(has_runtime_clock)]
+    {
+        let ns: i64 = crate::std::time::monotonic_steady_ns();
+        return ns / 1_000_000_i64;
+    }
+    #[cfg(not(has_runtime_clock))]
+    {
+        return next_counter();
+    }
+}
+
+// Test-only fixture entry point. Used by tests/bit_identity/ to pin
+// the clock value across architectures so envelope wrappers compare
+// byte-for-byte. Production paths MUST call `monotonic_now_ms`, not
+// this.
+@[determinism(BitIdentical)]
+pub fn monotonic_now_ms_with_injection(inject_ms: i64) -> i64 {
+    return inject_ms;
+}
+
+// ---------------------------------------------------------------------------
+// Per-inference counter fallback (WebGPU + tests)
+// ---------------------------------------------------------------------------
+
+// Thread-local monotonic counter for backends without a runtime
+// clock primitive. The counter is initialised to 0 at process start
+// and increments by 1 per call. Two envelopes minted from the same
+// process will see strictly increasing values, satisfying chain
+// monotonicity.
+//
+// Note: not a `static mut` — uses mind-runtime's thread-local cell
+// primitive so concurrent inferences in the same process do not
+// race. Phase 2 may extend to per-host counter persisted via the
+// evidence chain log; Phase 1 keeps it per-process.
+@[determinism(NotBitIdentical)]
+fn next_counter() -> i64 {
+    let cell: crate::std::cell::ThreadLocal<i64> =
+        crate::std::cell::ThreadLocal::<i64>::new(0_i64);
+    let v: i64 = cell.get();
+    let next: i64 = v + 1_i64;
+    cell.set(next);
+    return next;
+}

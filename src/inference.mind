@@ -22,6 +22,7 @@ use crate::mind_nerve::{
 };
 use crate::mind_nerve::model;
 use crate::mind_nerve::evidence;
+use crate::mind_nerve::clock;
 use crate::mind_nerve::sha256::sha256 as sha256_impl;
 use crate::mind_nerve::top_k::{
     self,
@@ -76,6 +77,15 @@ pub struct Request {
     pub bytes:          [u8],
     pub catalog_hash:   [u8; 32],
     pub k:              u32,
+
+    // Optional. When `Some(hash)`, mind-nerve refuses to run if
+    // `weights.model_hash != hash` and returns
+    // `InferenceError::ModelMismatch`. Lets the caller pin the exact
+    // model checkpoint the request was authored against — protects
+    // against silent model swaps between catalog distribution and
+    // inference. `None` disables the check (Phase 1 default; clients
+    // that care about strict pinning opt in by setting it).
+    pub expected_model_hash: Option<[u8; 32]>,
 }
 
 pub struct PreselectResult {
@@ -172,7 +182,17 @@ pub fn preselect(
         return Err(InferenceError::EmptyCatalog);
     }
 
-    // (3) Tokenize. Currently `unimplemented!()` — Phase 1.2 work item.
+    // (3) Strict model-hash pinning. When the caller asserts the exact
+    //     checkpoint the request was authored against, refuse to run
+    //     against a different loaded model. Protects against silent
+    //     model swaps between catalog distribution and inference.
+    if let Some(expected) = request.expected_model_hash {
+        if !hash_eq_32(expected, weights.model_hash) {
+            return Err(InferenceError::ModelMismatch);
+        }
+    }
+
+    // (4) Tokenize. Currently `unimplemented!()` — Phase 1.2 work item.
     //     Once landed, the produced length is bounded by MAX_REQUEST_TOKENS;
     //     this re-check is defence-in-depth and a stable contract for any
     //     replacement tokenizer implementation.
@@ -252,11 +272,12 @@ pub fn preselect_pre_tokenized(
     // (7) Envelope construction. chain_prev is zeros — the evidence chain
     //     is single-envelope at this entry point; the Phase 1.3 chain log
     //     will thread chain_prev through a session-scoped state holder.
-    //     timestamp_ms is 0 — the monotonic clock provider is a Phase 1.3
-    //     work item (see ROADMAP P1.3); for now the envelope carries 0
-    //     and downstream verifiers MUST NOT key any ordering decision off
-    //     timestamp_ms while this gap exists.
+    //     timestamp_ms comes from the monotonic clock provider in
+    //     src/clock.mind. On backends without a host monotonic clock
+    //     (WebGPU), it falls through to a per-inference counter; either
+    //     way the value is strictly non-decreasing within a process.
     let zero32: [u8; 32] = [0u8; 32];
+    let timestamp_ms: i64 = clock::monotonic_now_ms();
     let envelope_bytes = match evidence::emit_inference(
         weights.model_hash,
         weights.tokenizer_hash,
@@ -264,7 +285,7 @@ pub fn preselect_pre_tokenized(
         request_hash,
         result_hash,
         zero32,                                 // chain_prev (Phase 1.3)
-        0_i64,                                  // timestamp_ms (Phase 1.3)
+        timestamp_ms,
         ARCH_X86_64,                            // architecture (Phase 2: runtime)
         k,
         NUMERICS_WIRE_VERSION as u16,
@@ -304,4 +325,20 @@ fn request_hash_from_tokens(tokens: &[u32]) -> [u8; 32] {
         i = i + 1;
     }
     sha256(buf.as_slice())
+}
+
+// Constant-time 32-byte hash equality. Returns true iff all bytes match.
+// Constant-time discipline is overkill for hash-equality (the attacker
+// learns nothing about the hash from a timing side-channel they don't
+// already know), but writing it this way means the same primitive can
+// guard any future MAC verification without an audit revisit.
+@[determinism(BitIdentical)]
+fn hash_eq_32(a: [u8; 32], b: [u8; 32]) -> bool {
+    let mut diff: u8 = 0;
+    let mut i: usize = 0;
+    while i < 32 {
+        diff = diff | (a[i] ^ b[i]);
+        i = i + 1;
+    }
+    return diff == 0u8;
 }

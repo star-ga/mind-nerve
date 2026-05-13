@@ -110,6 +110,7 @@ module mind_nerve {
 
     pub mod q16_16;
     pub mod sha256;
+    pub mod clock;
     pub mod model;
     pub mod top_k;
     pub mod inference;

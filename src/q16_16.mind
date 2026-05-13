@@ -111,7 +111,13 @@ pub fn q16_abs(a: Q16_16) -> Q16_16 {
 @[determinism(BitIdentical)]
 pub fn q16_mul(a: Q16_16, b: Q16_16) -> Q16_16 {
     let wide:    i64 = (a as i64) * (b as i64);
-    let shifted: i64 = wide >> (Q16_FRAC_BITS as i64);   // arithmetic right shift, sign-extended
+    // MIND guarantees `>>` on signed integers is arithmetic right shift
+    // with sign extension (matches Rust semantics, lowers to LLVM `ashr`).
+    // This pins the truncation-toward-negative-infinity behaviour spec
+    // §4 property 2 requires; cross-arch bit-identity follows because
+    // `ashr` is the same primitive on AVX2 (vpsraq), NEON (sshr), and
+    // PTX (shr.s64). No C-style implementation-defined behaviour.
+    let shifted: i64 = wide >> (Q16_FRAC_BITS as i64);
     return q16_sat_cast(shifted);
 }
 

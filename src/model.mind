@@ -27,8 +27,8 @@ use crate::mind_nerve::q16_16::q16_dot_pinned;
 // directly; model.mind does not call them.
 mod encoder_kernels;
 
-// Encoder: 12 layers, sliding-window self-attention (window=256, stride=192),
-// gated residual, no FFN sublayer.
+// Encoder: 2 layers (ENCODER_LAYERS), sliding-window self-attention
+// (window=256, stride=192), gated residual, no FFN sublayer.
 //
 // Determinism is enforced by mindc lint codes E_NERVE_001 (reduction order)
 // and E_NERVE_004 (window overlap-add summation order).
@@ -61,7 +61,8 @@ where
         let mut x: tensor<Q16_16, [n, ENCODER_HIDDEN]> =
             encoder_kernels::token_embedding_lookup(&token_ids[b], weights.token_embedding);
 
-        // 12-layer sliding-window encoder. Pre-norm; no FFN sublayer.
+        // 2-layer sliding-window encoder (loop bound = ENCODER_LAYERS).
+        // Pre-norm; no FFN sublayer.
         let mut layer_i: u32 = 0;
         while layer_i < ENCODER_LAYERS {
             let w = weights.layers[layer_i as usize];

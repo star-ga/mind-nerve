@@ -109,12 +109,25 @@ pub fn monotonic_now_ms_with_injection(inject_ms: i64) -> i64 {
 // primitive so concurrent inferences in the same process do not
 // race. Phase 2 may extend to per-host counter persisted via the
 // evidence chain log; Phase 1 keeps it per-process.
+//
+// IMPLEMENTATION NOTE
+//
+// The cell MUST be a module-level static — constructing a fresh
+// `ThreadLocal::new(0)` inside the function body would reset the
+// counter to 0 on every call and break the monotonicity contract.
+// We declare it once at module scope so its lifetime spans the
+// process. `cell.fetch_add(1)` is the atomic increment primitive
+// mind-runtime exposes for thread-local cells; it returns the
+// previous value, so the post-increment value is `previous + 1`.
+static COUNTER: crate::std::cell::ThreadLocal<i64> =
+    crate::std::cell::ThreadLocal::<i64>::new(0_i64);
+
 @[determinism(NotBitIdentical)]
 fn next_counter() -> i64 {
-    let cell: crate::std::cell::ThreadLocal<i64> =
-        crate::std::cell::ThreadLocal::<i64>::new(0_i64);
-    let v: i64 = cell.get();
-    let next: i64 = v + 1_i64;
-    cell.set(next);
-    return next;
+    // fetch_add returns the previous value and atomically increments
+    // the cell. The first call observes 0 and stores 1; downstream
+    // callers see strictly increasing values, satisfying chain
+    // monotonicity even under preemption between get and set.
+    let previous: i64 = COUNTER.fetch_add(1_i64);
+    return previous + 1_i64;
 }

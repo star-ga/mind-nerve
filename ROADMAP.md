@@ -64,6 +64,46 @@ without measurable accuracy impact on agent-CLI request distributions.
 - Per-neuron weight attestation integrated with MindLLM evidence chain
 - Latency p95 ≤ 30 ms on ARM (Apple silicon, Snapdragon)
 
+### Phase 2 accuracy & latency enhancements (SOTA-track)
+
+The following improvements landed against fleet consensus on 2026-05-13 as
+the highest-leverage moves to differentiate mind-nerve from sentence-
+transformer retrievers, LLM-based routers, and ColBERT-style late-
+interaction models. Each preserves the Phase 1 non-negotiables (pure MIND,
+Q16.16 in flight, INT8 weights, cross-arch bit-identity, 30 ms p95).
+
+1. **Learnable per-route prior** (must-have). Adds a Q16.16 prior vector
+   over `|RouteCatalog|` routes derived offline from catalog-load
+   co-occurrence statistics. Logit-level addition before top-K extraction.
+   Encodes usage patterns (e.g. `git status → git diff` affinity) that no
+   general-purpose retriever can capture. Zero-latency win.
+
+2. **Input-fingerprinted attestation** (must-have). Bind each envelope's
+   nonce slot to `SHA-256(request_bytes[..32])` so every inference's
+   envelope is verifiably unique to its input — critical for regulated
+   agent deployments. Already implied by `request_hash` field in v2
+   envelope; promote to a strict non-zero invariant in Phase 2.
+
+3. **Adaptive window stride via input-entropy gating** (must-have).
+   Compute token-level entropy from the first 16 tokens' Q16.16
+   activations; select `ATTN_WINDOW_STRIDE ∈ {96, 192, 256}` from a
+   compile-baked table. Wider stride for low-entropy CLI commands
+   ("list files"), tighter overlap for high-entropy multi-clause queries.
+   Latency win on the realistic-workload median.
+
+4. **Frequency-adaptive route scaling** (nice-to-have). Multiply each row
+   of the route embedding table by a precomputed `1/sqrt(freq)` Q16.16
+   scalar at catalog-load time, floored at 0.5. Addresses the long-tail
+   problem of rare-but-critical routes being drowned by frequent ones.
+   Zero runtime cost (table is pre-scaled).
+
+5. **Per-head learned drop masks** (experimental). During training, learn
+   a binary mask per attention head; at inference, skip masked heads
+   entirely. Up to 50% compute reduction; gated on validation accuracy
+   not regressing more than 0.5 points top-5. Adds a training-pipeline
+   change; landing depends on Phase 2 native-MIND training reaching
+   stability first.
+
 ## Phase 3 — Ecosystem (target: Q3 2027)
 
 **Exit criteria**:

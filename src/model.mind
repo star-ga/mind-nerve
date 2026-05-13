@@ -17,6 +17,7 @@ use crate::mind_nerve::{
     ATTN_WINDOW_SIZE, ATTN_WINDOW_STRIDE,
     VOCAB_SIZE, MAX_REQUEST_TOKENS, ROUTE_EMBEDDING_DIM,
 };
+use crate::mind_nerve::q16_16::q16_dot_pinned;
 
 // Module-private helpers — sliding-window attention kernels, embedding lookup,
 // pre-norm, gated residual, mean-pool. Not part of the public stability
@@ -155,7 +156,46 @@ pub fn score_against_routes(
     route_embeddings: tensor<Q16_16, [num_routes, ROUTE_EMBEDDING_DIM]>,
 ) -> tensor<Q16_16, [batch, num_routes]>
 {
-    unimplemented!("Phase 1: query @ route_embeddings.T, Q16.16 saturating mac")
+    // Single-matmul scoring head: out[b, r] = <pooled_query[b], route_embeddings[r]>.
+    //
+    // Reduction order is pinned twice over:
+    //   (1) The outer (b, r) iteration is ascending, batch-major then
+    //       route-major. Output position is a pure function of (b, r); no
+    //       cross-output reduction.
+    //   (2) The inner dot product is `q16_dot_pinned`, which is
+    //       sequential left-to-right over the hidden axis (annotated
+    //       `@[reduction_order(Pinned)]` in q16_16.mind). Every Q16.16
+    //       multiply funnels through `q16_mul`'s single saturating-MAC
+    //       primitive, and every accumulate through `q16_add`'s
+    //       widen-then-saturate path. This is the lint anchor for
+    //       E_NERVE_001 (forward-path matmul) and E_NERVE_003 (Q16.16
+    //       saturating MAC).
+    //
+    // ENCODER_HIDDEN == ROUTE_EMBEDDING_DIM is invariant by construction
+    // (see lib.mind: `ROUTE_EMBEDDING_DIM: u32 = 256` // tied to ENCODER_HIDDEN).
+    // The typed signature pins the contraction axis; the slice operations
+    // below take whole rows.
+    //
+    // batch == 1 in Phase 1; the batch axis is iterated trivially to keep
+    // the public signature forward-compatible with Phase 2 batched inference.
+    let bsz: usize = pooled_query.len();
+    let nr:  usize = route_embeddings.len();
+
+    let mut out: tensor<Q16_16, [bsz, nr]> = [[0_i32; nr]; bsz];
+
+    let mut b: usize = 0;
+    while b < bsz {
+        let query_row: &[Q16_16] = &pooled_query[b];
+
+        let mut r: usize = 0;
+        while r < nr {
+            let route_row: &[Q16_16] = &route_embeddings[r];
+            out[b][r] = q16_dot_pinned(query_row, route_row);
+            r = r + 1;
+        }
+        b = b + 1;
+    }
+    return out;
 }
 
 // Weight containers. Sizes derived from compile-time parameters in `lib.mind`.

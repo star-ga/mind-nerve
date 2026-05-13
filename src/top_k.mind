@@ -384,9 +384,10 @@ pub fn extract_top_k(
     // Sequential ingest, left-to-right index order. Single reduction;
     // no vectorisation that could reorder eviction decisions.
     for i in 0..num_routes {
+        // RouteId IS already SHA-256(external_id), set at catalog load time.
+        // No re-hashing inside the hot path — the bytes ARE the tie-break key.
         let entry = HeapEntry {
             score:    logits[0, i],
-            sha:      sha256(catalog.ids[i] as [u8]),
             route_id: catalog.ids[i],
         };
 

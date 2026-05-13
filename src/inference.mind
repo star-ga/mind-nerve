@@ -14,6 +14,11 @@ use crate::mind_nerve::{
     DEFAULT_TOP_K,
     MAX_REQUEST_TOKENS,
     ROUTE_EMBEDDING_DIM,
+    ATTESTATION_VERSION,
+    ATTESTATION_BYTES,
+    NUMERICS_WIRE_VERSION,
+    ENTRY_KIND_INFERENCE,
+    ARCH_X86_64,
 };
 use crate::mind_nerve::model;
 use crate::mind_nerve::evidence;
@@ -46,71 +51,12 @@ pub fn extract_top_k(
     top_k::extract_top_k(logits, catalog, k)
 }
 
+// Canonical SHA-256 over a TopK result. Direct re-export of the
+// implementation in src/top_k.mind — no local stub. The implementation
+// is the single source of truth for the 40-byte-per-entry preimage layout.
 @[determinism(BitIdentical)]
 pub fn canonical_result_hash(result: TopK) -> [u8; 32] {
     top_k::canonical_result_hash(result)
-}
-
-// ---------------------------------------------------------------------------
-// Request / PreselectResult / preselect
-// ---------------------------------------------------------------------------
-
-pub struct Request {
-    pub bytes:          [u8],
-    pub catalog_hash:   [u8; 32],
-    pub k:              u32,
-}
-
-pub struct PreselectResult {
-    pub route_ids:      [RouteId; ?],   // length == request.k
-    pub scores:         [Q16_16;  ?],   // length == request.k
-    pub envelope:       evidence::AttestationEnvelope,
-}
-
-@[determinism(BitIdentical)]
-pub fn preselect(
-    request:    Request,
-    catalog:    RouteCatalog,
-    weights:    ModelWeights,
-) -> PreselectResult
-{
-    // Validate k is in range.
-    if request.k == 0 || request.k > MAX_TOP_K {
-        return error(InvalidK);
-    }
-
-    // Tokenize. BPE 32k, deterministic; same bytes -> same token sequence.
-    let tokens = tokenize_bpe(request.bytes);
-
-    if tokens.len() > MAX_REQUEST_TOKENS {
-        return error(RequestTooLong);
-    }
-
-    // Forward pass.
-    let enc_out      = model::encoder(tokens, weights.encoder);
-    let pooled_query = model::mean_pool_seq(enc_out);
-    let logits       = model::score_against_routes(pooled_query, catalog.embeddings);
-
-    // Deterministic top-K with SHA-256 tie-break.
-    let result = extract_top_k(logits, catalog, request.k);
-
-    // Attestation envelope.
-    let envelope = evidence::emit(
-        weights.model_hash,
-        request.catalog_hash,
-        sha256(request.bytes),
-        canonical_result_hash(result),
-    );
-
-    PreselectResult {
-        route_ids: result.ids,
-        scores:    result.scores,
-        envelope:  envelope,
-    }
-}
-
-fn tokenize_bpe(bytes: [u8]) -> [u32] {
-    unimplemented!("Phase 1: deterministic BPE 32k tokenizer")
 }
 
 // Re-export the SHA-256 primitive at the `inference` module path so the
@@ -122,13 +68,240 @@ pub fn sha256(bytes: &[u8]) -> [u8; 32] {
     sha256_impl(bytes)
 }
 
+// ---------------------------------------------------------------------------
+// Request / PreselectResult / ModelWeights / InferenceError
+// ---------------------------------------------------------------------------
+
+pub struct Request {
+    pub bytes:          [u8],
+    pub catalog_hash:   [u8; 32],
+    pub k:              u32,
+}
+
+pub struct PreselectResult {
+    pub route_ids:      [RouteId; ?],   // length == request.k (saturated at num_routes)
+    pub scores:         [Q16_16;  ?],   // length matches route_ids
+    pub envelope:       [u8; ATTESTATION_BYTES as usize], // packed v2, 212 bytes
+}
+
 pub struct ModelWeights {
     pub encoder:        model::EncoderWeights,
     pub model_hash:     [u8; 32],
     pub tokenizer_hash: [u8; 32],
 }
 
-pub enum Error {
+// Closed set of forward-path failure modes. Every public entry point in
+// this module returns `Result<PreselectResult, InferenceError>`; callers
+// pattern-match against this enum and do not need to inspect the inner
+// VerificationError surface of `evidence::emit_inference`.
+pub enum InferenceError {
+    // k == 0 or k > MAX_TOP_K. Tracks evidence::VerificationError::InvalidK
+    // at the wire layer, but `preselect` rejects out-of-range k before any
+    // forward compute so the envelope builder never sees a bad k.
     InvalidK,
+
+    // Post-tokenization token count exceeds MAX_REQUEST_TOKENS. The wire
+    // handshake is supposed to refuse oversized requests before they reach
+    // the preselect entry point; this is a defence-in-depth check.
     RequestTooLong,
+
+    // catalog.ids.len() == 0. Empty catalogs are valid at the type level
+    // (UniqueRouteCatalog::new accepts the empty input) but a preselect on
+    // an empty catalog has no meaningful top-K to emit. Distinguishing this
+    // from "k > num_routes" matters because the latter is silently
+    // saturated; an empty catalog is a configuration error.
+    EmptyCatalog,
+
+    // The loaded ModelWeights.model_hash does not match the caller-supplied
+    // expected model hash carried alongside the catalog (catalogs are
+    // produced against a specific model checkpoint). Mismatch means scores
+    // would be computed against weights that were not used to embed the
+    // routes — every downstream attestation would be honest about the
+    // mismatch but the top-K result would be semantically garbage. Refuse.
+    ModelMismatch,
+
+    // evidence::emit_inference returned a VerificationError. Should be
+    // unreachable in practice because preselect pre-validates k/architecture,
+    // but we surface it explicitly rather than panic.
+    EnvelopeBuildFailed,
+}
+
+// ---------------------------------------------------------------------------
+// Tokenizer contract — Phase 1.2 stub.
+// ---------------------------------------------------------------------------
+//
+// Produces a `[u32]` of length ≤ MAX_REQUEST_TOKENS. If the input would
+// exceed the cap, callers receive `InferenceError::RequestTooLong` from
+// `preselect`; the tokenizer itself never truncates silently.
+//
+// Until the BPE 32k tokenizer lands (Phase 1.2 — tracked in ROADMAP), the
+// `preselect` entry point cannot run end-to-end. The CLI binary and unit
+// tests use `preselect_pre_tokenized` below, which accepts a token array
+// directly and bypasses tokenization.
+fn tokenize_bpe(_bytes: [u8]) -> [u32] {
+    unimplemented!("Phase 1.2: BPE 32k tokenizer (see ROADMAP P1.2)")
+}
+
+// ---------------------------------------------------------------------------
+// preselect — full pipeline (bytes -> envelope).
+// ---------------------------------------------------------------------------
+//
+// The public top-level entry point. Composes:
+//
+//   tokenize_bpe -> encoder -> mean_pool_seq -> score_against_routes
+//                -> extract_top_k -> canonical_result_hash
+//                -> evidence::emit_inference
+//
+// Returns `Err(InferenceError)` on any validation failure; never panics.
+// Phase 1 callers that already hold tokens (e.g., CLI binary, integration
+// tests) should use `preselect_pre_tokenized` to skip tokenization.
+@[determinism(BitIdentical)]
+pub fn preselect(
+    request: Request,
+    catalog: RouteCatalog,
+    weights: ModelWeights,
+) -> Result<PreselectResult, InferenceError>
+{
+    // (1) k range gate. Same MIN/MAX policy as evidence::emit().
+    if request.k == 0 || request.k > MAX_TOP_K {
+        return Err(InferenceError::InvalidK);
+    }
+
+    // (2) Empty-catalog gate (audit: distinguish from k > num_routes).
+    if catalog.ids.len() == 0 {
+        return Err(InferenceError::EmptyCatalog);
+    }
+
+    // (3) Tokenize. Currently `unimplemented!()` — Phase 1.2 work item.
+    //     Once landed, the produced length is bounded by MAX_REQUEST_TOKENS;
+    //     this re-check is defence-in-depth and a stable contract for any
+    //     replacement tokenizer implementation.
+    let tokens: [u32] = tokenize_bpe(request.bytes);
+    if tokens.len() > (MAX_REQUEST_TOKENS as usize) {
+        return Err(InferenceError::RequestTooLong);
+    }
+
+    // Delegate to the pre-tokenized entry point for the forward path.
+    preselect_pre_tokenized(&tokens, &catalog, &weights, request.k)
+}
+
+// ---------------------------------------------------------------------------
+// preselect_pre_tokenized — forward path on pre-tokenized input.
+// ---------------------------------------------------------------------------
+//
+// Entry point used by the CLI binary and tests until BPE 32k lands
+// (Phase 1.2). Accepts token IDs directly, runs the encoder + scoring head,
+// and emits a fully-formed attestation envelope.
+//
+// The forward path is: encoder -> mean_pool_seq -> score_against_routes
+// -> extract_top_k -> canonical_result_hash -> evidence::emit_inference.
+// Each stage is `@[determinism(BitIdentical)]` with pinned reduction order
+// where applicable; the whole pipeline is bit-identical across runs and
+// architectures supported by ARCH_X86_64 / AARCH64 / CUDA in Phase 1.
+@[determinism(BitIdentical)]
+pub fn preselect_pre_tokenized(
+    tokens:  &[u32],
+    catalog: &RouteCatalog,
+    weights: &ModelWeights,
+    k:       u32,
+) -> Result<PreselectResult, InferenceError>
+{
+    // (1) k range gate.
+    if k == 0 || k > MAX_TOP_K {
+        return Err(InferenceError::InvalidK);
+    }
+
+    // (2) Token-cap gate. The wire handshake should have rejected oversize
+    //     requests already; this is defence-in-depth for callers that bypass
+    //     the wire layer (in-process tests, single-binary CLI).
+    if tokens.len() > (MAX_REQUEST_TOKENS as usize) {
+        return Err(InferenceError::RequestTooLong);
+    }
+
+    // (3) Empty-catalog gate (see InferenceError::EmptyCatalog).
+    let num_routes: usize = catalog.ids.len();
+    if num_routes == 0 {
+        return Err(InferenceError::EmptyCatalog);
+    }
+
+    // (4) Forward pass — encoder -> mean pool -> direct scoring head.
+    //     batch == 1: wrap the flat token slice into a [1, n] tensor view
+    //     so the model.mind signatures (which carry the batch axis on the
+    //     public surface for Phase 2 compatibility) stay typed.
+    let token_ids: tensor<u32, [1, tokens.len()]> = [tokens.to_owned()];
+    let enc_out      = model::encoder(token_ids, weights.encoder);
+    let pooled_query = model::mean_pool_seq(enc_out);
+    let logits       = model::score_against_routes(pooled_query, catalog.embeddings);
+
+    // (5) Deterministic top-K with SHA-256 (route_id) tie-break.
+    //     extract_top_k saturates at num_routes when k > num_routes, so
+    //     the returned `result.ids.len()` may be < k.
+    let result: TopK = extract_top_k(logits, *catalog, k);
+
+    // (6) Canonical preimage hashes for the attestation envelope.
+    //     - request_hash is SHA-256(raw token-id bytes). Tokens are u32 LE,
+    //       4 bytes each, in ascending position order. This is bit-identical
+    //       across architectures because the on-wire token byte layout is
+    //       pinned by the tokenizer manifest (Phase 1.2); for now the test
+    //       suite supplies tokens directly and we hash the raw u32 sequence.
+    //     - result_hash is canonical_result_hash(result) (40 bytes per
+    //       top-K entry; see src/top_k.mind §"canonical_result_hash").
+    let request_hash: [u8; 32] = request_hash_from_tokens(tokens);
+    let result_hash:  [u8; 32] = canonical_result_hash(result);
+
+    // (7) Envelope construction. chain_prev is zeros — the evidence chain
+    //     is single-envelope at this entry point; the Phase 1.3 chain log
+    //     will thread chain_prev through a session-scoped state holder.
+    //     timestamp_ms is 0 — the monotonic clock provider is a Phase 1.3
+    //     work item (see ROADMAP P1.3); for now the envelope carries 0
+    //     and downstream verifiers MUST NOT key any ordering decision off
+    //     timestamp_ms while this gap exists.
+    let zero32: [u8; 32] = [0u8; 32];
+    let envelope_bytes = match evidence::emit_inference(
+        weights.model_hash,
+        weights.tokenizer_hash,
+        catalog.hash,
+        request_hash,
+        result_hash,
+        zero32,                                 // chain_prev (Phase 1.3)
+        0_i64,                                  // timestamp_ms (Phase 1.3)
+        ARCH_X86_64,                            // architecture (Phase 2: runtime)
+        k,
+        NUMERICS_WIRE_VERSION as u16,
+    ) {
+        Ok(bytes) => bytes,
+        Err(_)    => return Err(InferenceError::EnvelopeBuildFailed),
+    };
+
+    Ok(PreselectResult {
+        route_ids: result.ids,
+        scores:    result.scores,
+        envelope:  envelope_bytes,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Local helpers
+// ---------------------------------------------------------------------------
+
+// SHA-256 over the raw u32-LE byte stream of a token-id sequence. Pinned
+// left-to-right serialization so the preimage is bit-identical across
+// architectures. Used as the envelope's `request_hash` field on the
+// pre-tokenized entry path; the full `preselect` path is expected to hash
+// `request.bytes` directly once BPE lands and ties the byte→token mapping
+// to a tokenizer manifest hash.
+@[determinism(BitIdentical)]
+fn request_hash_from_tokens(tokens: &[u32]) -> [u8; 32] {
+    let n: usize = tokens.len();
+    let mut buf: [u8] = [];
+    let mut i: usize = 0;
+    while i < n {
+        let t: u32 = tokens[i];
+        buf.push(( t         & 0xFFu32) as u8);
+        buf.push(((t >> 8 )  & 0xFFu32) as u8);
+        buf.push(((t >> 16)  & 0xFFu32) as u8);
+        buf.push(((t >> 24)  & 0xFFu32) as u8);
+        i = i + 1;
+    }
+    sha256(buf.as_slice())
 }

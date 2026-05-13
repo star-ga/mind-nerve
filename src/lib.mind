@@ -10,27 +10,68 @@ module mind_nerve {
     // Two's complement signed 32-bit, interpreted as Q16.16.
     pub type Q16_16 = i32;
 
+    // Q16.16 canonical constants. These appear in the public surface so the
+    // primitives in `q16_16.mind` and every test in `tests/unit/test_q16_16.mind`
+    // reference the same single source of truth.
+    //
+    // Encoding: a Q16.16 number x has integer bit pattern `round(x * 2^16)`.
+    pub const ONE_Q16_16:       Q16_16 =        65536_i32;   // 1.0
+    pub const MAX_Q16_16:       Q16_16 =   2147483647_i32;   // i32::MAX
+    pub const MIN_Q16_16:       Q16_16 =  -2147483648_i32;   // i32::MIN (saturation floor)
+    pub const NEG_ONE_Q16_16:   Q16_16 =       -65536_i32;   // -1.0
+    pub const HALF_Q16_16:      Q16_16 =        32768_i32;   // 0.5
+    pub const QUARTER_Q16_16:   Q16_16 =        16384_i32;   // 0.25
+    pub const THREE_Q16_16:     Q16_16 =       196608_i32;   // 3.0
+    pub const NEG_THREE_Q16_16: Q16_16 =      -196608_i32;   // -3.0
+    pub const ULP_Q16_16:       Q16_16 =            1_i32;   // 1 ULP
+
+    // Number of fractional bits in the Q16.16 representation. Used by
+    // q16_mul and q16_div_sat to control the arithmetic shift.
+    pub const Q16_FRAC_BITS:    u32    = 16;
+
     // Compile-time parameters. Changing any of these is a model-architecture
     // change and requires a new model_hash.
     pub const ENCODER_LAYERS:        u32 = 12;
     pub const ENCODER_HIDDEN:        u32 = 384;
     pub const ENCODER_HEADS:         u32 = 6;
+    pub const ENCODER_HEAD_DIM:      u32 = 64;   // ENCODER_HIDDEN / ENCODER_HEADS
 
-    pub const DECODER_LAYERS:        u32 = 8;
-    pub const DECODER_HIDDEN:        u32 = 384;
-    pub const DECODER_HEADS:         u32 = 6;
-    pub const DECODER_FFN_HIDDEN:    u32 = 1536;
+    // Sliding-window self-attention parameters. Window 256 / stride 192
+    // yields 64-token overlap, ~22 windows at MAX_REQUEST_TOKENS.
+    pub const ATTN_WINDOW_SIZE:      u32 = 256;
+    pub const ATTN_WINDOW_STRIDE:    u32 = 192;
+    pub const ATTN_WINDOW_OVERLAP:   u32 = 64;   // WINDOW_SIZE - WINDOW_STRIDE
 
     pub const VOCAB_SIZE:            u32 = 32768;
     pub const MAX_REQUEST_TOKENS:    u32 = 4096;
-    pub const ROUTE_EMBEDDING_DIM:   u32 = 384;
+    pub const ROUTE_EMBEDDING_DIM:   u32 = 384;  // tied to ENCODER_HIDDEN
     pub const DEFAULT_TOP_K:         u32 = 5;
     pub const MAX_TOP_K:             u32 = 64;
 
-    pub const ATTESTATION_BYTES:     u32 = 132;
-    pub const ATTESTATION_VERSION:   u8  = 1;
+    // Attestation envelope: v2 layout, 212 bytes packed.
+    // See spec/architecture.md and spec/numerics.md for the byte-level layout.
+    pub const ATTESTATION_BYTES:     u32 = 212;
+    pub const ATTESTATION_VERSION:   u8  = 2;
 
+    // Wire-format version pinned into every envelope. Bumped only when the
+    // per-op reduction order table emitted by mindc changes shape.
+    pub const NUMERICS_WIRE_VERSION: u8  = 2;
+
+    // Entry-kind discriminant in the envelope. 1=inference, 2=chain_reset.
+    pub const ENTRY_KIND_INFERENCE:   u8 = 1;
+    pub const ENTRY_KIND_CHAIN_RESET: u8 = 2;
+
+    // Architecture enum starts at 1 so uninitialised zero byte is invalid.
+    pub const ARCH_CPU_X86:           u8 = 1;
+    pub const ARCH_CPU_ARM:           u8 = 2;
+    pub const ARCH_CUDA:              u8 = 3;
+    pub const ARCH_WEBGPU:            u8 = 4;
+    pub const ARCH_NPU:               u8 = 5;
+
+    pub mod q16_16;
+    pub mod sha256;
     pub mod model;
+    pub mod top_k;
     pub mod inference;
     pub mod evidence;
 }

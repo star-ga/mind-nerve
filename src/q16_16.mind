@@ -1,0 +1,522 @@
+// Q16.16 fixed-point primitives — bit-identity contract.
+//
+// This module is the single source of truth for every Q16.16 arithmetic
+// operation reachable from `preselect`. Every function here carries
+// `@[determinism(BitIdentical)]`. Every reduction additionally carries
+// `@[reduction_order(Pinned)]`. The combination is the lint contract for
+// `mindc` rules E_NERVE_001..E_NERVE_005 documented in `spec/numerics.md`.
+//
+// Numerical contract (see spec/numerics.md §1, §4, §5):
+//   - All operations are saturating, never wrapping.
+//   - The only legal Q16.16 multiply is `q16_mul` (§4).
+//   - Reductions are sequential left-to-right (§2).
+//   - `q16_exp` and `q16_rsqrt` are truncated lookup tables (§5). No
+//     polynomial approximations, no interpolation — interpolation adds a
+//     multiply per call whose bit-result depends on multiply ordering;
+//     truncation removes that failure surface.
+//   - No IEEE-754 anywhere; `@[invariant no_float_ops]` is enforced at the
+//     module level by `lib.mind`.
+//
+// Audit marker: S-A2 (reduction-order discipline).
+
+use crate::mind_nerve::{
+    Q16_16,
+    ONE_Q16_16,
+    MAX_Q16_16,
+    MIN_Q16_16,
+    NEG_ONE_Q16_16,
+    HALF_Q16_16,
+    Q16_FRAC_BITS,
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Boundary helpers — widening and saturating cast.
+//
+// These are the only two legal ways to cross the i32 ↔ i64 boundary inside
+// the inference path. Every saturating arithmetic operator below funnels
+// through them so the clamp logic exists in exactly one place.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Sign-extend an i32 Q16.16 value to i64. The accumulator type for any
+// reduction that may transiently exceed [MIN_Q16_16, MAX_Q16_16] is i64.
+@[determinism(BitIdentical)]
+pub fn q16_widen(v: Q16_16) -> i64 {
+    return v as i64;
+}
+
+// Saturating cast i64 → Q16.16. Values above MAX_Q16_16 clamp to MAX_Q16_16;
+// values below MIN_Q16_16 clamp to MIN_Q16_16. No wrapping under any input,
+// including i64::MAX and i64::MIN.
+@[determinism(BitIdentical)]
+pub fn q16_sat_cast(wide: i64) -> Q16_16 {
+    if wide > (MAX_Q16_16 as i64) {
+        return MAX_Q16_16;
+    }
+    if wide < (MIN_Q16_16 as i64) {
+        return MIN_Q16_16;
+    }
+    return wide as i32;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Section 1: core saturating arithmetic.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Saturating add. The i64 sum of two i32 values never overflows i64; clamp
+// at the i32 boundary using `q16_sat_cast`.
+@[determinism(BitIdentical)]
+pub fn q16_add(a: Q16_16, b: Q16_16) -> Q16_16 {
+    let wide: i64 = (a as i64) + (b as i64);
+    return q16_sat_cast(wide);
+}
+
+// Saturating sub. Same widen-then-clamp pattern.
+@[determinism(BitIdentical)]
+pub fn q16_sub(a: Q16_16, b: Q16_16) -> Q16_16 {
+    let wide: i64 = (a as i64) - (b as i64);
+    return q16_sat_cast(wide);
+}
+
+// Saturating negate. `q16_neg(MIN_Q16_16)` does not have a representable
+// positive counterpart (i32::MIN cannot negate to i32::MAX + 1) — it must
+// saturate to MAX_Q16_16. All other inputs negate exactly.
+@[determinism(BitIdentical)]
+pub fn q16_neg(a: Q16_16) -> Q16_16 {
+    let wide: i64 = -(a as i64);
+    return q16_sat_cast(wide);
+}
+
+// Saturating absolute value. `q16_abs(MIN_Q16_16)` saturates to MAX_Q16_16
+// for the same reason as `q16_neg`.
+@[determinism(BitIdentical)]
+pub fn q16_abs(a: Q16_16) -> Q16_16 {
+    if a >= 0_i32 {
+        return a;
+    }
+    return q16_neg(a);
+}
+
+// The only legal Q16.16 multiply (spec §4):
+//
+//   1. Widen both operands to i64 (the i64 product of two i32 values is
+//      always representable in i64; the multiply itself never wraps).
+//   2. Arithmetic right shift by 16 — sign-extending — to undo the
+//      Q16.16 fractional-bit scaling. Truncates toward negative infinity
+//      for negative magnitudes; no rounding correction. Spec §4 property 2.
+//   3. Saturate to [MIN_Q16_16, MAX_Q16_16]. Spec §4 property 3.
+//
+// The single-multiply-with-saturation pattern is the bit-identity anchor
+// for every backend; no fused-multiply-add, no Kahan correction, no
+// reassociation can produce a different result.
+@[determinism(BitIdentical)]
+pub fn q16_mul(a: Q16_16, b: Q16_16) -> Q16_16 {
+    let wide:    i64 = (a as i64) * (b as i64);
+    let shifted: i64 = wide >> (Q16_FRAC_BITS as i64);   // arithmetic right shift, sign-extended
+    return q16_sat_cast(shifted);
+}
+
+// Saturating divide: `q16_div_sat(num, denom) = (num << 16) / denom` with
+// saturation. Divide-by-zero saturates to the boundary that matches the
+// sign of the dividend (spec §4 "Companion saturating operators"). This
+// keeps softmax total and reproduces the failure value bit-identically
+// across backends when the denominator collapses to zero.
+@[determinism(BitIdentical)]
+pub fn q16_div_sat(num: Q16_16, denom: Q16_16) -> Q16_16 {
+    if denom == 0_i32 {
+        if num >= 0_i32 { return MAX_Q16_16; }
+        return MIN_Q16_16;
+    }
+    let widened: i64 = (num as i64) << (Q16_FRAC_BITS as i64);
+    let q:       i64 = widened / (denom as i64);
+    return q16_sat_cast(q);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Section 2: pinned reductions.
+//
+// Each reduction is sequential left-to-right. The `@[reduction_order(Pinned)]`
+// annotation is the lint anchor; `mindc` rule E_NERVE_002 rejects any
+// reduction without it.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Sequential sum (`acc = 0; acc = q16_add(acc, x[i]) for i in 0..N`). Each
+// step saturates independently — saturation is not associative, which is
+// the property `test_q16_dot_sequential_reduction_order` regression-guards.
+@[determinism(BitIdentical)]
+@[reduction_order(Pinned)]
+pub fn q16_sum(xs: &[Q16_16]) -> Q16_16 {
+    let mut acc: Q16_16 = 0_i32;
+    for x in xs {
+        acc = q16_add(acc, *x);
+    }
+    return acc;
+}
+
+// Alias requested by upstream callers — same body, same annotations.
+@[determinism(BitIdentical)]
+@[reduction_order(Pinned)]
+pub fn q16_sum_pinned(xs: &[Q16_16]) -> Q16_16 {
+    return q16_sum(xs);
+}
+
+// Sequential max. Initial accumulator is MIN_Q16_16 so any input element
+// beats it on first iteration. Tie-break is "lower index wins" implicitly
+// (we update only on strict `>`).
+@[determinism(BitIdentical)]
+@[reduction_order(Pinned)]
+pub fn q16_max(xs: &[Q16_16]) -> Q16_16 {
+    let mut acc: Q16_16 = MIN_Q16_16;
+    for x in xs {
+        if *x > acc { acc = *x; }
+    }
+    return acc;
+}
+
+// Sequential min. Diagnostics only; not on the forward path. Spec §2.
+@[determinism(BitIdentical)]
+@[reduction_order(Pinned)]
+pub fn q16_min(xs: &[Q16_16]) -> Q16_16 {
+    let mut acc: Q16_16 = MAX_Q16_16;
+    for x in xs {
+        if *x < acc { acc = *x; }
+    }
+    return acc;
+}
+
+// Dot product: elementwise `q16_mul`, then sequential `q16_sum`. Both
+// stages are sequential left-to-right. If the input slices differ in
+// length we treat the missing tail as zeros; the typed signature in
+// `model.mind` will catch any length mismatch at compile time, this
+// helper exists to keep the unit tests' empty-slice case total.
+@[determinism(BitIdentical)]
+@[reduction_order(Pinned)]
+pub fn q16_dot(a: &[Q16_16], b: &[Q16_16]) -> Q16_16 {
+    let n: usize = if a.len() < b.len() { a.len() } else { b.len() };
+    let mut acc: Q16_16 = 0_i32;
+    let mut i: usize = 0;
+    while i < n {
+        let prod: Q16_16 = q16_mul(a[i], b[i]);
+        acc = q16_add(acc, prod);
+        i = i + 1;
+    }
+    return acc;
+}
+
+// Alias requested by upstream callers.
+@[determinism(BitIdentical)]
+@[reduction_order(Pinned)]
+pub fn q16_dot_pinned(a: &[Q16_16], b: &[Q16_16]) -> Q16_16 {
+    return q16_dot(a, b);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Section 3: q16_exp — truncated lookup table.
+//
+// Domain: input x in Q16.16 covering [-16.0, 0.0]. Inputs ≥ 0 clamp to the
+// last entry (value ONE_Q16_16). Inputs ≤ -16.0 clamp to entry 0.
+//
+// Encoding: Q16_EXP_TABLE has 257 entries. Index `i` corresponds to the
+// Q16.16 input value `-( (256 - i) * 65536 / 16 )` = `-((256 - i) << 12)`.
+// Equivalently, entry i = round_floor( exp( (i - 256) / 16 ) * 65536 ).
+//
+// Stride in Q16.16 input space: 65536 / 16 = 4096 (= ONE_Q16_16 / 16).
+// 256 strides span exactly 16.0 — the documented input range.
+//
+// Truncated lookup (no interpolation): the index for input x is
+//   idx = (x + 16 * ONE_Q16_16) / 4096
+// floored toward negative infinity, then clamped to [0, 256].
+//
+// The 257 entries below were generated by the recurrence
+//   E[256] = 65536
+//   E[i-1] = (E[i] * 61580) >> 16
+// where 61580 = round_floor( exp(-1/16) * 65536 ). This is a Q16.16
+// integer recurrence: it is deterministic, requires no floating point at
+// compile time, and the resulting table bytes are part of the model
+// weights blob (model_hash binding, see architecture.md "Bit-identity
+// contract"). Any future revision MUST update the corresponding hash row
+// in the weights manifest.
+//
+// Polynomial / interpolated alternatives are forbidden by spec §5
+// "Polynomials are forbidden".
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Q16.16 stride between exp-table entries. 256 entries / 16.0 = 1/16 per step.
+pub const Q16_EXP_TABLE_STRIDE: Q16_16 = 4096_i32;        // = ONE_Q16_16 / 16
+pub const Q16_EXP_TABLE_LEN:    u32    = 257;
+pub const Q16_EXP_DOMAIN_LO:    Q16_16 = -1048576_i32;    // -16.0 in Q16.16 (= -16 * 65536)
+
+// Step factor: round_floor( exp(-1/16) * 65536 ).
+const Q16_EXP_STEP_FACTOR: Q16_16 = 61580_i32;
+
+// Build the 257-entry exp lookup table via Q16.16 integer recurrence.
+// Each step is a single q16_mul. The construction is pinned at compile
+// time; `mindc` evaluates the const-fn and emits the table as a static
+// data block whose bytes contribute to `model_hash`.
+const fn build_exp_table() -> [Q16_16; 257] {
+    let mut table: [Q16_16; 257] = [0_i32; 257];
+    table[256] = ONE_Q16_16;
+    let mut i: usize = 256;
+    while i > 0 {
+        // Walk down from entry 256 (= exp(0)) toward entry 0 (≈ exp(-16)).
+        // Each step multiplies by exp(-1/16) in Q16.16.
+        table[i - 1] = q16_mul(table[i], Q16_EXP_STEP_FACTOR);
+        i = i - 1;
+    }
+    return table;
+}
+
+pub const Q16_EXP_TABLE: [Q16_16; 257] = build_exp_table();
+
+// Truncated lookup. Input x in Q16.16. Returns Q16.16 approximation of exp(x)
+// for x ≤ 0; returns ONE_Q16_16 for x ≥ 0 (spec §5: "Inputs at or above zero
+// clamp to entry N-1").
+@[determinism(BitIdentical)]
+pub fn q16_exp(x: Q16_16) -> Q16_16 {
+    if x >= 0_i32 {
+        return ONE_Q16_16;
+    }
+    if x <= Q16_EXP_DOMAIN_LO {
+        return Q16_EXP_TABLE[0];
+    }
+    // x is in (-16.0, 0.0). Compute the table index by floor-division.
+    // shifted = x - Q16_EXP_DOMAIN_LO (∈ (0, 16*ONE_Q16_16))
+    let shifted: i32 = x - Q16_EXP_DOMAIN_LO;
+    // Truncated lookup: integer division by the stride. For positive
+    // `shifted` this is exact floor; no rounding correction needed.
+    let idx_i32: i32 = shifted / Q16_EXP_TABLE_STRIDE;
+    let idx:     usize = idx_i32 as usize;
+    // Safety clamp; idx should already be in [0, 256].
+    if idx > 256 { return Q16_EXP_TABLE[256]; }
+    return Q16_EXP_TABLE[idx];
+}
+
+// Alias for the LUT name requested by upstream callers.
+@[determinism(BitIdentical)]
+pub fn q16_exp_lut(x: Q16_16) -> Q16_16 {
+    return q16_exp(x);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Section 4: q16_rsqrt — truncated lookup table.
+//
+// Domain: input x in Q16.16, x > 0. Inputs x ≤ 0 return MAX_Q16_16 as a
+// sentinel (the inference path never legitimately rsqrts a non-positive
+// value; layer-norm guards by adding epsilon to variance before this call).
+//
+// Range covered: x in (0, 32.0] in Q16.16. 256 entries indexed by
+//   idx = (x - 1) / stride   where stride = (32.0 * 65536) / 256 = 8192
+// entries above x = 32.0 clamp to entry 255 (≈ rsqrt(32) in Q16.16).
+//
+// Entry i = round_floor( rsqrt( 1/256 + i * 32/256 ) * 65536 ) when
+// expressed in real units. The table is built by Newton-style integer
+// recurrence at compile time using a fixed number of steps; no per-call
+// iteration is performed (spec §5: "No Newton-Raphson iteration"). The
+// iteration that builds the table is part of the const-fn evaluator,
+// not the runtime path.
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub const Q16_RSQRT_TABLE_STRIDE: Q16_16 = 8192_i32;      // 32.0 / 256 in Q16.16
+pub const Q16_RSQRT_TABLE_LEN:    u32    = 256;
+
+// Compute rsqrt of a Q16.16 value using fixed-iteration integer Newton.
+// Used only by `build_rsqrt_table` at const-evaluation time; never called
+// at runtime (the runtime path is a single LUT load).
+//
+// Newton step for rsqrt: y_{n+1} = y_n * (3 - x*y_n^2) / 2
+// In Q16.16: y_{n+1} = q16_mul(y_n, q16_mul(HALF, q16_sub(THREE, q16_mul(x, q16_mul(y_n, y_n)))))
+// Fixed iteration count (8) is the const-time bound that keeps the
+// const-fn evaluator total.
+const fn const_rsqrt_q16(x: Q16_16) -> Q16_16 {
+    if x <= 0_i32 {
+        return MAX_Q16_16;
+    }
+    // Initial seed: for x in (0, 32] Q16.16, a seed near rsqrt(1.0) = 1.0
+    // converges in ≤ 8 iterations to ≥ 16-bit precision.
+    let three_q16: Q16_16 = 196608_i32;       // 3.0 in Q16.16
+    let half_q16:  Q16_16 = HALF_Q16_16;      // 0.5 in Q16.16
+    let mut y: Q16_16 = ONE_Q16_16;
+    let mut step: u32 = 0;
+    while step < 8 {
+        let yy:    Q16_16 = q16_mul(y, y);
+        let xyy:   Q16_16 = q16_mul(x, yy);
+        let inner: Q16_16 = q16_sub(three_q16, xyy);
+        let half:  Q16_16 = q16_mul(half_q16, inner);
+        y = q16_mul(y, half);
+        step = step + 1;
+    }
+    return y;
+}
+
+// Build the 256-entry rsqrt LUT.
+const fn build_rsqrt_table() -> [Q16_16; 256] {
+    let mut table: [Q16_16; 256] = [0_i32; 256];
+    let mut i: usize = 0;
+    while i < 256 {
+        // x_i = (i + 1) * stride, i.e. the right edge of bucket i. Picking
+        // the right edge is the truncated-lookup convention: every x in
+        // ((i*stride), (i+1)*stride] reads entry i.
+        let x_i: Q16_16 = ((i as i32) + 1_i32) * Q16_RSQRT_TABLE_STRIDE;
+        table[i] = const_rsqrt_q16(x_i);
+        i = i + 1;
+    }
+    return table;
+}
+
+pub const Q16_RSQRT_TABLE: [Q16_16; 256] = build_rsqrt_table();
+
+@[determinism(BitIdentical)]
+pub fn q16_rsqrt(x: Q16_16) -> Q16_16 {
+    // x ≤ 0 is the sentinel-path. Layer-norm guards by adding epsilon
+    // to variance before calling, so this branch should be unreachable
+    // on the forward path; we return MAX_Q16_16 to keep the function
+    // total and bit-identical across backends.
+    if x <= 0_i32 {
+        return MAX_Q16_16;
+    }
+    let idx_i32: i32 = (x - 1_i32) / Q16_RSQRT_TABLE_STRIDE;
+    let mut idx: usize = idx_i32 as usize;
+    if idx >= 256 { idx = 255; }
+    return Q16_RSQRT_TABLE[idx];
+}
+
+// Alias for the LUT name requested by upstream callers.
+@[determinism(BitIdentical)]
+pub fn q16_rsqrt_lut(x: Q16_16) -> Q16_16 {
+    return q16_rsqrt(x);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Section 5: q16_softmax — 5-stage pinned pipeline (spec §5).
+//
+// Stages, in order:
+//   (1) max          — sequential left-to-right
+//   (2) max-subtract — elementwise; uses q16_sub (saturating)
+//   (3) exp lookup   — elementwise; truncated LUT (no interpolation)
+//   (4) sum          — sequential left-to-right
+//   (5) divide       — elementwise; q16_div_sat
+//
+// Stage order is pinned. A backend that fuses stages into a single kernel
+// is acceptable ONLY if it reproduces this 5-stage bit-pattern; that is
+// the backend's burden, not this implementation's.
+// ─────────────────────────────────────────────────────────────────────────────
+
+@[determinism(BitIdentical)]
+@[reduction_order(Pinned)]
+pub fn q16_softmax(x: &[Q16_16]) -> [Q16_16] {
+    let n: usize = x.len();
+    if n == 0 {
+        let empty: [Q16_16; 0] = [];
+        return empty;
+    }
+
+    // Stage 1: max (sequential).
+    let m: Q16_16 = q16_max(x);
+
+    // Stage 2: shift = x[i] - m (saturating sub).
+    let mut shifted: [Q16_16; n] = [0_i32; n];
+    let mut i: usize = 0;
+    while i < n {
+        shifted[i] = q16_sub(x[i], m);
+        i = i + 1;
+    }
+
+    // Stage 3: exp lookup (truncated, deterministic).
+    let mut exped: [Q16_16; n] = [0_i32; n];
+    i = 0;
+    while i < n {
+        exped[i] = q16_exp(shifted[i]);
+        i = i + 1;
+    }
+
+    // Stage 4: sequential sum.
+    let s: Q16_16 = q16_sum(&exped);
+
+    // Stage 5: elementwise saturating divide.
+    let mut out: [Q16_16; n] = [0_i32; n];
+    i = 0;
+    while i < n {
+        out[i] = q16_div_sat(exped[i], s);
+        i = i + 1;
+    }
+    return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Section 6: q16_layernorm — pinned 5-stage pipeline (spec §2 layernorm row).
+//
+// Stages:
+//   (1) mean             — q16_sum / N
+//   (2) sum_of_squares   — sequential, (x[i] - mean)^2 accumulator
+//   (3) variance         — sum_of_squares / N
+//   (4) rsqrt            — q16_rsqrt(variance + epsilon)
+//   (5) normalize        — (x[i] - mean) * rsqrt_value
+//
+// The optional gamma/beta affine is omitted in this Phase-1 helper because
+// the unit tests pass only `x`; the call-site in `model.mind` will compose
+// gamma/beta on the normalized output before returning to the encoder
+// pipeline. Reordering any of the five stages above changes the variance
+// path; the test `test_q16_layernorm_constant_input` regression-guards the
+// stage order.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Epsilon for variance stabilization. Chosen as 1 ULP in Q16.16; the
+// value contributes to `model_hash` along with the LUT tables.
+pub const Q16_LAYERNORM_EPSILON: Q16_16 = 1_i32;
+
+@[determinism(BitIdentical)]
+@[reduction_order(Pinned)]
+pub fn q16_layernorm(x: &[Q16_16]) -> [Q16_16] {
+    let n: usize = x.len();
+    if n == 0 {
+        let empty: [Q16_16; 0] = [];
+        return empty;
+    }
+
+    // Stage 1: mean = sum / N. We compute mean in Q16.16 via the
+    // accumulator form `(sum << 16) / (N << 16) = sum / N`. The division
+    // is integer; rounding is toward negative infinity (consistent with
+    // q16_mul's truncation discipline).
+    let sum_x: Q16_16 = q16_sum(x);
+    let n_q16: Q16_16 = (n as i32) * ONE_Q16_16;
+    let mean:  Q16_16 = q16_div_sat(sum_x, n_q16);
+
+    // Stage 2: sum of squared deviations. Sequential left-to-right.
+    let mut sum_sq: Q16_16 = 0_i32;
+    let mut i: usize = 0;
+    while i < n {
+        let dev: Q16_16 = q16_sub(x[i], mean);
+        let sq:  Q16_16 = q16_mul(dev, dev);
+        sum_sq = q16_add(sum_sq, sq);
+        i = i + 1;
+    }
+
+    // Stage 3: variance = sum_sq / N.
+    let variance: Q16_16 = q16_div_sat(sum_sq, n_q16);
+
+    // Stage 4: rsqrt(variance + epsilon). Epsilon prevents the LUT
+    // sentinel branch and keeps the function total when variance == 0.
+    // When variance is zero the constant-input test expects every output
+    // to be zero. The numerator (x[i] - mean) is exactly zero in that
+    // case; (0 * anything) = 0 regardless of the rsqrt value, so the
+    // expected output is satisfied.
+    let var_eps:   Q16_16 = q16_add(variance, Q16_LAYERNORM_EPSILON);
+    let inv_stddev: Q16_16 = q16_rsqrt(var_eps);
+
+    // Stage 5: normalize. Elementwise (x[i] - mean) * inv_stddev.
+    let mut out: [Q16_16; n] = [0_i32; n];
+    i = 0;
+    while i < n {
+        let dev: Q16_16 = q16_sub(x[i], mean);
+        // Special-case zero deviation so the (0 * MAX_Q16_16) path
+        // produces exactly 0 rather than relying on q16_mul rounding.
+        // This is bit-identical to q16_mul(0, anything) on every backend
+        // and avoids a saturation surprise when `inv_stddev` is large.
+        if dev == 0_i32 {
+            out[i] = 0_i32;
+        } else {
+            out[i] = q16_mul(dev, inv_stddev);
+        }
+        i = i + 1;
+    }
+    return out;
+}

@@ -10,6 +10,7 @@ use crate::mind_nerve::{
 };
 use crate::mind_nerve::model;
 use crate::mind_nerve::evidence;
+use crate::mind_nerve::sha256::sha256 as sha256_impl;
 
 pub struct Request {
     pub bytes:          [u8],
@@ -90,8 +91,13 @@ fn canonical_result_hash(top_k: TopK) -> [u8; 32] {
     unimplemented!("Phase 1: SHA-256 of length-prefixed (route_id || score) pairs")
 }
 
-fn sha256(bytes: [u8]) -> [u8; 32] {
-    unimplemented!("Phase 1: standard SHA-256")
+// Re-export the SHA-256 primitive at the `inference` module path so the
+// existing call-sites in this file (and the `tests/unit/test_sha256.mind`
+// import `crate::mind_nerve::inference::sha256`) keep resolving without
+// change. The implementation lives in `src/sha256.mind`.
+@[determinism(BitIdentical)]
+pub fn sha256(bytes: &[u8]) -> [u8; 32] {
+    sha256_impl(bytes)
 }
 
 pub struct RouteCatalog {

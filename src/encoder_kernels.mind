@@ -1,0 +1,430 @@
+// Encoder kernels — module-private helpers for the sliding-window encoder.
+//
+// Composition rules (see spec/numerics.md and spec/architecture.md "Encoder"):
+//   - Every reduction is sequential left-to-right; we compose `q16_dot_pinned`,
+//     `q16_sum_pinned`, `q16_softmax`, and `q16_layernorm` from `q16_16.mind`.
+//     This module never rolls its own Q16.16 op.
+//   - Window iteration is ascending start index. Tokens in the 64-token
+//     overlap region accumulate contributions from both adjacent windows via
+//     saturating `q16_add`; the order of accumulation is pinned by the loop,
+//     not by the runtime — that is the load-bearing reduction-order pin.
+//   - Pre-norm: layer norm is applied to the residual stream BEFORE attention,
+//     not on the output. Gated residual replaces the FFN sublayer; there is
+//     no FFN, and there is no second normalization inside a layer.
+//   - No allocation inside the per-layer loop beyond what mindc emits for
+//     intermediate tensors. The `@[reduction_order(Pinned)]` annotations carry
+//     the constraint into codegen.
+//
+// Module-private: this file is `mod encoder_kernels;` from `model.mind`, NOT
+// `pub mod`. Nothing here is part of the public stability surface.
+
+use crate::mind_nerve::{
+    Q16_16,
+    ONE_Q16_16,
+    ENCODER_HIDDEN,
+    ENCODER_HEADS,
+    ENCODER_HEAD_DIM,
+    ATTN_WINDOW_SIZE,
+    ATTN_WINDOW_STRIDE,
+    VOCAB_SIZE,
+};
+use crate::mind_nerve::q16_16::{
+    q16_add,
+    q16_sub,
+    q16_mul,
+    q16_div_sat,
+    q16_dot_pinned,
+    q16_sum_pinned,
+    q16_softmax,
+    q16_layernorm,
+    q16_sigmoid_lut,
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Attention score scaling.
+//
+// scores = (Q @ K.T) * (1 / sqrt(head_dim))
+//
+// ENCODER_HEAD_DIM = 64, sqrt(64) = 8, so the scale is 1/8 = 0.125 in Q16.16
+// which is exactly 8192. Precomputed as a const; no FP, no runtime rsqrt.
+// ─────────────────────────────────────────────────────────────────────────────
+pub const ATTN_SCALE_Q16: Q16_16 = 8192_i32;   // 1/8 in Q16.16 = ONE_Q16_16 / 8
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Window iteration math.
+//
+// Given seq_len, window=ATTN_WINDOW_SIZE, stride=ATTN_WINDOW_STRIDE, the
+// windows cover positions [s, min(s + window, seq_len)) for
+//   s ∈ {0, stride, 2*stride, …} while s < seq_len.
+//
+// The number of windows is `ceil((seq_len - overlap) / stride)` clamped at
+// least 1. The function is total; for seq_len = 0 it returns 0.
+// ─────────────────────────────────────────────────────────────────────────────
+@[determinism(BitIdentical)]
+pub fn num_windows(seq_len: u32) -> u32 {
+    if seq_len == 0 { return 0; }
+    if seq_len <= ATTN_WINDOW_SIZE { return 1; }
+    // ceil((seq_len - WINDOW + STRIDE) / STRIDE)  (the +STRIDE accounts for the
+    // first window that starts at 0). Equivalently:
+    //   n = 1 + ceil((seq_len - WINDOW) / STRIDE)
+    let tail: u32 = seq_len - ATTN_WINDOW_SIZE;
+    let extra: u32 = (tail + ATTN_WINDOW_STRIDE - 1) / ATTN_WINDOW_STRIDE;
+    return 1 + extra;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Token embedding lookup.
+//
+// Gather `embeddings[token_ids[i], :]` for each i in [0, seq_len). Token IDs
+// are u32; out-of-vocab is a tokenizer bug, not an inference fallback.
+// `tokenize_bpe` is responsible for emitting only IDs in [0, VOCAB_SIZE);
+// this helper bounds-checks defensively and clamps to ID 0 (the BOS/UNK
+// position by convention) if a violator slips through, so the function
+// stays total and bit-identical.
+// ─────────────────────────────────────────────────────────────────────────────
+@[determinism(BitIdentical)]
+pub fn token_embedding_lookup(
+    token_ids:        &[u32],
+    token_embedding:  tensor<Q16_16, [VOCAB_SIZE, ENCODER_HIDDEN]>,
+) -> tensor<Q16_16, [token_ids.len(), ENCODER_HIDDEN]> {
+    let n: usize = token_ids.len();
+    let mut out: tensor<Q16_16, [n, ENCODER_HIDDEN]> = [[0_i32; ENCODER_HIDDEN]; n];
+    let mut i: usize = 0;
+    while i < n {
+        let raw_id: u32   = token_ids[i];
+        let id:     u32   = if raw_id < VOCAB_SIZE { raw_id } else { 0_u32 };
+        let row:    usize = id as usize;
+        let mut d:  usize = 0;
+        while d < ENCODER_HIDDEN as usize {
+            out[i][d] = token_embedding[row][d];
+            d = d + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Apply gain + bias affine after `q16_layernorm`.
+//
+// `q16_layernorm` returns the normalized vector with no affine; per
+// spec/numerics.md §6 layer-norm row "The optional gamma/beta affine is
+// omitted in this Phase-1 helper because the unit tests pass only x; the
+// call-site in model.mind will compose gamma/beta on the normalized output".
+// This helper is that call-site.
+// ─────────────────────────────────────────────────────────────────────────────
+@[determinism(BitIdentical)]
+pub fn apply_ln_affine(
+    normalized: &[Q16_16],
+    gain:       &[Q16_16],
+    bias:       &[Q16_16],
+) -> [Q16_16] {
+    let h: usize = normalized.len();
+    let mut out: [Q16_16; h] = [0_i32; h];
+    let mut d: usize = 0;
+    while d < h {
+        let scaled: Q16_16 = q16_mul(normalized[d], gain[d]);
+        out[d] = q16_add(scaled, bias[d]);
+        d = d + 1;
+    }
+    return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pre-norm: layer-norm + gain/bias affine, applied per token position.
+//
+// Sequential across positions; per-position uses the pinned 5-stage layer
+// norm pipeline in `q16_16::q16_layernorm`.
+// ─────────────────────────────────────────────────────────────────────────────
+@[determinism(BitIdentical)]
+@[reduction_order(Pinned)]
+pub fn prenorm_seq(
+    x:    tensor<Q16_16, [seq_len, ENCODER_HIDDEN]>,
+    gain: &[Q16_16],
+    bias: &[Q16_16],
+) -> tensor<Q16_16, [seq_len, ENCODER_HIDDEN]> {
+    let n: usize = x.len();
+    let mut out: tensor<Q16_16, [n, ENCODER_HIDDEN]> = [[0_i32; ENCODER_HIDDEN]; n];
+    let mut i: usize = 0;
+    while i < n {
+        let normed: [Q16_16] = q16_layernorm(&x[i]);
+        let affined: [Q16_16] = apply_ln_affine(&normed, gain, bias);
+        let mut d: usize = 0;
+        while d < ENCODER_HIDDEN as usize {
+            out[i][d] = affined[d];
+            d = d + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Linear projection: `out[i, :] = x[i, :] @ W` where W is stored as
+// [in_dim, out_dim]. Computed per output column via `q16_dot_pinned` on a
+// per-column slice — both stages (elementwise multiply, sequential sum) are
+// pinned by the underlying primitive.
+//
+// In matmul terms this is the [seq, H] @ [H, H] projection used for Q, K, V,
+// and the output projection. The reduction order is fixed: the dot product
+// runs left-to-right over the hidden axis; cross-position results never
+// share an accumulator.
+// ─────────────────────────────────────────────────────────────────────────────
+@[determinism(BitIdentical)]
+@[reduction_order(Pinned)]
+pub fn project_linear(
+    x: tensor<Q16_16, [seq_len, ENCODER_HIDDEN]>,
+    w: tensor<Q16_16, [ENCODER_HIDDEN, ENCODER_HIDDEN]>,
+) -> tensor<Q16_16, [seq_len, ENCODER_HIDDEN]> {
+    let n: usize = x.len();
+    let h: usize = ENCODER_HIDDEN as usize;
+    let mut out: tensor<Q16_16, [n, ENCODER_HIDDEN]> = [[0_i32; ENCODER_HIDDEN]; n];
+    let mut i: usize = 0;
+    while i < n {
+        let mut o: usize = 0;
+        while o < h {
+            // Build the o'th column of W as a contiguous slice for the
+            // dot-product. mindc lowers this into a single SIMD-strided gather
+            // on the lowering pass; the source-level reduction order remains
+            // sequential left-to-right over the hidden axis.
+            let mut col: [Q16_16; h] = [0_i32; h];
+            let mut k: usize = 0;
+            while k < h {
+                col[k] = w[k][o];
+                k = k + 1;
+            }
+            out[i][o] = q16_dot_pinned(&x[i], &col);
+            o = o + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sliding-window self-attention.
+//
+// Steps (pinned in this order):
+//   1. Q, K, V projections via `project_linear` on the pre-normalized input.
+//   2. For each window in ascending start-index order:
+//      a. For each head h in 0..ENCODER_HEADS:
+//         - Build qw, kw, vw views of width `w_len = e - s` and per-head
+//           dim ENCODER_HEAD_DIM.
+//         - scores[i, j] = q16_dot_pinned(qw[i], kw[j])   (over head_dim)
+//         - scores[i, j] *= ATTN_SCALE_Q16                (rsqrt(head_dim))
+//         - probs[i, :] = q16_softmax(scores[i, :])       (5-stage pinned)
+//         - attended[i, d] = q16_dot_pinned(probs[i, :], vw[:, d])
+//      b. Accumulate `attended` into the head-tiled output buffer at
+//         positions [s, e) using saturating q16_add. This is the window
+//         overlap-add reduction; tokens in the 64-token overlap region
+//         receive contributions from both adjacent windows. The
+//         accumulation order is fixed by the ascending window loop.
+//   3. Output projection wo over the head-tiled buffer.
+// ─────────────────────────────────────────────────────────────────────────────
+@[determinism(BitIdentical)]
+@[reduction_order(Pinned)]
+@[attention_kind(SlidingWindow(window = ATTN_WINDOW_SIZE, stride = ATTN_WINDOW_STRIDE))]
+pub fn sliding_window_attention(
+    x:  tensor<Q16_16, [seq_len, ENCODER_HIDDEN]>,
+    wq: tensor<Q16_16, [ENCODER_HIDDEN, ENCODER_HIDDEN]>,
+    wk: tensor<Q16_16, [ENCODER_HIDDEN, ENCODER_HIDDEN]>,
+    wv: tensor<Q16_16, [ENCODER_HIDDEN, ENCODER_HIDDEN]>,
+    wo: tensor<Q16_16, [ENCODER_HIDDEN, ENCODER_HIDDEN]>,
+) -> tensor<Q16_16, [seq_len, ENCODER_HIDDEN]> {
+    let n: usize = x.len();
+    let h: usize = ENCODER_HIDDEN as usize;
+    let heads: usize = ENCODER_HEADS as usize;
+    let hd:    usize = ENCODER_HEAD_DIM as usize;
+    let win:   usize = ATTN_WINDOW_SIZE as usize;
+    let stride: usize = ATTN_WINDOW_STRIDE as usize;
+
+    // Step 1: Q, K, V projections. These are pre-norm activations in, Q16.16
+    // saturating mac over the hidden axis. Bit-identical per `project_linear`.
+    let q: tensor<Q16_16, [n, ENCODER_HIDDEN]> = project_linear(x, wq);
+    let k: tensor<Q16_16, [n, ENCODER_HIDDEN]> = project_linear(x, wk);
+    let v: tensor<Q16_16, [n, ENCODER_HIDDEN]> = project_linear(x, wv);
+
+    // Step 2: head-tiled output buffer, zero-initialised. Accumulated into
+    // per-window via overlap-add. mindc lowers this allocation to the layer
+    // entry; no per-window allocation inside the loop.
+    let mut attended_tiled: tensor<Q16_16, [n, ENCODER_HIDDEN]> = [[0_i32; ENCODER_HIDDEN]; n];
+
+    let mut s: usize = 0;
+    while s < n {
+        let e: usize = if s + win > n { n } else { s + win };
+        let w_len: usize = e - s;
+
+        // Per head, compute scores → softmax → attended, then add into the
+        // head's slice of attended_tiled[s:e, head_offset:head_offset+hd].
+        let mut head_i: usize = 0;
+        while head_i < heads {
+            let head_off: usize = head_i * hd;
+
+            // Build qw, kw, vw views: [w_len, hd] slices of q, k, v over the
+            // hidden axis at the head offset. Materialising the slice keeps
+            // the dot-product input contiguous for `q16_dot_pinned`.
+            let mut qw: [[Q16_16; hd]; w_len] = [[0_i32; hd]; w_len];
+            let mut kw: [[Q16_16; hd]; w_len] = [[0_i32; hd]; w_len];
+            let mut vw: [[Q16_16; hd]; w_len] = [[0_i32; hd]; w_len];
+            let mut t: usize = 0;
+            while t < w_len {
+                let mut d: usize = 0;
+                while d < hd {
+                    qw[t][d] = q[s + t][head_off + d];
+                    kw[t][d] = k[s + t][head_off + d];
+                    vw[t][d] = v[s + t][head_off + d];
+                    d = d + 1;
+                }
+                t = t + 1;
+            }
+
+            // scores[i, j] = (qw[i] · kw[j]) * ATTN_SCALE_Q16.
+            // ATTN_SCALE_Q16 = 1/sqrt(head_dim) = 1/8 in Q16.16 (= 8192).
+            let mut scores: [[Q16_16; w_len]; w_len] = [[0_i32; w_len]; w_len];
+            let mut i: usize = 0;
+            while i < w_len {
+                let mut j: usize = 0;
+                while j < w_len {
+                    let raw: Q16_16 = q16_dot_pinned(&qw[i], &kw[j]);
+                    scores[i][j] = q16_mul(raw, ATTN_SCALE_Q16);
+                    j = j + 1;
+                }
+                i = i + 1;
+            }
+
+            // probs[i, :] = q16_softmax(scores[i, :]) — pinned 5-stage flow
+            // per spec §5. Bit-identical across backends.
+            let mut probs: [[Q16_16; w_len]; w_len] = [[0_i32; w_len]; w_len];
+            i = 0;
+            while i < w_len {
+                let p: [Q16_16] = q16_softmax(&scores[i]);
+                let mut j: usize = 0;
+                while j < w_len {
+                    probs[i][j] = p[j];
+                    j = j + 1;
+                }
+                i = i + 1;
+            }
+
+            // attended[i, d] = sum_j probs[i, j] * vw[j, d]
+            //                = q16_dot_pinned(probs[i, :], vw[:, d])
+            // built column-by-column so the dot input stays contiguous.
+            i = 0;
+            while i < w_len {
+                let mut d: usize = 0;
+                while d < hd {
+                    // Materialise the d'th column of vw as a contiguous slice
+                    // for the dot product.
+                    let mut v_col: [Q16_16; w_len] = [0_i32; w_len];
+                    let mut j: usize = 0;
+                    while j < w_len {
+                        v_col[j] = vw[j][d];
+                        j = j + 1;
+                    }
+                    let contrib: Q16_16 = q16_dot_pinned(&probs[i], &v_col);
+                    // Window overlap-add: ascending start-index loop pins the
+                    // accumulation order; q16_add is saturating, not associative.
+                    let pos: usize = s + i;
+                    let col: usize = head_off + d;
+                    attended_tiled[pos][col] = q16_add(attended_tiled[pos][col], contrib);
+                    d = d + 1;
+                }
+                i = i + 1;
+            }
+
+            head_i = head_i + 1;
+        }
+
+        // Advance to the next window. Ascending start-index iteration; the
+        // last window may not advance by a full stride if the tail is short.
+        if e >= n { break; }
+        s = s + stride;
+    }
+
+    // Step 3: output projection. Linear [seq, H] @ [H, H].
+    return project_linear(attended_tiled, wo);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Gated residual.
+//
+//   out[i, d] = layer_in[i, d] + sigmoid(gate[d]) * layer_out[i, d]
+//
+// Gate is a per-hidden-dim Q16.16 scalar. Sigmoid is the truncated LUT
+// `q16_sigmoid_lut` (spec-compliant: 257-entry table, no polynomial, no
+// interpolation; table bytes contribute to `model_hash`). The gate values
+// themselves are learned during quantization-aware training.
+//
+// This is the ONLY nonlinearity per encoder layer besides attention's
+// softmax. There is no FFN sublayer — gated residual replaces it (see
+// spec/architecture.md "No feed-forward sublayer").
+// ─────────────────────────────────────────────────────────────────────────────
+@[determinism(BitIdentical)]
+pub fn gated_residual(
+    layer_in:  tensor<Q16_16, [seq_len, ENCODER_HIDDEN]>,
+    layer_out: tensor<Q16_16, [seq_len, ENCODER_HIDDEN]>,
+    gate:      &[Q16_16],
+) -> tensor<Q16_16, [seq_len, ENCODER_HIDDEN]> {
+    let n: usize = layer_in.len();
+    let h: usize = ENCODER_HIDDEN as usize;
+
+    // Precompute sigmoid(gate[d]) once per layer — gate is shared across the
+    // sequence axis. This keeps the per-token cost to a single q16_mul +
+    // q16_add per hidden dimension.
+    let mut sig_gate: [Q16_16; h] = [0_i32; h];
+    let mut d: usize = 0;
+    while d < h {
+        sig_gate[d] = q16_sigmoid_lut(gate[d]);
+        d = d + 1;
+    }
+
+    let mut out: tensor<Q16_16, [n, ENCODER_HIDDEN]> = [[0_i32; ENCODER_HIDDEN]; n];
+    let mut i: usize = 0;
+    while i < n {
+        let mut d2: usize = 0;
+        while d2 < h {
+            let gated: Q16_16 = q16_mul(sig_gate[d2], layer_out[i][d2]);
+            out[i][d2] = q16_add(layer_in[i][d2], gated);
+            d2 = d2 + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Mean-pool over the seq_len axis.
+//
+// Sequential sum along seq_len (pinned by `q16_sum_pinned`), then divide by
+// seq_len-as-Q16.16 with `q16_div_sat`. Returns the pooled [ENCODER_HIDDEN]
+// vector. `seq_len == 0` returns the all-zero vector; the caller in
+// `model::mean_pool_seq` enforces seq_len ≤ MAX_REQUEST_TOKENS upstream.
+// ─────────────────────────────────────────────────────────────────────────────
+@[determinism(BitIdentical)]
+@[reduction_order(Pinned)]
+pub fn mean_pool_seq_kernel(
+    x: tensor<Q16_16, [seq_len, ENCODER_HIDDEN]>,
+) -> [Q16_16; ENCODER_HIDDEN as usize] {
+    let n: usize = x.len();
+    let h: usize = ENCODER_HIDDEN as usize;
+    let mut out: [Q16_16; h] = [0_i32; h];
+    if n == 0 { return out; }
+
+    // Per-dimension sequential sum down the seq_len axis. Materialise the
+    // column as a contiguous slice so `q16_sum_pinned` consumes the canonical
+    // left-to-right element order.
+    let mut d: usize = 0;
+    while d < h {
+        let mut col: [Q16_16; n] = [0_i32; n];
+        let mut i: usize = 0;
+        while i < n {
+            col[i] = x[i][d];
+            i = i + 1;
+        }
+        let s: Q16_16 = q16_sum_pinned(&col);
+        let n_q16: Q16_16 = (n as i32) * ONE_Q16_16;
+        out[d] = q16_div_sat(s, n_q16);
+        d = d + 1;
+    }
+    return out;
+}

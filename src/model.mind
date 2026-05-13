@@ -18,6 +18,14 @@ use crate::mind_nerve::{
     VOCAB_SIZE, MAX_REQUEST_TOKENS, ROUTE_EMBEDDING_DIM,
 };
 
+// Module-private helpers — sliding-window attention kernels, embedding lookup,
+// pre-norm, gated residual, mean-pool. Not part of the public stability
+// surface; deliberately not `pub mod`. The Q16.16 primitives those helpers
+// compose against (`q16_dot_pinned`, `q16_sum_pinned`, `q16_softmax`,
+// `q16_layernorm`, `q16_sigmoid_lut`) are imported inside `encoder_kernels.mind`
+// directly; model.mind does not call them.
+mod encoder_kernels;
+
 // Encoder: 12 layers, sliding-window self-attention (window=256, stride=192),
 // gated residual, no FFN sublayer.
 //
@@ -33,7 +41,69 @@ pub fn encoder(
 where
     seq_len <= MAX_REQUEST_TOKENS,
 {
-    unimplemented!("Phase 1: 12-layer sliding-window attention + gated residual, no FFN")
+    // batch == 1 in Phase 1 (preselect is single-batch; throughput-mode batch
+    // ≥ 32 is a Phase 1 non-goal). The shape is kept on the public signature
+    // for forward-compatibility with Phase 2; the body iterates over the
+    // batch axis trivially.
+    let bsz: usize = token_ids.len();
+    let n:   usize = if bsz == 0 { 0 } else { token_ids[0].len() };
+    let h:   usize = ENCODER_HIDDEN as usize;
+
+    let mut out: tensor<Q16_16, [bsz, n, ENCODER_HIDDEN]> =
+        [[[0_i32; ENCODER_HIDDEN]; n]; bsz];
+
+    let mut b: usize = 0;
+    while b < bsz {
+        // Token embedding lookup: gather rows of `token_embedding` indexed by
+        // u32 token IDs. Out-of-vocab IDs are a tokenizer bug per spec; the
+        // kernel clamps defensively to id 0 to keep the function total.
+        let mut x: tensor<Q16_16, [n, ENCODER_HIDDEN]> =
+            encoder_kernels::token_embedding_lookup(&token_ids[b], weights.token_embedding);
+
+        // 12-layer sliding-window encoder. Pre-norm; no FFN sublayer.
+        let mut layer_i: u32 = 0;
+        while layer_i < ENCODER_LAYERS {
+            let w = weights.layers[layer_i as usize];
+
+            // Pre-norm: layer-norm + gain/bias affine, per token position.
+            // The 5-stage pinned layer-norm flow lives in `q16_layernorm`;
+            // `prenorm_seq` composes it per row and applies the affine.
+            let ln: tensor<Q16_16, [n, ENCODER_HIDDEN]> =
+                encoder_kernels::prenorm_seq(x, &w.ln_gain, &w.ln_bias);
+
+            // Sliding-window self-attention. Q/K/V projections, per-window
+            // softmax-attention, window overlap-add accumulation, output
+            // projection. Bit-identical reduction order pinned by ascending
+            // window iteration and pinned softmax/sum kernels.
+            let attn: tensor<Q16_16, [n, ENCODER_HIDDEN]> =
+                encoder_kernels::sliding_window_attention(
+                    ln, w.wq, w.wk, w.wv, w.wo,
+                );
+
+            // Gated residual replaces the FFN sublayer:
+            //   x = x + sigmoid(gate) * attn
+            // sigmoid via the truncated LUT in q16_16.mind.
+            x = encoder_kernels::gated_residual(x, attn, &w.residual_gate);
+
+            layer_i = layer_i + 1;
+        }
+
+        // Final layer-norm + affine before returning to the scoring head.
+        let final_ln: tensor<Q16_16, [n, ENCODER_HIDDEN]> =
+            encoder_kernels::prenorm_seq(x, &weights.final_ln_gain, &weights.final_ln_bias);
+
+        let mut i: usize = 0;
+        while i < n {
+            let mut d: usize = 0;
+            while d < h {
+                out[b][i][d] = final_ln[i][d];
+                d = d + 1;
+            }
+            i = i + 1;
+        }
+        b = b + 1;
+    }
+    return out;
 }
 
 // Mean-pool over the sequence axis. Pinned reduction order; bit-identical
@@ -47,7 +117,25 @@ pub fn mean_pool_seq(
 where
     seq_len <= MAX_REQUEST_TOKENS,
 {
-    unimplemented!("Phase 1: pinned-order sum along seq_len, divide by seq_len")
+    let bsz: usize = encoder_out.len();
+    let h:   usize = ENCODER_HIDDEN as usize;
+    let mut out: tensor<Q16_16, [bsz, ENCODER_HIDDEN]> = [[0_i32; ENCODER_HIDDEN]; bsz];
+
+    let mut b: usize = 0;
+    while b < bsz {
+        // Pinned per-dimension sequential sum along seq_len followed by
+        // saturating divide by seq_len. Kernel lives in encoder_kernels so
+        // the reduction-strategy annotation site is co-located with the
+        // composition of `q16_sum_pinned` + `q16_div_sat`.
+        let pooled: [Q16_16; h] = encoder_kernels::mean_pool_seq_kernel(encoder_out[b]);
+        let mut d: usize = 0;
+        while d < h {
+            out[b][d] = pooled[d];
+            d = d + 1;
+        }
+        b = b + 1;
+    }
+    return out;
 }
 
 // Scoring head: a single matmul between the pooled query vector and the

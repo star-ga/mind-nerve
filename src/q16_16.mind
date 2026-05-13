@@ -520,3 +520,81 @@ pub fn q16_layernorm(x: &[Q16_16]) -> [Q16_16] {
     }
     return out;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Section 7: q16_sigmoid_lut — truncated lookup table (gated-residual gate).
+//
+// Domain: input x in Q16.16 covering [-8.0, +8.0]. Inputs ≤ -8.0 clamp to
+// entry 0 (≈ 0). Inputs ≥ +8.0 clamp to the last entry (≈ ONE_Q16_16).
+//
+// Encoding: Q16_SIGMOID_TABLE has 257 entries. Index i corresponds to the
+// Q16.16 input value `-8.0 + i * (16.0 / 256) = -8.0 + i * (1/16)`. Stride
+// in Q16.16 input space: 65536 / 16 = 4096 (= ONE_Q16_16 / 16). 256 strides
+// span exactly 16.0 — the documented input range.
+//
+// Construction (no IEEE-754, no polynomial, no interpolation — spec §5):
+//   sigmoid(x) = exp(x) / (1 + exp(x)) for x ≤ 0
+//   sigmoid(x) = 1 - sigmoid(-x)       for x > 0   (symmetric reflection)
+// Both halves compose `q16_exp` (the spec-compliant truncated LUT) with
+// `q16_div_sat`. The const-fn evaluator runs at compile time; the resulting
+// table bytes contribute to `model_hash` along with the exp/rsqrt tables.
+//
+// Truncated lookup at runtime: a single index compute, one array load, no
+// arithmetic on the result. The same shape as `q16_exp`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub const Q16_SIGMOID_TABLE_STRIDE: Q16_16 = 4096_i32;        // = ONE_Q16_16 / 16
+pub const Q16_SIGMOID_TABLE_LEN:    u32    = 257;
+pub const Q16_SIGMOID_DOMAIN_LO:    Q16_16 = -524288_i32;     // -8.0 in Q16.16 (= -8 * 65536)
+pub const Q16_SIGMOID_DOMAIN_HI:    Q16_16 =  524288_i32;     // +8.0 in Q16.16
+
+// Build the 257-entry sigmoid lookup table via Q16.16 integer composition of
+// the already-pinned q16_exp LUT. Each entry is `exp(x) / (1 + exp(x))` for
+// x ≤ 0, and `1 - sigmoid(-x)` for x > 0. The 1.0 used in the denominator is
+// the canonical Q16.16 ONE_Q16_16; the divide is `q16_div_sat`.
+const fn build_sigmoid_table() -> [Q16_16; 257] {
+    let mut table: [Q16_16; 257] = [0_i32; 257];
+    let mut i: usize = 0;
+    while i < 257 {
+        // x_i = -8.0 + i * stride, in Q16.16.
+        let x_i: Q16_16 = Q16_SIGMOID_DOMAIN_LO + ((i as i32) * Q16_SIGMOID_TABLE_STRIDE);
+        if x_i <= 0_i32 {
+            // sigmoid(x) = exp(x) / (1 + exp(x)) for x ≤ 0.
+            let ex:  Q16_16 = q16_exp(x_i);
+            let den: Q16_16 = q16_add(ONE_Q16_16, ex);
+            table[i] = q16_div_sat(ex, den);
+        } else {
+            // sigmoid(x) = 1 - exp(-x) / (1 + exp(-x)) = 1 / (1 + exp(-x))
+            // Computed via the symmetric reflection of the x ≤ 0 case to
+            // preserve bit-identity with the lower half.
+            let neg_x: Q16_16 = q16_neg(x_i);
+            let ex:    Q16_16 = q16_exp(neg_x);
+            let den:   Q16_16 = q16_add(ONE_Q16_16, ex);
+            let lo:    Q16_16 = q16_div_sat(ex, den);
+            table[i] = q16_sub(ONE_Q16_16, lo);
+        }
+        i = i + 1;
+    }
+    return table;
+}
+
+pub const Q16_SIGMOID_TABLE: [Q16_16; 257] = build_sigmoid_table();
+
+// Truncated lookup. Input x in Q16.16. Returns Q16.16 approximation of
+// sigmoid(x). Clamps to [Q16_SIGMOID_DOMAIN_LO, Q16_SIGMOID_DOMAIN_HI]; no
+// interpolation, no polynomial.
+@[determinism(BitIdentical)]
+pub fn q16_sigmoid_lut(x: Q16_16) -> Q16_16 {
+    if x <= Q16_SIGMOID_DOMAIN_LO {
+        return Q16_SIGMOID_TABLE[0];
+    }
+    if x >= Q16_SIGMOID_DOMAIN_HI {
+        return Q16_SIGMOID_TABLE[256];
+    }
+    // x is in (-8.0, +8.0). Compute the table index by floor-division.
+    let shifted: i32   = x - Q16_SIGMOID_DOMAIN_LO;   // in (0, 16*ONE_Q16_16)
+    let idx_i32: i32   = shifted / Q16_SIGMOID_TABLE_STRIDE;
+    let idx:     usize = idx_i32 as usize;
+    if idx > 256 { return Q16_SIGMOID_TABLE[256]; }
+    return Q16_SIGMOID_TABLE[idx];
+}

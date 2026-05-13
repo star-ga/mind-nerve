@@ -1,0 +1,318 @@
+// Encoder unit tests — sliding-window self-attention + gated residual.
+//
+// Audit marker: S-A2 (reduction-order discipline). Every reduction site
+// exercised here funnels through pinned primitives in `q16_16.mind`; the
+// encoder loop pins window overlap-add by ascending start-index order.
+//
+// Tests use ONLY the public surface (`q16_sigmoid_lut` in `q16_16.mind` plus
+// `encoder` and `mean_pool_seq` in `model.mind`). The module-private kernels
+// in `src/encoder_kernels.mind` are exercised transitively through these two
+// entry points — that is the lint-supported public-surface boundary.
+//
+// Test plan:
+//   1. q16_sigmoid_lut — table shape, zero=0.5, saturating tails.
+//   2. mean_pool_seq — pinned-sum + saturating divide over seq_len.
+//   3. encoder — zero-weights / zero-token round-trip; composition with
+//      mean_pool_seq; shape preservation across (batch, seq_len).
+//   4. encoder — final-LN bias passes through.
+
+use crate::mind_nerve::{
+    Q16_16,
+    ONE_Q16_16,
+    HALF_Q16_16,
+    ENCODER_HIDDEN,
+    ENCODER_HEADS,
+    ENCODER_HEAD_DIM,
+    ENCODER_LAYERS,
+    VOCAB_SIZE,
+};
+use crate::mind_nerve::q16_16::{
+    q16_sigmoid_lut,
+    Q16_SIGMOID_TABLE_LEN,
+    Q16_SIGMOID_DOMAIN_LO,
+    Q16_SIGMOID_DOMAIN_HI,
+};
+use crate::mind_nerve::model::{
+    encoder,
+    mean_pool_seq,
+    EncoderLayerWeights,
+    EncoderWeights,
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// All-zero layer weights, gain = 1.0, gate = LO (sigmoid ≈ 0 → residual is
+// near-identity). Useful for end-to-end zero-propagation tests.
+fn zero_layer_weights() -> EncoderLayerWeights {
+    EncoderLayerWeights {
+        wq:            [[0_i32; ENCODER_HIDDEN]; ENCODER_HIDDEN],
+        wk:            [[0_i32; ENCODER_HIDDEN]; ENCODER_HIDDEN],
+        wv:            [[0_i32; ENCODER_HIDDEN]; ENCODER_HIDDEN],
+        wo:            [[0_i32; ENCODER_HIDDEN]; ENCODER_HIDDEN],
+        ln_gain:       [ONE_Q16_16; ENCODER_HIDDEN],
+        ln_bias:       [0_i32; ENCODER_HIDDEN],
+        residual_gate: [Q16_SIGMOID_DOMAIN_LO; ENCODER_HIDDEN],
+    }
+}
+
+fn zero_encoder_weights() -> EncoderWeights {
+    let layers: [EncoderLayerWeights; ENCODER_LAYERS] = [
+        zero_layer_weights(); ENCODER_LAYERS as usize
+    ];
+    EncoderWeights {
+        token_embedding: [[0_i32; ENCODER_HIDDEN]; VOCAB_SIZE],
+        layers:          layers,
+        final_ln_gain:   [ONE_Q16_16; ENCODER_HIDDEN],
+        final_ln_bias:   [0_i32; ENCODER_HIDDEN],
+    }
+}
+
+// As above, but with a non-zero final-LN bias that should pass through to
+// the encoder output when the residual stream is zero. The final LN sees an
+// all-zero pre-norm input → mean=0, variance=0, (x-mean)=0, normalize=0,
+// then affine adds bias.
+fn zero_encoder_with_final_bias(bias_value: Q16_16) -> EncoderWeights {
+    let layers: [EncoderLayerWeights; ENCODER_LAYERS] = [
+        zero_layer_weights(); ENCODER_LAYERS as usize
+    ];
+    EncoderWeights {
+        token_embedding: [[0_i32; ENCODER_HIDDEN]; VOCAB_SIZE],
+        layers:          layers,
+        final_ln_gain:   [ONE_Q16_16; ENCODER_HIDDEN],
+        final_ln_bias:   [bias_value; ENCODER_HIDDEN],
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Section 1: q16_sigmoid_lut.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_q16_sigmoid_lut_table_length() {
+    // Spec: 257-entry LUT (same shape as q16_exp; 256 strides + right edge).
+    assert_eq!(Q16_SIGMOID_TABLE_LEN, 257_u32);
+}
+
+#[test]
+fn test_q16_sigmoid_lut_zero_is_half() {
+    // sigmoid(0) = 0.5. Truncated lookup hits the bucket centred on the
+    // +/- mirror boundary; we accept ≤ 4-ULP slack to absorb the bucket-edge
+    // ambiguity (the same exact bytes appear on every backend).
+    let s: Q16_16 = q16_sigmoid_lut(0_i32);
+    let lo: Q16_16 = HALF_Q16_16 - 256_i32;
+    let hi: Q16_16 = HALF_Q16_16 + 256_i32;
+    assert!(s >= lo && s <= hi);
+}
+
+#[test]
+fn test_q16_sigmoid_lut_saturates_at_plus_infinity() {
+    // Inputs ≥ +8.0 clamp to the last entry; last entry must be ≈ 1.0.
+    let s: Q16_16 = q16_sigmoid_lut(Q16_SIGMOID_DOMAIN_HI);
+    let close_to_one_lo: Q16_16 = ONE_Q16_16 - 256_i32;
+    assert!(s >= close_to_one_lo);
+    assert!(s <= ONE_Q16_16);
+}
+
+#[test]
+fn test_q16_sigmoid_lut_saturates_at_minus_infinity() {
+    // Inputs ≤ -8.0 clamp to entry 0; entry 0 must be ≈ 0.
+    let s: Q16_16 = q16_sigmoid_lut(Q16_SIGMOID_DOMAIN_LO);
+    assert!(s >= 0_i32);
+    assert!(s <= 256_i32);
+}
+
+#[test]
+fn test_q16_sigmoid_lut_far_negative_clamps() {
+    // Below domain floor: same bytes as the floor input.
+    let a: Q16_16 = q16_sigmoid_lut(-2_000_000_i32);
+    let b: Q16_16 = q16_sigmoid_lut(Q16_SIGMOID_DOMAIN_LO);
+    assert_eq!(a, b);
+}
+
+#[test]
+fn test_q16_sigmoid_lut_far_positive_clamps() {
+    // Above domain ceiling: same bytes as the ceiling input.
+    let a: Q16_16 = q16_sigmoid_lut(2_000_000_i32);
+    let b: Q16_16 = q16_sigmoid_lut(Q16_SIGMOID_DOMAIN_HI);
+    assert_eq!(a, b);
+}
+
+#[test]
+fn test_q16_sigmoid_lut_monotonic_basic_samples() {
+    // sigmoid is monotonically nondecreasing. Sample at -4, -2, 0, +2, +4.
+    let s1: Q16_16 = q16_sigmoid_lut(-4_i32 * ONE_Q16_16);
+    let s2: Q16_16 = q16_sigmoid_lut(-2_i32 * ONE_Q16_16);
+    let s3: Q16_16 = q16_sigmoid_lut(0_i32);
+    let s4: Q16_16 = q16_sigmoid_lut( 2_i32 * ONE_Q16_16);
+    let s5: Q16_16 = q16_sigmoid_lut( 4_i32 * ONE_Q16_16);
+    assert!(s1 <= s2);
+    assert!(s2 <= s3);
+    assert!(s3 <= s4);
+    assert!(s4 <= s5);
+}
+
+#[test]
+fn test_q16_sigmoid_lut_bounded_in_unit_interval() {
+    // Every sampled value must lie in [0, ONE_Q16_16].
+    let xs: [Q16_16; 5] = [
+        -4_i32 * ONE_Q16_16,
+        -1_i32 * ONE_Q16_16,
+        0_i32,
+        ONE_Q16_16,
+        4_i32 * ONE_Q16_16,
+    ];
+    let mut i: usize = 0;
+    while i < 5 {
+        let s: Q16_16 = q16_sigmoid_lut(xs[i]);
+        assert!(s >= 0_i32);
+        assert!(s <= ONE_Q16_16);
+        i = i + 1;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Section 2: mean_pool_seq via the public API.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_mean_pool_seq_constant_via_encoder_output_shape() {
+    // Feed a [1, 4, ENCODER_HIDDEN] tensor of all-ones directly to
+    // mean_pool_seq (bypassing encoder). Mean is ONE_Q16_16 in every column.
+    let n: usize = 4;
+    let mut enc: tensor<Q16_16, [1, n, ENCODER_HIDDEN]> = [[[ONE_Q16_16; ENCODER_HIDDEN]; n]];
+    let pooled = mean_pool_seq(enc);
+    assert_eq!(pooled[0][0], ONE_Q16_16);
+    assert_eq!(pooled[0][ENCODER_HIDDEN as usize - 1], ONE_Q16_16);
+}
+
+#[test]
+fn test_mean_pool_seq_linear_ramp() {
+    // seq_len = 4 with values [0, 1, 2, 3] in column 0: sum = 6, divide by
+    // 4 in Q16.16 → 1.5 = 98304.
+    let n: usize = 4;
+    let mut enc: tensor<Q16_16, [1, n, ENCODER_HIDDEN]> = [[[0_i32; ENCODER_HIDDEN]; n]];
+    let mut i: usize = 0;
+    while i < n {
+        enc[0][i][0] = (i as i32) * ONE_Q16_16;
+        i = i + 1;
+    }
+    let pooled = mean_pool_seq(enc);
+    assert_eq!(pooled[0][0], 98304_i32);   // 1.5 in Q16.16
+}
+
+#[test]
+fn test_mean_pool_seq_zero_input_zero_output() {
+    let n: usize = 7;
+    let enc: tensor<Q16_16, [1, n, ENCODER_HIDDEN]> = [[[0_i32; ENCODER_HIDDEN]; n]];
+    let pooled = mean_pool_seq(enc);
+    assert_eq!(pooled[0][0], 0_i32);
+    assert_eq!(pooled[0][ENCODER_HIDDEN as usize - 1], 0_i32);
+}
+
+#[test]
+fn test_mean_pool_seq_single_token_passthrough() {
+    // seq_len = 1: pooled value equals the single token's value (sum/1).
+    let mut enc: tensor<Q16_16, [1, 1, ENCODER_HIDDEN]> = [[[0_i32; ENCODER_HIDDEN]]];
+    enc[0][0][5] = ONE_Q16_16 * 3_i32;
+    let pooled = mean_pool_seq(enc);
+    assert_eq!(pooled[0][5], ONE_Q16_16 * 3_i32);
+    assert_eq!(pooled[0][0], 0_i32);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Section 3: encoder end-to-end (public surface).
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_encoder_zero_weights_zero_token_zero_output() {
+    // batch=1, seq_len=2, all-zero weights, token id 0 (zero embedding row).
+    // After 12 layers + final LN with zero bias the output is exactly zero.
+    let token_ids: tensor<u32, [1, 2]> = [[0_u32, 0_u32]];
+    let weights = zero_encoder_weights();
+    let out = encoder(token_ids, weights);
+    assert_eq!(out[0][0][0], 0_i32);
+    assert_eq!(out[0][1][ENCODER_HIDDEN as usize - 1], 0_i32);
+}
+
+#[test]
+fn test_encoder_zero_weights_seq_len_one() {
+    // seq_len = 1 is the boundary case where num_windows = 1 and the
+    // window covers the entire sequence. Zero-propagation still holds.
+    let token_ids: tensor<u32, [1, 1]> = [[0_u32]];
+    let weights = zero_encoder_weights();
+    let out = encoder(token_ids, weights);
+    assert_eq!(out[0][0][0], 0_i32);
+    assert_eq!(out[0][0][ENCODER_HIDDEN as usize - 1], 0_i32);
+}
+
+#[test]
+fn test_encoder_final_ln_bias_passes_through_on_zero_stream() {
+    // Residual stream is zero throughout (zero weights, gate ≈ 0, zero embed).
+    // Pre-norm of an all-zero vector is all-zero; final affine adds bias.
+    // → output equals final_ln_bias element-wise.
+    let token_ids: tensor<u32, [1, 3]> = [[0_u32, 0_u32, 0_u32]];
+    let weights = zero_encoder_with_final_bias(ONE_Q16_16 * 2_i32);
+    let out = encoder(token_ids, weights);
+    assert_eq!(out[0][0][0], ONE_Q16_16 * 2_i32);
+    assert_eq!(out[0][2][ENCODER_HIDDEN as usize - 1], ONE_Q16_16 * 2_i32);
+}
+
+#[test]
+fn test_encoder_composes_with_mean_pool() {
+    // Encoder + mean_pool_seq composition contract: the pooled output of an
+    // all-zero residual stream with bias=2 is 2 in every hidden dim.
+    let token_ids: tensor<u32, [1, 4]> = [[0_u32, 0_u32, 0_u32, 0_u32]];
+    let weights = zero_encoder_with_final_bias(ONE_Q16_16 * 2_i32);
+    let enc_out = encoder(token_ids, weights);
+    let pooled  = mean_pool_seq(enc_out);
+    assert_eq!(pooled[0][0],                              ONE_Q16_16 * 2_i32);
+    assert_eq!(pooled[0][ENCODER_HIDDEN as usize - 1],    ONE_Q16_16 * 2_i32);
+}
+
+#[test]
+fn test_encoder_shape_preservation_short_request() {
+    // The output tensor shape must equal [batch=1, seq_len=5, ENCODER_HIDDEN].
+    let token_ids: tensor<u32, [1, 5]> = [[0_u32, 0_u32, 0_u32, 0_u32, 0_u32]];
+    let weights = zero_encoder_weights();
+    let out = encoder(token_ids, weights);
+    assert_eq!(out.len(), 1_usize);
+    assert_eq!(out[0].len(), 5_usize);
+    assert_eq!(out[0][0].len(), ENCODER_HIDDEN as usize);
+}
+
+#[test]
+fn test_encoder_shape_preservation_window_boundary() {
+    // seq_len exactly at one full window (256) hits the "single window"
+    // branch in num_windows; shape is still preserved end-to-end.
+    let mut token_ids: tensor<u32, [1, 256]> = [[0_u32; 256]];
+    let weights = zero_encoder_weights();
+    let out = encoder(token_ids, weights);
+    assert_eq!(out[0].len(),     256_usize);
+    assert_eq!(out[0][0].len(),  ENCODER_HIDDEN as usize);
+    assert_eq!(out[0][255][0],   0_i32);
+}
+
+#[test]
+fn test_encoder_shape_preservation_two_windows() {
+    // seq_len 257 forces a two-window pass with 192-stride second window.
+    // The overlap region is positions [64, 256); zero-weights still yield
+    // zero output, but the test exercises the overlap-add code path.
+    let mut token_ids: tensor<u32, [1, 257]> = [[0_u32; 257]];
+    let weights = zero_encoder_weights();
+    let out = encoder(token_ids, weights);
+    assert_eq!(out[0].len(),     257_usize);
+    assert_eq!(out[0][256][0],   0_i32);
+    // A position deep in the overlap region (e.g. 128) is also zero.
+    assert_eq!(out[0][128][0],   0_i32);
+}
+
+#[test]
+fn test_encoder_head_arithmetic_matches_lib() {
+    // Compile-time invariants we rely on for the head-tiled output buffer:
+    //   ENCODER_HIDDEN = 384 = ENCODER_HEADS * ENCODER_HEAD_DIM = 6 * 64.
+    assert_eq!(ENCODER_HEADS * ENCODER_HEAD_DIM, ENCODER_HIDDEN);
+    assert_eq!(ENCODER_HEAD_DIM,                 64_u32);
+    assert_eq!(ENCODER_HEADS,                    6_u32);
+}

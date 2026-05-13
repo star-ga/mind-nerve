@@ -1,0 +1,6 @@
+[model]
+name = "codex-latest"
+temperature = 0.2
+
+[shell]
+allow_list = ["git", "npm", "node"]

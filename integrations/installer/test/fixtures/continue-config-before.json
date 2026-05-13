@@ -1,0 +1,10 @@
+{
+  "models": [
+    {
+      "title": "Claude",
+      "provider": "anthropic",
+      "model": "claude-opus-4-7"
+    }
+  ],
+  "mcpServers": {}
+}

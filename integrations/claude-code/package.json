@@ -1,0 +1,28 @@
+{
+  "name": "@mind-nerve/claude-code-hook",
+  "version": "0.1.0",
+  "description": "mind-nerve UserPromptSubmit hook for Claude Code — projector pattern",
+  "type": "module",
+  "main": "dist/preselect.js",
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@mind/mic-map": "file:../../../mind/sdk/ts/mic-map",
+    "pino": "^9.6.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@vitest/coverage-v8": "^4.1.6",
+    "typescript": "^5.5.0",
+    "vitest": "^2.1.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

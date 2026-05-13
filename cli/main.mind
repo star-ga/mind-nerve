@@ -1,0 +1,17 @@
+// mind-nerve single-binary CLI entrypoint.
+//
+// Reads JSON request from stdin, emits JSON response to stdout, appends
+// attestation envelope to the local evidence log. Intended to be called by
+// host shims (Claude Code, codex, MCP façade); not user-facing.
+
+use crate::mind_nerve::inference;
+use crate::mind_nerve::DEFAULT_TOP_K;
+
+@[determinism(BitIdentical)]
+fn main(args: [string]) -> i32 {
+    // CLI surface is intentionally tiny:
+    //   mind-nerve preselect [--top-k N]      reads stdin, writes stdout
+    //   mind-nerve verify  <envelope-base64>  exit 0 if valid, 1 if not
+    //   mind-nerve version                    prints semver + model_hash
+    unimplemented!("Phase 1: stdin/stdout JSON dispatch")
+}

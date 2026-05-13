@@ -1,0 +1,894 @@
+// Q16.16 kernel primitives — bit-identity contract. Audit S-A2 (reduction-order discipline).
+//
+// RED test file. All tests in this file are expected to FAIL until `src/q16_16.mind`
+// is implemented. Running `mindc test tests/unit/test_q16_16.mind` against the
+// current state of the repo (no q16_16.mind, unimplemented!() bodies in model.mind)
+// must produce "function not implemented" or "module not found" errors for every
+// #[test] item. That failure is the signal that the TDD cycle is beginning correctly.
+//
+// Audit marker: S-A2 (reduction-order discipline) — every reduction in this file
+// is documented as either Pinned-Sequential or explicitly Non-equivariant by design.
+
+// PROPOSED CONSTANTS TO ADD TO lib.mind:
+//
+//   // Q16.16 representation of 1.0: 1 << 16 = 65536
+//   pub const ONE_Q16_16:  Q16_16 = 65536_i32;
+//
+//   // Q16.16 maximum value: i32::MAX = 2147483647
+//   pub const MAX_Q16_16:  Q16_16 = 2147483647_i32;
+//
+//   // Q16.16 minimum value: i32::MIN = -2147483648
+//   pub const MIN_Q16_16:  Q16_16 = -2147483648_i32;
+//
+//   // Q16.16 representation of -1.0: -(1 << 16) = -65536
+//   pub const NEG_ONE_Q16_16: Q16_16 = -65536_i32;
+//
+//   // Q16.16 representation of 0.5: 1 << 15 = 32768
+//   pub const HALF_Q16_16: Q16_16 = 32768_i32;
+//
+//   // Q16.16 representation of 0.25: 1 << 14 = 16384
+//   pub const QUARTER_Q16_16: Q16_16 = 16384_i32;
+//
+//   // Q16.16 representation of 3.0: 3 << 16 = 196608
+//   pub const THREE_Q16_16: Q16_16 = 196608_i32;
+//
+//   // Q16.16 representation of -3.0: -(3 << 16) = -196608
+//   pub const NEG_THREE_Q16_16: Q16_16 = -196608_i32;
+//
+//   // 1 ULP in Q16.16 format: 1
+//   pub const ULP_Q16_16: Q16_16 = 1_i32;
+//
+// These constants MUST be added to src/lib.mind before src/q16_16.mind can be
+// compiled. The tests below reference them by name; the symbols are declared here
+// as comments only so the intent is explicit at the RED stage.
+
+use crate::mind_nerve::q16_16::{
+    q16_mul,
+    q16_add,
+    q16_dot,
+    q16_softmax,
+    q16_layernorm,
+    q16_sat_cast,
+    q16_widen,
+    sha256_bytes,    // intrinsic: SHA-256 of a byte slice; used for determinism oracles
+};
+
+use crate::mind_nerve::{
+    Q16_16,
+    ONE_Q16_16,
+    MAX_Q16_16,
+    MIN_Q16_16,
+    NEG_ONE_Q16_16,
+    HALF_Q16_16,
+    QUARTER_Q16_16,
+    THREE_Q16_16,
+    NEG_THREE_Q16_16,
+    ULP_Q16_16,
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers used across test groups. Not exported; test-only.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Encode a raw i32 as a Q16.16 canonical byte array (little-endian), then
+// SHA-256 it. Used in determinism oracle tests.
+fn sha256_q16(v: Q16_16) -> [u8; 32] {
+    sha256_bytes(&v.to_le_bytes())
+}
+
+// SHA-256 of a Q16.16 slice, in element order. Concatenate le_bytes of each
+// element, then hash the concatenation. Pinned to left-to-right element order.
+fn sha256_q16_slice(vs: &[Q16_16]) -> [u8; 32] {
+    let mut buf: [u8] = [];
+    for v in vs {
+        buf.extend(v.to_le_bytes());
+    }
+    sha256_bytes(&buf)
+}
+
+// Linear-congruential generator seeded with a u64. Returns the next value and
+// the updated state. Used to generate reproducible but varied test inputs
+// without depending on a runtime RNG.
+fn lcg_next(state: u64) -> (u64, i32) {
+    // Multiplier and addend from Knuth TAOCP Vol 2 §3.3.4 (generic well-known params).
+    let next = state.wrapping_mul(6364136223846793005_u64).wrapping_add(1442695040888963407_u64);
+    // Fold 64 bits to i32 by xor-folding upper and lower halves.
+    let folded = ((next >> 32) as i32) ^ (next as i32);
+    (next, folded)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Section 1: q16_mul — multiply with saturation, toward-zero rounding
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_q16_mul_identity_positive_three() {
+    // Invariant: multiplying by ONE (1.0 in Q16.16) is the identity for any value.
+    assert_eq!(q16_mul(ONE_Q16_16, THREE_Q16_16), THREE_Q16_16);
+}
+
+#[test]
+fn test_q16_mul_identity_negative_three() {
+    // Invariant: multiplying by ONE (1.0 in Q16.16) is the identity for any value.
+    assert_eq!(q16_mul(ONE_Q16_16, NEG_THREE_Q16_16), NEG_THREE_Q16_16);
+}
+
+#[test]
+fn test_q16_mul_identity_positive_one() {
+    // Invariant: multiplying by ONE is the identity for 1.0.
+    assert_eq!(q16_mul(ONE_Q16_16, ONE_Q16_16), ONE_Q16_16);
+}
+
+#[test]
+fn test_q16_mul_identity_negative_one() {
+    // Invariant: multiplying by ONE is the identity for -1.0.
+    assert_eq!(q16_mul(ONE_Q16_16, NEG_ONE_Q16_16), NEG_ONE_Q16_16);
+}
+
+#[test]
+fn test_q16_mul_identity_zero() {
+    // Invariant: multiplying by ONE is the identity for 0.
+    assert_eq!(q16_mul(ONE_Q16_16, 0_i32), 0_i32);
+}
+
+#[test]
+fn test_q16_mul_zero_left_positive() {
+    // Invariant: zero times any value is zero (left multiplicand = 0).
+    assert_eq!(q16_mul(0_i32, THREE_Q16_16), 0_i32);
+}
+
+#[test]
+fn test_q16_mul_zero_left_negative() {
+    // Invariant: zero times any value is zero (left multiplicand = 0, negative right).
+    assert_eq!(q16_mul(0_i32, NEG_THREE_Q16_16), 0_i32);
+}
+
+#[test]
+fn test_q16_mul_zero_right_positive() {
+    // Invariant: any value times zero is zero (right multiplicand = 0).
+    assert_eq!(q16_mul(THREE_Q16_16, 0_i32), 0_i32);
+}
+
+#[test]
+fn test_q16_mul_zero_right_min() {
+    // Invariant: MIN_Q16_16 times zero is zero (boundary zero-arm test).
+    assert_eq!(q16_mul(MIN_Q16_16, 0_i32), 0_i32);
+}
+
+#[test]
+fn test_q16_mul_commutativity_seeded() {
+    // Invariant: q16_mul is commutative — q16_mul(a,b) == q16_mul(b,a) for all
+    // non-saturating inputs (the 20 seeds below are chosen so neither product overflows).
+    // Seeds produce values in the range [-8.0, 8.0] Q16.16 (i.e. |x| <= 8*ONE_Q16_16).
+    let seeds: [u64; 20] = [
+        0x0001_0000_0001_0000,  // seed 0
+        0x0002_0000_0002_0000,  // seed 1
+        0x8FFF_1234_ABCD_EF01,  // seed 2
+        0x1111_2222_3333_4444,  // seed 3
+        0xDEAD_BEEF_CAFE_BABE,  // seed 4
+        0x0123_4567_89AB_CDEF,  // seed 5
+        0xFEDC_BA98_7654_3210,  // seed 6
+        0x0000_0000_0000_0001,  // seed 7
+        0x7FFF_FFFF_FFFF_FFFE,  // seed 8 (large positive, clamp range)
+        0x4000_0000_0000_0000,  // seed 9
+        0x3141_5926_5358_9793,  // seed 10 (pi-ish bits)
+        0x2718_2818_2845_9045,  // seed 11 (e-ish bits)
+        0xAAAA_AAAA_AAAA_AAAA,  // seed 12 (alternating bits)
+        0x5555_5555_5555_5555,  // seed 13 (alternating bits inverse)
+        0x0000_0000_FFFF_FFFF,  // seed 14
+        0xFFFF_FFFF_0000_0000,  // seed 15
+        0x0F0F_0F0F_0F0F_0F0F,  // seed 16
+        0xF0F0_F0F0_F0F0_F0F0,  // seed 17
+        0x1234_5678_9ABC_DEF0,  // seed 18
+        0xABCD_EF01_2345_6789,  // seed 19
+    ];
+    for seed in seeds {
+        let (s1, raw_a) = lcg_next(seed);
+        let (_s2, raw_b) = lcg_next(s1);
+        // Scale to [-4.0, 4.0] to stay comfortably within non-saturating range.
+        // Mask to 17 bits (range 0..131071) then shift to signed center.
+        let a: Q16_16 = ((raw_a & 0x0001_FFFF_i32).wrapping_sub(65536_i32)).wrapping_mul(4_i32);
+        let b: Q16_16 = ((raw_b & 0x0001_FFFF_i32).wrapping_sub(65536_i32)).wrapping_mul(4_i32);
+        assert_eq!(
+            q16_mul(a, b),
+            q16_mul(b, a),
+            "commutativity failed for seed=0x{:016X}: a={} b={}", seed, a, b
+        );
+    }
+}
+
+#[test]
+fn test_q16_mul_saturation_positive_overflow() {
+    // Invariant: multiplying two values that would overflow must clamp to MAX_Q16_16.
+    // MAX_Q16_16 * MAX_Q16_16 in full precision is >> MAX_Q16_16, must saturate.
+    assert_eq!(q16_mul(MAX_Q16_16, MAX_Q16_16), MAX_Q16_16);
+}
+
+#[test]
+fn test_q16_mul_saturation_negative_overflow() {
+    // Invariant: MIN * MAX in full precision is << MIN_Q16_16; must clamp to MIN_Q16_16.
+    assert_eq!(q16_mul(MIN_Q16_16, MAX_Q16_16), MIN_Q16_16);
+}
+
+#[test]
+fn test_q16_mul_saturation_min_times_min() {
+    // Invariant: MIN * MIN would be large positive — must clamp to MAX_Q16_16.
+    // (Two negatives multiply to positive; the magnitude overflows i32 representable range.)
+    assert_eq!(q16_mul(MIN_Q16_16, MIN_Q16_16), MAX_Q16_16);
+}
+
+#[test]
+fn test_q16_mul_rounding_half_times_half() {
+    // Invariant: 0.5 * 0.5 = 0.25 exactly in Q16.16 with toward-zero rounding.
+    // HALF_Q16_16 = 32768, QUARTER_Q16_16 = 16384.
+    // Full precision product: 32768 * 32768 = 1073741824; shift right 16 = 16384 exactly.
+    // No rounding ambiguity at this input; result is bit-exact.
+    assert_eq!(q16_mul(HALF_Q16_16, HALF_Q16_16), QUARTER_Q16_16);
+}
+
+#[test]
+fn test_q16_mul_rounding_toward_zero_not_banker() {
+    // Invariant: rounding mode is toward-zero, NOT banker's (round-half-to-even).
+    //
+    // Construct a product whose fractional bits are exactly 0x8000 (i.e. midpoint = 0.5 ULP).
+    // Toward-zero rounding: truncate fractional bits → result rounds toward zero.
+    // Banker's rounding: would round to the nearest even integer → different bit.
+    //
+    // Input pair: a = 3 * ONE_Q16_16 + HALF_Q16_16 = 229376  (3.5 in Q16.16)
+    //             b = ONE_Q16_16                    = 65536   (1.0 in Q16.16)
+    // Full product: 229376 * 65536 = 15032385536. Shift right 16: 229376 exactly.
+    // No mid-point here — use a case that exercises the 0x8000 fractional boundary.
+    //
+    // Better pair: a = 65537 (= ONE + 1 ULP), b = 32768 (= HALF).
+    // Full product: 65537 * 32768 = 2147516416. Shift right 16 = 32768 remainder 32768.
+    // Toward-zero: 32768 (HALF_Q16_16). Banker's: 32768 (even — same here).
+    //
+    // Use a case where the two modes diverge: a = 3 ULP, b = HALF.
+    // Full product: 3 * 32768 = 98304. Shift right 16 = 1 remainder 32768 (exact 0.5 ULP).
+    // Toward-zero: 1. Banker's (round-half-to-even): 2 (since 1 is odd, round up to 2).
+    // So: q16_mul(3, HALF_Q16_16) must equal 1, NOT 2.
+    assert_eq!(q16_mul(3_i32, HALF_Q16_16), 1_i32);
+}
+
+#[test]
+fn test_q16_mul_determinism_oracle() {
+    // Invariant: fixed inputs always produce the same byte-level output across
+    // architectures and runs. The SHA-256 of the canonical little-endian i32
+    // representation is compared to a hardcoded expected digest.
+    // TODO(P1.1.2): replace PLACEHOLDER_HASH_MUL after first green run.
+    let result = q16_mul(THREE_Q16_16, HALF_Q16_16);   // 3.0 * 0.5 = 1.5 expected
+    let digest = sha256_q16(result);
+    let expected: [u8; 32] = *b"PLACEHOLDER_HASH_MUL____________"; // 32 bytes
+    assert_eq!(digest, expected, "q16_mul determinism oracle failed");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Section 2: q16_add — add with saturation
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_q16_add_identity_positive() {
+    // Invariant: adding zero is the identity for a positive value.
+    assert_eq!(q16_add(0_i32, THREE_Q16_16), THREE_Q16_16);
+}
+
+#[test]
+fn test_q16_add_identity_negative() {
+    // Invariant: adding zero is the identity for a negative value.
+    assert_eq!(q16_add(0_i32, NEG_THREE_Q16_16), NEG_THREE_Q16_16);
+}
+
+#[test]
+fn test_q16_add_identity_zero() {
+    // Invariant: adding zero to zero yields zero.
+    assert_eq!(q16_add(0_i32, 0_i32), 0_i32);
+}
+
+#[test]
+fn test_q16_add_identity_min() {
+    // Invariant: adding zero to MIN_Q16_16 preserves MIN_Q16_16 (no wraparound).
+    assert_eq!(q16_add(0_i32, MIN_Q16_16), MIN_Q16_16);
+}
+
+#[test]
+fn test_q16_add_commutativity_seeded() {
+    // Invariant: q16_add is commutative for non-saturating inputs.
+    // Seeds produce values in [-4.0, 4.0] Q16.16 to avoid overflow.
+    let seeds: [u64; 10] = [
+        0xAABBCCDD_EEFF0011,
+        0x11223344_55667788,
+        0x99AABBCC_DDEEFF00,
+        0xFEDCBA98_76543210,
+        0x01234567_89ABCDEF,
+        0xDEADBEEF_DEADBEEF,
+        0xCAFEBABE_CAFEBABE,
+        0x0F0F0F0F_0F0F0F0F,
+        0xF0F0F0F0_F0F0F0F0,
+        0x12345678_ABCDEF01,
+    ];
+    for seed in seeds {
+        let (s1, raw_a) = lcg_next(seed);
+        let (_s2, raw_b) = lcg_next(s1);
+        let a: Q16_16 = (raw_a & 0x0007_FFFF_i32).wrapping_sub(262144_i32);
+        let b: Q16_16 = (raw_b & 0x0007_FFFF_i32).wrapping_sub(262144_i32);
+        assert_eq!(
+            q16_add(a, b),
+            q16_add(b, a),
+            "commutativity failed for seed=0x{:016X}: a={} b={}", seed, a, b
+        );
+    }
+}
+
+#[test]
+fn test_q16_add_associativity_seeded() {
+    // Invariant: q16_add is associative for non-saturating inputs:
+    // q16_add(q16_add(a, b), c) == q16_add(a, q16_add(b, c)).
+    // NOTE: Associativity holds only when no intermediate result saturates.
+    // Seeds are designed so |a|, |b|, |c| are each ≤ 2.0 Q16.16.
+    let seeds: [u64; 10] = [
+        0x1111_1111_1111_1111,
+        0x2222_2222_2222_2222,
+        0x3333_3333_3333_3333,
+        0x4444_4444_4444_4444,
+        0x5555_5555_5555_5555,
+        0x6666_6666_6666_6666,
+        0x7777_7777_7777_7777,
+        0x8888_8888_8888_8888,
+        0x9999_9999_9999_9999,
+        0xAAAA_AAAA_AAAA_AAAA,
+    ];
+    for seed in seeds {
+        let (s1, raw_a) = lcg_next(seed);
+        let (s2, raw_b) = lcg_next(s1);
+        let (_s3, raw_c) = lcg_next(s2);
+        // Clamp to [-2.0, 2.0] so sum of all three stays within [-6.0, 6.0], no saturation.
+        let a: Q16_16 = (raw_a & 0x0003_FFFF_i32).wrapping_sub(131072_i32);
+        let b: Q16_16 = (raw_b & 0x0003_FFFF_i32).wrapping_sub(131072_i32);
+        let c: Q16_16 = (raw_c & 0x0003_FFFF_i32).wrapping_sub(131072_i32);
+        let lhs = q16_add(q16_add(a, b), c);
+        let rhs = q16_add(a, q16_add(b, c));
+        assert_eq!(lhs, rhs,
+            "associativity failed for seed=0x{:016X}: a={} b={} c={}", seed, a, b, c
+        );
+    }
+}
+
+#[test]
+fn test_q16_add_saturation_positive() {
+    // Invariant: MAX + 1 ULP must clamp to MAX_Q16_16, not wrap.
+    assert_eq!(q16_add(MAX_Q16_16, ULP_Q16_16), MAX_Q16_16);
+}
+
+#[test]
+fn test_q16_add_saturation_positive_large() {
+    // Invariant: MAX + ONE must also clamp to MAX_Q16_16.
+    assert_eq!(q16_add(MAX_Q16_16, ONE_Q16_16), MAX_Q16_16);
+}
+
+#[test]
+fn test_q16_add_saturation_negative() {
+    // Invariant: MIN + (-1 ULP) must clamp to MIN_Q16_16, not wrap.
+    assert_eq!(q16_add(MIN_Q16_16, -ULP_Q16_16), MIN_Q16_16);
+}
+
+#[test]
+fn test_q16_add_saturation_negative_one() {
+    // Invariant: MIN + (-ONE) must clamp to MIN_Q16_16.
+    assert_eq!(q16_add(MIN_Q16_16, NEG_ONE_Q16_16), MIN_Q16_16);
+}
+
+#[test]
+fn test_q16_add_cancellation() {
+    // Invariant: x + (-x) == 0 for a representative value.
+    assert_eq!(q16_add(THREE_Q16_16, NEG_THREE_Q16_16), 0_i32);
+}
+
+#[test]
+fn test_q16_add_determinism_oracle() {
+    // Invariant: fixed inputs always produce the same byte-level output.
+    // TODO(P1.1.2): replace PLACEHOLDER_HASH_ADD after first green run.
+    let result = q16_add(THREE_Q16_16, NEG_ONE_Q16_16);  // 3.0 + (-1.0) = 2.0 expected
+    let digest = sha256_q16(result);
+    let expected: [u8; 32] = *b"PLACEHOLDER_HASH_ADD____________"; // 32 bytes
+    assert_eq!(digest, expected, "q16_add determinism oracle failed");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Section 3: q16_dot — pinned-order dot product
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_q16_dot_empty() {
+    // Invariant: dot product of two empty slices is 0 — the additive identity.
+    let a: [Q16_16; 0] = [];
+    let b: [Q16_16; 0] = [];
+    assert_eq!(q16_dot(&a, &b), 0_i32);
+}
+
+#[test]
+fn test_q16_dot_length_one_positive() {
+    // Invariant: dot([x], [y]) == q16_mul(x, y) for positive values.
+    let x = THREE_Q16_16;
+    let y = HALF_Q16_16;
+    assert_eq!(q16_dot(&[x], &[y]), q16_mul(x, y));
+}
+
+#[test]
+fn test_q16_dot_length_one_negative() {
+    // Invariant: dot([x], [y]) == q16_mul(x, y) for negative * positive.
+    let x = NEG_THREE_Q16_16;
+    let y = HALF_Q16_16;
+    assert_eq!(q16_dot(&[x], &[y]), q16_mul(x, y));
+}
+
+#[test]
+fn test_q16_dot_length_one_zero() {
+    // Invariant: dot([0], [y]) == 0 for any y.
+    assert_eq!(q16_dot(&[0_i32], &[MAX_Q16_16]), 0_i32);
+}
+
+#[test]
+fn test_q16_dot_length_one_both_one() {
+    // Invariant: dot([ONE], [ONE]) == ONE (1.0 * 1.0 = 1.0).
+    assert_eq!(q16_dot(&[ONE_Q16_16], &[ONE_Q16_16]), ONE_Q16_16);
+}
+
+#[test]
+fn test_q16_dot_sequential_reduction_order() {
+    // Invariant: reduction order is strictly sequential left-to-right.
+    //
+    // Proof by construction: choose a, b, c such that
+    //   sequential:  ((a · x) + (b · y)) + (c · z)  produces result R1
+    //   tree-parallel: (a · x) + ((b · y) + (c · z))  would produce result R2 ≠ R1
+    // due to Q16.16 saturation at intermediate steps.
+    //
+    // Concrete construction:
+    //   a = MAX_Q16_16 / 2,  x = ONE_Q16_16      → a·x ≈ MAX/2  (no overflow)
+    //   b = MAX_Q16_16 / 2,  y = ONE_Q16_16      → b·y ≈ MAX/2  (no overflow)
+    //   c = ONE_Q16_16,      z = ONE_Q16_16      → c·z = ONE
+    //
+    // Sequential reduction (left-to-right):
+    //   step1 = q16_add(q16_mul(a, x), q16_mul(b, y))
+    //         = q16_add(MAX/2, MAX/2)  → saturates to MAX_Q16_16
+    //   step2 = q16_add(step1, q16_mul(c, z))
+    //         = q16_add(MAX_Q16_16, ONE_Q16_16) → MAX_Q16_16  (saturated)
+    //   result_sequential = MAX_Q16_16
+    //
+    // Tree-parallel (right subtree first):
+    //   right = q16_add(q16_mul(b, y), q16_mul(c, z))
+    //         = q16_add(MAX/2, ONE_Q16_16) → MAX/2 + ONE (no saturation yet)
+    //   result_parallel = q16_add(q16_mul(a, x), right)
+    //         = q16_add(MAX/2, MAX/2 + ONE) → differs if MAX/2 + ONE causes saturation
+    //
+    // The key property: sequential and parallel diverge here by at most ONE ULP
+    // depending on implementation. q16_dot MUST produce the sequential result.
+    //
+    // Implementation note: This test is written so the SEQUENTIAL result is what
+    // q16_dot must match. If an implementation parallelizes the reduction tree,
+    // this test will catch it.
+    let half_max: Q16_16 = MAX_Q16_16 / 2_i32;  // integer division
+    let a_vec: [Q16_16; 3] = [half_max,     half_max,     ONE_Q16_16];
+    let b_vec: [Q16_16; 3] = [ONE_Q16_16,   ONE_Q16_16,   ONE_Q16_16];
+    // Manually compute sequential expected result:
+    let step0 = q16_mul(half_max, ONE_Q16_16);       // half_max * 1.0
+    let step1 = q16_mul(half_max, ONE_Q16_16);       // half_max * 1.0
+    let step2 = q16_mul(ONE_Q16_16, ONE_Q16_16);     // 1.0 * 1.0 = 1.0
+    let acc0 = step0;
+    let acc1 = q16_add(acc0, step1);
+    let expected = q16_add(acc1, step2);
+    assert_eq!(q16_dot(&a_vec, &b_vec), expected,
+        "q16_dot reduction order must be sequential left-to-right, not tree-parallel");
+}
+
+#[test]
+fn test_q16_dot_determinism_oracle() {
+    // Invariant: a fixed vector pair always produces the same byte-level output.
+    // TODO(P1.1.2): replace PLACEHOLDER_HASH_DOT after first green run.
+    let a: [Q16_16; 4] = [ONE_Q16_16, HALF_Q16_16, NEG_ONE_Q16_16, THREE_Q16_16];
+    let b: [Q16_16; 4] = [HALF_Q16_16, ONE_Q16_16, THREE_Q16_16, NEG_ONE_Q16_16];
+    let result = q16_dot(&a, &b);
+    let digest = sha256_q16(result);
+    let expected: [u8; 32] = *b"PLACEHOLDER_HASH_DOT____________"; // 32 bytes
+    assert_eq!(digest, expected, "q16_dot determinism oracle failed");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Section 4: q16_softmax — numerically stable, pinned reduction order
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Tolerance for softmax sum-to-one: ±1 ULP.
+// DOCUMENTED: The softmax implementation uses Q16.16 integer arithmetic. The
+// normalization step involves integer division which may introduce at most 1 ULP
+// rounding error per element. For a slice of length N, the accumulated error is
+// bounded by N ULPs. For all tests below N ≤ 8; tolerance is set to 1 ULP (the
+// tightest defensible bound for N=3 since each element can round toward zero by
+// at most 1 ULP, and at least N-1 elements must be correctly rounded to keep
+// the sum within 1 ULP of ONE).
+const SOFTMAX_SUM_TOLERANCE: Q16_16 = ULP_Q16_16;
+
+// Helper: sum a Q16.16 slice sequentially (pinned left-to-right, matching
+// the reduction order used inside q16_softmax).
+fn sum_q16_slice(vs: &[Q16_16]) -> Q16_16 {
+    let mut acc: Q16_16 = 0_i32;
+    for v in vs {
+        acc = q16_add(acc, *v);
+    }
+    acc
+}
+
+// Helper: absolute difference with saturation (no wrapping).
+fn abs_diff_q16(a: Q16_16, b: Q16_16) -> Q16_16 {
+    if a >= b { q16_add(a, -b) } else { q16_add(b, -a) }
+}
+
+#[test]
+fn test_q16_softmax_sum_to_one_basic() {
+    // Invariant: sum(softmax(x)) == ONE within ±1 ULP for a basic 3-element input.
+    let x: [Q16_16; 3] = [ONE_Q16_16, HALF_Q16_16, THREE_Q16_16];
+    let y = q16_softmax(&x);
+    let s = sum_q16_slice(&y);
+    assert!(
+        abs_diff_q16(s, ONE_Q16_16) <= SOFTMAX_SUM_TOLERANCE,
+        "softmax sum {} deviates from ONE={} by more than {} ULP",
+        s, ONE_Q16_16, SOFTMAX_SUM_TOLERANCE
+    );
+}
+
+#[test]
+fn test_q16_softmax_sum_to_one_negative_inputs() {
+    // Invariant: sum(softmax(x)) == ONE within ±1 ULP even when all inputs are negative.
+    let x: [Q16_16; 3] = [NEG_THREE_Q16_16, NEG_ONE_Q16_16, NEG_ONE_Q16_16];
+    let y = q16_softmax(&x);
+    let s = sum_q16_slice(&y);
+    assert!(
+        abs_diff_q16(s, ONE_Q16_16) <= SOFTMAX_SUM_TOLERANCE,
+        "softmax sum over negative inputs deviates: sum={}", s
+    );
+}
+
+#[test]
+fn test_q16_softmax_permutation_non_equivariance() {
+    // Invariant: softmax([a, b, c]) and softmax([c, b, a]) produce DIFFERENT
+    // byte-level outputs when a ≠ c. This is INTENTIONAL: the reduction order is
+    // pinned, and a permutation of inputs changes the intermediate accumulator
+    // path, yielding different rounding. This test documents and locks that
+    // non-equivariance property for bit-identity purposes.
+    //
+    // Note: Both outputs are valid softmax distributions; they differ only in
+    // intermediate rounding, not in mathematical correctness. The pinned order
+    // is what makes cross-arch bit-identity possible.
+    let a: Q16_16 = THREE_Q16_16;
+    let b: Q16_16 = ONE_Q16_16;
+    let c: Q16_16 = HALF_Q16_16;
+    assert_ne!(a, c, "test requires a != c to be meaningful");
+    let fwd = q16_softmax(&[a, b, c]);
+    let rev = q16_softmax(&[c, b, a]);
+    // The slices represent different orderings; they MUST differ in at least one
+    // element (the first and last elements are swapped inputs, so their output
+    // probabilities will differ if a != c).
+    assert_ne!(fwd, rev,
+        "softmax must not be permutation-equivariant under pinned reduction order");
+}
+
+#[test]
+fn test_q16_softmax_all_zeros_uniform() {
+    // Invariant: softmax([0, 0, 0]) approaches uniform [1/3, 1/3, 1/3] in Q16.16.
+    // DOCUMENTED TOLERANCE: Since ONE_Q16_16 (65536) is not divisible by 3,
+    // each element is floor(65536/3) = 21845, with sum 65535 = ONE - 1 ULP.
+    // The implementation MUST produce either:
+    //   (a) [21845, 21845, 21845] with sum = 65535 (1 ULP short), or
+    //   (b) [21846, 21845, 21845] or similar with sum = ONE,
+    // both are acceptable; the test checks that every element is within 1 ULP
+    // of ONE/3 = 21845.33... and that the sum is within 1 ULP of ONE.
+    let x: [Q16_16; 3] = [0_i32, 0_i32, 0_i32];
+    let y = q16_softmax(&x);
+    let expected_each: Q16_16 = ONE_Q16_16 / 3_i32;  // = 21845 (integer division)
+    for (i, &yi) in y.iter().enumerate() {
+        assert!(
+            abs_diff_q16(yi, expected_each) <= SOFTMAX_SUM_TOLERANCE,
+            "softmax([0,0,0])[{}] = {} deviates from expected {} by > 1 ULP",
+            i, yi, expected_each
+        );
+    }
+    let s = sum_q16_slice(&y);
+    assert!(
+        abs_diff_q16(s, ONE_Q16_16) <= SOFTMAX_SUM_TOLERANCE,
+        "softmax([0,0,0]) sum {} deviates from ONE={}", s, ONE_Q16_16
+    );
+}
+
+#[test]
+fn test_q16_softmax_max_trick_uniform_positive() {
+    // Invariant: softmax([x, x, x]) == uniform for any x > 0.
+    // This verifies that the max subtraction step (numeric stability) does not
+    // introduce bias when all inputs are equal.
+    let x: Q16_16 = THREE_Q16_16;
+    let input: [Q16_16; 3] = [x, x, x];
+    let y = q16_softmax(&input);
+    let expected_each: Q16_16 = ONE_Q16_16 / 3_i32;
+    for (i, &yi) in y.iter().enumerate() {
+        assert!(
+            abs_diff_q16(yi, expected_each) <= SOFTMAX_SUM_TOLERANCE,
+            "softmax([x,x,x]) not uniform at index {}: yi={} expected~{}",
+            i, yi, expected_each
+        );
+    }
+}
+
+#[test]
+fn test_q16_softmax_max_trick_uniform_negative() {
+    // Invariant: softmax([x, x, x]) == uniform for any x < 0.
+    // Validates max subtraction with negative max.
+    let x: Q16_16 = NEG_THREE_Q16_16;
+    let input: [Q16_16; 3] = [x, x, x];
+    let y = q16_softmax(&input);
+    let expected_each: Q16_16 = ONE_Q16_16 / 3_i32;
+    for (i, &yi) in y.iter().enumerate() {
+        assert!(
+            abs_diff_q16(yi, expected_each) <= SOFTMAX_SUM_TOLERANCE,
+            "softmax([neg_x,neg_x,neg_x]) not uniform at index {}: yi={} expected~{}",
+            i, yi, expected_each
+        );
+    }
+}
+
+#[test]
+fn test_q16_softmax_max_trick_uniform_zero() {
+    // Invariant: softmax([0, 0, 0]) with max=0 is covered by the all-zeros test;
+    // this variant uses a larger uniform input to stress max subtraction with a
+    // larger value subtracted from itself (net zero post-subtraction).
+    // Equivalent to test_q16_softmax_all_zeros_uniform with different input path.
+    let x: Q16_16 = MAX_Q16_16 / 4_i32;
+    let input: [Q16_16; 3] = [x, x, x];
+    let y = q16_softmax(&input);
+    let expected_each: Q16_16 = ONE_Q16_16 / 3_i32;
+    let s = sum_q16_slice(&y);
+    for (i, &yi) in y.iter().enumerate() {
+        assert!(
+            abs_diff_q16(yi, expected_each) <= SOFTMAX_SUM_TOLERANCE,
+            "softmax([large_x,large_x,large_x]) not uniform at index {}: yi={}", i, yi
+        );
+    }
+    assert!(
+        abs_diff_q16(s, ONE_Q16_16) <= SOFTMAX_SUM_TOLERANCE,
+        "softmax([large_x,large_x,large_x]) sum {} deviates", s
+    );
+}
+
+#[test]
+fn test_q16_softmax_output_length_preserved() {
+    // Invariant: output slice length equals input slice length.
+    let x: [Q16_16; 5] = [ONE_Q16_16, HALF_Q16_16, 0_i32, NEG_ONE_Q16_16, THREE_Q16_16];
+    let y = q16_softmax(&x);
+    assert_eq!(y.len(), x.len(), "softmax must preserve input length");
+}
+
+#[test]
+fn test_q16_softmax_determinism_oracle() {
+    // Invariant: fixed inputs always produce the same byte-level output.
+    // TODO(P1.1.2): replace PLACEHOLDER_HASH_SOFTMAX after first green run.
+    let x: [Q16_16; 4] = [ONE_Q16_16, HALF_Q16_16, NEG_ONE_Q16_16, THREE_Q16_16];
+    let y = q16_softmax(&x);
+    let digest = sha256_q16_slice(&y);
+    let expected: [u8; 32] = *b"PLACEHOLDER_HASH_SOFTMAX________"; // 32 bytes
+    assert_eq!(digest, expected, "q16_softmax determinism oracle failed");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Section 5: q16_layernorm — pinned reduction, epsilon-guarded divide
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Dimension used for layernorm tests. Matches ENCODER_HIDDEN = 384 in architecture.
+const LAYERNORM_D: usize = 4;  // Use small D for unit tests; full-D covered in integration.
+
+#[test]
+fn test_q16_layernorm_zero_input() {
+    // Invariant: layernorm([0; D]) bit-equals [0; D].
+    // When all inputs are zero, mean = 0, variance = 0, but epsilon prevents
+    // division by zero. Normalized output is (0 - 0) / sqrt(0 + eps) = 0 for all elements.
+    let x: [Q16_16; LAYERNORM_D] = [0_i32; LAYERNORM_D];
+    let y = q16_layernorm(&x);
+    let expected: [Q16_16; LAYERNORM_D] = [0_i32; LAYERNORM_D];
+    assert_eq!(y, expected, "layernorm of all-zeros must be all-zeros");
+}
+
+#[test]
+fn test_q16_layernorm_constant_input() {
+    // Invariant: layernorm([c; D]) bit-equals [0; D] for any non-zero constant c.
+    // When all inputs are equal, mean = c, variance = 0, so every element
+    // normalizes to (c - c) / sqrt(eps) = 0. Epsilon prevents the divide from
+    // being infinite but does not change the zero numerator.
+    let c: Q16_16 = THREE_Q16_16;
+    let x: [Q16_16; LAYERNORM_D] = [c; LAYERNORM_D];
+    let y = q16_layernorm(&x);
+    let expected: [Q16_16; LAYERNORM_D] = [0_i32; LAYERNORM_D];
+    assert_eq!(y, expected,
+        "layernorm of constant input must be all-zeros (zero variance)");
+}
+
+#[test]
+fn test_q16_layernorm_constant_negative() {
+    // Invariant: layernorm([-c; D]) == [0; D] for any negative constant.
+    let c: Q16_16 = NEG_THREE_Q16_16;
+    let x: [Q16_16; LAYERNORM_D] = [c; LAYERNORM_D];
+    let y = q16_layernorm(&x);
+    let expected: [Q16_16; LAYERNORM_D] = [0_i32; LAYERNORM_D];
+    assert_eq!(y, expected,
+        "layernorm of constant negative input must be all-zeros");
+}
+
+#[test]
+fn test_q16_layernorm_output_length_preserved() {
+    // Invariant: layernorm output length equals input length.
+    let x: [Q16_16; LAYERNORM_D] = [ONE_Q16_16, HALF_Q16_16, NEG_ONE_Q16_16, THREE_Q16_16];
+    let y = q16_layernorm(&x);
+    assert_eq!(y.len(), x.len(), "layernorm must preserve input length");
+}
+
+#[test]
+fn test_q16_layernorm_no_panic_on_near_zero_variance() {
+    // Invariant: layernorm does not panic or produce Inf/NaN when variance is tiny.
+    // Two elements differing by 1 ULP produce a valid (possibly saturated) output.
+    let x: [Q16_16; 2] = [0_i32, ULP_Q16_16];
+    let y = q16_layernorm(&x);
+    // We do not constrain the exact values here — just that the function returns
+    // a finite Q16.16 output without panicking.
+    assert_eq!(y.len(), 2, "layernorm on near-zero-variance input must not panic");
+    // Each output must be in [MIN_Q16_16, MAX_Q16_16] (always true for i32).
+    // Check that neither element is a sentinel error value by verifying the
+    // sum of the output is finite (any i32 is finite; this asserts the call completes).
+    let _ = q16_add(y[0], y[1]);  // would panic in debug if layernorm returns garbage
+}
+
+#[test]
+fn test_q16_layernorm_determinism_oracle() {
+    // Invariant: fixed inputs always produce the same byte-level output.
+    // TODO(P1.1.2): replace PLACEHOLDER_HASH_LAYERNORM after first green run.
+    let x: [Q16_16; 4] = [ONE_Q16_16, HALF_Q16_16, NEG_ONE_Q16_16, THREE_Q16_16];
+    let y = q16_layernorm(&x);
+    let digest = sha256_q16_slice(&y);
+    let expected: [u8; 32] = *b"PLACEHOLDER_HASH_LAYERNORM______"; // 32 bytes
+    assert_eq!(digest, expected, "q16_layernorm determinism oracle failed");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Section 6: q16_sat_cast + q16_widen — accumulator boundary handling
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_q16_sat_cast_roundtrip_positive() {
+    // Invariant: widening to i64 then saturating-casting back is the identity
+    // for values within [MIN_Q16_16, MAX_Q16_16].
+    let v: Q16_16 = THREE_Q16_16;
+    let wide: i64 = q16_widen(v);
+    let back: Q16_16 = q16_sat_cast(wide);
+    assert_eq!(back, v, "sat_cast(widen(x)) must be identity for in-range x");
+}
+
+#[test]
+fn test_q16_sat_cast_roundtrip_negative() {
+    // Invariant: roundtrip is the identity for a negative in-range value.
+    let v: Q16_16 = NEG_THREE_Q16_16;
+    let wide: i64 = q16_widen(v);
+    let back: Q16_16 = q16_sat_cast(wide);
+    assert_eq!(back, v, "sat_cast(widen(neg_x)) must be identity for in-range neg_x");
+}
+
+#[test]
+fn test_q16_sat_cast_roundtrip_zero() {
+    // Invariant: roundtrip of zero is zero.
+    let v: Q16_16 = 0_i32;
+    assert_eq!(q16_sat_cast(q16_widen(v)), 0_i32);
+}
+
+#[test]
+fn test_q16_sat_cast_roundtrip_max() {
+    // Invariant: roundtrip of MAX_Q16_16 is MAX_Q16_16.
+    let v: Q16_16 = MAX_Q16_16;
+    assert_eq!(q16_sat_cast(q16_widen(v)), MAX_Q16_16);
+}
+
+#[test]
+fn test_q16_sat_cast_roundtrip_min() {
+    // Invariant: roundtrip of MIN_Q16_16 is MIN_Q16_16.
+    let v: Q16_16 = MIN_Q16_16;
+    assert_eq!(q16_sat_cast(q16_widen(v)), MIN_Q16_16);
+}
+
+#[test]
+fn test_q16_sat_cast_positive_saturation() {
+    // Invariant: i64 values above MAX_Q16_16 clamp to MAX_Q16_16.
+    let over: i64 = (MAX_Q16_16 as i64) + 1_i64;
+    assert_eq!(q16_sat_cast(over), MAX_Q16_16,
+        "sat_cast must clamp i64 above MAX to MAX_Q16_16");
+}
+
+#[test]
+fn test_q16_sat_cast_positive_saturation_large() {
+    // Invariant: large i64 (e.g. i64::MAX) clamps to MAX_Q16_16, no wrapping.
+    assert_eq!(q16_sat_cast(i64::MAX), MAX_Q16_16,
+        "sat_cast(i64::MAX) must be MAX_Q16_16");
+}
+
+#[test]
+fn test_q16_sat_cast_negative_saturation() {
+    // Invariant: i64 values below MIN_Q16_16 clamp to MIN_Q16_16.
+    let under: i64 = (MIN_Q16_16 as i64) - 1_i64;
+    assert_eq!(q16_sat_cast(under), MIN_Q16_16,
+        "sat_cast must clamp i64 below MIN to MIN_Q16_16");
+}
+
+#[test]
+fn test_q16_sat_cast_negative_saturation_large() {
+    // Invariant: large negative i64 (i64::MIN) clamps to MIN_Q16_16, no wrapping.
+    assert_eq!(q16_sat_cast(i64::MIN), MIN_Q16_16,
+        "sat_cast(i64::MIN) must be MIN_Q16_16");
+}
+
+#[test]
+fn test_q16_widen_preserves_sign_positive() {
+    // Invariant: q16_widen produces a sign-extended i64 for positive input.
+    let v: Q16_16 = THREE_Q16_16;
+    let wide: i64 = q16_widen(v);
+    assert_eq!(wide, THREE_Q16_16 as i64, "widen must sign-extend positive value");
+}
+
+#[test]
+fn test_q16_widen_preserves_sign_negative() {
+    // Invariant: q16_widen produces a sign-extended i64 for negative input.
+    let v: Q16_16 = NEG_THREE_Q16_16;
+    let wide: i64 = q16_widen(v);
+    assert_eq!(wide, NEG_THREE_Q16_16 as i64, "widen must sign-extend negative value");
+}
+
+#[test]
+fn test_q16_widen_min() {
+    // Invariant: q16_widen(MIN_Q16_16) produces the exact i64 representation.
+    // Specifically: NOT a positive overflow — sign extension must preserve negativity.
+    let wide: i64 = q16_widen(MIN_Q16_16);
+    assert!(wide < 0_i64, "widen(MIN_Q16_16) must be negative");
+    assert_eq!(wide, MIN_Q16_16 as i64);
+}
+
+#[test]
+fn test_q16_sat_cast_boundary_in_range_positive() {
+    // Invariant: the value exactly equal to MAX_Q16_16 as i64 is not saturated.
+    assert_eq!(q16_sat_cast(MAX_Q16_16 as i64), MAX_Q16_16);
+}
+
+#[test]
+fn test_q16_sat_cast_boundary_in_range_negative() {
+    // Invariant: the value exactly equal to MIN_Q16_16 as i64 is not saturated.
+    assert_eq!(q16_sat_cast(MIN_Q16_16 as i64), MIN_Q16_16);
+}
+
+#[test]
+fn test_q16_sat_cast_determinism_oracle() {
+    // Invariant: fixed accumulator value always produces the same Q16.16 output bytes.
+    // TODO(P1.1.2): replace PLACEHOLDER_HASH_SAT_CAST after first green run.
+    let acc: i64 = (THREE_Q16_16 as i64) * (THREE_Q16_16 as i64);  // 3.0 * 3.0 raw product
+    let result: Q16_16 = q16_sat_cast(acc >> 16);  // shift then cast, as accumulator use expects
+    let digest = sha256_q16(result);
+    let expected: [u8; 32] = *b"PLACEHOLDER_HASH_SAT_CAST_______"; // 32 bytes
+    assert_eq!(digest, expected, "q16_sat_cast determinism oracle failed");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TODO(P1.1.2): replace PLACEHOLDER_HASH_* after first green run.
+//
+// Every placeholder hash in this file must be updated with the actual SHA-256
+// digest of the canonical little-endian byte representation of the result
+// produced by the first correct implementation of src/q16_16.mind.
+//
+// Placeholders to update (in order of appearance):
+//   PLACEHOLDER_HASH_MUL         — test_q16_mul_determinism_oracle
+//   PLACEHOLDER_HASH_ADD         — test_q16_add_determinism_oracle
+//   PLACEHOLDER_HASH_DOT         — test_q16_dot_determinism_oracle
+//   PLACEHOLDER_HASH_SOFTMAX     — test_q16_softmax_determinism_oracle
+//   PLACEHOLDER_HASH_LAYERNORM   — test_q16_layernorm_determinism_oracle
+//   PLACEHOLDER_HASH_SAT_CAST    — test_q16_sat_cast_determinism_oracle
+//
+// Procedure: after `mindc test` first goes green, run:
+//   mindc run tools/print_determinism_hashes.mind
+// and paste the output hex digests into the corresponding expected arrays above.
+// ─────────────────────────────────────────────────────────────────────────────

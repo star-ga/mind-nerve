@@ -1,0 +1,59 @@
+// Attestation envelope and tamper-evident chain.
+//
+// Every inference emits exactly one envelope. Envelopes are SHA-256-chained
+// to the previous envelope on the same host so the sequence is replay-
+// verifiable: given the model and catalog, any historical envelope can be
+// recomputed from its inputs and checked against `chain_curr`.
+
+use crate::mind_nerve::ATTESTATION_VERSION;
+
+@[layout(Packed)]
+pub struct AttestationEnvelope {
+    pub version:       u8,           // ATTESTATION_VERSION
+    pub model_hash:    [u8; 32],
+    pub catalog_hash:  [u8; 32],
+    pub request_hash:  [u8; 32],
+    pub result_hash:   [u8; 32],
+    pub architecture:  u8,           // see Architecture enum
+    pub timestamp_ms:  u64,          // monotonic, not wall-clock
+    pub chain_prev:    [u8; 32],
+    pub chain_curr:    [u8; 32],
+}
+// sizeof(AttestationEnvelope) must be 132 bytes; static_assert in lib.
+
+pub enum Architecture {
+    CpuX86  = 0,
+    CpuArm  = 1,
+    Cuda    = 2,
+    WebGpu  = 3,
+    Npu     = 4,
+}
+
+// Emit an envelope for the inference just completed. Reads the chain head
+// from the per-process evidence log, updates it atomically.
+@[determinism(BitIdentical)]
+pub fn emit(
+    model_hash:     [u8; 32],
+    catalog_hash:   [u8; 32],
+    request_hash:   [u8; 32],
+    result_hash:    [u8; 32],
+) -> AttestationEnvelope
+{
+    unimplemented!("Phase 1: read chain head, build envelope, atomic chain update")
+}
+
+// Replay verification. Given an envelope and the inputs it claims to attest,
+// reproduce the chain_curr and check.
+@[determinism(BitIdentical)]
+pub fn verify(envelope: AttestationEnvelope) -> VerificationOutcome
+{
+    unimplemented!("Phase 1: recompute SHA-256 of fields, compare to chain_curr")
+}
+
+pub enum VerificationOutcome {
+    Valid,
+    ChainBroken,
+    ModelHashMismatch,
+    CatalogHashMismatch,
+    VersionUnsupported,
+}

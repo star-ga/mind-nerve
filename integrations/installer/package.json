@@ -1,0 +1,36 @@
+{
+  "name": "@mind-nerve/installer",
+  "version": "0.1.0",
+  "description": "mind-nerve install matrix — wires 17 AI CLI clients to the mind-nerve MCP façade",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "mind-nerve-installer": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@iarna/toml": "^2.2.5",
+    "js-yaml": "^4.1.0",
+    "pino": "^9.6.0",
+    "which": "^4.0.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^22.0.0",
+    "@types/which": "^3.0.4",
+    "@vitest/coverage-v8": "^4.1.6",
+    "typescript": "^5.5.0",
+    "vitest": "^2.1.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "license": "Apache-2.0"
+}

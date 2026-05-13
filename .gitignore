@@ -1,0 +1,43 @@
+# Build artefacts
+/target/
+/build/
+*.o
+*.so
+*.dylib
+*.dll
+*.exe
+
+# MIND compiler outputs
+*.mind-cache/
+*.mind-bin
+*.mind-ir
+
+# Trained weights — never committed
+*.mind-weights
+*.safetensors
+*.bin
+
+# Evidence chain logs (local, per-host)
+*.evidence.log
+.mind-nerve/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Python tooling (training pipeline lives outside the inference tree)
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Node tooling (for TypeScript integrations)
+node_modules/
+*.tsbuildinfo
+
+# Internal research / audit / planning notes — never published
+/research/
+/AUDITS/
+/.internal/

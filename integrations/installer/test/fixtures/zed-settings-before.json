@@ -1,0 +1,9 @@
+{
+  "assistant": {
+    "default_model": {
+      "provider": "anthropic",
+      "model": "claude-opus-4-7"
+    }
+  },
+  "context_servers": {}
+}

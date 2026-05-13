@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "command": "node /home/user/.claude/hook.js"
+      }
+    ]
+  },
+  "mcpServers": {
+    "existing-tool": {
+      "command": "npx",
+      "args": ["-y", "existing-mcp-server"]
+    }
+  }
+}

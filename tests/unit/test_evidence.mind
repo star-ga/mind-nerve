@@ -1,0 +1,1146 @@
+// Attestation envelope v2 + chain integrity. Audit A4 (binding completeness), A5 (entry_kind), A6 (chain_reset_reason).
+//
+// RED TEST FILE — all tests FAIL against the current v1 stub in src/evidence.mind.
+//
+// Proposed v2 layout (212 bytes, packed):
+//
+//   offset  size  field
+//   0       1     version (= 2)
+//   1       1     entry_kind (u8: 1=inference, 2=model_load, 3=catalog_load)
+//   2       2     wire_version (u16, little-endian)
+//   4       4     k (u32, top-K parameter — audit A4)
+//   8       8     timestamp_ms (i64, monotonic)
+//   16      1     architecture (u8: 1=x86_64, 2=aarch64, 3=cuda)
+//   17      1     reserved (must be 0)
+//   18      2     chain_reset_reason (u16: 0=continuation, 1=model_swap,
+//                                      2=catalog_changed, 3=clock_reset)
+//   20      32    model_hash (SHA-256)
+//   52      32    tokenizer_hash (SHA-256 — audit A4)
+//   84      32    catalog_hash (SHA-256)
+//   116     32    request_hash (SHA-256)
+//   148     32    result_hash (SHA-256)
+//   180     32    chain_prev (SHA-256 of prior envelope, or zeros if chain start)
+//   TOTAL: 212 bytes
+//
+// chain_curr = SHA-256(all 212 envelope bytes); computed at verify time, never stored.
+//
+// Alignment note: all multi-byte fields happen to be naturally aligned within
+// the packed layout (u16 at even offset, u32 at offset 4, i64 at offset 8).
+// @[layout(Packed)] is still required to prevent any compiler-inserted padding.
+//
+// Architecture enum mapping (v2, 1-based to distinguish 0=uninitialised):
+//   1 = x86_64
+//   2 = aarch64
+//   3 = cuda
+//
+// (v1 used 0-based; v2 resets the numbering. v1 envelopes are rejected at verify.)
+
+use crate::mind_nerve::evidence::{
+    AttestationEnvelope,
+    AttestationEnvelopeV2,
+    EntryKind,
+    Architecture,
+    ChainResetReason,
+    VerificationOutcome,
+    VerificationError,
+    emit,
+    verify,
+    ATTESTATION_V2_SIZE,
+    ATTESTATION_V2_VERSION,
+};
+use crate::mind_nerve::testing::{
+    sha256,
+    zeros32,
+    fixture_hash,
+};
+
+// ---------------------------------------------------------------------------
+// Shared test fixtures
+// ---------------------------------------------------------------------------
+//
+// All PLACEHOLDER_HASH_* values are 32-byte arrays of a repeating sentinel
+// byte. Impl agent: replace with real SHA-256 of representative payloads
+// after the first green run.
+
+const PLACEHOLDER_HASH_MODEL:     [u8; 32] = [0x01u8; 32];
+const PLACEHOLDER_HASH_TOKENIZER: [u8; 32] = [0x02u8; 32];
+const PLACEHOLDER_HASH_CATALOG:   [u8; 32] = [0x03u8; 32];
+const PLACEHOLDER_HASH_REQUEST:   [u8; 32] = [0x04u8; 32];
+const PLACEHOLDER_HASH_RESULT:    [u8; 32] = [0x05u8; 32];
+
+const DEFAULT_K:            u32 = 5;
+const DEFAULT_WIRE_VERSION: u16 = 1;
+const DEFAULT_ARCH:         u8  = 1;  // x86_64
+const DEFAULT_TIMESTAMP:    i64 = 1_000_000;  // arbitrary monotonic tick
+
+// ---------------------------------------------------------------------------
+// §1. Layout assertions
+// ---------------------------------------------------------------------------
+
+// Struct size is exactly 212 bytes; any padding would be a spec violation.
+#[test]
+fn test_envelope_size_is_212_bytes() {
+    static_assert!(ATTESTATION_V2_SIZE == 212);
+    assert_eq!(size_of::<AttestationEnvelopeV2>(), 212);
+}
+
+// The Packed annotation must be present; without it the compiler may insert
+// padding between fields and silently change the wire format.
+#[test]
+#[lint(requires = "@[layout(Packed)]")]
+fn test_envelope_has_packed_layout_annotation() {
+    assert_layout_annotation!(AttestationEnvelopeV2, Packed);
+}
+
+// Verify every field starts at the offset documented in the header comment.
+// These tests are the ground-truth contract for the impl agent.
+
+#[test]
+fn test_envelope_offset_version_is_0() {
+    assert_eq!(offset_of!(AttestationEnvelopeV2, version), 0);
+}
+
+#[test]
+fn test_envelope_offset_entry_kind_is_1() {
+    assert_eq!(offset_of!(AttestationEnvelopeV2, entry_kind), 1);
+}
+
+#[test]
+fn test_envelope_offset_wire_version_is_2() {
+    assert_eq!(offset_of!(AttestationEnvelopeV2, wire_version), 2);
+}
+
+#[test]
+fn test_envelope_offset_k_is_4() {
+    assert_eq!(offset_of!(AttestationEnvelopeV2, k), 4);
+}
+
+#[test]
+fn test_envelope_offset_timestamp_ms_is_8() {
+    assert_eq!(offset_of!(AttestationEnvelopeV2, timestamp_ms), 8);
+}
+
+#[test]
+fn test_envelope_offset_architecture_is_16() {
+    assert_eq!(offset_of!(AttestationEnvelopeV2, architecture), 16);
+}
+
+#[test]
+fn test_envelope_offset_reserved_is_17() {
+    assert_eq!(offset_of!(AttestationEnvelopeV2, reserved), 17);
+}
+
+#[test]
+fn test_envelope_offset_chain_reset_reason_is_18() {
+    assert_eq!(offset_of!(AttestationEnvelopeV2, chain_reset_reason), 18);
+}
+
+#[test]
+fn test_envelope_offset_model_hash_is_20() {
+    assert_eq!(offset_of!(AttestationEnvelopeV2, model_hash), 20);
+}
+
+#[test]
+fn test_envelope_offset_tokenizer_hash_is_52() {
+    // tokenizer_hash was absent in v1; this offset is the load-bearing
+    // change that closes audit A4 (binding completeness).
+    assert_eq!(offset_of!(AttestationEnvelopeV2, tokenizer_hash), 52);
+}
+
+#[test]
+fn test_envelope_offset_catalog_hash_is_84() {
+    assert_eq!(offset_of!(AttestationEnvelopeV2, catalog_hash), 84);
+}
+
+#[test]
+fn test_envelope_offset_request_hash_is_116() {
+    assert_eq!(offset_of!(AttestationEnvelopeV2, request_hash), 116);
+}
+
+#[test]
+fn test_envelope_offset_result_hash_is_148() {
+    assert_eq!(offset_of!(AttestationEnvelopeV2, result_hash), 148);
+}
+
+#[test]
+fn test_envelope_offset_chain_prev_is_180() {
+    assert_eq!(offset_of!(AttestationEnvelopeV2, chain_prev), 180);
+}
+
+// ---------------------------------------------------------------------------
+// §2. Emit / round-trip
+// ---------------------------------------------------------------------------
+
+// emit() returns a 212-byte packed envelope; verify() parses it and returns
+// the struct plus the computed chain_curr.
+
+#[test]
+fn test_envelope_emit_produces_212_byte_payload() {
+    let bytes = emit(
+        PLACEHOLDER_HASH_MODEL,
+        PLACEHOLDER_HASH_TOKENIZER,
+        PLACEHOLDER_HASH_CATALOG,
+        PLACEHOLDER_HASH_REQUEST,
+        PLACEHOLDER_HASH_RESULT,
+        k             = DEFAULT_K,
+        wire_version  = DEFAULT_WIRE_VERSION,
+        architecture  = DEFAULT_ARCH,
+        timestamp_ms  = DEFAULT_TIMESTAMP,
+        entry_kind    = EntryKind::Inference,
+        chain_prev    = zeros32(),
+        chain_reset_reason = ChainResetReason::Continuation,
+    );
+    assert_eq!(bytes.len(), 212);
+}
+
+// Round-trip: emit then verify; every caller-supplied field must survive.
+#[test]
+fn test_envelope_round_trip_fields_preserved() {
+    let bytes = emit(
+        PLACEHOLDER_HASH_MODEL,
+        PLACEHOLDER_HASH_TOKENIZER,
+        PLACEHOLDER_HASH_CATALOG,
+        PLACEHOLDER_HASH_REQUEST,
+        PLACEHOLDER_HASH_RESULT,
+        k             = DEFAULT_K,
+        wire_version  = DEFAULT_WIRE_VERSION,
+        architecture  = DEFAULT_ARCH,
+        timestamp_ms  = DEFAULT_TIMESTAMP,
+        entry_kind    = EntryKind::Inference,
+        chain_prev    = zeros32(),
+        chain_reset_reason = ChainResetReason::Continuation,
+    );
+    let (env, _chain_curr) = verify(bytes, zeros32()).unwrap();
+
+    assert_eq!(env.version,            ATTESTATION_V2_VERSION);
+    assert_eq!(env.entry_kind,         EntryKind::Inference as u8);
+    assert_eq!(env.wire_version,       DEFAULT_WIRE_VERSION);
+    assert_eq!(env.k,                  DEFAULT_K);
+    assert_eq!(env.timestamp_ms,       DEFAULT_TIMESTAMP);
+    assert_eq!(env.architecture,       DEFAULT_ARCH);
+    assert_eq!(env.reserved,           0u8);
+    assert_eq!(env.chain_reset_reason, ChainResetReason::Continuation as u16);
+    assert_eq!(env.model_hash,         PLACEHOLDER_HASH_MODEL);
+    assert_eq!(env.tokenizer_hash,     PLACEHOLDER_HASH_TOKENIZER);
+    assert_eq!(env.catalog_hash,       PLACEHOLDER_HASH_CATALOG);
+    assert_eq!(env.request_hash,       PLACEHOLDER_HASH_REQUEST);
+    assert_eq!(env.result_hash,        PLACEHOLDER_HASH_RESULT);
+    assert_eq!(env.chain_prev,         zeros32());
+}
+
+// verify() must return the envelope bytes' SHA-256 as chain_curr.
+#[test]
+fn test_envelope_verify_returns_sha256_of_bytes_as_chain_curr() {
+    let bytes = emit(
+        PLACEHOLDER_HASH_MODEL,
+        PLACEHOLDER_HASH_TOKENIZER,
+        PLACEHOLDER_HASH_CATALOG,
+        PLACEHOLDER_HASH_REQUEST,
+        PLACEHOLDER_HASH_RESULT,
+        k             = DEFAULT_K,
+        wire_version  = DEFAULT_WIRE_VERSION,
+        architecture  = DEFAULT_ARCH,
+        timestamp_ms  = DEFAULT_TIMESTAMP,
+        entry_kind    = EntryKind::Inference,
+        chain_prev    = zeros32(),
+        chain_reset_reason = ChainResetReason::Continuation,
+    );
+    let expected_chain_curr = sha256(&bytes);
+    let (_env, chain_curr) = verify(bytes, zeros32()).unwrap();
+    assert_eq!(chain_curr, expected_chain_curr);
+}
+
+// ---------------------------------------------------------------------------
+// §3. Chain integrity
+// ---------------------------------------------------------------------------
+
+// First envelope in any chain has chain_prev = [0; 32] (chain start sentinel).
+#[test]
+fn test_chain_first_envelope_has_zero_chain_prev() {
+    let bytes = emit(
+        PLACEHOLDER_HASH_MODEL,
+        PLACEHOLDER_HASH_TOKENIZER,
+        PLACEHOLDER_HASH_CATALOG,
+        PLACEHOLDER_HASH_REQUEST,
+        PLACEHOLDER_HASH_RESULT,
+        k             = DEFAULT_K,
+        wire_version  = DEFAULT_WIRE_VERSION,
+        architecture  = DEFAULT_ARCH,
+        timestamp_ms  = DEFAULT_TIMESTAMP,
+        entry_kind    = EntryKind::Inference,
+        chain_prev    = zeros32(),
+        chain_reset_reason = ChainResetReason::Continuation,
+    );
+    let (env, _) = verify(bytes, zeros32()).unwrap();
+    assert_eq!(env.chain_prev, zeros32());
+}
+
+// Each subsequent envelope's chain_prev must equal the SHA-256 of the
+// immediately preceding envelope. Build a 3-link chain and verify every link.
+#[test]
+fn test_chain_three_link_chain_prev_references_are_correct() {
+    // Link 1
+    let bytes_1 = emit(
+        PLACEHOLDER_HASH_MODEL,
+        PLACEHOLDER_HASH_TOKENIZER,
+        PLACEHOLDER_HASH_CATALOG,
+        fixture_hash(0x10),
+        fixture_hash(0x11),
+        k             = DEFAULT_K,
+        wire_version  = DEFAULT_WIRE_VERSION,
+        architecture  = DEFAULT_ARCH,
+        timestamp_ms  = DEFAULT_TIMESTAMP,
+        entry_kind    = EntryKind::Inference,
+        chain_prev    = zeros32(),
+        chain_reset_reason = ChainResetReason::Continuation,
+    );
+    let (_env_1, chain_curr_1) = verify(bytes_1, zeros32()).unwrap();
+
+    // Link 2: chain_prev is chain_curr of link 1.
+    let bytes_2 = emit(
+        PLACEHOLDER_HASH_MODEL,
+        PLACEHOLDER_HASH_TOKENIZER,
+        PLACEHOLDER_HASH_CATALOG,
+        fixture_hash(0x20),
+        fixture_hash(0x21),
+        k             = DEFAULT_K,
+        wire_version  = DEFAULT_WIRE_VERSION,
+        architecture  = DEFAULT_ARCH,
+        timestamp_ms  = DEFAULT_TIMESTAMP + 1,
+        entry_kind    = EntryKind::Inference,
+        chain_prev    = chain_curr_1,
+        chain_reset_reason = ChainResetReason::Continuation,
+    );
+    let (env_2, chain_curr_2) = verify(bytes_2, chain_curr_1).unwrap();
+    assert_eq!(env_2.chain_prev, chain_curr_1);
+
+    // Link 3: chain_prev is chain_curr of link 2.
+    let bytes_3 = emit(
+        PLACEHOLDER_HASH_MODEL,
+        PLACEHOLDER_HASH_TOKENIZER,
+        PLACEHOLDER_HASH_CATALOG,
+        fixture_hash(0x30),
+        fixture_hash(0x31),
+        k             = DEFAULT_K,
+        wire_version  = DEFAULT_WIRE_VERSION,
+        architecture  = DEFAULT_ARCH,
+        timestamp_ms  = DEFAULT_TIMESTAMP + 2,
+        entry_kind    = EntryKind::Inference,
+        chain_prev    = chain_curr_2,
+        chain_reset_reason = ChainResetReason::Continuation,
+    );
+    let (env_3, _chain_curr_3) = verify(bytes_3, chain_curr_2).unwrap();
+    assert_eq!(env_3.chain_prev, chain_curr_2);
+}
+
+// Tamper test: flip one bit in link 2. Verify of link 3 (which embeds
+// chain_curr_2 as chain_prev) must fail with ChainBroken.
+#[test]
+fn test_chain_tampered_middle_envelope_breaks_next_link() {
+    // Build a valid 3-link chain first.
+    let bytes_1 = emit(
+        PLACEHOLDER_HASH_MODEL,
+        PLACEHOLDER_HASH_TOKENIZER,
+        PLACEHOLDER_HASH_CATALOG,
+        fixture_hash(0xA0),
+        fixture_hash(0xA1),
+        k             = DEFAULT_K,
+        wire_version  = DEFAULT_WIRE_VERSION,
+        architecture  = DEFAULT_ARCH,
+        timestamp_ms  = DEFAULT_TIMESTAMP,
+        entry_kind    = EntryKind::Inference,
+        chain_prev    = zeros32(),
+        chain_reset_reason = ChainResetReason::Continuation,
+    );
+    let (_env_1, chain_curr_1) = verify(bytes_1, zeros32()).unwrap();
+
+    let bytes_2_original = emit(
+        PLACEHOLDER_HASH_MODEL,
+        PLACEHOLDER_HASH_TOKENIZER,
+        PLACEHOLDER_HASH_CATALOG,
+        fixture_hash(0xB0),
+        fixture_hash(0xB1),
+        k             = DEFAULT_K,
+        wire_version  = DEFAULT_WIRE_VERSION,
+        architecture  = DEFAULT_ARCH,
+        timestamp_ms  = DEFAULT_TIMESTAMP + 1,
+        entry_kind    = EntryKind::Inference,
+        chain_prev    = chain_curr_1,
+        chain_reset_reason = ChainResetReason::Continuation,
+    );
+    let (_env_2, chain_curr_2_original) = verify(bytes_2_original, chain_curr_1).unwrap();
+
+    // Tamper: flip the low bit of the first byte of link 2's request_hash
+    // (offset 116 in the 212-byte envelope).
+    let mut bytes_2_tampered = bytes_2_original.clone();
+    bytes_2_tampered[116] ^= 0x01u8;
+
+    // chain_curr of the tampered envelope differs from the original.
+    let chain_curr_2_tampered = sha256(&bytes_2_tampered);
+    assert_ne!(chain_curr_2_tampered, chain_curr_2_original);
+
+    // Link 3 was emitted with the ORIGINAL chain_curr_2. When we try to
+    // verify it against the tampered chain_curr, verify must reject.
+    let bytes_3 = emit(
+        PLACEHOLDER_HASH_MODEL,
+        PLACEHOLDER_HASH_TOKENIZER,
+        PLACEHOLDER_HASH_CATALOG,
+        fixture_hash(0xC0),
+        fixture_hash(0xC1),
+        k             = DEFAULT_K,
+        wire_version  = DEFAULT_WIRE_VERSION,
+        architecture  = DEFAULT_ARCH,
+        timestamp_ms  = DEFAULT_TIMESTAMP + 2,
+        entry_kind    = EntryKind::Inference,
+        chain_prev    = chain_curr_2_original,
+        chain_reset_reason = ChainResetReason::Continuation,
+    );
+
+    // Pass the tampered chain_curr as the expected predecessor — must fail.
+    let result = verify(bytes_3, chain_curr_2_tampered);
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), VerificationError::ChainBroken);
+}
+
+// ---------------------------------------------------------------------------
+// §4. Entry kind discriminator (audit A5)
+// ---------------------------------------------------------------------------
+
+// All three valid entry_kind values must parse without error.
+#[test]
+fn test_envelope_entry_kind_inference_parses() {
+    let bytes = emit(
+        PLACEHOLDER_HASH_MODEL,
+        PLACEHOLDER_HASH_TOKENIZER,
+        PLACEHOLDER_HASH_CATALOG,
+        PLACEHOLDER_HASH_REQUEST,
+        PLACEHOLDER_HASH_RESULT,
+        k             = DEFAULT_K,
+        wire_version  = DEFAULT_WIRE_VERSION,
+        architecture  = DEFAULT_ARCH,
+        timestamp_ms  = DEFAULT_TIMESTAMP,
+        entry_kind    = EntryKind::Inference,
+        chain_prev    = zeros32(),
+        chain_reset_reason = ChainResetReason::Continuation,
+    );
+    let (env, _) = verify(bytes, zeros32()).unwrap();
+    assert_eq!(env.entry_kind, EntryKind::Inference as u8);
+}
+
+#[test]
+fn test_envelope_entry_kind_model_load_parses() {
+    let bytes = emit(
+        PLACEHOLDER_HASH_MODEL,
+        PLACEHOLDER_HASH_TOKENIZER,
+        PLACEHOLDER_HASH_CATALOG,
+        PLACEHOLDER_HASH_REQUEST,
+        PLACEHOLDER_HASH_RESULT,
+        k             = DEFAULT_K,
+        wire_version  = DEFAULT_WIRE_VERSION,
+        architecture  = DEFAULT_ARCH,
+        timestamp_ms  = DEFAULT_TIMESTAMP,
+        entry_kind    = EntryKind::ModelLoad,
+        chain_prev    = zeros32(),
+        chain_reset_reason = ChainResetReason::Continuation,
+    );
+    let (env, _) = verify(bytes, zeros32()).unwrap();
+    assert_eq!(env.entry_kind, EntryKind::ModelLoad as u8);
+}
+
+#[test]
+fn test_envelope_entry_kind_catalog_load_parses() {
+    let bytes = emit(
+        PLACEHOLDER_HASH_MODEL,
+        PLACEHOLDER_HASH_TOKENIZER,
+        PLACEHOLDER_HASH_CATALOG,
+        PLACEHOLDER_HASH_REQUEST,
+        PLACEHOLDER_HASH_RESULT,
+        k             = DEFAULT_K,
+        wire_version  = DEFAULT_WIRE_VERSION,
+        architecture  = DEFAULT_ARCH,
+        timestamp_ms  = DEFAULT_TIMESTAMP,
+        entry_kind    = EntryKind::CatalogLoad,
+        chain_prev    = zeros32(),
+        chain_reset_reason = ChainResetReason::Continuation,
+    );
+    let (env, _) = verify(bytes, zeros32()).unwrap();
+    assert_eq!(env.entry_kind, EntryKind::CatalogLoad as u8);
+}
+
+// Different entry_kind values with all other fields identical must produce
+// distinct chain_curr values — entry_kind at offset 1 feeds into SHA-256.
+#[test]
+fn test_chain_entry_kind_discriminates_chain_curr() {
+    let make_bytes = |ek: EntryKind| -> [u8; 32] {
+        let bytes = emit(
+            PLACEHOLDER_HASH_MODEL,
+            PLACEHOLDER_HASH_TOKENIZER,
+            PLACEHOLDER_HASH_CATALOG,
+            PLACEHOLDER_HASH_REQUEST,
+            PLACEHOLDER_HASH_RESULT,
+            k             = DEFAULT_K,
+            wire_version  = DEFAULT_WIRE_VERSION,
+            architecture  = DEFAULT_ARCH,
+            timestamp_ms  = DEFAULT_TIMESTAMP,
+            entry_kind    = ek,
+            chain_prev    = zeros32(),
+            chain_reset_reason = ChainResetReason::Continuation,
+        );
+        let (_, chain_curr) = verify(bytes, zeros32()).unwrap();
+        chain_curr
+    };
+
+    let cc_inference    = make_bytes(EntryKind::Inference);
+    let cc_model_load   = make_bytes(EntryKind::ModelLoad);
+    let cc_catalog_load = make_bytes(EntryKind::CatalogLoad);
+
+    assert_ne!(cc_inference, cc_model_load);
+    assert_ne!(cc_inference, cc_catalog_load);
+    assert_ne!(cc_model_load, cc_catalog_load);
+}
+
+// ---------------------------------------------------------------------------
+// §5. Chain reset semantics (audit A6 closure)
+//
+// chain_reset_reason annotates WHY this envelope follows a discontinuity
+// (e.g., catalog hot-swap); the cryptographic chain remains continuous.
+// The reset reason is metadata — the chain is NOT forked. Envelope B's
+// chain_prev is A.chain_curr, and envelope C's chain_prev is B.chain_curr,
+// regardless of chain_reset_reason values.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_chain_reset_reason_does_not_fork_cryptographic_chain() {
+    // Envelope A: normal inference.
+    let bytes_a = emit(
+        PLACEHOLDER_HASH_MODEL,
+        PLACEHOLDER_HASH_TOKENIZER,
+        PLACEHOLDER_HASH_CATALOG,
+        fixture_hash(0xD0),
+        fixture_hash(0xD1),
+        k             = DEFAULT_K,
+        wire_version  = DEFAULT_WIRE_VERSION,
+        architecture  = DEFAULT_ARCH,
+        timestamp_ms  = DEFAULT_TIMESTAMP,
+        entry_kind    = EntryKind::Inference,
+        chain_prev    = zeros32(),
+        chain_reset_reason = ChainResetReason::Continuation,
+    );
+    let (_env_a, chain_curr_a) = verify(bytes_a, zeros32()).unwrap();
+
+    // Envelope B: catalog_changed annotated, but chain_prev is A's chain_curr.
+    let bytes_b = emit(
+        PLACEHOLDER_HASH_MODEL,
+        PLACEHOLDER_HASH_TOKENIZER,
+        fixture_hash(0xFF),  // new catalog hash post-swap
+        fixture_hash(0xE0),
+        fixture_hash(0xE1),
+        k             = DEFAULT_K,
+        wire_version  = DEFAULT_WIRE_VERSION,
+        architecture  = DEFAULT_ARCH,
+        timestamp_ms  = DEFAULT_TIMESTAMP + 1,
+        entry_kind    = EntryKind::Inference,
+        chain_prev    = chain_curr_a,       // continuous — chain NOT broken
+        chain_reset_reason = ChainResetReason::CatalogChanged,
+    );
+    let (env_b, chain_curr_b) = verify(bytes_b, chain_curr_a).unwrap();
+    // Chain is unbroken: B.chain_prev == A.chain_curr.
+    assert_eq!(env_b.chain_prev, chain_curr_a);
+    assert_eq!(env_b.chain_reset_reason, ChainResetReason::CatalogChanged as u16);
+
+    // Envelope C: normal continuation; chain_prev is B.chain_curr.
+    let bytes_c = emit(
+        PLACEHOLDER_HASH_MODEL,
+        PLACEHOLDER_HASH_TOKENIZER,
+        fixture_hash(0xFF),  // same new catalog
+        fixture_hash(0xF0),
+        fixture_hash(0xF1),
+        k             = DEFAULT_K,
+        wire_version  = DEFAULT_WIRE_VERSION,
+        architecture  = DEFAULT_ARCH,
+        timestamp_ms  = DEFAULT_TIMESTAMP + 2,
+        entry_kind    = EntryKind::Inference,
+        chain_prev    = chain_curr_b,
+        chain_reset_reason = ChainResetReason::Continuation,
+    );
+    let (env_c, _chain_curr_c) = verify(bytes_c, chain_curr_b).unwrap();
+    assert_eq!(env_c.chain_prev, chain_curr_b);
+}
+
+// All four ChainResetReason values must parse without error.
+#[test]
+fn test_envelope_chain_reset_reason_continuation_parses() {
+    let bytes = emit(
+        PLACEHOLDER_HASH_MODEL,
+        PLACEHOLDER_HASH_TOKENIZER,
+        PLACEHOLDER_HASH_CATALOG,
+        PLACEHOLDER_HASH_REQUEST,
+        PLACEHOLDER_HASH_RESULT,
+        k             = DEFAULT_K,
+        wire_version  = DEFAULT_WIRE_VERSION,
+        architecture  = DEFAULT_ARCH,
+        timestamp_ms  = DEFAULT_TIMESTAMP,
+        entry_kind    = EntryKind::Inference,
+        chain_prev    = zeros32(),
+        chain_reset_reason = ChainResetReason::Continuation,
+    );
+    let (env, _) = verify(bytes, zeros32()).unwrap();
+    assert_eq!(env.chain_reset_reason, 0u16);
+}
+
+#[test]
+fn test_envelope_chain_reset_reason_model_swap_parses() {
+    let bytes = emit(
+        PLACEHOLDER_HASH_MODEL,
+        PLACEHOLDER_HASH_TOKENIZER,
+        PLACEHOLDER_HASH_CATALOG,
+        PLACEHOLDER_HASH_REQUEST,
+        PLACEHOLDER_HASH_RESULT,
+        k             = DEFAULT_K,
+        wire_version  = DEFAULT_WIRE_VERSION,
+        architecture  = DEFAULT_ARCH,
+        timestamp_ms  = DEFAULT_TIMESTAMP,
+        entry_kind    = EntryKind::Inference,
+        chain_prev    = zeros32(),
+        chain_reset_reason = ChainResetReason::ModelSwap,
+    );
+    let (env, _) = verify(bytes, zeros32()).unwrap();
+    assert_eq!(env.chain_reset_reason, 1u16);
+}
+
+#[test]
+fn test_envelope_chain_reset_reason_catalog_changed_parses() {
+    let bytes = emit(
+        PLACEHOLDER_HASH_MODEL,
+        PLACEHOLDER_HASH_TOKENIZER,
+        PLACEHOLDER_HASH_CATALOG,
+        PLACEHOLDER_HASH_REQUEST,
+        PLACEHOLDER_HASH_RESULT,
+        k             = DEFAULT_K,
+        wire_version  = DEFAULT_WIRE_VERSION,
+        architecture  = DEFAULT_ARCH,
+        timestamp_ms  = DEFAULT_TIMESTAMP,
+        entry_kind    = EntryKind::Inference,
+        chain_prev    = zeros32(),
+        chain_reset_reason = ChainResetReason::CatalogChanged,
+    );
+    let (env, _) = verify(bytes, zeros32()).unwrap();
+    assert_eq!(env.chain_reset_reason, 2u16);
+}
+
+#[test]
+fn test_envelope_chain_reset_reason_clock_reset_parses() {
+    let bytes = emit(
+        PLACEHOLDER_HASH_MODEL,
+        PLACEHOLDER_HASH_TOKENIZER,
+        PLACEHOLDER_HASH_CATALOG,
+        PLACEHOLDER_HASH_REQUEST,
+        PLACEHOLDER_HASH_RESULT,
+        k             = DEFAULT_K,
+        wire_version  = DEFAULT_WIRE_VERSION,
+        architecture  = DEFAULT_ARCH,
+        timestamp_ms  = DEFAULT_TIMESTAMP,
+        entry_kind    = EntryKind::Inference,
+        chain_prev    = zeros32(),
+        chain_reset_reason = ChainResetReason::ClockReset,
+    );
+    let (env, _) = verify(bytes, zeros32()).unwrap();
+    assert_eq!(env.chain_reset_reason, 3u16);
+}
+
+// ---------------------------------------------------------------------------
+// §6. Version field
+// ---------------------------------------------------------------------------
+
+// verify() accepts version=2 envelopes.
+#[test]
+fn test_envelope_version_2_is_accepted() {
+    let bytes = emit(
+        PLACEHOLDER_HASH_MODEL,
+        PLACEHOLDER_HASH_TOKENIZER,
+        PLACEHOLDER_HASH_CATALOG,
+        PLACEHOLDER_HASH_REQUEST,
+        PLACEHOLDER_HASH_RESULT,
+        k             = DEFAULT_K,
+        wire_version  = DEFAULT_WIRE_VERSION,
+        architecture  = DEFAULT_ARCH,
+        timestamp_ms  = DEFAULT_TIMESTAMP,
+        entry_kind    = EntryKind::Inference,
+        chain_prev    = zeros32(),
+        chain_reset_reason = ChainResetReason::Continuation,
+    );
+    // Sanity: version byte at offset 0 must be 2.
+    assert_eq!(bytes[0], 2u8);
+    let result = verify(bytes, zeros32());
+    assert!(result.is_ok());
+}
+
+// v1 envelopes must be rejected. Forcibly write 1 into offset 0.
+// (v1 has no production users — safe to make a hard break.)
+#[test]
+fn test_envelope_version_1_is_rejected() {
+    let mut bytes = emit(
+        PLACEHOLDER_HASH_MODEL,
+        PLACEHOLDER_HASH_TOKENIZER,
+        PLACEHOLDER_HASH_CATALOG,
+        PLACEHOLDER_HASH_REQUEST,
+        PLACEHOLDER_HASH_RESULT,
+        k             = DEFAULT_K,
+        wire_version  = DEFAULT_WIRE_VERSION,
+        architecture  = DEFAULT_ARCH,
+        timestamp_ms  = DEFAULT_TIMESTAMP,
+        entry_kind    = EntryKind::Inference,
+        chain_prev    = zeros32(),
+        chain_reset_reason = ChainResetReason::Continuation,
+    );
+    bytes[0] = 1u8;  // downgrade version byte
+    let result = verify(bytes, zeros32());
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), VerificationError::VersionUnsupported);
+}
+
+// Future version 99 must be rejected with an "unknown version" error,
+// not silently accepted, to prevent future format skew.
+#[test]
+fn test_envelope_version_99_is_rejected_as_unknown() {
+    let mut bytes = emit(
+        PLACEHOLDER_HASH_MODEL,
+        PLACEHOLDER_HASH_TOKENIZER,
+        PLACEHOLDER_HASH_CATALOG,
+        PLACEHOLDER_HASH_REQUEST,
+        PLACEHOLDER_HASH_RESULT,
+        k             = DEFAULT_K,
+        wire_version  = DEFAULT_WIRE_VERSION,
+        architecture  = DEFAULT_ARCH,
+        timestamp_ms  = DEFAULT_TIMESTAMP,
+        entry_kind    = EntryKind::Inference,
+        chain_prev    = zeros32(),
+        chain_reset_reason = ChainResetReason::Continuation,
+    );
+    bytes[0] = 99u8;  // unknown future version
+    let result = verify(bytes, zeros32());
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), VerificationError::VersionUnsupported);
+}
+
+// ---------------------------------------------------------------------------
+// §7. Reserved field
+// ---------------------------------------------------------------------------
+
+// reserved byte at offset 17 must be 0; any other value → verify error.
+// This guards the byte against accidental re-use before it is officially
+// allocated to a new field in a future version.
+#[test]
+fn test_envelope_reserved_must_be_zero() {
+    let mut bytes = emit(
+        PLACEHOLDER_HASH_MODEL,
+        PLACEHOLDER_HASH_TOKENIZER,
+        PLACEHOLDER_HASH_CATALOG,
+        PLACEHOLDER_HASH_REQUEST,
+        PLACEHOLDER_HASH_RESULT,
+        k             = DEFAULT_K,
+        wire_version  = DEFAULT_WIRE_VERSION,
+        architecture  = DEFAULT_ARCH,
+        timestamp_ms  = DEFAULT_TIMESTAMP,
+        entry_kind    = EntryKind::Inference,
+        chain_prev    = zeros32(),
+        chain_reset_reason = ChainResetReason::Continuation,
+    );
+    bytes[17] = 0xAAu8;  // non-zero reserved byte
+    let result = verify(bytes, zeros32());
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), VerificationError::ReservedByteNonZero);
+}
+
+// Confirm emit() writes 0 into the reserved byte.
+#[test]
+fn test_envelope_emit_sets_reserved_to_zero() {
+    let bytes = emit(
+        PLACEHOLDER_HASH_MODEL,
+        PLACEHOLDER_HASH_TOKENIZER,
+        PLACEHOLDER_HASH_CATALOG,
+        PLACEHOLDER_HASH_REQUEST,
+        PLACEHOLDER_HASH_RESULT,
+        k             = DEFAULT_K,
+        wire_version  = DEFAULT_WIRE_VERSION,
+        architecture  = DEFAULT_ARCH,
+        timestamp_ms  = DEFAULT_TIMESTAMP,
+        entry_kind    = EntryKind::Inference,
+        chain_prev    = zeros32(),
+        chain_reset_reason = ChainResetReason::Continuation,
+    );
+    assert_eq!(bytes[17], 0u8);
+}
+
+// ---------------------------------------------------------------------------
+// §8. wire_version binding (audit A4)
+// ---------------------------------------------------------------------------
+
+// Two envelopes differing ONLY in wire_version must have distinct chain_curr.
+// Prevents replaying Phase 1 envelopes as Phase 2 envelopes across a wire
+// schema bump.
+#[test]
+fn test_chain_wire_version_enters_chain_curr() {
+    let make_chain_curr = |wv: u16| -> [u8; 32] {
+        let bytes = emit(
+            PLACEHOLDER_HASH_MODEL,
+            PLACEHOLDER_HASH_TOKENIZER,
+            PLACEHOLDER_HASH_CATALOG,
+            PLACEHOLDER_HASH_REQUEST,
+            PLACEHOLDER_HASH_RESULT,
+            k             = DEFAULT_K,
+            wire_version  = wv,
+            architecture  = DEFAULT_ARCH,
+            timestamp_ms  = DEFAULT_TIMESTAMP,
+            entry_kind    = EntryKind::Inference,
+            chain_prev    = zeros32(),
+            chain_reset_reason = ChainResetReason::Continuation,
+        );
+        let (_, cc) = verify(bytes, zeros32()).unwrap();
+        cc
+    };
+
+    let cc_v1 = make_chain_curr(1);
+    let cc_v2 = make_chain_curr(2);
+    assert_ne!(cc_v1, cc_v2);
+}
+
+// ---------------------------------------------------------------------------
+// §9. k binding (audit A4)
+// ---------------------------------------------------------------------------
+
+// Two envelopes differing ONLY in k must have distinct chain_curr.
+// An envelope for k=5 cannot be replayed as evidence of a k=64 request.
+#[test]
+fn test_chain_k_enters_chain_curr() {
+    let make_chain_curr = |top_k: u32| -> [u8; 32] {
+        let bytes = emit(
+            PLACEHOLDER_HASH_MODEL,
+            PLACEHOLDER_HASH_TOKENIZER,
+            PLACEHOLDER_HASH_CATALOG,
+            PLACEHOLDER_HASH_REQUEST,
+            PLACEHOLDER_HASH_RESULT,
+            k             = top_k,
+            wire_version  = DEFAULT_WIRE_VERSION,
+            architecture  = DEFAULT_ARCH,
+            timestamp_ms  = DEFAULT_TIMESTAMP,
+            entry_kind    = EntryKind::Inference,
+            chain_prev    = zeros32(),
+            chain_reset_reason = ChainResetReason::Continuation,
+        );
+        let (_, cc) = verify(bytes, zeros32()).unwrap();
+        cc
+    };
+
+    let cc_k5  = make_chain_curr(5);
+    let cc_k64 = make_chain_curr(64);
+    assert_ne!(cc_k5, cc_k64);
+}
+
+// Specifically test the k=5 vs k=64 replay scenario mentioned in audit A4.
+#[test]
+fn test_chain_k5_envelope_cannot_be_replayed_as_k64() {
+    let bytes_k5 = emit(
+        PLACEHOLDER_HASH_MODEL,
+        PLACEHOLDER_HASH_TOKENIZER,
+        PLACEHOLDER_HASH_CATALOG,
+        PLACEHOLDER_HASH_REQUEST,
+        PLACEHOLDER_HASH_RESULT,
+        k             = 5u32,
+        wire_version  = DEFAULT_WIRE_VERSION,
+        architecture  = DEFAULT_ARCH,
+        timestamp_ms  = DEFAULT_TIMESTAMP,
+        entry_kind    = EntryKind::Inference,
+        chain_prev    = zeros32(),
+        chain_reset_reason = ChainResetReason::Continuation,
+    );
+    let (env_k5, chain_curr_k5) = verify(bytes_k5, zeros32()).unwrap();
+    assert_eq!(env_k5.k, 5u32);
+
+    // Build the k=64 envelope that claims the same chain_curr as its chain_prev.
+    // This would be the adversarial replay: pass k5's chain_curr as if it were
+    // the predecessor of a k64 envelope.
+    let bytes_k64 = emit(
+        PLACEHOLDER_HASH_MODEL,
+        PLACEHOLDER_HASH_TOKENIZER,
+        PLACEHOLDER_HASH_CATALOG,
+        PLACEHOLDER_HASH_REQUEST,
+        PLACEHOLDER_HASH_RESULT,
+        k             = 64u32,
+        wire_version  = DEFAULT_WIRE_VERSION,
+        architecture  = DEFAULT_ARCH,
+        timestamp_ms  = DEFAULT_TIMESTAMP + 1,
+        entry_kind    = EntryKind::Inference,
+        chain_prev    = chain_curr_k5,   // attempts to splice into k5's chain
+        chain_reset_reason = ChainResetReason::Continuation,
+    );
+    let (env_k64, chain_curr_k64) = verify(bytes_k64, chain_curr_k5).unwrap();
+    assert_eq!(env_k64.k, 64u32);
+    // The two chain_curr values are distinct — the hash encodes k.
+    assert_ne!(chain_curr_k5, chain_curr_k64);
+}
+
+// ---------------------------------------------------------------------------
+// §10. tokenizer_hash binding (audit A4)
+// ---------------------------------------------------------------------------
+
+// Two envelopes differing ONLY in tokenizer_hash must have distinct chain_curr.
+// A tokenizer swap (same model weights, different BPE table) MUST produce a
+// fresh chain link and NOT silently match a prior envelope.
+#[test]
+fn test_chain_tokenizer_hash_enters_chain_curr() {
+    let make_chain_curr = |tok_hash: [u8; 32]| -> [u8; 32] {
+        let bytes = emit(
+            PLACEHOLDER_HASH_MODEL,
+            tok_hash,
+            PLACEHOLDER_HASH_CATALOG,
+            PLACEHOLDER_HASH_REQUEST,
+            PLACEHOLDER_HASH_RESULT,
+            k             = DEFAULT_K,
+            wire_version  = DEFAULT_WIRE_VERSION,
+            architecture  = DEFAULT_ARCH,
+            timestamp_ms  = DEFAULT_TIMESTAMP,
+            entry_kind    = EntryKind::Inference,
+            chain_prev    = zeros32(),
+            chain_reset_reason = ChainResetReason::Continuation,
+        );
+        let (_, cc) = verify(bytes, zeros32()).unwrap();
+        cc
+    };
+
+    let tokenizer_v1 = [0xAAu8; 32];
+    let tokenizer_v2 = [0xBBu8; 32];
+    assert_ne!(make_chain_curr(tokenizer_v1), make_chain_curr(tokenizer_v2));
+}
+
+// Tokenizer-swap scenario: same model, same request, different BPE table.
+// The two envelopes must have distinct chain_curr, so they cannot be
+// mistaken for each other in a chain verification pass.
+#[test]
+fn test_chain_tokenizer_swap_produces_fresh_chain_link() {
+    let tokenizer_bpe32k    = [0xC0u8; 32];  // 32k BPE table hash
+    let tokenizer_bpe48k    = [0xC1u8; 32];  // 48k BPE table hash (Phase 2 candidate)
+
+    let bytes_32k = emit(
+        PLACEHOLDER_HASH_MODEL,
+        tokenizer_bpe32k,
+        PLACEHOLDER_HASH_CATALOG,
+        PLACEHOLDER_HASH_REQUEST,
+        PLACEHOLDER_HASH_RESULT,
+        k             = DEFAULT_K,
+        wire_version  = DEFAULT_WIRE_VERSION,
+        architecture  = DEFAULT_ARCH,
+        timestamp_ms  = DEFAULT_TIMESTAMP,
+        entry_kind    = EntryKind::Inference,
+        chain_prev    = zeros32(),
+        chain_reset_reason = ChainResetReason::Continuation,
+    );
+    let (_env_32k, chain_curr_32k) = verify(bytes_32k, zeros32()).unwrap();
+
+    let bytes_48k = emit(
+        PLACEHOLDER_HASH_MODEL,
+        tokenizer_bpe48k,
+        PLACEHOLDER_HASH_CATALOG,
+        PLACEHOLDER_HASH_REQUEST,
+        PLACEHOLDER_HASH_RESULT,
+        k             = DEFAULT_K,
+        wire_version  = DEFAULT_WIRE_VERSION,
+        architecture  = DEFAULT_ARCH,
+        timestamp_ms  = DEFAULT_TIMESTAMP,
+        entry_kind    = EntryKind::Inference,
+        chain_prev    = zeros32(),
+        chain_reset_reason = ChainResetReason::Continuation,
+    );
+    let (_env_48k, chain_curr_48k) = verify(bytes_48k, zeros32()).unwrap();
+
+    // The two chain_curr values must differ because tokenizer_hash differs.
+    assert_ne!(chain_curr_32k, chain_curr_48k);
+}
+
+// ---------------------------------------------------------------------------
+// §11. Edge cases and error paths
+// ---------------------------------------------------------------------------
+
+// Empty / short byte slice must be rejected, not panic.
+#[test]
+fn test_envelope_verify_rejects_empty_bytes() {
+    let result = verify([], zeros32());
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), VerificationError::InvalidLength);
+}
+
+// Byte slice shorter than 212 bytes must be rejected.
+#[test]
+fn test_envelope_verify_rejects_truncated_bytes() {
+    let result = verify([0u8; 100], zeros32());
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), VerificationError::InvalidLength);
+}
+
+// Byte slice longer than 212 bytes must be rejected (no trailing garbage).
+#[test]
+fn test_envelope_verify_rejects_oversized_bytes() {
+    let result = verify([0u8; 300], zeros32());
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), VerificationError::InvalidLength);
+}
+
+// An invalid entry_kind value (e.g. 0 or 255) must be rejected.
+#[test]
+fn test_envelope_verify_rejects_unknown_entry_kind() {
+    let mut bytes = emit(
+        PLACEHOLDER_HASH_MODEL,
+        PLACEHOLDER_HASH_TOKENIZER,
+        PLACEHOLDER_HASH_CATALOG,
+        PLACEHOLDER_HASH_REQUEST,
+        PLACEHOLDER_HASH_RESULT,
+        k             = DEFAULT_K,
+        wire_version  = DEFAULT_WIRE_VERSION,
+        architecture  = DEFAULT_ARCH,
+        timestamp_ms  = DEFAULT_TIMESTAMP,
+        entry_kind    = EntryKind::Inference,
+        chain_prev    = zeros32(),
+        chain_reset_reason = ChainResetReason::Continuation,
+    );
+    bytes[1] = 0u8;  // 0 is not a valid EntryKind (1-based enum)
+    let result = verify(bytes, zeros32());
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), VerificationError::InvalidEntryKind);
+}
+
+#[test]
+fn test_envelope_verify_rejects_entry_kind_255() {
+    let mut bytes = emit(
+        PLACEHOLDER_HASH_MODEL,
+        PLACEHOLDER_HASH_TOKENIZER,
+        PLACEHOLDER_HASH_CATALOG,
+        PLACEHOLDER_HASH_REQUEST,
+        PLACEHOLDER_HASH_RESULT,
+        k             = DEFAULT_K,
+        wire_version  = DEFAULT_WIRE_VERSION,
+        architecture  = DEFAULT_ARCH,
+        timestamp_ms  = DEFAULT_TIMESTAMP,
+        entry_kind    = EntryKind::Inference,
+        chain_prev    = zeros32(),
+        chain_reset_reason = ChainResetReason::Continuation,
+    );
+    bytes[1] = 255u8;  // out-of-range entry_kind
+    let result = verify(bytes, zeros32());
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), VerificationError::InvalidEntryKind);
+}
+
+// k=0 is below the MIN_TOP_K boundary; emit must reject it.
+#[test]
+fn test_envelope_emit_rejects_k_zero() {
+    let result = emit(
+        PLACEHOLDER_HASH_MODEL,
+        PLACEHOLDER_HASH_TOKENIZER,
+        PLACEHOLDER_HASH_CATALOG,
+        PLACEHOLDER_HASH_REQUEST,
+        PLACEHOLDER_HASH_RESULT,
+        k             = 0u32,
+        wire_version  = DEFAULT_WIRE_VERSION,
+        architecture  = DEFAULT_ARCH,
+        timestamp_ms  = DEFAULT_TIMESTAMP,
+        entry_kind    = EntryKind::Inference,
+        chain_prev    = zeros32(),
+        chain_reset_reason = ChainResetReason::Continuation,
+    );
+    assert!(result.is_err());
+}
+
+// k > MAX_TOP_K (64) must be rejected; spec §architecture.md line 19.
+#[test]
+fn test_envelope_emit_rejects_k_above_max() {
+    let result = emit(
+        PLACEHOLDER_HASH_MODEL,
+        PLACEHOLDER_HASH_TOKENIZER,
+        PLACEHOLDER_HASH_CATALOG,
+        PLACEHOLDER_HASH_REQUEST,
+        PLACEHOLDER_HASH_RESULT,
+        k             = 65u32,
+        wire_version  = DEFAULT_WIRE_VERSION,
+        architecture  = DEFAULT_ARCH,
+        timestamp_ms  = DEFAULT_TIMESTAMP,
+        entry_kind    = EntryKind::Inference,
+        chain_prev    = zeros32(),
+        chain_reset_reason = ChainResetReason::Continuation,
+    );
+    assert!(result.is_err());
+}
+
+// All-zero model_hash is structurally valid (zeros are a legal SHA-256 preimage
+// output only in adversarial contexts, but emit must not special-case it).
+#[test]
+fn test_envelope_emit_accepts_all_zero_model_hash() {
+    let result = emit(
+        zeros32(),
+        PLACEHOLDER_HASH_TOKENIZER,
+        PLACEHOLDER_HASH_CATALOG,
+        PLACEHOLDER_HASH_REQUEST,
+        PLACEHOLDER_HASH_RESULT,
+        k             = DEFAULT_K,
+        wire_version  = DEFAULT_WIRE_VERSION,
+        architecture  = DEFAULT_ARCH,
+        timestamp_ms  = DEFAULT_TIMESTAMP,
+        entry_kind    = EntryKind::Inference,
+        chain_prev    = zeros32(),
+        chain_reset_reason = ChainResetReason::Continuation,
+    );
+    assert!(result.is_ok());
+}
+
+// Two calls with all-zero hashes and differing only in timestamp produce
+// distinct chain_curr — timestamp enters the hash.
+#[test]
+fn test_chain_timestamp_discriminates_chain_curr() {
+    let make_cc = |ts: i64| -> [u8; 32] {
+        let bytes = emit(
+            PLACEHOLDER_HASH_MODEL,
+            PLACEHOLDER_HASH_TOKENIZER,
+            PLACEHOLDER_HASH_CATALOG,
+            PLACEHOLDER_HASH_REQUEST,
+            PLACEHOLDER_HASH_RESULT,
+            k             = DEFAULT_K,
+            wire_version  = DEFAULT_WIRE_VERSION,
+            architecture  = DEFAULT_ARCH,
+            timestamp_ms  = ts,
+            entry_kind    = EntryKind::Inference,
+            chain_prev    = zeros32(),
+            chain_reset_reason = ChainResetReason::Continuation,
+        );
+        let (_, cc) = verify(bytes, zeros32()).unwrap();
+        cc
+    };
+
+    assert_ne!(make_cc(1_000_000), make_cc(1_000_001));
+}
+
+// Verifying a valid envelope against a WRONG expected chain_prev returns
+// ChainBroken (the envelope's own chain_prev field doesn't match what we
+// supply as the expected predecessor hash).
+#[test]
+fn test_chain_verify_rejects_wrong_expected_predecessor() {
+    let bytes = emit(
+        PLACEHOLDER_HASH_MODEL,
+        PLACEHOLDER_HASH_TOKENIZER,
+        PLACEHOLDER_HASH_CATALOG,
+        PLACEHOLDER_HASH_REQUEST,
+        PLACEHOLDER_HASH_RESULT,
+        k             = DEFAULT_K,
+        wire_version  = DEFAULT_WIRE_VERSION,
+        architecture  = DEFAULT_ARCH,
+        timestamp_ms  = DEFAULT_TIMESTAMP,
+        entry_kind    = EntryKind::Inference,
+        chain_prev    = zeros32(),   // envelope records zeros as predecessor
+        chain_reset_reason = ChainResetReason::Continuation,
+    );
+    // Tell verify we expect a non-zero predecessor — mismatch.
+    let wrong_predecessor = [0xFFu8; 32];
+    let result = verify(bytes, wrong_predecessor);
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), VerificationError::ChainBroken);
+}
+
+// TODO(P1.1.16): replace any PLACEHOLDER_HASH_* after first green run.

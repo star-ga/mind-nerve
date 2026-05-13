@@ -1,0 +1,6 @@
+[model]
+name = "mistral-large-latest"
+
+mcp_servers = [
+  { name = "other-server", command = "npx", args = ["-y", "other-mcp"], env = {} }
+]

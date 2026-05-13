@@ -1,0 +1,57 @@
+// Model: encoder, decoder, classifier head.
+//
+// Phase 0 — typed signatures with bit-identity annotations. Bodies are
+// `unimplemented!()` pending Phase 1 implementation. The signatures are the
+// contract; implementations that change shapes here are architecture changes,
+// not bug fixes.
+
+use crate::mind_nerve::{
+    Q16_16,
+    ENCODER_LAYERS, ENCODER_HIDDEN, ENCODER_HEADS,
+    DECODER_LAYERS, DECODER_HIDDEN, DECODER_HEADS, DECODER_FFN_HIDDEN,
+    VOCAB_SIZE, MAX_REQUEST_TOKENS, ROUTE_EMBEDDING_DIM,
+};
+
+// Encoder: 12 layers, no FFN sublayer, gated residual.
+@[determinism(BitIdentical)]
+@[reduction_order(Pinned)]
+pub fn encoder(
+    token_ids:   tensor<u32, [batch, seq_len]>,
+    weights:     EncoderWeights,
+) -> tensor<Q16_16, [batch, seq_len, ENCODER_HIDDEN]>
+where
+    seq_len <= MAX_REQUEST_TOKENS,
+{
+    unimplemented!("Phase 1: 12-layer attention + gated residual, no FFN")
+}
+
+// Decoder: 8 layers, self-attention + cross-attention to encoder + route
+// embedding table, feed-forward sublayer present.
+@[determinism(BitIdentical)]
+@[reduction_order(Pinned)]
+pub fn decoder(
+    encoder_out:        tensor<Q16_16, [batch, seq_len, ENCODER_HIDDEN]>,
+    route_embeddings:   tensor<Q16_16, [num_routes, ROUTE_EMBEDDING_DIM]>,
+    weights:            DecoderWeights,
+) -> tensor<Q16_16, [batch, num_routes, DECODER_HIDDEN]>
+where
+    seq_len <= MAX_REQUEST_TOKENS,
+{
+    unimplemented!("Phase 1: 8-layer self-attn + cross-attn + FFN")
+}
+
+// Classifier head: linear projection to per-route logits.
+// Embedding table tie: shares parameters with `decoder`'s cross-attention
+// route embedding input.
+@[determinism(BitIdentical)]
+pub fn classifier_head(
+    decoder_out:        tensor<Q16_16, [batch, num_routes, DECODER_HIDDEN]>,
+    route_embeddings:   tensor<Q16_16, [num_routes, ROUTE_EMBEDDING_DIM]>,
+) -> tensor<Q16_16, [batch, num_routes]>
+{
+    unimplemented!("Phase 1: linear projection with tied embedding parameters")
+}
+
+// Weight containers. Sizes derived from compile-time parameters in `lib.mind`.
+pub struct EncoderWeights { /* 12 layer blocks */ }
+pub struct DecoderWeights { /* 8 layer blocks */ }

@@ -1,0 +1,36 @@
+// mind-nerve top-level module.
+//
+// Re-exports the public surface used by `cli/main.mind` and the integration
+// façades. Every name exported here is part of the stability contract; do not
+// remove or change a signature without bumping the API version.
+
+module mind_nerve {
+
+    // Fixed-point numeric type used throughout the inference path.
+    // Two's complement signed 32-bit, interpreted as Q16.16.
+    pub type Q16_16 = i32;
+
+    // Compile-time parameters. Changing any of these is a model-architecture
+    // change and requires a new model_hash.
+    pub const ENCODER_LAYERS:        u32 = 12;
+    pub const ENCODER_HIDDEN:        u32 = 384;
+    pub const ENCODER_HEADS:         u32 = 6;
+
+    pub const DECODER_LAYERS:        u32 = 8;
+    pub const DECODER_HIDDEN:        u32 = 384;
+    pub const DECODER_HEADS:         u32 = 6;
+    pub const DECODER_FFN_HIDDEN:    u32 = 1536;
+
+    pub const VOCAB_SIZE:            u32 = 32768;
+    pub const MAX_REQUEST_TOKENS:    u32 = 4096;
+    pub const ROUTE_EMBEDDING_DIM:   u32 = 384;
+    pub const DEFAULT_TOP_K:         u32 = 5;
+    pub const MAX_TOP_K:             u32 = 64;
+
+    pub const ATTESTATION_BYTES:     u32 = 132;
+    pub const ATTESTATION_VERSION:   u8  = 1;
+
+    pub mod model;
+    pub mod inference;
+    pub mod evidence;
+}

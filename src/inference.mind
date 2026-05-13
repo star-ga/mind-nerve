@@ -1,0 +1,117 @@
+// Inference: tokenization, forward pass, top-K extraction with deterministic
+// tie-breaking, attestation envelope emission.
+
+use crate::mind_nerve::{
+    Q16_16,
+    MAX_TOP_K,
+    DEFAULT_TOP_K,
+    MAX_REQUEST_TOKENS,
+    ROUTE_EMBEDDING_DIM,
+};
+use crate::mind_nerve::model;
+use crate::mind_nerve::evidence;
+
+pub struct Request {
+    pub bytes:          [u8],
+    pub catalog_hash:   [u8; 32],
+    pub k:              u32,
+}
+
+pub struct PreselectResult {
+    pub route_ids:      [RouteId; ?],   // length == request.k
+    pub scores:         [Q16_16;  ?],   // length == request.k
+    pub envelope:       evidence::AttestationEnvelope,
+}
+
+pub type RouteId = [u8; 32];   // SHA-256 of the route's external string id
+
+@[determinism(BitIdentical)]
+pub fn preselect(
+    request:    Request,
+    catalog:    RouteCatalog,
+    weights:    ModelWeights,
+) -> PreselectResult
+{
+    // Validate k is in range.
+    if request.k == 0 || request.k > MAX_TOP_K {
+        return error(InvalidK);
+    }
+
+    // Tokenize. BPE 32k, deterministic; same bytes -> same token sequence.
+    let tokens = tokenize_bpe(request.bytes);
+
+    if tokens.len() > MAX_REQUEST_TOKENS {
+        return error(RequestTooLong);
+    }
+
+    // Forward pass.
+    let enc_out  = model::encoder(tokens, weights.encoder);
+    let dec_out  = model::decoder(enc_out, catalog.embeddings, weights.decoder);
+    let logits   = model::classifier_head(dec_out, catalog.embeddings);
+
+    // Deterministic top-K with SHA-256 tie-break.
+    let top_k = extract_top_k(logits, catalog, request.k);
+
+    // Attestation envelope.
+    let envelope = evidence::emit(
+        weights.model_hash,
+        request.catalog_hash,
+        sha256(request.bytes),
+        canonical_result_hash(top_k),
+    );
+
+    PreselectResult {
+        route_ids: top_k.ids,
+        scores:    top_k.scores,
+        envelope:  envelope,
+    }
+}
+
+// Deterministic top-K extraction.
+//
+// Standard top-K returns ambiguous orderings on ties. mind-nerve breaks ties
+// by `SHA-256(route_id) ascending` so the same logits + same catalog produces
+// the same top-K bit-for-bit across architectures and runs.
+@[determinism(BitIdentical)]
+fn extract_top_k(
+    logits:     tensor<Q16_16, [batch, num_routes]>,
+    catalog:    RouteCatalog,
+    k:          u32,
+) -> TopK
+{
+    unimplemented!("Phase 1: masked argmax K times, tie-break by SHA-256(route_id)")
+}
+
+fn tokenize_bpe(bytes: [u8]) -> [u32] {
+    unimplemented!("Phase 1: deterministic BPE 32k tokenizer")
+}
+
+fn canonical_result_hash(top_k: TopK) -> [u8; 32] {
+    unimplemented!("Phase 1: SHA-256 of length-prefixed (route_id || score) pairs")
+}
+
+fn sha256(bytes: [u8]) -> [u8; 32] {
+    unimplemented!("Phase 1: standard SHA-256")
+}
+
+pub struct RouteCatalog {
+    pub ids:         [RouteId],
+    pub embeddings:  tensor<Q16_16, [num_routes, ROUTE_EMBEDDING_DIM]>,
+    pub hash:        [u8; 32],
+}
+
+pub struct ModelWeights {
+    pub encoder:    model::EncoderWeights,
+    pub decoder:    model::DecoderWeights,
+    pub model_hash: [u8; 32],
+}
+
+pub struct TopK {
+    pub ids:    [RouteId; ?],
+    pub scores: [Q16_16; ?],
+}
+
+pub enum Error {
+    InvalidK,
+    RequestTooLong,
+}

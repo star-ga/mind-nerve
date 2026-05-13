@@ -41,3 +41,9 @@ node_modules/
 /research/
 /AUDITS/
 /.internal/
+
+# autoresearch per-iteration artifacts
+/run.log
+/autoresearch_results.tsv
+/.autoresearch-*.log
+/.autoresearch-state/

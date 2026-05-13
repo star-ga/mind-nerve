@@ -25,7 +25,10 @@ SKILL=$(/home/n/.local/bin/skill-improve report 2>/dev/null \
 [ -z "$SKILL" ] && SKILL=0
 
 # --- Gate 3: accepted RFC count ---
-RFCS=$(ls research/RFC-*.md 2>/dev/null | wc -l)
+# Each RFC is a level-1 header (`# RFC-NNN — …`) inside RFCs/INDEX.md.
+# The accumulator is git-tracked so kept iterations advance HEAD and
+# discarded iterations revert the file on git_reset_hard(anchor).
+RFCS=$(grep -c '^# RFC-' RFCs/INDEX.md 2>/dev/null || echo 0)
 
 # --- Composite ---
 COMPOSITE=$(python3 -c "print(f'{float('${ARCH}') + float('${SKILL}') * 100 + float('${RFCS}') * 1000:.2f}')")

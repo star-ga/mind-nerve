@@ -44,7 +44,7 @@ cli_options:
 # writeable; the source tree is in scope when the RFC includes a code
 # change. Everything outside this list is read-only.
 target_files:
-  - research/AUTORESEARCH_RFCS.md      # rolling RFC index (created if missing)
+  - RFCs/INDEX.md                       # rolling RFC accumulator (tracked)
   - src/q16_16.mind
   - src/sha256.mind
   - src/top_k.mind

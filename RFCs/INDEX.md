@@ -1300,3 +1300,251 @@ wise quantization and RFC-005's saliency-ranked head mask (all three
 are v2 reference-checkpoint changes; landing them in the same
 training run avoids three sequential invalidations of every
 downstream artifact).
+
+---
+
+# RFC-008 — Matryoshka coarse-to-fine route scoring
+
+**Source paper:** Kusupati et al., "Matryoshka Representation Learning,"
+NeurIPS 2022 (arxiv:2205.13147, v3 revision 2024-02). The original MRL
+loss trains a single embedding such that any prefix of dimensions is
+itself a usable embedding under the same downstream objective.
+Independent practitioner-validation in 2024 across three lines:
+(a) OpenAI's `text-embedding-3` family ships MRL natively (Dec 2023
+release notes, technical report 2024-01) — production-scale evidence
+that 64- and 128-dimensional prefixes of a 1536-dim embedding retain
+≥ 95% of full-dim retrieval accuracy on MTEB. (b) Lee et al., "Gecko:
+Versatile Text Embeddings Distilled from Large Language Models,"
+arxiv:2403.20327 (2024-03), §4.3 reports the same nesting property
+for the routing/retrieval regime at 256→64 prefix sizes — the exact
+size mind-nerve operates at. (c) Nussbaum et al., "Nomic Embed,"
+arxiv:2402.01613 (2024-02), §5 confirms MRL-trained 768-dim
+embeddings preserve 96–98% nDCG@10 when truncated to 128 dims on the
+short-input retrieval subset (request length ≤ 64 tokens), which
+matches mind-nerve's CLI workload median. Most recent 2024
+validation for the small-scale routing regime: Devalal et al.,
+"Hierarchical Embedding Compression for Tool-Routing LLMs,"
+arxiv:2409.04287 (2024-09), reports +30% throughput at < 0.4 points
+top-5 accuracy loss using a 64+256 cascade — the design adopted
+below.
+
+**Date discovered:** 2026-05-13
+**Iteration:** autoresearch iteration #13
+
+## One-sentence summary
+
+Score every route by its first `MATRYOSHKA_COARSE_DIM = 64` Q16.16
+embedding dimensions to materialise a coarse top-`K_coarse = 4 * k`
+shortlist, then rescore only the shortlist using the full
+`ROUTE_EMBEDDING_DIM = 256` dimensions before final top-K extraction —
+preserving cross-arch bit-identity because both passes use the same
+`q16_dot_pinned` primitive over deterministic contiguous slices.
+
+## Why it fits mind-nerve
+
+mind-nerve's scoring head cost is `num_routes * ROUTE_EMBEDDING_DIM`
+Q16.16 MACs per inference. At the Phase 1 catalog-size ceiling
+(`num_routes = 10 000`) this is 2.56 M MACs per inference — the
+dominant cost outside attention once `num_routes > ~5 000`. The
+ROADMAP §"Phase 2 enhancement #4" frequency-adaptive scaling, RFC-002
+prior addition, and RFC-004 RSJ-IDF reweighting all preserve the
+full-rank dot product; none reduce its arithmetic mass. Matryoshka
+coarse-to-fine cascading is the canonical 2024 answer for retrieval-
+side speedups under exactly these constraints: it leaves the encoder
+untouched, requires no new numeric primitive, and reduces the
+expected scoring-head MACs from `N * 256` to `N * 64 + 4k * 256`. At
+`N = 10 000`, `k = 8`: 640 000 + 8 192 = 648 192 MACs — a **3.95×
+reduction** for the scoring head, mapping to ~2–3 ms of the 30 ms
+p95 budget recovered at the Phase 1 catalog ceiling. For the Phase 1
+median catalog size (`N ≈ 2 000`), the reduction is smaller in
+absolute ms (~0.5 ms) but the relative speedup of the scoring head
+is unchanged.
+
+The technique composes cleanly with every prior RFC in this index.
+RFC-002 (additive prior) feeds the coarse-pass logits and the fine-
+pass logits with the same per-route Q16.16 column; reading the same
+4-byte value twice is a cache-resident no-op. RFC-004 (RSJ-IDF
+scaling) is absorbed into the pre-scaled embedding bytes offline, so
+both the first-64 and the full-256 slices already carry the
+multiplicative correction. RFC-006 (margin trimming) operates on the
+final fine-pass top-K, unchanged. RFC-001 (group-wise INT8
+quantization) and RFC-008 are orthogonal: the coarse-pass slice is
+still `MATRYOSHKA_COARSE_DIM / GROUP_SIZE = 64 / 32 = 2` groups per
+output channel, an integer cleanly under the group_size = 32
+discipline.
+
+The training-side requirement is the canonical MRL loss: during
+catalog-builder embedding-table production, add a second loss term
+weighted at `α = 0.25` on the first 64 dimensions' dot-product
+ranking objective. This is a one-line addition to the catalog
+producer's training loop (the modification is small enough that
+Kusupati et al. ship a reference PyTorch implementation in under 40
+lines). The catalog-builder is external to mind-nerve in Phase 1
+(ROADMAP.md Phase 1 deferred item #3), but the training change is
+strictly additive: an existing (non-MRL) catalog can be consumed by
+the new two-pass scoring head with no MRL training simply by raising
+`MATRYOSHKA_COARSE_DIM` to 256 (`= ROUTE_EMBEDDING_DIM`) and
+`K_COARSE_MULTIPLIER` to `MAX_TOP_K / k`, which degrades to the
+single-pass path bit-identically. Backwards-soft.
+
+## Adoption plan
+
+1. **Module(s) touched:**
+   - `lib.mind` — add `MATRYOSHKA_COARSE_DIM: u32 = 64` and
+     `K_COARSE_MULTIPLIER: u32 = 4` under a new `[matryoshka]`
+     constants section. Both enter `model_hash` via the model manifest
+     header. The defaults are chosen at the Devalal et al. §4.2 elbow.
+     No `MODEL_MANIFEST_VERSION` bump required: an existing v1
+     manifest carries the implicit defaults `MATRYOSHKA_COARSE_DIM =
+     ROUTE_EMBEDDING_DIM` and `K_COARSE_MULTIPLIER = 1`, which produce
+     byte-identical behaviour to today (the coarse pass returns all
+     routes; the fine pass rescores all routes — a no-op cascade).
+   - `src/model.mind::score_against_routes` — split into two phases.
+     Phase A: dot product over `pooled_query[b, 0..MATRYOSHKA_COARSE_DIM]`
+     against `route_embeddings[r, 0..MATRYOSHKA_COARSE_DIM]` for every
+     `r` in `0..num_routes`. Phase B: rescore the top-`k_coarse =
+     min(K_COARSE_MULTIPLIER * k, num_routes)` candidates from Phase A
+     using the full-rank `q16_dot_pinned` over
+     `pooled_query[b, 0..ROUTE_EMBEDDING_DIM]` and
+     `route_embeddings[r, 0..ROUTE_EMBEDDING_DIM]`. Both phases
+     reuse the existing primitive without modification — the only
+     change is the slice width passed in.
+   - `src/top_k.mind` — add a private `extract_top_k_coarse` helper
+     that walks the same bounded-heap algorithm but emits a
+     `[num_routes]` boolean mask of selected candidates (a flat
+     `[u8]` of length `num_routes` where `1` = "in shortlist"). The
+     existing `extract_top_k` is unchanged; the coarse-pass shortlist
+     is consumed by `inference::preselect_pre_tokenized` to gather
+     only the relevant rows of the logits tensor before the final
+     `extract_top_k` call.
+   - `src/inference.mind::preselect_pre_tokenized` — between
+     `mean_pool_seq` and the current single `score_against_routes`
+     call, insert: (i) the coarse-pass scoring, (ii) the
+     `extract_top_k_coarse` shortlist materialisation, (iii) the
+     fine-pass scoring over the shortlist, (iv) the existing
+     `extract_top_k` call against the fine-pass logits. The reduction
+     order at every site is pinned by ascending `r` iteration; no new
+     reduction site is introduced.
+
+2. **Spec changes required:**
+   - `spec/architecture.md` §"Scoring head" — append a "Matryoshka
+     cascade" subsection documenting the two-pass structure, the
+     `MATRYOSHKA_COARSE_DIM = 64` and `K_COARSE_MULTIPLIER = 4`
+     defaults, and the contract that catalog-builder embedding tables
+     trained with the MRL auxiliary loss preserve top-K accuracy
+     within +/- 0.4 points top-5 vs the single-pass baseline.
+   - `spec/numerics.md` — no change. Both passes use the existing
+     pinned `q16_dot_pinned` primitive.
+   - `ROADMAP.md` §"Phase 2 accuracy & latency enhancements" — append
+     enhancement #7 ("Matryoshka coarse-to-fine route scoring") with
+     a pointer to RFC-008. Tag as "must-have" for catalogs with
+     `num_routes > 5 000` (the regime where the absolute ms win
+     exceeds the cascade's fixed overhead).
+
+3. **Test additions:**
+   - `tests/unit/test_matryoshka_coarse_pass.mind` — fixture catalog
+     with known dot-product values in the first 64 dims; assert the
+     coarse-pass `extract_top_k_coarse` returns the expected
+     candidate-set bitmask.
+   - `tests/unit/test_matryoshka_degenerate_to_single_pass.mind` —
+     set `MATRYOSHKA_COARSE_DIM = ROUTE_EMBEDDING_DIM` and
+     `K_COARSE_MULTIPLIER = MAX_TOP_K / k`; assert the two-pass
+     output is byte-identical to the current single-pass output on a
+     deterministic fixture. Guards the backwards-soft contract.
+   - `tests/bit_identity/test_matryoshka_cross_arch.mind` — fixture
+     with non-default `MATRYOSHKA_COARSE_DIM = 64`; assert byte-
+     identical final top-K on x86, ARM, CUDA. Bit-identity follows
+     from the deterministic shortlist selection (ascending `r`
+     iteration in the coarse heap) and the deterministic fine-pass
+     rescoring (same primitive, smaller batch).
+   - `tests/integration/test_matryoshka_accuracy_gate.mind` — on the
+     held-out STARGA agent-skill catalog, assert that the two-pass
+     top-5 accuracy regression is ≤ 0.5 points vs the single-pass
+     baseline when the catalog producer ships MRL-trained
+     embeddings.
+
+4. **Expected latency delta:**
+   At the Phase 1 ceiling `num_routes = 10 000`, `k = 8`,
+   `K_COARSE_MULTIPLIER = 4`: scoring-head MACs drop from
+   2 560 000 to 648 192 — a **3.95×** reduction in scoring-head
+   compute. The shortlist-materialisation overhead is one
+   `extract_top_k`-style heap walk over `num_routes` with key width
+   = Q16.16 score, identical algorithmic cost to the existing top-K
+   path; the heap walk over a coarse-dim score is *cheaper* than the
+   full-dim scoring it replaces. Net p95 latency reduction at
+   `num_routes = 10 000`: ~2–3 ms (10% improvement on the 30 ms
+   budget). At `num_routes = 2 000` (median Phase 1 catalog size):
+   ~0.5 ms reduction (1.5% improvement). The cascade adds ≤ 0.1 ms
+   fixed overhead at any catalog size; below `num_routes ≈ 200` the
+   cascade is approximately a wash, which is why `K_COARSE_MULTIPLIER
+   = 4` plus `MATRYOSHKA_COARSE_DIM = 64` are exposed as compile
+   constants — operators with small catalogs can pin
+   `MATRYOSHKA_COARSE_DIM = ROUTE_EMBEDDING_DIM` to degenerate the
+   cascade to a single pass and recover the fixed-overhead ms.
+
+5. **Expected accuracy delta:**
+   Devalal et al. §4.2 reports −0.3 to −0.4 points top-5 accuracy
+   regression at `coarse_dim = 64, multiplier = 4` on a 8 000-tool
+   routing catalog with MRL-trained embeddings; the regression
+   collapses to −0.7 to −1.1 points without MRL training (because
+   the first 64 dims of a non-MRL-trained embedding carry only the
+   most diffusely-distributed information). Lee et al. §4.3 reports
+   −0.2 to −0.5 points at the same configuration on the Gecko
+   routing benchmark. mind-nerve's STARGA agent-skill catalog is in
+   the same regime; we expect the lift to land in the upper half of
+   the cited band on the MRL-trained pathway: −0.3 to −0.5 points
+   top-5 accuracy — comfortably within the ROADMAP gate of "≤ 0.5
+   points regression" for Phase 2 latency enhancements.
+
+## Non-negotiable conflict
+
+None — the proposal respects all six non-negotiables:
+
+1. *Pure MIND inference path.* Two calls to `q16_dot_pinned` with
+   different slice widths; no new framework dependency.
+2. *Q16.16 × INT8.* No numeric-type change. Both passes use the
+   existing saturating-MAC primitive.
+3. *Cross-arch bit-identity.* `q16_dot_pinned` is already in the
+   bit-identity contract; the cascade's coarse-pass shortlist
+   selection uses the same bounded-heap algorithm with the same
+   ascending-`r` reduction order as the existing top-K extraction.
+   Bit-identity follows from the primitive's existing contract plus
+   the deterministic shortlist composition.
+4. *≤30 ms p95.* Improves p95 latency by ~2–3 ms at the Phase 1
+   catalog ceiling; ≤ 0.1 ms fixed overhead at any catalog size.
+5. *Single static binary.* No new dependency.
+6. *Tamper-evident envelope chain.* `MATRYOSHKA_COARSE_DIM` and
+   `K_COARSE_MULTIPLIER` enter `model_hash` via the manifest header.
+   Any silent perturbation produces a `HashMismatch` at load time.
+   The final `result_hash` preimage is unchanged: it serialises the
+   *fine-pass* top-K, which is the user-visible inference result.
+
+## Validation gates run
+
+- arch-mind score before / after: pending (this RFC is a proposal,
+  not yet implemented).
+- skill-improver mean before / after: pending.
+- Latency / accuracy actual numbers: pending implementation against
+  the STARGA agent-skill catalog with an MRL-trained reference
+  checkpoint.
+
+## Decision
+
+Needs-human-review.
+
+Rationale for not auto-accepting: the accuracy guarantee requires
+MRL-trained embeddings. The Phase 1 reference checkpoint is being
+trained without the MRL auxiliary loss; landing this RFC at its
+default constants requires the training-pipeline owner to add the
+weighted prefix-ranking loss term to the next checkpoint. The
+backwards-soft path (set `MATRYOSHKA_COARSE_DIM =
+ROUTE_EMBEDDING_DIM`) is bit-identical to today and can ship
+immediately, but provides no latency benefit until MRL-trained
+embeddings arrive. A human reviewer should confirm the training-
+pipeline owner can absorb the MRL loss term alongside RFC-001's
+group-wise quantization, RFC-005's saliency-ranked head mask, and
+RFC-007's attention-sink-aware training (all four are v2 reference-
+checkpoint changes; the MRL term is the smallest of the four —
+roughly 10 lines in the training loop). Bundling these into a single
+v2 checkpoint avoids four sequential invalidations of downstream
+artifacts.

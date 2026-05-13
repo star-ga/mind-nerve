@@ -115,4 +115,6 @@ module mind_nerve {
     pub mod top_k;
     pub mod inference;
     pub mod evidence;
+    pub mod chain_log;
+    pub mod tokenizer;
 }

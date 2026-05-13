@@ -113,7 +113,7 @@
 // =============================================================================
 
 use crate::mind_nerve::inference::{
-    preselect_pre_tokenized,
+    preselect_pre_tokenized_stateless,
     PreselectResult,
     InferenceError,
     RouteCatalog,
@@ -230,7 +230,11 @@ pub fn main() -> i32 {
     };
 
     // 4. Inference. Pre-tokenized path — BPE is Phase 1.2.
-    match preselect_pre_tokenized(&req.tokens, &catalog, &weights, req.k) {
+    //    Stateless variant: the CLI is a one-shot process so every
+    //    invocation is a chain-of-one (chain_prev = zeros32 by design).
+    //    Long-running hosts that want cross-call chain continuity
+    //    construct a ChainLog and call `preselect_pre_tokenized` directly.
+    match preselect_pre_tokenized_stateless(&req.tokens, &catalog, &weights, req.k) {
         Ok(result) => {
             let frame = emit_mic_b_response(&result);
             match write_stdout(&frame) {

@@ -25,6 +25,7 @@ use crate::mind_nerve::model;
 use crate::mind_nerve::model::score_against_routes;
 use crate::mind_nerve::inference::{
     preselect_pre_tokenized,
+    preselect_pre_tokenized_stateless,
     InferenceError,
     PreselectResult,
     RouteCatalog,
@@ -183,7 +184,7 @@ fn preselect_rejects_k_zero() {
     let weights = zero_model_weights();
     let tokens: [u32; 1] = [42u32];
 
-    let result = preselect_pre_tokenized(&tokens, &catalog, &weights, 0u32);
+    let result = preselect_pre_tokenized_stateless(&tokens, &catalog, &weights, 0u32);
 
     match result {
         Err(InferenceError::InvalidK) => { /* expected */ }
@@ -197,7 +198,7 @@ fn preselect_rejects_k_above_max() {
     let weights = zero_model_weights();
     let tokens: [u32; 1] = [42u32];
 
-    let result = preselect_pre_tokenized(&tokens, &catalog, &weights, MAX_TOP_K + 1u32);
+    let result = preselect_pre_tokenized_stateless(&tokens, &catalog, &weights, MAX_TOP_K + 1u32);
 
     match result {
         Err(InferenceError::InvalidK) => { /* expected */ }
@@ -215,7 +216,7 @@ fn preselect_rejects_oversize_token_stream() {
     let n: usize = (MAX_REQUEST_TOKENS as usize) + 1;
     let mut tokens: [u32; n] = [0u32; n];
 
-    let result = preselect_pre_tokenized(&tokens, &catalog, &weights, 1u32);
+    let result = preselect_pre_tokenized_stateless(&tokens, &catalog, &weights, 1u32);
 
     match result {
         Err(InferenceError::RequestTooLong) => { /* expected */ }
@@ -230,7 +231,7 @@ fn preselect_rejects_empty_catalog() {
     let weights = zero_model_weights();
     let tokens: [u32; 1] = [42u32];
 
-    let result = preselect_pre_tokenized(&tokens, &empty_catalog, &weights, 1u32);
+    let result = preselect_pre_tokenized_stateless(&tokens, &empty_catalog, &weights, 1u32);
 
     match result {
         Err(InferenceError::EmptyCatalog) => { /* expected */ }
@@ -255,7 +256,7 @@ fn preselect_k_check_precedes_length_check() {
     let mut tokens: [u32; n] = [0u32; n];
 
     // k == 0 AND oversize tokens. Must report InvalidK, not RequestTooLong.
-    let result = preselect_pre_tokenized(&tokens, &catalog, &weights, 0u32);
+    let result = preselect_pre_tokenized_stateless(&tokens, &catalog, &weights, 0u32);
 
     match result {
         Err(InferenceError::InvalidK) => { /* expected */ }
@@ -272,7 +273,7 @@ fn preselect_length_check_precedes_empty_catalog_check() {
     let mut tokens: [u32; n] = [0u32; n];
 
     // Oversize tokens AND empty catalog. Must report RequestTooLong first.
-    let result = preselect_pre_tokenized(&tokens, &empty_catalog, &weights, 1u32);
+    let result = preselect_pre_tokenized_stateless(&tokens, &empty_catalog, &weights, 1u32);
 
     match result {
         Err(InferenceError::RequestTooLong) => { /* expected */ }
@@ -293,7 +294,7 @@ fn preselect_envelope_is_212_bytes() {
     let weights = zero_model_weights();
     let tokens: [u32; 4] = [1u32, 2u32, 3u32, 4u32];
 
-    let result = preselect_pre_tokenized(&tokens, &catalog, &weights, 1u32);
+    let result = preselect_pre_tokenized_stateless(&tokens, &catalog, &weights, 1u32);
 
     match result {
         Ok(pr) => {

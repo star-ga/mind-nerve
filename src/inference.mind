@@ -23,6 +23,9 @@ use crate::mind_nerve::{
 use crate::mind_nerve::model;
 use crate::mind_nerve::evidence;
 use crate::mind_nerve::clock;
+use crate::mind_nerve::chain_log;
+use crate::mind_nerve::chain_log::ChainLog;
+use crate::mind_nerve::tokenizer;
 use crate::mind_nerve::sha256::sha256 as sha256_impl;
 use crate::mind_nerve::top_k::{
     self,
@@ -144,12 +147,24 @@ pub enum InferenceError {
 // exceed the cap, callers receive `InferenceError::RequestTooLong` from
 // `preselect`; the tokenizer itself never truncates silently.
 //
-// Until the BPE 32k tokenizer lands (Phase 1.2 — tracked in ROADMAP), the
-// `preselect` entry point cannot run end-to-end. The CLI binary and unit
-// tests use `preselect_pre_tokenized` below, which accepts a token array
-// directly and bypasses tokenization.
-fn tokenize_bpe(_bytes: [u8]) -> [u32] {
-    unimplemented!("Phase 1.2: BPE 32k tokenizer (see ROADMAP P1.2)")
+// Phase 1.2 — BPE 32k tokenizer lives in `src/tokenizer.mind`. The current
+// merge table is a 32-entry placeholder; the real 32k merges arrive with
+// the first reference checkpoint and replace BPE_MERGES wholesale. See
+// src/tokenizer.mind §"PHASE 1.2 STATUS" for the follow-up flag.
+//
+// `tokenizer::tokenize_bpe` returns `Result<[u32], TokenizeError>`. This
+// thin local wrapper maps the tokenizer error surface onto the inference
+// `InferenceError` enum so the `preselect` body keeps a single error
+// type. `InputEmpty` is treated as a malformed request and surfaces as
+// `InvalidK` (the wire-handshake-level "this request cannot run"
+// discriminant); `TooLong` maps to `RequestTooLong` 1:1.
+@[determinism(BitIdentical)]
+fn tokenize_bpe(bytes: &[u8]) -> Result<[u32], InferenceError> {
+    match tokenizer::tokenize_bpe(bytes) {
+        Ok(toks) => Ok(toks),
+        Err(tokenizer::TokenizeError::InputEmpty) => Err(InferenceError::InvalidK),
+        Err(tokenizer::TokenizeError::TooLong)    => Err(InferenceError::RequestTooLong),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -170,6 +185,7 @@ pub fn preselect(
     request: Request,
     catalog: RouteCatalog,
     weights: ModelWeights,
+    log:     &mut ChainLog,
 ) -> Result<PreselectResult, InferenceError>
 {
     // (1) k range gate. Same MIN/MAX policy as evidence::emit().
@@ -192,17 +208,22 @@ pub fn preselect(
         }
     }
 
-    // (4) Tokenize. Currently `unimplemented!()` — Phase 1.2 work item.
-    //     Once landed, the produced length is bounded by MAX_REQUEST_TOKENS;
-    //     this re-check is defence-in-depth and a stable contract for any
-    //     replacement tokenizer implementation.
-    let tokens: [u32] = tokenize_bpe(request.bytes);
+    // (4) Tokenize. Phase 1.2 — delegates to `tokenizer::tokenize_bpe`
+    //     via the local `tokenize_bpe` wrapper, which maps the tokenizer
+    //     error surface onto `InferenceError`. The tokenizer enforces
+    //     `bytes.len() > 0` and `tokens.len() ≤ MAX_REQUEST_TOKENS`; the
+    //     re-check below is defence-in-depth — it stays as a stable
+    //     contract for any replacement tokenizer implementation.
+    let tokens: [u32] = match tokenize_bpe(request.bytes.as_slice()) {
+        Ok(toks) => toks,
+        Err(err) => return Err(err),
+    };
     if tokens.len() > (MAX_REQUEST_TOKENS as usize) {
         return Err(InferenceError::RequestTooLong);
     }
 
     // Delegate to the pre-tokenized entry point for the forward path.
-    preselect_pre_tokenized(&tokens, &catalog, &weights, request.k)
+    preselect_pre_tokenized(&tokens, &catalog, &weights, request.k, log)
 }
 
 // ---------------------------------------------------------------------------
@@ -224,6 +245,7 @@ pub fn preselect_pre_tokenized(
     catalog: &RouteCatalog,
     weights: &ModelWeights,
     k:       u32,
+    log:     &mut ChainLog,
 ) -> Result<PreselectResult, InferenceError>
 {
     // (1) k range gate.
@@ -269,22 +291,28 @@ pub fn preselect_pre_tokenized(
     let request_hash: [u8; 32] = request_hash_from_tokens(tokens);
     let result_hash:  [u8; 32] = canonical_result_hash(result);
 
-    // (7) Envelope construction. chain_prev is zeros — the evidence chain
-    //     is single-envelope at this entry point; the Phase 1.3 chain log
-    //     will thread chain_prev through a session-scoped state holder.
+    // (7) Envelope construction. chain_prev is the previous envelope's
+    //     chain_curr, threaded through the session-scoped ChainLog. The
+    //     first envelope in a session sees `chain_prev = zeros32` by
+    //     construction (ChainLog::new_session initialises
+    //     `last_chain_curr` to the zero hash); subsequent envelopes see
+    //     SHA-256 of the previous envelope's 212-byte serialized form.
+    //     This closes the Phase 1.3 "chain-of-one" gap and makes
+    //     `evidence::verify_chain` meaningful end-to-end.
+    //
     //     timestamp_ms comes from the monotonic clock provider in
     //     src/clock.mind. On backends without a host monotonic clock
     //     (WebGPU), it falls through to a per-inference counter; either
     //     way the value is strictly non-decreasing within a process.
-    let zero32: [u8; 32] = [0u8; 32];
-    let timestamp_ms: i64 = clock::monotonic_now_ms();
+    let chain_prev:   [u8; 32] = chain_log::chain_prev_for_next(log);
+    let timestamp_ms: i64      = clock::monotonic_now_ms();
     let envelope_bytes = match evidence::emit_inference(
         weights.model_hash,
         weights.tokenizer_hash,
         catalog.hash,
         request_hash,
         result_hash,
-        zero32,                                 // chain_prev (Phase 1.3)
+        chain_prev,                             // = log.last_chain_curr
         timestamp_ms,
         ARCH_X86_64,                            // architecture (Phase 2: runtime)
         k,
@@ -294,11 +322,44 @@ pub fn preselect_pre_tokenized(
         Err(_)    => return Err(InferenceError::EnvelopeBuildFailed),
     };
 
+    // (8) Advance the chain log. After this call, log.last_chain_curr
+    //     equals SHA-256(envelope_bytes), which becomes the chain_prev
+    //     of the NEXT envelope minted from this session.
+    let _ = chain_log::append(log, &envelope_bytes);
+
     Ok(PreselectResult {
         route_ids: result.ids,
         scores:    result.scores,
         envelope:  envelope_bytes,
     })
+}
+
+// ---------------------------------------------------------------------------
+// preselect_pre_tokenized_stateless — backwards-compatible ephemeral-log
+// variant for callers that do not (yet) carry a session-scoped ChainLog.
+// ---------------------------------------------------------------------------
+//
+// Every call constructs a fresh ChainLog, runs the forward path, and
+// drops the log. The emitted envelope's `chain_prev` is therefore always
+// zeros32 — a chain-of-one. Use this from one-shot CLI invocations or
+// integration tests that don't care about cross-call chain continuity.
+// Production hosts that DO care MUST use `preselect_pre_tokenized` with
+// a long-lived ChainLog threaded across every inference in the session.
+//
+// The session_id is pinned to all-zero so the stateless variant does
+// not consume entropy (BitIdentical-compatible). For the few callers
+// that want a unique id even in stateless mode, build a ChainLog with
+// `chain_log::new_session()` and use the stateful entry point.
+@[determinism(BitIdentical)]
+pub fn preselect_pre_tokenized_stateless(
+    tokens:  &[u32],
+    catalog: &RouteCatalog,
+    weights: &ModelWeights,
+    k:       u32,
+) -> Result<PreselectResult, InferenceError>
+{
+    let mut ephemeral: ChainLog = chain_log::new_session_with_id([0u8; 16]);
+    preselect_pre_tokenized(tokens, catalog, weights, k, &mut ephemeral)
 }
 
 // ---------------------------------------------------------------------------

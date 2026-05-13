@@ -12,7 +12,6 @@
     "lint": "tsc --noEmit"
   },
   "dependencies": {
-    "@mind/mic-map": "file:../../../mind/sdk/ts/mic-map",
     "pino": "^9.6.0",
     "zod": "^3.23.8"
   },

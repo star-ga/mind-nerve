@@ -108,6 +108,7 @@ module mind_nerve {
     pub const CHAIN_RESET_CATALOG_CHANGED: u16 = 2;
     pub const CHAIN_RESET_CLOCK_RESET:     u16 = 3;
 
+    pub mod runtime_ffi;
     pub mod q16_16;
     pub mod sha256;
     pub mod clock;
@@ -117,4 +118,5 @@ module mind_nerve {
     pub mod evidence;
     pub mod chain_log;
     pub mod tokenizer;
+    pub mod loader;
 }

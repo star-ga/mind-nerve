@@ -1,0 +1,102 @@
+// Host-runtime foreign function interface.
+//
+// Every external dependency mind-nerve has on the surrounding mind-runtime
+// is declared here as `extern fn`. Pure-MIND modules call into this module
+// rather than scattering `extern` declarations across the source tree,
+// so the host contract is in a single, auditable place.
+//
+// mind-runtime is responsible for resolving each extern at link time. A
+// backend that cannot fulfil a given extern (e.g. WebGPU has no stdin)
+// MUST refuse to compile that target — silent fallback to a stub would
+// break the audit chain.
+//
+// SYNTAX
+//
+// `extern fn` is the same surface 512-mind uses for HSM + crypto host
+// primitives (see 512-mind/src/nexus_key.mind, key_management.mind).
+// mindc 0.2.4+ lowers extern fns to symbol references; mind-runtime
+// resolves them with native shims.
+//
+// DETERMINISM
+//
+// extern fns are NOT bit-identical by definition (they read OS state).
+// Inference paths that touch externs (timestamp_ms, stderr error frames)
+// route the result into the envelope WRAPPER (timestamp_ms field) or into
+// stderr, never into the `result_hash` preimage. The route_id ordering
+// remains bit-identical across runs and architectures regardless of
+// what monotonic_steady_ns returns.
+//
+// PHASE 1 RUNTIME CONTRACT (mind-runtime ≥ 0.2.4 provides):
+//
+//   - clock_gettime(CLOCK_MONOTONIC_RAW)  -> monotonic_steady_ns
+//   - read(0, buf, n)                     -> read_stdin
+//   - write(1, buf, n)                    -> write_stdout
+//   - write(2, buf, n)                    -> write_stderr
+//   - read(open(path, O_RDONLY), ...)     -> read_file
+//   - getrandom(buf, 16, GRND_NONBLOCK)   -> os_entropy_16
+//   - exit(code)                          -> exit
+//
+// Backends listed in Mind.toml [bit-identity] backends-phase1 MUST resolve
+// all of the above. WebGPU (Phase 2) currently lacks stdin/stdout/fs and
+// will need an alternative I/O strategy before its bit-identity gate lands.
+
+module runtime_ffi {
+
+    // ----- Time -----------------------------------------------------------
+
+    // Monotonic, non-decreasing nanosecond timer.
+    //   Linux:   clock_gettime(CLOCK_MONOTONIC_RAW)
+    //   Darwin:  mach_continuous_time() with mach_timebase_info scaling
+    //   Windows: QueryPerformanceCounter() with QueryPerformanceFrequency scaling
+    //
+    // Process suspend / resume are transparent. Operator clock adjustments
+    // (settimeofday, NTP step) do NOT affect this counter. Returns ns
+    // since an implementation-defined epoch (typically boot).
+    extern fn monotonic_steady_ns() -> i64
+
+    // ----- Standard I/O ---------------------------------------------------
+
+    // Read up to `max_bytes` bytes from fd 0 (stdin) into a fresh byte
+    // buffer. Returns the actual bytes read. EOF or `max_bytes` ends the
+    // read. Errors return an empty buffer; callers check length to detect.
+    extern fn read_stdin(max_bytes: usize) -> [u8]
+
+    // Write `bytes` to fd 1 (stdout). Returns count written; partial
+    // writes are surfaced. mindc inserts a flush after the call.
+    extern fn write_stdout(bytes: [u8]) -> usize
+
+    // Write `bytes` to fd 2 (stderr). Same semantics as write_stdout.
+    extern fn write_stderr(bytes: [u8]) -> usize
+
+    // ----- File system (read-only) ----------------------------------------
+
+    // Read the file at `path` (UTF-8 path bytes) into a fresh byte buffer.
+    // Used by src/loader.mind for catalog + weights file loading.
+    //
+    // On error (file not found, permission denied, I/O error) returns a
+    // zero-length buffer. Callers must check the length against an
+    // expected minimum (e.g. >= header size) to detect failures.
+    //
+    // No write_file primitive is exposed — mind-nerve never writes to the
+    // filesystem in Phase 1.
+    extern fn read_file(path: [u8]) -> [u8]
+
+    // ----- Entropy --------------------------------------------------------
+
+    // Read 16 bytes of cryptographic-quality entropy from the host RNG.
+    //   Linux:   getrandom(buf, 16, GRND_NONBLOCK)
+    //   Darwin:  arc4random_buf(buf, 16)
+    //   Windows: BCryptGenRandom(NULL, buf, 16, BCRYPT_USE_SYSTEM_PREFERRED_RNG)
+    //
+    // Used by src/chain_log.mind to seed session_id at session start.
+    // On a backend without an RNG (test-only), the runtime SHOULD return
+    // [0u8; 16] and rely on the test fixture entry
+    // `chain_log::new_session_with_id` to inject a deterministic value.
+    extern fn os_entropy_16() -> [u8; 32]
+
+    // ----- Process exit ---------------------------------------------------
+
+    // Terminate the process with the given exit code. No return.
+    // The runtime SHOULD flush stdout + stderr before exiting.
+    extern fn exit(code: i32) -> i32
+}

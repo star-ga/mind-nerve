@@ -120,6 +120,11 @@ use crate::mind_nerve::inference::{
     ModelWeights,
     RouteId,
 };
+use crate::mind_nerve::loader::{
+    load_catalog  as loader_load_catalog,
+    load_weights  as loader_load_weights,
+    LoaderError,
+};
 use crate::mind_nerve::evidence::{serialize, ATTESTATION_V2_SIZE};
 use crate::mind_nerve::{
     Q16_16,
@@ -559,21 +564,23 @@ fn emit_mic_b_response(result: &PreselectResult) -> [u8] {
 }
 
 // ---------------------------------------------------------------------------
-// On-disk loaders. Thin shims over the model/catalog readers that live in
-// `src/model.rs` and the (Phase 1.1) catalog manifest reader.
+// On-disk loaders. Thin shims over `src/loader.mind` that translate
+// LoaderError into the CLI's `Result<_, ()>` surface; the caller maps `()`
+// to exit code 8 (LoaderError) via the central error-code table.
 // ---------------------------------------------------------------------------
 
 @[determinism(BitIdentical)]
 fn load_catalog(path_bytes: &[u8]) -> Result<RouteCatalog, ()> {
-    // Phase 1.1 TODO: src/model.mind must expose `pub fn load_catalog_from_path
-    // (path: &[u8]) -> Result<RouteCatalog, CatalogLoadError>`. Until then we
-    // refuse to silently stub — the unimplemented! is the build gate.
-    unimplemented!("Phase 1.1: src/model.mind catalog loader")
+    match loader_load_catalog(path_bytes) {
+        Ok(catalog) => Ok(catalog),
+        Err(_)      => Err(()),
+    }
 }
 
 @[determinism(BitIdentical)]
 fn load_weights(path_bytes: &[u8]) -> Result<ModelWeights, ()> {
-    // Phase 1.1 TODO: src/model.mind must expose `pub fn load_weights_from_path
-    // (path: &[u8]) -> Result<ModelWeights, WeightsLoadError>`.
-    unimplemented!("Phase 1.1: src/model.mind weights loader")
+    match loader_load_weights(path_bytes) {
+        Ok(weights) => Ok(weights),
+        Err(_)      => Err(()),
+    }
 }

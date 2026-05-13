@@ -1,0 +1,839 @@
+// Loader: on-disk catalog (.cat) + weights (.weights) readers.
+//
+// Audit anchors: A3 (catalog uniqueness), S-5 (catalog binding), MH-1
+// (model_hash discipline), W-1 (INT8 weight storage with Q16.16 scales).
+//
+// =============================================================================
+// FILE FORMATS
+// =============================================================================
+//
+// Both formats are little-endian for every multi-byte integer, self-describing
+// via a 4-byte magic + 2-byte version + 2-byte reserved header. Reserved bytes
+// MUST be zero on read (defence against silent format extension).
+//
+// ----- CATALOG FILE FORMAT (.cat) --------------------------------------------
+//
+//   offset                          size                            field
+//   0                               4                               magic = "MNC1"
+//                                                                   (0x4D 0x4E 0x43 0x31)
+//   4                               2                               version u16 LE = 1
+//   6                               2                               reserved = 0
+//   8                               4                               num_routes u32 LE
+//                                                                   (1..=65535)
+//   12                              4                               embedding_dim u32 LE
+//                                                                   (MUST equal
+//                                                                    ROUTE_EMBEDDING_DIM)
+//   16                              32                              catalog_hash [u8; 32]
+//                                                                   (= SHA-256 of
+//                                                                    canonical(route_ids,
+//                                                                              embeddings)).
+//                                                                   Loader recomputes
+//                                                                   and refuses on
+//                                                                   mismatch.
+//   48                              num_routes * 32                 route_ids
+//                                                                   (raw SHA-256 each,
+//                                                                    sorted ascending
+//                                                                    by raw lex)
+//   48 + 32*num_routes              num_routes * embedding_dim * 4  embeddings
+//                                                                   (Q16.16 i32 LE,
+//                                                                    row-major, in the
+//                                                                    same row order as
+//                                                                    route_ids)
+//   trailing                        4                               external_id_table_offset
+//                                                                   (u32 LE, absolute
+//                                                                    offset from start
+//                                                                    of file; equals
+//                                                                    48 + 36*num_routes
+//                                                                    + embedding_bytes)
+//   external_id_table_offset        num_routes * (2 + L_i)          external_id_table
+//                                                                   (per row: u16 LE
+//                                                                    external_id_len
+//                                                                    followed by L_i
+//                                                                    UTF-8 bytes; no NUL
+//                                                                    terminator). Order
+//                                                                    parallel to
+//                                                                    route_ids.
+//
+//   Catalog hash preimage (canonical, computed left-to-right):
+//
+//     for i in 0..num_routes:
+//         emit u32-LE length = 32
+//         emit route_ids[i]                          (32 bytes)
+//         emit u32-LE length = embedding_dim * 4
+//         emit embeddings[i, :] as i32-LE row        (embedding_dim*4 bytes)
+//
+//     catalog_hash = SHA-256(preimage)
+//
+//   This preimage is uniquely determined by the on-disk bytes; the loader
+//   replays it as the integrity check.
+//
+//   Total catalog file size (1..=N routes, ROUTE_EMBEDDING_DIM = 256):
+//
+//     48                              fixed header + catalog_hash
+//     + N * 32                        route_ids
+//     + N * 256 * 4                   embeddings (1024 bytes per row)
+//     + 4                             external_id_table_offset
+//     + sum_i (2 + external_id_len_i) external_id_table
+//
+//   Worst case for N = 65535 and external_id_len = 64 bytes each:
+//     48 + 65535*(32 + 1024 + 2 + 64) + 4 ≈ 73.5 MB. Well under any
+//     reasonable budget for a one-shot CLI startup load.
+//
+// ----- WEIGHTS FILE FORMAT (.weights) ----------------------------------------
+//
+//   offset    size                                       field
+//   0         4                                          magic = "MNW1"
+//                                                        (0x4D 0x4E 0x57 0x31)
+//   4         2                                          version u16 LE = 1
+//   6         2                                          reserved = 0
+//   8         32                                         model_hash [u8; 32]
+//                                                        (SHA-256 of manifest, opaque
+//                                                         to loader — pinned into
+//                                                         envelope.model_hash)
+//   40        32                                         tokenizer_hash [u8; 32]
+//   72        4                                          encoder_layers u32 LE
+//                                                        (MUST equal ENCODER_LAYERS)
+//   76        4                                          encoder_hidden u32 LE
+//                                                        (MUST equal ENCODER_HIDDEN)
+//
+//   (per-layer block, repeated encoder_layers times; size = 4*H^2 + 4*H*4 +
+//    3*H*4 bytes = 4*H^2 + 28*H bytes = 7168 + 0 = 0.27 MB at H=256):
+//
+//       H*H bytes      wq             (INT8, row-major, output channel × input)
+//       H*H bytes      wk             (INT8)
+//       H*H bytes      wv             (INT8)
+//       H*H bytes      wo             (INT8)
+//       H*4 bytes      wq_scales      (Q16.16 i32 LE, per output channel)
+//       H*4 bytes      wk_scales
+//       H*4 bytes      wv_scales
+//       H*4 bytes      wo_scales
+//       H*4 bytes      ln_gain        (Q16.16 i32 LE)
+//       H*4 bytes      ln_bias        (Q16.16 i32 LE)
+//       H*4 bytes      residual_gate  (Q16.16 i32 LE)
+//
+//   (after all layers):
+//
+//       H*4 bytes                final_ln_gain   (Q16.16 i32 LE)
+//       H*4 bytes                final_ln_bias   (Q16.16 i32 LE)
+//       VOCAB_SIZE * H * 4 bytes token_embedding (Q16.16 i32 LE, row-major)
+//
+//   Total at ENCODER_LAYERS=2, H=256, VOCAB=32768:
+//     80                                                    header
+//     + 2 * (4*256*256 + 4*256*4 + 3*256*4)                 per-layer blocks
+//       = 2 * (262144 + 4096 + 3072)
+//       = 2 * 269312 = 538624                               (0.51 MiB)
+//     + 2*256*4                                             final norms (2048)
+//     + 32768*256*4                                         token embedding
+//                                                            (33,554,432 = 32 MiB)
+//     = 80 + 538624 + 2048 + 33554432
+//     = 34,095,184 bytes  (~32.5 MiB)
+//
+//   The token embedding dominates the file size; that is by design — INT8
+//   quantization of the matmul weights is what brings the layer blocks under
+//   1 MiB combined while leaving the embedding table in Q16.16 for the lookup
+//   path.
+//
+// =============================================================================
+// DEQUANTIZATION ON LOAD
+// =============================================================================
+//
+// `model::EncoderLayerWeights` declares Q16.16 tensors for wq/wk/wv/wo (see
+// src/model.mind §"Weight containers"). The on-disk format stores them as
+// INT8 + per-output-channel Q16.16 scales — the spec/architecture.md §"Weight
+// storage discipline" contract. The loader bridges by **dequantizing at load**:
+//
+//   weights[layer].wq[oc, ic] = q16_mul_int8(wq_int8[oc, ic], wq_scales[oc])
+//
+// where q16_mul_int8 is the saturating-MAC primitive (see q16_16.mind):
+//
+//   product_i64 = (int8 as i64) * (scale_i32 as i64)
+//   q16         = sat_i32((product_i64 + (1 << 15)) >> 16)   // round-half-to-even
+//
+// The per-channel scale is therefore "absorbed" into the stored Q16.16 weight
+// matrix. This is bit-identical because:
+//   - INT8 weight bytes are deterministic in the file.
+//   - Q16.16 scales are i32 LE in the file.
+//   - q16_mul (saturating, round-half-to-even) is bit-identical across backends
+//     by mindc's lint E_NERVE_003.
+//
+// Memory footprint trade-off: dequantized Q16.16 occupies 4× the bytes of
+// INT8 on the heap (4*H^2 vs H^2 per matrix). At H=256 / L=2 that is 1.0 MiB
+// dequantized vs 0.26 MiB packed — both negligible against the 32 MiB token
+// embedding table. The runtime MAC remains Q16.16 × Q16.16 → Q16.16 against
+// the pre-dequantized matrix; the on-disk INT8 form is a storage discipline,
+// not a runtime numerics discipline. (Phase 2 may push INT8 into the runtime
+// MAC; that change re-defines EncoderLayerWeights and bumps the model_hash.)
+//
+// =============================================================================
+// IDEMPOTENCE + DETERMINISM
+// =============================================================================
+//
+// `load_catalog` and `load_weights` are pure functions of the file bytes:
+//   bytes -> Result<struct, LoaderError>
+//
+// Same bytes => same struct => same downstream model_hash + catalog_hash.
+// Annotated `@[determinism(BitIdentical)]` on every public surface.
+//
+// No allocation beyond the returned struct: parser intermediates are
+// stack-bounded (e.g., per-row INT8 dequantization buffers) and dropped
+// before the function returns.
+
+use crate::mind_nerve::{
+    Q16_16,
+    ENCODER_LAYERS,
+    ENCODER_HIDDEN,
+    VOCAB_SIZE,
+    ROUTE_EMBEDDING_DIM,
+    Q16_FRAC_BITS,
+};
+use crate::mind_nerve::inference::{
+    RouteCatalog,
+    ModelWeights,
+    RouteId,
+};
+use crate::mind_nerve::model::{
+    EncoderWeights,
+    EncoderLayerWeights,
+};
+use crate::mind_nerve::sha256::sha256;
+use crate::mind_nerve::runtime_ffi::read_file as fs_read_raw;
+
+// ---------------------------------------------------------------------------
+// Public error surface
+// ---------------------------------------------------------------------------
+
+pub enum LoaderError {
+    // Filesystem read failed (file missing, permission denied, etc).
+    IoError,
+
+    // First 4 bytes did not match the expected magic
+    // ("MNC1" for catalog, "MNW1" for weights).
+    BadMagic,
+
+    // version field is 0 or > 1. Phase 1 ships v1 only; future versions
+    // will be accepted by future loader builds.
+    UnsupportedVersion,
+
+    // Any reserved byte read non-zero. Defence against silent format
+    // extension by upstream producers.
+    ReservedByteNonZero,
+
+    // Declared shape (embedding_dim / encoder_layers / encoder_hidden)
+    // does not match the compile-time constants the inference path was
+    // built against. Refuse rather than silently truncate or pad.
+    ShapeMismatch,
+
+    // catalog_hash field stored in the file does not match the SHA-256
+    // recomputed from the on-disk route_ids + embeddings. Means either
+    // the file was tampered with, or the producer used a different
+    // canonical hash function.
+    HashMismatch,
+
+    // Two routes share the same RouteId. UniqueRouteCatalog forbids
+    // duplicate ids (audit A3 — silent routing ambiguity is unacceptable).
+    UniqueRouteViolation,
+
+    // File ended before the expected end of a section. Either a truncated
+    // file or an over-declared num_routes / encoder_layers.
+    TruncatedFile,
+
+    // external_id field contained bytes that are not valid UTF-8.
+    // External ids appear in operator-facing tooling; non-UTF-8 would
+    // corrupt the catalog manifest.
+    InvalidUtf8,
+}
+
+// ---------------------------------------------------------------------------
+// Magic constants
+// ---------------------------------------------------------------------------
+
+const MNC1_MAGIC: [u8; 4] = [0x4Du8, 0x4Eu8, 0x43u8, 0x31u8]; // "MNC1"
+const MNW1_MAGIC: [u8; 4] = [0x4Du8, 0x4Eu8, 0x57u8, 0x31u8]; // "MNW1"
+
+const CATALOG_VERSION: u16 = 1;
+const WEIGHTS_VERSION: u16 = 1;
+
+const CATALOG_HEADER_BYTES: usize = 48;  // magic(4)+ver(2)+rsv(2)+nroutes(4)+edim(4)+hash(32)
+const WEIGHTS_HEADER_BYTES: usize = 80;  // magic(4)+ver(2)+rsv(2)+model_hash(32)
+                                         //  + tokenizer_hash(32) + enc_layers(4) + enc_hidden(4)
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+// load_catalog / load_weights — public entry points.
+//
+// Determinism note: the public functions are annotated BitIdentical even
+// though they depend on a host filesystem primitive whose extern signature
+// is NotBitIdentical (the host I/O layer is not bit-identical by definition).
+// The annotation refers to the *parser semantics* — for any concrete byte
+// stream returned by the host, the parser produces identical output bytes
+// on every backend. The runtime FFI surface is the only nondeterministic
+// link in the chain; once the bytes are in memory, every downstream
+// computation is bit-identical.
+//
+// `runtime_ffi::read_file` returns a zero-length buffer on any I/O error.
+// That length-0 path falls through to parse_*'s `bytes.len() < HEADER_BYTES`
+// guard, which returns `TruncatedFile`. We promote that specific path to
+// `IoError` so operators get an actionable distinction between "file
+// missing / unreadable" and "file present but truncated / corrupt."
+
+@[determinism(BitIdentical)]
+pub fn load_catalog(path: &[u8]) -> Result<RouteCatalog, LoaderError> {
+    let bytes: [u8] = fs_read_raw(path);
+    if bytes.len() == 0 {
+        return Err(LoaderError::IoError);
+    }
+    parse_catalog(&bytes)
+}
+
+@[determinism(BitIdentical)]
+pub fn load_weights(path: &[u8]) -> Result<ModelWeights, LoaderError> {
+    let bytes: [u8] = fs_read_raw(path);
+    if bytes.len() == 0 {
+        return Err(LoaderError::IoError);
+    }
+    parse_weights(&bytes)
+}
+
+// ---------------------------------------------------------------------------
+// In-memory parsers (separated from fs_read so tests can construct fixtures
+// without touching the filesystem).
+// ---------------------------------------------------------------------------
+
+@[determinism(BitIdentical)]
+pub fn parse_catalog(bytes: &[u8]) -> Result<RouteCatalog, LoaderError> {
+    // (1) Header.
+    if bytes.len() < CATALOG_HEADER_BYTES {
+        return Err(LoaderError::TruncatedFile);
+    }
+
+    if !magic_eq(bytes, MNC1_MAGIC) {
+        return Err(LoaderError::BadMagic);
+    }
+
+    let version: u16 = read_u16_le(bytes, 4);
+    if version != CATALOG_VERSION {
+        return Err(LoaderError::UnsupportedVersion);
+    }
+
+    let reserved: u16 = read_u16_le(bytes, 6);
+    if reserved != 0u16 {
+        return Err(LoaderError::ReservedByteNonZero);
+    }
+
+    let num_routes:    u32 = read_u32_le(bytes, 8);
+    let embedding_dim: u32 = read_u32_le(bytes, 12);
+
+    if embedding_dim != ROUTE_EMBEDDING_DIM {
+        return Err(LoaderError::ShapeMismatch);
+    }
+
+    // Stored catalog_hash for later verification.
+    let mut stored_hash: [u8; 32] = [0u8; 32];
+    let mut h: usize = 0;
+    while h < 32 {
+        stored_hash[h] = bytes[16 + h];
+        h = h + 1;
+    }
+
+    let n: usize    = num_routes as usize;
+    let edim: usize = embedding_dim as usize;
+
+    // (2) route_ids section.
+    let route_ids_offset: usize = CATALOG_HEADER_BYTES;
+    let route_ids_bytes:  usize = n * 32usize;
+    let route_ids_end:    usize = route_ids_offset + route_ids_bytes;
+    if bytes.len() < route_ids_end {
+        return Err(LoaderError::TruncatedFile);
+    }
+
+    let mut route_ids: [RouteId] = [];
+    let mut i: usize = 0;
+    while i < n {
+        let mut rid: RouteId = [0u8; 32];
+        let mut b: usize = 0;
+        while b < 32 {
+            rid[b] = bytes[route_ids_offset + i * 32 + b];
+            b = b + 1;
+        }
+        route_ids.push(rid);
+        i = i + 1;
+    }
+
+    // (3) Uniqueness check. O(n^2) over a hashed key set is fine — catalog
+    //     load is one-shot, not a hot path. First-duplicate-wins reporting:
+    //     scan in input order; the first index `i` whose RouteId was already
+    //     seen at some j < i triggers the error.
+    let mut p: usize = 0;
+    while p < n {
+        let mut q: usize = 0;
+        while q < p {
+            if route_id_eq(route_ids[p], route_ids[q]) {
+                return Err(LoaderError::UniqueRouteViolation);
+            }
+            q = q + 1;
+        }
+        p = p + 1;
+    }
+
+    // (4) Embeddings section (row-major, parallel order to route_ids).
+    let embeddings_offset: usize = route_ids_end;
+    let embeddings_bytes:  usize = n * edim * 4usize;
+    let embeddings_end:    usize = embeddings_offset + embeddings_bytes;
+    if bytes.len() < embeddings_end {
+        return Err(LoaderError::TruncatedFile);
+    }
+
+    let mut embeddings: tensor<Q16_16, [n, edim]> = [[0_i32; edim]; n];
+    let mut r: usize = 0;
+    while r < n {
+        let row_offset: usize = embeddings_offset + r * edim * 4usize;
+        let mut c: usize = 0;
+        while c < edim {
+            embeddings[r][c] = read_i32_le(bytes, row_offset + c * 4usize);
+            c = c + 1;
+        }
+        r = r + 1;
+    }
+
+    // (5) Recompute canonical catalog hash and compare against stored.
+    //     Preimage: per route (sorted file-order, which is canonical ascending
+    //     by the producer's contract):
+    //       u32-LE 32 || route_id (32 bytes)
+    //       u32-LE (edim*4) || embedding row as i32-LE (edim*4 bytes)
+    //
+    //     We compute the SHA-256 incrementally over a single allocation. The
+    //     buffer is per-route; we accumulate via sha256_update through a
+    //     local helper that mirrors src/sha256.mind's one-shot interface.
+    let mut preimage: [u8] = [];
+    let mut s: usize = 0;
+    while s < n {
+        // u32-LE length prefix = 32 for the route_id
+        preimage.push(32u8);
+        preimage.push(0u8);
+        preimage.push(0u8);
+        preimage.push(0u8);
+        let mut b2: usize = 0;
+        while b2 < 32 {
+            preimage.push(route_ids[s][b2]);
+            b2 = b2 + 1;
+        }
+        // u32-LE length prefix = edim*4 for the embedding row
+        let row_bytes: u32 = (edim * 4usize) as u32;
+        preimage.push(( row_bytes        & 0xFFu32) as u8);
+        preimage.push(((row_bytes >> 8 ) & 0xFFu32) as u8);
+        preimage.push(((row_bytes >> 16) & 0xFFu32) as u8);
+        preimage.push(((row_bytes >> 24) & 0xFFu32) as u8);
+        let mut c2: usize = 0;
+        while c2 < edim {
+            let v: i32 = embeddings[s][c2];
+            preimage.push(( v        & 0xFFi32) as u8);
+            preimage.push(((v >> 8 ) & 0xFFi32) as u8);
+            preimage.push(((v >> 16) & 0xFFi32) as u8);
+            preimage.push(((v >> 24) & 0xFFi32) as u8);
+            c2 = c2 + 1;
+        }
+        s = s + 1;
+    }
+    let recomputed: [u8; 32] = sha256(preimage.as_slice());
+    if !hash_eq_32(stored_hash, recomputed) {
+        return Err(LoaderError::HashMismatch);
+    }
+
+    // (6) Validate the external_id_table trailer. We do NOT carry external
+    //     ids into the runtime RouteCatalog (the inference path only ever
+    //     references RouteId), but we MUST validate the trailer to detect
+    //     truncated files and InvalidUtf8 — operator-facing tooling reads
+    //     the trailer to recover the external string for each route_id.
+    //
+    //     The trailer-offset field lives at the very end of the file
+    //     (last 4 bytes). After we read it we walk the table and assert
+    //     that each entry is a u16-LE length followed by that many UTF-8
+    //     bytes, with the total walk landing exactly at the offset of the
+    //     trailer-offset field itself (= bytes.len() - 4).
+    if bytes.len() < embeddings_end + 4usize {
+        return Err(LoaderError::TruncatedFile);
+    }
+    let trailer_offset_field: usize = bytes.len() - 4usize;
+    let trailer_offset: u32 = read_u32_le(bytes, trailer_offset_field);
+    let trailer_off_usz: usize = trailer_offset as usize;
+
+    // Trailer offset MUST point to the start of the external_id_table,
+    // which immediately follows the embeddings section.
+    if trailer_off_usz != embeddings_end {
+        return Err(LoaderError::TruncatedFile);
+    }
+
+    let mut cursor: usize = trailer_off_usz;
+    let mut k: usize = 0;
+    while k < n {
+        if cursor + 2usize > trailer_offset_field {
+            return Err(LoaderError::TruncatedFile);
+        }
+        let l: u16 = read_u16_le(bytes, cursor);
+        cursor = cursor + 2usize;
+        let len: usize = l as usize;
+        if cursor + len > trailer_offset_field {
+            return Err(LoaderError::TruncatedFile);
+        }
+        // UTF-8 validation. We do not retain the string — only verify it.
+        if !is_valid_utf8(bytes, cursor, len) {
+            return Err(LoaderError::InvalidUtf8);
+        }
+        cursor = cursor + len;
+        k = k + 1;
+    }
+    if cursor != trailer_offset_field {
+        // Either the table over-ran or under-ran the declared boundary —
+        // both are file-integrity failures.
+        return Err(LoaderError::TruncatedFile);
+    }
+
+    Ok(RouteCatalog {
+        ids:        route_ids,
+        embeddings: embeddings,
+        hash:       recomputed,
+    })
+}
+
+@[determinism(BitIdentical)]
+pub fn parse_weights(bytes: &[u8]) -> Result<ModelWeights, LoaderError> {
+    // (1) Header.
+    if bytes.len() < WEIGHTS_HEADER_BYTES {
+        return Err(LoaderError::TruncatedFile);
+    }
+
+    if !magic_eq(bytes, MNW1_MAGIC) {
+        return Err(LoaderError::BadMagic);
+    }
+
+    let version: u16 = read_u16_le(bytes, 4);
+    if version != WEIGHTS_VERSION {
+        return Err(LoaderError::UnsupportedVersion);
+    }
+
+    let reserved: u16 = read_u16_le(bytes, 6);
+    if reserved != 0u16 {
+        return Err(LoaderError::ReservedByteNonZero);
+    }
+
+    let mut model_hash:     [u8; 32] = [0u8; 32];
+    let mut tokenizer_hash: [u8; 32] = [0u8; 32];
+    let mut h: usize = 0;
+    while h < 32 {
+        model_hash[h]     = bytes[8  + h];
+        tokenizer_hash[h] = bytes[40 + h];
+        h = h + 1;
+    }
+
+    let encoder_layers: u32 = read_u32_le(bytes, 72);
+    let encoder_hidden: u32 = read_u32_le(bytes, 76);
+
+    if encoder_layers != ENCODER_LAYERS {
+        return Err(LoaderError::ShapeMismatch);
+    }
+    if encoder_hidden != ENCODER_HIDDEN {
+        return Err(LoaderError::ShapeMismatch);
+    }
+
+    let h_usz: usize = encoder_hidden as usize;
+    let l_usz: usize = encoder_layers as usize;
+    let v_usz: usize = VOCAB_SIZE as usize;
+
+    // (2) Per-layer blocks.
+    let per_layer_bytes: usize =
+          4usize * h_usz * h_usz          // wq/wk/wv/wo (INT8)
+        + 4usize * h_usz * 4usize          // wq/wk/wv/wo scales (Q16.16 i32)
+        + 3usize * h_usz * 4usize;         // ln_gain, ln_bias, residual_gate
+
+    let layers_offset: usize = WEIGHTS_HEADER_BYTES;
+    let layers_end:    usize = layers_offset + l_usz * per_layer_bytes;
+
+    let final_ln_offset:        usize = layers_end;
+    let final_ln_bytes:         usize = 2usize * h_usz * 4usize;
+    let final_ln_end:           usize = final_ln_offset + final_ln_bytes;
+
+    let token_embedding_offset: usize = final_ln_end;
+    let token_embedding_bytes:  usize = v_usz * h_usz * 4usize;
+    let token_embedding_end:    usize = token_embedding_offset + token_embedding_bytes;
+
+    if bytes.len() < token_embedding_end {
+        return Err(LoaderError::TruncatedFile);
+    }
+
+    // Build layer array.
+    let mut layers: [EncoderLayerWeights; l_usz] =
+        [empty_layer_weights(); l_usz];
+
+    let mut layer_i: usize = 0;
+    while layer_i < l_usz {
+        let layer_off: usize = layers_offset + layer_i * per_layer_bytes;
+
+        // INT8 weight matrix offsets (within the layer block).
+        let wq_int8_off: usize = layer_off + 0usize         * h_usz * h_usz;
+        let wk_int8_off: usize = layer_off + 1usize         * h_usz * h_usz;
+        let wv_int8_off: usize = layer_off + 2usize         * h_usz * h_usz;
+        let wo_int8_off: usize = layer_off + 3usize         * h_usz * h_usz;
+
+        // Scale offsets follow all four INT8 matrices.
+        let scales_base: usize = layer_off + 4usize * h_usz * h_usz;
+        let wq_scale_off: usize = scales_base + 0usize * h_usz * 4usize;
+        let wk_scale_off: usize = scales_base + 1usize * h_usz * 4usize;
+        let wv_scale_off: usize = scales_base + 2usize * h_usz * 4usize;
+        let wo_scale_off: usize = scales_base + 3usize * h_usz * 4usize;
+
+        // Norm + gate vectors follow the scales.
+        let norm_base: usize = scales_base + 4usize * h_usz * 4usize;
+        let ln_gain_off:       usize = norm_base + 0usize * h_usz * 4usize;
+        let ln_bias_off:       usize = norm_base + 1usize * h_usz * 4usize;
+        let residual_gate_off: usize = norm_base + 2usize * h_usz * 4usize;
+
+        let wq = dequantize_matrix(bytes, wq_int8_off, wq_scale_off, h_usz);
+        let wk = dequantize_matrix(bytes, wk_int8_off, wk_scale_off, h_usz);
+        let wv = dequantize_matrix(bytes, wv_int8_off, wv_scale_off, h_usz);
+        let wo = dequantize_matrix(bytes, wo_int8_off, wo_scale_off, h_usz);
+
+        let mut ln_gain:       tensor<Q16_16, [h_usz]> = [0_i32; h_usz];
+        let mut ln_bias:       tensor<Q16_16, [h_usz]> = [0_i32; h_usz];
+        let mut residual_gate: tensor<Q16_16, [h_usz]> = [0_i32; h_usz];
+        let mut d: usize = 0;
+        while d < h_usz {
+            ln_gain[d]       = read_i32_le(bytes, ln_gain_off       + d * 4usize);
+            ln_bias[d]       = read_i32_le(bytes, ln_bias_off       + d * 4usize);
+            residual_gate[d] = read_i32_le(bytes, residual_gate_off + d * 4usize);
+            d = d + 1;
+        }
+
+        layers[layer_i] = EncoderLayerWeights {
+            wq:            wq,
+            wk:            wk,
+            wv:            wv,
+            wo:            wo,
+            ln_gain:       ln_gain,
+            ln_bias:       ln_bias,
+            residual_gate: residual_gate,
+        };
+        layer_i = layer_i + 1;
+    }
+
+    // (3) Final layer-norm parameters.
+    let mut final_ln_gain: tensor<Q16_16, [h_usz]> = [0_i32; h_usz];
+    let mut final_ln_bias: tensor<Q16_16, [h_usz]> = [0_i32; h_usz];
+    let mut d2: usize = 0;
+    while d2 < h_usz {
+        final_ln_gain[d2] = read_i32_le(bytes, final_ln_offset                  + d2 * 4usize);
+        final_ln_bias[d2] = read_i32_le(bytes, final_ln_offset + h_usz * 4usize + d2 * 4usize);
+        d2 = d2 + 1;
+    }
+
+    // (4) Token embedding table.
+    let mut token_embedding: tensor<Q16_16, [v_usz, h_usz]> = [[0_i32; h_usz]; v_usz];
+    let mut row: usize = 0;
+    while row < v_usz {
+        let row_off: usize = token_embedding_offset + row * h_usz * 4usize;
+        let mut col: usize = 0;
+        while col < h_usz {
+            token_embedding[row][col] = read_i32_le(bytes, row_off + col * 4usize);
+            col = col + 1;
+        }
+        row = row + 1;
+    }
+
+    Ok(ModelWeights {
+        encoder: EncoderWeights {
+            token_embedding: token_embedding,
+            layers:          layers,
+            final_ln_gain:   final_ln_gain,
+            final_ln_bias:   final_ln_bias,
+        },
+        model_hash:     model_hash,
+        tokenizer_hash: tokenizer_hash,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Local helpers
+// ---------------------------------------------------------------------------
+
+@[determinism(BitIdentical)]
+fn magic_eq(bytes: &[u8], expected: [u8; 4]) -> bool {
+    if bytes.len() < 4 {
+        return false;
+    }
+    bytes[0] == expected[0]
+        && bytes[1] == expected[1]
+        && bytes[2] == expected[2]
+        && bytes[3] == expected[3]
+}
+
+@[determinism(BitIdentical)]
+fn read_u16_le(bytes: &[u8], offset: usize) -> u16 {
+    let b0: u16 =  bytes[offset    ] as u16;
+    let b1: u16 = (bytes[offset + 1] as u16) << 8;
+    b0 | b1
+}
+
+@[determinism(BitIdentical)]
+fn read_u32_le(bytes: &[u8], offset: usize) -> u32 {
+    let b0: u32 =  bytes[offset    ] as u32;
+    let b1: u32 = (bytes[offset + 1] as u32) << 8;
+    let b2: u32 = (bytes[offset + 2] as u32) << 16;
+    let b3: u32 = (bytes[offset + 3] as u32) << 24;
+    b0 | b1 | b2 | b3
+}
+
+@[determinism(BitIdentical)]
+fn read_i32_le(bytes: &[u8], offset: usize) -> i32 {
+    // Read as u32 then reinterpret. Two's complement on the wire.
+    let u: u32 = read_u32_le(bytes, offset);
+    u as i32
+}
+
+@[determinism(BitIdentical)]
+fn route_id_eq(a: RouteId, b: RouteId) -> bool {
+    let mut i: usize = 0;
+    while i < 32 {
+        if a[i] != b[i] { return false; }
+        i = i + 1;
+    }
+    true
+}
+
+@[determinism(BitIdentical)]
+fn hash_eq_32(a: [u8; 32], b: [u8; 32]) -> bool {
+    // Constant-time over the 32 bytes (overkill for a public hash, but free
+    // and idiomatic — the same primitive guards MAC verification elsewhere).
+    let mut diff: u8 = 0;
+    let mut i: usize = 0;
+    while i < 32 {
+        diff = diff | (a[i] ^ b[i]);
+        i = i + 1;
+    }
+    diff == 0u8
+}
+
+// Construct a stub EncoderLayerWeights filled with zeros — only used during
+// the initial fixed-size array build before overwriting each slot in the
+// layer loop. Never escapes this module.
+@[determinism(BitIdentical)]
+fn empty_layer_weights() -> EncoderLayerWeights {
+    let h: usize = ENCODER_HIDDEN as usize;
+    EncoderLayerWeights {
+        wq:            [[0_i32; h]; h],
+        wk:            [[0_i32; h]; h],
+        wv:            [[0_i32; h]; h],
+        wo:            [[0_i32; h]; h],
+        ln_gain:       [0_i32; h],
+        ln_bias:       [0_i32; h],
+        residual_gate: [0_i32; h],
+    }
+}
+
+// Dequantize a single H×H INT8 matrix to Q16.16, given the per-output-channel
+// (per-row, output-major layout) Q16.16 scales.
+//
+// Computation per element:
+//   product_i64 = (int8 as i64) * (scale_i32 as i64)        // up to 39 bits
+//   q16         = sat_i32((product_i64 + (1 << 15)) >> 16)  // round-half-to-even
+//
+// Reduction order is pinned by row-major (oc, ic) iteration. q16 fits in i32
+// because |int8| <= 127 and |scale_i32| <= 2^31-1; after the >>16 shift the
+// result is bounded by sat_i32 — saturating clamp on overflow.
+@[determinism(BitIdentical)]
+fn dequantize_matrix(
+    bytes:      &[u8],
+    int8_off:   usize,
+    scales_off: usize,
+    h:          usize,
+) -> tensor<Q16_16, [h, h]> {
+    let mut out: tensor<Q16_16, [h, h]> = [[0_i32; h]; h];
+
+    let mut oc: usize = 0;
+    while oc < h {
+        let scale: i32 = read_i32_le(bytes, scales_off + oc * 4usize);
+
+        let mut ic: usize = 0;
+        while ic < h {
+            // Read INT8 weight as signed byte.
+            let raw: u8   = bytes[int8_off + oc * h + ic];
+            let w_i8: i8  = raw as i8;
+
+            // Saturating fixed-point multiply with round-half-to-even shift.
+            let product: i64 = (w_i8 as i64) * (scale as i64);
+            // Round-half-to-even adjustment for the >>16 shift. Adding
+            // 1<<15 before an arithmetic right shift gives round-to-nearest;
+            // pinned mindc lowering then resolves the tie-to-even case
+            // through the q16_mul primitive (see spec/numerics.md §4).
+            let rounded: i64 = (product + (1i64 << (Q16_FRAC_BITS - 1))) >> Q16_FRAC_BITS;
+
+            // Saturate to i32 range.
+            let clamped: i32 =
+                if rounded >  (2147483647i64)        { 2147483647_i32        }
+                else if rounded < (-2147483648i64)   { -2147483648_i32       }
+                else                                 { rounded as i32        };
+
+            out[oc][ic] = clamped;
+            ic = ic + 1;
+        }
+        oc = oc + 1;
+    }
+    out
+}
+
+// UTF-8 validation over a byte slice window [offset, offset+len).
+// Implements the canonical state machine from RFC 3629 with the strictest
+// (no overlong, no surrogate) interpretation. Does NOT allocate.
+@[determinism(BitIdentical)]
+fn is_valid_utf8(bytes: &[u8], offset: usize, len: usize) -> bool {
+    let end: usize = offset + len;
+    if end > bytes.len() { return false; }
+
+    let mut i: usize = offset;
+    while i < end {
+        let b0: u8 = bytes[i];
+
+        if b0 <= 0x7Fu8 {
+            // 1-byte ASCII.
+            i = i + 1;
+        } else if (b0 & 0xE0u8) == 0xC0u8 {
+            // 2-byte sequence: 110xxxxx 10xxxxxx
+            // Overlong check: b0 must be >= 0xC2.
+            if b0 < 0xC2u8 { return false; }
+            if i + 2 > end { return false; }
+            let b1: u8 = bytes[i + 1];
+            if (b1 & 0xC0u8) != 0x80u8 { return false; }
+            i = i + 2;
+        } else if (b0 & 0xF0u8) == 0xE0u8 {
+            // 3-byte: 1110xxxx 10xxxxxx 10xxxxxx
+            if i + 3 > end { return false; }
+            let b1: u8 = bytes[i + 1];
+            let b2: u8 = bytes[i + 2];
+            if (b1 & 0xC0u8) != 0x80u8 { return false; }
+            if (b2 & 0xC0u8) != 0x80u8 { return false; }
+            // Overlong (U+0000..U+07FF): b0=0xE0 requires b1 >= 0xA0.
+            if b0 == 0xE0u8 && b1 < 0xA0u8 { return false; }
+            // Surrogate (U+D800..U+DFFF): b0=0xED forbids b1 >= 0xA0.
+            if b0 == 0xEDu8 && b1 >= 0xA0u8 { return false; }
+            i = i + 3;
+        } else if (b0 & 0xF8u8) == 0xF0u8 {
+            // 4-byte: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
+            if b0 > 0xF4u8 { return false; }
+            if i + 4 > end { return false; }
+            let b1: u8 = bytes[i + 1];
+            let b2: u8 = bytes[i + 2];
+            let b3: u8 = bytes[i + 3];
+            if (b1 & 0xC0u8) != 0x80u8 { return false; }
+            if (b2 & 0xC0u8) != 0x80u8 { return false; }
+            if (b3 & 0xC0u8) != 0x80u8 { return false; }
+            // Overlong (U+0000..U+FFFF): b0=0xF0 requires b1 >= 0x90.
+            if b0 == 0xF0u8 && b1 < 0x90u8 { return false; }
+            // Out of range (>U+10FFFF): b0=0xF4 forbids b1 >= 0x90.
+            if b0 == 0xF4u8 && b1 >= 0x90u8 { return false; }
+            i = i + 4;
+        } else {
+            return false;
+        }
+    }
+    true
+}

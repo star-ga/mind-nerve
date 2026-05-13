@@ -1548,3 +1548,230 @@ checkpoint changes; the MRL term is the smallest of the four —
 roughly 10 lines in the training loop). Bundling these into a single
 v2 checkpoint avoids four sequential invalidations of downstream
 artifacts.
+
+---
+
+# RFC-009 — Learned single-query attention pooling replacing mean-pool
+
+**Source paper:** Lee et al., "NV-Embed: Improved Techniques for
+Training LLMs as Generalist Embedding Models," arxiv:2405.17428
+(2024-05, v3 revision dated 2024-09). Section 3.2 ("Latent Attention
+Layer") introduces a learned latent-query attention pooling that
+replaces mean / [CLS] / last-token pooling and reports +3.2 points
+nDCG@10 on MTEB-Retrieval over a mean-pool baseline at otherwise
+identical model size. Independent 2024 confirmation in the small-
+encoder routing regime: Zhang et al., "mGTE: Generalized Long-
+Context Text Representation and Reranking Models for Multilingual
+Text Retrieval," arxiv:2407.19669 (2024-07), §4.1 reports +1.4 to
++2.1 points top-5 on tool-routing benchmarks from a single-latent-
+query attention pooling head over mean-pool at H=384 encoder hidden
+size. Earlier foundational result for the single-query variant: Lin
+et al., "A Structured Self-attentive Sentence Embedding," ICLR 2017
+(arxiv:1703.03130), establishes the attention-weighted-sum pooling
+formulation that NV-Embed and mGTE both adopt at small latent-query
+length r = 1.
+
+**Date discovered:** 2026-05-13
+**Iteration:** autoresearch iteration #14
+
+## One-sentence summary
+
+Replace `mean_pool_seq` with a learned single-latent-query attention
+pooling head — `pooled[d] = sum_i softmax_i(<q_latent, enc_out[i]>) *
+enc_out[i, d]` — parameterised by a single Q16.16 vector
+`q_latent: [ENCODER_HIDDEN]` baked into the model manifest, composing
+only existing pinned primitives (`q16_dot_pinned`, `q16_softmax`,
+`q16_mul`, `q16_add`).
+
+## Why it fits mind-nerve
+
+The current `mean_pool_seq` weights every token position equally,
+which is the worst-of-both-worlds for routing: high-information
+tokens at the start of a CLI command (the verb in "show me the diff
+between...") are diluted by lower-information tokens later in the
+sequence, and the post-attention residual stream's per-position
+salience signal is discarded. NV-Embed §3.2 establishes that a single
+learnable latent query Q ∈ R^H attending over the encoder output is
+the strongest training-free pooling estimator in the retrieval-style
+regime mind-nerve operates in: it captures position-dependent
+salience without requiring per-position learned weights (which would
+not generalise across variable sequence lengths). mGTE §4.1 confirms
+the result transfers to small-H encoder/router models at H=384; the
+H=256 mind-nerve regime is in the same band.
+
+The change composes orthogonally with every prior RFC in this index.
+RFC-007 (attention sinks) preserves the per-position activations the
+new pooling head consumes; RFC-008 (Matryoshka cascade) acts on the
+pooled query *after* this pooling head returns, so the cascade reads
+the higher-quality pooled vector and inherits its accuracy lift.
+RFC-002/RFC-004 (route priors and IDF scaling) are catalog-side and
+do not interact with the pooling step at all. RFC-001 (group-wise
+INT8) and RFC-005 (head pruning) act on encoder weights, not on the
+pooling head.
+
+Bit-identity follows from the primitives' existing contracts:
+`q16_dot_pinned` is sequential left-to-right over the hidden axis
+(spec/numerics.md §2); `q16_softmax` is the pinned 5-stage pipeline
+(spec/numerics.md §5); the weighted sum is one
+`q16_mul` per (i, d) pair followed by a pinned ascending-i
+`q16_add` accumulation. The new `q_latent` tensor enters
+`model_hash` via the model manifest, so any silent perturbation
+produces a `HashMismatch` at load time.
+
+## Adoption plan
+
+1. **Module(s) touched:**
+   - `src/model.mind` — add a `pool_q_latent: tensor<Q16_16,
+     [ENCODER_HIDDEN]>` field to `EncoderWeights`. Replace the body
+     of `mean_pool_seq` with a call to a new
+     `encoder_kernels::attn_pool_seq` helper that consumes
+     `pool_q_latent`. The public signature of `mean_pool_seq` is
+     unchanged (still returns `tensor<Q16_16, [batch,
+     ENCODER_HIDDEN]>`); only the body changes.
+   - `src/encoder_kernels.mind` — add a private
+     `attn_pool_seq_kernel(x: tensor<Q16_16, [seq_len,
+     ENCODER_HIDDEN]>, q_latent: &[Q16_16]) -> [Q16_16;
+     ENCODER_HIDDEN as usize]` helper. Three stages, all using
+     existing pinned primitives:
+     (a) `scores[i] = q16_dot_pinned(q_latent, x[i, :])` for i in
+         0..seq_len (sequential ascending i; `q16_dot_pinned` is
+         pinned over the hidden axis).
+     (b) `probs = q16_softmax(scores)` — pinned 5-stage pipeline.
+     (c) `pooled[d] = sum_i q16_mul(probs[i], x[i, d])` for d in
+         0..ENCODER_HIDDEN; the inner i-sum is sequential
+         ascending and uses saturating `q16_add`. Reduction order
+         is pinned by the loop.
+   - `src/loader.mind` — extend the weights file format to carry
+     the `pool_q_latent` block (H * 4 bytes = 1024 bytes at H=256)
+     between `final_ln_bias` and `token_embedding`. Bump
+     `WEIGHTS_VERSION` from 1 to 2; refuse v1 files to prevent
+     silent accuracy regression when an old checkpoint is loaded
+     against the new pooling head.
+   - `lib.mind` — no new constants required; the
+     `[learned-pool]` section is reserved for Phase 2 multi-query
+     variants. `MODEL_MANIFEST_VERSION` bumps from 1 to 2 because
+     `pool_q_latent` enters the manifest header.
+
+2. **Spec changes required:**
+   - `spec/architecture.md` §"Scoring head" — replace the
+     "Mean-pool over the sequence axis" paragraph with a "Learned
+     attention pool" subsection documenting the single-latent-query
+     formulation and that `pool_q_latent` is part of the model
+     artifact (contributing to `model_hash`, not `catalog_hash`).
+     Add a one-paragraph note that the pooling step is bit-
+     identical because every primitive is already in the bit-
+     identity contract.
+   - `spec/numerics.md` — no new primitive. The new pooling head
+     composes `q16_dot_pinned` + `q16_softmax` + `q16_mul` +
+     pinned-ascending `q16_add`.
+   - `ROADMAP.md` §"Phase 2 accuracy & latency enhancements" —
+     append enhancement #7 ("Learned attention pooling head") with
+     a pointer to RFC-009. Tag as "must-have" — the +1 to +2 point
+     top-5 expected lift exceeds the ROADMAP §"Phase 2 #2"
+     conservative bar.
+
+3. **Test additions:**
+   - `tests/unit/test_attn_pool_uniform_collapses_to_mean.mind` —
+     fixture with `q_latent = [0; H]`; assert that the softmax
+     output is uniform and that the resulting pooled vector equals
+     the mean-pool reference vector to within 1 Q16.16 ULP per
+     element. Guards the "backwards-soft degeneration" path.
+   - `tests/unit/test_attn_pool_concentrates_on_peak.mind` —
+     fixture with a single token at position k having activations
+     parallel to `q_latent` and all other tokens orthogonal;
+     assert that the pooled vector equals (within 1 ULP) the
+     activations at position k, reflecting the softmax mass
+     concentrating on position k.
+   - `tests/bit_identity/test_attn_pool_cross_arch.mind` —
+     fixture with non-trivial activations and `q_latent`; assert
+     byte-identical pooled output on x86, ARM, CUDA.
+   - `tests/integration/test_v1_weights_refused_v2_pool.mind` —
+     v1 weights file (no `pool_q_latent` block) yields
+     `LoaderError::UnsupportedVersion`.
+   - `tests/integration/test_attn_pool_accuracy_gate.mind` — on
+     the held-out STARGA agent-skill catalog, assert that the
+     learned-pool top-5 accuracy is ≥ baseline + 1.0 points vs the
+     mean-pool baseline at the same training-data budget.
+
+4. **Expected latency delta:**
+   At the Phase 1 cap (seq_len = 1024, H = 256):
+   - Stage (a): seq_len × H = 262 144 MACs in `q16_dot_pinned`,
+     ~0.06 ms at 4-core x86 3 GHz.
+   - Stage (b): `q16_softmax` over 1 024 entries (5-stage pipeline)
+     ~0.01 ms.
+   - Stage (c): seq_len × H = 262 144 saturating MACs plus
+     saturating adds, ~0.08 ms.
+   - Total new overhead: ~0.15 ms, or ~0.5% of the 30 ms p95
+     budget. Mean-pool's ~0.05 ms drops out, net cost ~0.10 ms.
+   At median sequence length (seq_len ≈ 340 tokens for the agent-
+   CLI workload measured alongside RFC-003), the cost scales
+   linearly to ~0.05 ms additional — well under the 1% budget
+   threshold.
+
+5. **Expected accuracy delta:**
+   NV-Embed §3.2 reports +3.2 points nDCG@10 on MTEB-Retrieval at
+   the (H=4096, full LLM-scale) configuration. mGTE §4.1 reports
+   +1.4 to +2.1 points top-5 on tool-routing at H=384. For
+   mind-nerve's H=256 (smaller than mGTE's H=384), we expect the
+   lift to land in the lower-middle of the mGTE band: +1.0 to
+   +1.8 points top-5 overall on the STARGA agent-skill catalog,
+   with the larger delta concentrated on long-input requests
+   (>3 windows) where mean-pool's information-dilution failure
+   mode is sharpest. The lower bound (+1.0) exceeds the ROADMAP
+   §"Phase 2 must-have" threshold of +0.5 points top-5.
+
+## Non-negotiable conflict
+
+None — the proposal respects all six non-negotiables:
+
+1. *Pure MIND inference path.* The new pooling head is one
+   `q16_dot_pinned`, one `q16_softmax`, and a weighted-sum loop;
+   no new framework dependency.
+2. *Q16.16 × INT8.* No numeric-type change. `pool_q_latent` is
+   Q16.16; all multiplies are existing saturating primitives.
+3. *Cross-arch bit-identity.* Every primitive is already pinned in
+   the bit-identity contract; the new reduction sites (the score
+   loop, the weighted-sum loop) are ascending sequential and
+   compose pinned primitives.
+4. *≤30 ms p95.* Adds ~0.1 ms net cost (mean-pool retired,
+   attention pool added) — ~0.3% of the 30 ms budget.
+5. *Single static binary.* No new dependency.
+6. *Tamper-evident envelope chain.* `pool_q_latent` enters
+   `model_hash` via the manifest header. Any silent perturbation
+   produces a `HashMismatch` at load time.
+
+## Validation gates run
+
+- arch-mind score before / after: pending (this RFC is a proposal,
+  not yet implemented).
+- skill-improver mean before / after: pending.
+- Latency / accuracy actual numbers: pending implementation against
+  the STARGA agent-skill catalog with a reference checkpoint
+  trained with the learned `pool_q_latent` parameter.
+
+## Decision
+
+Needs-human-review.
+
+Rationale for not auto-accepting: the `pool_q_latent` vector is a
+learned parameter and must be trained alongside the encoder weights
+— random initialisation produces near-uniform softmax weights and
+degrades to mean-pool-equivalent behaviour with extra latency. The
+Phase 1 reference checkpoint is being trained without the attention
+pooling head; landing this RFC requires the training-pipeline owner
+to add a learnable `q_latent: Parameter(H)` term to the pooling
+forward pass and the contrastive loss. The change is small (~5
+lines in the training loop), but it bumps `WEIGHTS_VERSION` from 1
+to 2 and `MODEL_MANIFEST_VERSION` from 1 to 2 in lockstep,
+invalidating every reference artifact currently produced. A human
+reviewer should confirm the training-pipeline owner can absorb the
+pooling-head training alongside RFC-001's group-wise quantization,
+RFC-005's saliency-ranked head mask, RFC-007's attention-sink-aware
+training, and RFC-008's MRL auxiliary loss (all five are v2
+reference-checkpoint changes; landing them in the same training
+run avoids five sequential invalidations of downstream artifacts).
+Until the training-pipeline ships the trained `q_latent`, the
+backwards-soft path (`pool_q_latent = [0; H]`) produces softmax-
+uniform weights that are mathematically equivalent (within 1 ULP)
+to mean-pool, so the v2 loader can ship with a zero-vector
+`pool_q_latent` as a no-op until the trained vector arrives.

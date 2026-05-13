@@ -9,7 +9,10 @@ this spec. Discrepancies are bugs against this document, not against the code.
 preselect : (Request, RouteCatalog, K) -> [RouteId; K]
 ```
 
-- `Request` is a UTF-8 byte sequence, length ≤ 4096 tokens after BPE encoding.
+- `Request` is a UTF-8 byte sequence, length ≤ 1024 tokens after BPE encoding.
+  Requests longer than 1024 tokens are rejected at the wire handshake with
+  `RequestTooLong`. 1024 covers ≥99% of realistic agent-CLI request lengths;
+  longer requests should be split or summarised by the caller.
 - `RouteCatalog` is a static set of `RouteId`s with associated route
   descriptors (skill descriptions, tool docstrings, agent capability prose).
   The catalog is hashed at load time; classification is conditioned on the
@@ -20,38 +23,70 @@ preselect : (Request, RouteCatalog, K) -> [RouteId; K]
 
 ## Model shape
 
-Encoder + direct scoring head. No decoder. Total parameter budget ≤ 50M
-(encoder ~22M weights + route embedding table sized by `|RouteCatalog|` ×
-hidden).
+Encoder + direct scoring head. No decoder. Total parameter budget ≤ 4M
+(encoder ~0.8M INT8 weights + route embedding table sized by
+`|RouteCatalog|` × hidden — at 4400 routes that is ~1.1M Q16.16 values).
 
-The deliberate omission of a decoder is the dominant architectural decision.
-A decoder that cross-attends to a fixed route table has the same expressive
-power as a single matmul between a pooled query vector and the route
-embedding table, at a fraction of the FLOPs. The decoder was budget for a
-problem we do not actually have: there are no autoregressive steps; output is
-a fixed-cardinality top-K, not a token sequence.
+The architecture has been through two reductions to fit a strict CPU latency
+budget on 4-core x86:
+
+1. **Drop the decoder.** A decoder cross-attending to a fixed route table
+   has the same expressive power as a single matmul between a pooled query
+   vector and the route embedding table, at a fraction of the FLOPs.
+2. **Shrink the encoder.** Fleet-consensus latency analysis showed 12-layer
+   sliding-window encoders at hidden=384 cannot fit 30 ms p95 on commodity
+   4-core x86 even with all SIMD optimizations applied. The encoder is
+   reduced to 2 layers at hidden=256, paired with INT8 weight quantization
+   and a window K/V overlap cache. This brings analytical worst-case
+   latency at the 1024-token cap to ~16 ms, leaving half the budget for
+   tokenization, scoring, top-K, and envelope SHA-256.
 
 ### Encoder
 
-- 12 layers
-- Hidden dimension 384
-- 6 attention heads (head dim 64)
+- 2 layers
+- Hidden dimension 256
+- 4 attention heads (head dim 64)
 - **Sliding-window self-attention.** Window 256 tokens, stride 192 (overlap
-  64). At the worst-case 4096-token request this is 22 windows × 256² scores
-  instead of 4096² scores — a 16× FLOP reduction with no measurable loss on
+  64). At the worst-case 1024-token request this is 5 windows × 256² scores
+  instead of 1024² scores — a 4× FLOP reduction with no measurable loss on
   intent classification, because route relevance is dominated by local
-  phrase semantics, not long-range syntactic structure.
-- **No feed-forward sublayer** — attention + gated residual only. This is the
-  primary parameter saving vs a standard Transformer encoder of equivalent
-  depth.
+  phrase semantics.
+- **K/V overlap cache.** The 64-token overlap between adjacent windows
+  re-uses K and V projections rather than recomputing them. Reduces
+  per-layer KV-projection MACs by ~25%.
+- **Fused QKV+O projection kernel.** Q, K, V projections are emitted as a
+  single (3 × hidden² × seq) matmul rather than three separate matmuls,
+  amortising load/store overhead. Output projection is fused into the same
+  kernel sequence to keep activations in cache. mindc lowering enforces the
+  fusion; reduction order is pinned.
+- **No feed-forward sublayer** — attention + gated residual only.
 - Pre-norm; gated residual replaces standard residual to compensate for the
   missing FFN's representational role.
 - Window overlap-add: token positions inside the overlap region receive
-  contributions from both adjacent windows. Reduction is sum, not mean —
+  contributions from both adjacent windows. Reduction is sum (not mean) —
   pinning the reduction order is the compiler's responsibility, not a
   runtime decision (see [`numerics.md`](numerics.md)).
 - Vocabulary: 32k BPE, multilingual base (English + Russian targeted; CJK and
   others handled by base BPE coverage but not benchmarked in Phase 1).
+
+### Weight storage discipline
+
+The inference path is **Q16.16 activations × INT8 weights**:
+
+- Weights are stored as `i8` per-output-channel-quantized integers.
+- A per-output-channel `i32` scale tensor (Q16.16) multiplies the integer
+  product to recover Q16.16 activations.
+- MAC primitive: `((act_i32 as i64) * (weight_i8 as i64)) * scale_i32`
+  accumulated in `i64`, shifted `>> 16`, saturated to `i32`. The rounding
+  mode is round-to-nearest-even, pinned by mindc into a single scalar
+  primitive that emits identical bytes on every backend.
+- This relaxes the "pure Q16.16 everywhere" framing to "Q16.16 in flight,
+  INT8 on disk and on the multiplier weight side." Cross-arch bit-identity
+  is preserved because the saturated-MAC primitive is the same bytes on
+  every architecture.
+- Per-channel scales contribute to the weight manifest hash, which
+  contributes to `model_hash`. Tampering with a scale tensor breaks the
+  attestation chain on first inference.
 
 ### Query pooling
 
@@ -77,51 +112,59 @@ trivially pinned order.
 
 ## Numerical strategy
 
-All weights stored as Q16.16. All activations in the inference path computed
-in Q16.16. Softmax, layer norm, attention, mean pool, and the scoring matmul
-are reduction-order pinned by the compile-time topology — no runtime
+Activations in the inference path are Q16.16 throughout. Weights are INT8
+(per-output-channel) with Q16.16 scale tensors; see "Weight storage
+discipline" above. Softmax, layer norm, attention, mean pool, and the scoring
+matmul are reduction-order pinned by the compile-time topology — no runtime
 non-determinism. See [`numerics.md`](numerics.md) for the per-op reduction
 table and the five mindc lint codes (`E_NERVE_001..005`) that enforce it.
 
 Quantization-aware training is required; post-training quantization is
 explicitly out of scope. Reference weights ship with quantization noise ≤
-0.02 in top-5 accuracy vs the FP32 reference checkpoint used during training.
+0.02 in top-5 accuracy vs the FP32 reference checkpoint used during training,
+measured at INT8-weights / Q16.16-activations.
 
-The Phase 1 training pipeline may run in FP32, but the Q16.16 inference
+The Phase 1 training pipeline may run in FP32, but the INT8/Q16.16 inference
 checkpoint is the canonical artifact. The FP32 reference checkpoint is
 diagnostic only and is never distributed.
 
 ## Latency budget
 
-Target: p95 ≤ 30 ms end-to-end on 4-core x86 CPU at single-batch, 4096-token
-request. MIND-compiled SIMD codegen — no interpreter, no Python loop
-overhead, no BLAS dependency. Q16.16 i32×i32→i64 multiply-accumulate maps to
-AVX2 (x86) and NEON (ARM) intrinsics generated by mind-runtime's lowering
-passes.
+Target: p95 ≤ 30 ms end-to-end on 4-core x86 CPU at single-batch, 1024-token
+worst-case request. MIND-compiled SIMD codegen — no interpreter, no Python
+loop overhead, no BLAS dependency. INT8×i32 → i64 multiply-accumulate maps
+to AVX2 VPDPBUSD (x86) and NEON SDOT (ARM) intrinsics generated by
+mind-runtime's lowering passes.
 
-Decomposition:
+Decomposition (worst-case 1024-token request):
 
 | Stage | Budget |
 |---|---|
 | Tokenize (32k BPE, byte fallback) | 2 ms |
-| Encoder forward (12L sliding-window) | 17 ms |
+| Encoder forward (2L sliding-window, INT8 weights, K/V cache) | 12 ms |
 | Mean pool + direct scoring (4400-route catalog) | 5 ms |
 | Top-K extraction | 1 ms |
-| Attestation envelope (SHA-256 over preimage) | 5 ms |
+| Attestation envelope (SHA-256 over 212-byte preimage) | 5 ms |
+| Slack | 5 ms |
 | **Total** | **30 ms** |
 
-Encoder budget reflects 22 windows × 12 layers × (Q,K,V,O projections + per-
-window attention) at hidden=384, head_dim=64. The matmul-dominated scoring
-step is the cheapest stage because no decoder layers stand between the
-encoder output and the route table.
+Encoder budget reflects 5 windows × 2 layers × (fused QKV+O projection +
+per-window attention) at hidden=256, head_dim=64, with K/V overlap cache
+amortising the 64-token overlap region. The matmul-dominated scoring step
+is the next biggest stage because the 4400-route table is 4× larger than
+the per-layer projection matrices.
 
 Phase 1 may exceed budget on architectures other than x86-CPU; Phase 2 must
 meet budget on ARM as well. CUDA and WebGPU are not budgeted on latency in
 Phase 1 (throughput-mode, batch ≥ 32).
 
-Typical-case is much cheaper. A 512-token request runs 3 windows × 12 layers,
-roughly 1/7 the encoder cost. The 30 ms budget is the worst case; p50 on
-typical agent requests lands in the 5–10 ms range.
+Typical-case is much cheaper. A 256-token request runs 1 window × 2 layers,
+roughly 1/5 the encoder cost. The 30 ms budget is the worst case at the
+1024-token cap; p50 on typical agent requests lands in the 5–8 ms range.
+
+Requests longer than 1024 tokens are rejected at the wire handshake. The cap
+is not negotiable at runtime; clients that need longer-context routing
+should split or summarise upstream.
 
 ## Catalog hashing
 

@@ -31,22 +31,49 @@ module mind_nerve {
 
     // Compile-time parameters. Changing any of these is a model-architecture
     // change and requires a new model_hash.
-    pub const ENCODER_LAYERS:        u32 = 12;
-    pub const ENCODER_HIDDEN:        u32 = 384;
-    pub const ENCODER_HEADS:         u32 = 6;
+    //
+    // Architecture v3 (post-pivot + fleet-consensus optimization, 2026-05-13):
+    //   - 2 layers (down from 12) — 12L is 7× over the 30 ms p95 budget on
+    //     commodity 4-core x86 CPU even with all SIMD optimizations; 2L
+    //     fits the budget after INT8 weight quantization + K/V overlap cache.
+    //   - hidden = 256 (down from 384) — reduces per-layer MACs by 56%.
+    //     4 heads × 64 head_dim preserves head capacity.
+    pub const ENCODER_LAYERS:        u32 = 2;
+    pub const ENCODER_HIDDEN:        u32 = 256;
+    pub const ENCODER_HEADS:         u32 = 4;
     pub const ENCODER_HEAD_DIM:      u32 = 64;   // ENCODER_HIDDEN / ENCODER_HEADS
 
     // Sliding-window self-attention parameters. Window 256 / stride 192
-    // yields 64-token overlap, ~22 windows at MAX_REQUEST_TOKENS.
+    // yields 64-token overlap; at MAX_REQUEST_TOKENS = 1024 this is 5
+    // windows worst case.
     pub const ATTN_WINDOW_SIZE:      u32 = 256;
     pub const ATTN_WINDOW_STRIDE:    u32 = 192;
     pub const ATTN_WINDOW_OVERLAP:   u32 = 64;   // WINDOW_SIZE - WINDOW_STRIDE
 
     pub const VOCAB_SIZE:            u32 = 32768;
-    pub const MAX_REQUEST_TOKENS:    u32 = 4096;
-    pub const ROUTE_EMBEDDING_DIM:   u32 = 384;  // tied to ENCODER_HIDDEN
+    // Hard wire-level input cap. 1024 BPE tokens covers ≥99% of realistic
+    // agent-CLI requests; requests exceeding the cap are rejected at the
+    // wire handshake with `RequestTooLong`. The cap is part of the
+    // model_hash discipline — changing it is a versioned architecture
+    // change, not a configuration tweak.
+    pub const MAX_REQUEST_TOKENS:    u32 = 1024;
+    pub const ROUTE_EMBEDDING_DIM:   u32 = 256;  // tied to ENCODER_HIDDEN
     pub const DEFAULT_TOP_K:         u32 = 5;
     pub const MAX_TOP_K:             u32 = 64;
+
+    // Weight storage discipline. Inference path uses INT8 weights with
+    // Q16.16 activations:
+    //   - WEIGHT_BITS = 8 (signed per-output-channel quantization)
+    //   - ACTIVATION_BITS = 32 (Q16.16 i32, unchanged)
+    //   - MAC: (act_i32 * weight_i8 cast i32) accumulated in i64, scaled
+    //     by per-channel Q16.16 scale, >>16 shift, saturated to i32.
+    //   - The per-output-channel scale tensor is itself Q16.16 and is part
+    //     of the EncoderLayerWeights manifest hashed into model_hash.
+    //   - Rounding mode is round-to-nearest-even, pinned by mindc lowering
+    //     into a single scalar saturated-mac primitive that emits identical
+    //     bytes on every backend. Cross-arch bit-identity is preserved.
+    pub const WEIGHT_BITS:           u8  = 8;
+    pub const ACTIVATION_BITS:       u8  = 32;
 
     // Attestation envelope: v2 layout, 212 bytes packed.
     // The authoritative byte-level contract is tests/unit/test_evidence.mind

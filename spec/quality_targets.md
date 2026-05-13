@@ -42,8 +42,8 @@ English.
 
 | Backend | p50 | p95 | p99 |
 |---|---|---|---|
-| x86 CPU (4-core, 4096 tok) | ≤ 18 ms | ≤ 30 ms | ≤ 45 ms |
-| ARM CPU (Apple silicon M-series, 4096 tok) | ≤ 14 ms | ≤ 24 ms | ≤ 36 ms |
+| x86 CPU (4-core, 1024 tok) | ≤ 18 ms | ≤ 30 ms | ≤ 45 ms |
+| ARM CPU (Apple silicon M-series, 1024 tok) | ≤ 14 ms | ≤ 24 ms | ≤ 36 ms |
 | CUDA (any, batch 32) | ≤ 4 ms/req | ≤ 7 ms/req | ≤ 12 ms/req |
 | WebGPU (Chrome desktop, single request) | ≤ 22 ms | ≤ 38 ms | ≤ 60 ms |
 

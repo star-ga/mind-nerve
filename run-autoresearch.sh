@@ -22,7 +22,9 @@
 set -e
 
 CLI="${1:-claude}"
-TAG="$(date +%b%d | tr A-Z a-z)$(printf %s "$CLI" | head -c1)"
+# Default tag = mmmDDc where c is first letter of CLI. Override with
+# TAG=... when multiple workers share a first letter (e.g. claude + codex).
+TAG="${TAG:-$(date +%b%d | tr A-Z a-z)$(printf %s "$CLI" | head -c1)}"
 
 # Sanity: chosen CLI is in the supported set.
 case "$CLI" in

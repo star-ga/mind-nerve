@@ -4573,6 +4573,23 @@ because the resulting embeddings are byte-compatible with the
 existing mind-nerve inference path (only the byte values inside the
 embedding rows change, and `catalog_hash` updates correspondingly).
 
+**Status:** SKIPPED — Training/catalog-builder-side only. The RFC's
+own "Adoption plan" lists `src/loader.mind`, `src/inference.mind`,
+`src/model.mind`, and `Mind.toml` all explicitly as "no change"; the
+entire LLM-generation + cross-encoder-filter + concatenation pipeline
+lives in the catalog-builder repo (ROADMAP §"Phase 1 deferred item
+#3"), and the augmented route description is absorbed offline into
+the pre-computed Q16.16 route embedding bytes that the existing
+`parse_catalog` already consumes via the unchanged per-row preimage.
+The `catalog_hash` discipline already binds the resulting bytes, so
+any tampering downstream produces a `HashMismatch` regardless of how
+the upstream text was augmented. The `training_recipe.toml` artifact
+documenting the generation LLM, `N_QUERIES_PER_ROUTE`, `T_FILTER`,
+and separator string is human-auditability metadata, not a hash
+binding. Belongs in the catalog-builder repo alongside RFC-004,
+RFC-015, RFC-016, RFC-018, RFC-019, and the rest of the
+training/catalog-builder cohort.
+
 ---
 
 # RFC-018 — AnglE loss for cosine-optimal contrastive training of catalog-builder reference checkpoint
@@ -4949,6 +4966,23 @@ catalog-builder team can adopt it incrementally without coordination
 because the resulting weights are byte-compatible with the existing
 mind-nerve inference path (only the byte values inside the weights
 file change, and `model_hash` updates correspondingly).
+
+**Status:** SKIPPED — Training/catalog-builder-side only. The RFC's
+own "Adoption plan" lists `src/loader.mind`, `src/inference.mind`,
+`src/model.mind`, and `Mind.toml` all explicitly as "no change"; the
+complex-projection + angular-loss + combined-loss composition lives
+entirely in the offline training pipeline's PyTorch graph (FP32
+complex arithmetic via `torch.complex` / `torch.angle`), is lost at
+training-time after the loss is computed, and never appears in the
+serialized Q16.16 weights file that mind-nerve's pinned-primitive
+inference path consumes. The trained bytes enter `model_hash` via
+the existing manifest discipline regardless of which loss function
+produced them, so bit-identity is preserved trivially. The
+`training_recipe.toml` artifact documenting `λ_angular`, `τ`, and
+the complex-projection decomposition direction is human-auditability
+metadata, not a hash binding. Belongs in the catalog-builder repo
+alongside RFC-004, RFC-015, RFC-016, RFC-017, RFC-019, and the rest
+of the training/catalog-builder cohort.
 
 ---
 
@@ -5342,6 +5376,24 @@ incrementally without coordination because the resulting weights
 are byte-compatible with the existing mind-nerve inference path
 (only the byte values inside the weights file change, and
 `model_hash` updates correspondingly).
+
+**Status:** SKIPPED — Training/catalog-builder-side only. The RFC's
+own "Adoption plan" lists `src/loader.mind`, `src/inference.mind`,
+`src/model.mind`, and `Mind.toml` all explicitly as "no change"; the
+base-model embedding pass, k-means clustering (scikit-learn
+`MiniBatchKMeans` in FP32 / FP16), and cluster-aware batch sampler
+live entirely in the offline training pipeline. The k-means
+centroids and cluster assignments are ephemeral training-time
+artifacts that never appear in the serialized Q16.16 weights file
+that mind-nerve's pinned-primitive inference path consumes. The
+trained bytes enter `model_hash` via the existing manifest
+discipline regardless of which batch-composition discipline produced
+them, so bit-identity is preserved trivially. The
+`training_recipe.toml` artifact documenting `N_CLUSTERS`, base-model
+identity, and k-means random_state is human-auditability metadata,
+not a hash binding. Belongs in the catalog-builder repo alongside
+RFC-004, RFC-015, RFC-016, RFC-017, RFC-018, and the rest of the
+training/catalog-builder cohort.
 
 ---
 

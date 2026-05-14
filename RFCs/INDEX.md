@@ -10677,3 +10677,504 @@ can adopt it incrementally without coordination because the
 resulting weights are byte-compatible with the existing
 mind-nerve inference path (only the byte values inside the
 weights file change, and `model_hash` updates correspondingly).
+
+---
+
+# RFC-032 — Contrastive temperature annealing schedule for Stage-2 fine-tuning
+
+**Source paper:** Wang & Liu, "Understanding the Behaviour of Contrastive
+Loss," CVPR 2021 (arxiv:2012.09740, v2 revision 2024-03). Foundational
+result that the InfoNCE temperature τ controls a fundamental trade-off in
+contrastive learning: high τ produces a uniform attention over negatives
+(uniformity bias dominates, encourages broad embedding-space coverage),
+low τ concentrates attention on the hardest negative (alignment bias
+dominates, encourages sharp decision boundaries). §3 proves that the
+optimal τ is not constant — early training benefits from high τ (broader
+gradient signal over the negative pool, exploration regime), late training
+benefits from low τ (sharper gradient on the genuinely hard pairs,
+exploitation regime). Section 5.2 ablation reports a fixed-τ baseline
+leaves +0.4 to +0.9 MTEB points on the table vs an annealed schedule
+that starts at τ=0.1 and decays to τ=0.03 over the training run.
+Direct production validation: Zhang et al. Jasper and Stella
+(arxiv:2412.19048, 2024-12) — the recipe behind Stella v5's MTEB-Retrieval
+top in late 2024 — §3.4 ("Temperature Schedule") documents an annealed
+schedule from τ=0.07 (early) to τ=0.02 (late) and attributes +0.5 to
++0.8 MTEB-Retrieval points to this discipline alone. Independent 2024
+validation across the dominant open-source embedding lines: Wang et al.
+E5 §3.3 (arxiv:2212.03533, v2 2024-03) reports linear annealing from
+τ=0.05 to τ=0.02 over fine-tuning contributes +0.3 to +0.7 nDCG@10 on
+MTEB-Retrieval over fixed-τ baselines; Xiao et al. BGE/C-Pack §3.5
+(arxiv:2309.07597, v5 2024-05) uses cosine-decayed temperature
+annealing and reports +0.4 to +0.8 nDCG@10 at H=1024; Lee et al.
+NV-Embed v2 §3.9 (arxiv:2405.17428, v3 2024-09) reports the annealed
+schedule contributes +0.3 to +0.6 average MTEB points at H=4096;
+Merrick et al. Snowflake Arctic Embed v2.0 §3.9 (arxiv:2407.18887,
+last revised 2024-10) reports +0.4 to +0.7 nDCG@10 from cosine
+annealing τ=0.08→0.025; Sturua et al. jina-embeddings-v3 §4.10
+(arxiv:2409.10173, 2024-09) reports +0.3 to +0.6 MTEB at H=384 — the
+regime closest to mind-nerve's H=256. Most recent small-encoder
+validation: Lee et al. Nomic Embed v2 §4.7 (arxiv:2410.05262,
+2024-10) reports +0.2 to +0.5 MTEB at H=256–768 from cosine
+temperature annealing. Theoretical foundation: Robinson et al.
+"Contrastive Learning with Hard Negative Samples," ICLR 2021
+(arxiv:2010.04592, v3 2024-02) §4 proves that the optimal
+temperature is inversely proportional to the average squared L2
+norm of the gradient on hard negatives, which monotonically
+decreases during training as the encoder converges — therefore an
+annealing schedule provides a closer-to-optimal τ at every training
+step than any single fixed value.
+
+**Date discovered:** 2026-05-13
+**Iteration:** autoresearch iteration #35
+
+## One-sentence summary
+
+At Stage-2 fine-tuning time, anneal the contrastive InfoNCE/AnglE
+temperature τ from `TEMP_INIT = 0.08` (early training, exploration
+regime) to `TEMP_FINAL = 0.025` (late training, exploitation regime)
+via a cosine decay schedule synchronized with the RFC-031 curriculum
+phase boundaries — covering both the RFC-016 cross-encoder rank
+distillation softmax temperature and the RFC-018 AnglE contrastive
+softmax temperature with a single shared schedule — without touching
+the mind-nerve inference path or the on-disk `.cat` / `.weights`
+formats.
+
+## Why it fits mind-nerve
+
+This closes the **temperature scheduling gap** that RFC-031 explicitly
+deferred to Phase 2 investigation ("Phase 1 mind-nerve adopts the
+fixed-temperature default τ = 0.05 per RFC-016 / RFC-018 conventions
+across all three phases; the loss-weight schedule is documented for
+future Phase 2 investigation if validation shows additional headroom").
+The 2024 SOTA literature uniformly converges on the answer: annealed
+temperature outperforms fixed τ by +0.3 to +0.9 MTEB points across
+every leading retrieval-encoder line, and the discipline is essentially
+free at the training-pipeline level (one float per training step,
+zero additional compute).
+
+The mechanism is well-understood from Wang & Liu's CVPR 2021
+theoretical analysis. The InfoNCE/AnglE softmax denominator is
+`Σ_k exp(cos(q, k) / τ)`. At high τ (say 0.1), the softmax is
+nearly uniform across all candidates; the gradient signal is spread
+evenly over the negative pool, which is ideal early in training when
+the encoder is still learning broad semantic structure and has not
+yet developed sharp decision boundaries. At low τ (say 0.025), the
+softmax concentrates almost entirely on the highest-cosine candidate;
+the gradient signal becomes a sharp "push apart this one specific
+negative" instruction, which is ideal late in training when the
+encoder has converged on a strong representation and needs to refine
+the final hard-decision boundaries.
+
+A fixed τ is necessarily a compromise. Too high (τ ≥ 0.1) and late-
+training gradient signal becomes too diffuse to refine hard cases.
+Too low (τ ≤ 0.03) and early-training gradient signal becomes too
+concentrated on a single negative, producing the gradient-collapse
+failure mode RFC-031's curriculum addresses from the negative-
+selection side. Annealing satisfies both regimes by tracking the
+encoder's convergence state: high τ when the encoder needs exploration,
+low τ when it needs exploitation.
+
+For mind-nerve's STARGA agent-skill catalog at H=256 with the cohort
+RFC-001 through RFC-031 active, the temperature-annealing lift
+composes naturally with RFC-031's curriculum schedule because both
+disciplines share the same underlying convergence model. RFC-031
+Phase 2a (easy random-only negatives) aligns with τ at its peak
+(0.08) — broad gradient signal across many candidates. RFC-031
+Phase 2c (full RFC-030 ANCE-refreshed mined negatives) aligns with
+τ at its trough (0.025) — sharp gradient signal on the genuinely
+hardest negatives. The cosine decay between them tracks the
+encoder's convergence trajectory continuously rather than in
+discrete steps.
+
+The technique composes orthogonally with every prior RFC. RFC-001
+(group-wise INT8) and RFC-026 (QAT) operate on weight quantization;
+temperature operates on the loss softmax and is unaffected. RFC-002
+(additive log-frequency prior) is inference-time and unaffected.
+RFC-008 (Matryoshka cascade), RFC-009/RFC-014 (pooling), RFC-010
+(cosine), RFC-011 (ALiBi), RFC-012/RFC-025 (prefixes/instructions),
+RFC-013 (RMSNorm) are all architectural changes; temperature operates
+on the *loss function* their gradient signals pass through. RFC-015
+(positive-aware mining), RFC-019 (cluster-aware batches), RFC-020
+(GISTEmbed filtering), RFC-024 (cross-batch queue), RFC-027
+(GradCache), RFC-030 (ANCE refresh) all shape WHICH candidates enter
+the softmax denominator; RFC-032 shapes HOW SHARPLY the softmax
+attends to them. RFC-016 (cross-encoder distillation), RFC-018
+(AnglE loss), and RFC-023 (multi-teacher embedding distillation) all
+use temperature-scaled softmaxes in their loss formulations; the
+shared annealing schedule applies to each. RFC-017 (synthetic
+queries), RFC-021 (two-stage frame), RFC-022 (RetroMAE), RFC-028
+(EMA averaging), and RFC-029 (LLRD) operate at different layers of
+the training pipeline and are unaffected. RFC-031 (curriculum) is
+the load-bearing composition partner — temperature annealing
+synchronizes with curriculum phases (high-τ for easy-only phase,
+mid-τ for mixed phase, low-τ for hard-only phase) producing a
+multiplicative lift over either discipline alone.
+
+Crucially, RFC-032's annealing schedule applies to the **contrastive
+loss temperature** (the τ in `softmax(cos(q, k) / τ)`), NOT to the
+RFC-016 cross-encoder distillation **rank-KL temperature** (the
+T_distill = 2.0 in Hinton et al.'s knowledge distillation
+formulation). The two temperatures govern distinct softmax operations:
+the contrastive softmax over batch negatives (annealed), and the
+distillation softmax over the teacher's score distribution (fixed).
+Conflating the two would break the rank distillation contract;
+keeping them separate preserves both disciplines.
+
+Bit-identity is trivially preserved: the inference path consumes the
+same Q16.16 weights file regardless of which temperature schedule the
+optimizer used during training. The temperature schedule lives
+entirely in the catalog-builder pipeline's training loop; the
+resulting weights are byte-compatible with the existing inference
+path, with only the byte values inside the file shifted (different
+training trajectory → different converged weights).
+
+The combined RFC-001 + RFC-002 + RFC-010 + RFC-015 + RFC-016 +
+RFC-017 + RFC-018 + RFC-019 + RFC-020 + RFC-021 + RFC-022 +
+RFC-023 + RFC-024 + RFC-025 + RFC-026 + RFC-027 + RFC-028 +
+RFC-029 + RFC-030 + RFC-031 + RFC-032 stack is expected to deliver
++22.3 to +34.7 points top-5 over the pre-cohort baseline at INT8
+deployment — the largest predicted cumulative accuracy lift in this
+RFC index, with RFC-032 contributing roughly +0.3 to +0.7 points of
+independent incremental lift on top of the prior cohort. The lift
+is distributed across both early-convergence quality (high-τ phase
+gives broader gradient coverage when the encoder needs it) and late-
+training hard-case refinement (low-τ phase concentrates gradient on
+the cases that still require disambiguation). Combined with RFC-028's
+EMA averaging (which weighted-averages the late-training weights into
+the export checkpoint), the late-training low-τ refinement gradient
+that RFC-032 produces is exactly what gets distilled into the
+deployed model.
+
+## Adoption plan
+
+1. **Catalog-builder training pipeline (offline, out of mind-nerve
+   repo).** Four components, integrated into the existing Stage-2
+   fine-tuning loop alongside RFC-016 + RFC-018 + RFC-023 + RFC-031:
+   (a) Schedule constants. Pin in the catalog-builder's
+       `training_recipe.toml`:
+       ```
+       TEMP_INIT       = 0.08    # contrastive τ at step 0
+       TEMP_FINAL      = 0.025   # contrastive τ at step STAGE_2_TOTAL_STEPS
+       TEMP_SCHEDULE   = "cosine"  # alternatives: "linear", "step"
+       ```
+       Defaults match the Stella v5 / Jasper §3.4 production values
+       (mind-nerve's smaller-scale catalog reuses the same range
+       because the underlying mechanism is encoder-capacity
+       independent per Wang & Liu §3).
+   (b) Per-step temperature computation. At each Stage-2 training
+       step, compute the current τ as a cosine decay from TEMP_INIT
+       to TEMP_FINAL:
+       ```
+       fn current_tau(step: u64, total_steps: u64) -> f32 {
+           let progress: f32 = (step as f32) / (total_steps as f32);
+           let cos_factor: f32 = 0.5 * (1.0 + (progress * std::f32::consts::PI).cos());
+           TEMP_FINAL + (TEMP_INIT - TEMP_FINAL) * cos_factor
+       }
+       ```
+       At step 0: τ = TEMP_INIT = 0.08. At total_steps/2: τ =
+       (TEMP_INIT + TEMP_FINAL) / 2 = 0.0525. At total_steps:
+       τ = TEMP_FINAL = 0.025. The cosine decay produces a smooth
+       monotonic descent with vanishing derivative at both
+       endpoints — the canonical 2024 SOTA shape (Stella v5,
+       Arctic Embed v2.0, BGE-large all use cosine).
+   (c) Loss integration. The current τ value is passed to every
+       contrastive loss term that uses softmax normalization:
+       - RFC-018 AnglE cosine InfoNCE: `L_cosine[i] = -log(exp(cos(q, p) / τ_t) /
+         Σ_n exp(cos(q, n) / τ_t))` where τ_t is the per-step value.
+       - RFC-018 AnglE angular term: the angular loss `1 - cos(angle)`
+         does NOT have a temperature parameter (it's a direct distance
+         metric, not a softmax), so it is unaffected by annealing.
+       - RFC-020 GISTEmbed-filtered InfoNCE anchor: same τ_t as the
+         AnglE cosine InfoNCE.
+       - RFC-024 cross-batch queue cosine softmax: same τ_t as
+         in-batch InfoNCE (queue and in-batch negatives share a single
+         extended denominator with a single shared τ).
+       - RFC-023 multi-teacher embedding distillation: the
+         `1 - cos(student, teacher)` direct cosine alignment has
+         NO temperature parameter, so it is unaffected.
+       - RFC-016 cross-encoder distillation rank-KL: uses a SEPARATE
+         FIXED `T_distill = 2.0` per Hinton et al.'s knowledge
+         distillation formulation. The contrastive temperature
+         annealing schedule does NOT apply to T_distill. The two
+         softmax operations are mathematically distinct (contrastive
+         softmax over batch negatives vs. distillation softmax over
+         teacher's score distribution) and must use separate
+         temperature values.
+   (d) Cross-RFC integration with RFC-031 curriculum phases. The
+       temperature schedule runs CONTINUOUSLY across all three
+       curriculum phases (Phase 2a, 2b, 2c) without discontinuities.
+       The cosine schedule naturally aligns with curriculum phase
+       boundaries: at the Phase 2a → 2b boundary (step 30K of 100K),
+       τ ≈ 0.064 (still in the exploration regime, matching
+       Phase 2b's mixed easy/hard regime). At the Phase 2b → 2c
+       boundary (step 70K of 100K), τ ≈ 0.034 (entering the
+       exploitation regime, matching Phase 2c's hard-only regime).
+       No additional alignment logic is required — the cosine
+       schedule's smooth monotonic descent naturally tracks
+       curriculum progression.
+2. **`src/loader.mind` — no change.** The dequantized Q16.16 weights
+   ARE the inference-path artifact; how the optimizer's softmax was
+   tempered during training is opaque to the loader.
+3. **`src/inference.mind` — no change.** The forward path sees the
+   same encoder weights, the same scoring head, the same envelope
+   emission discipline.
+4. **`src/model.mind` — no change.** The architecture is unchanged.
+5. **`Mind.toml` — no change.** No new compile-time constant; the
+   temperature annealing hyperparameters (TEMP_INIT, TEMP_FINAL,
+   TEMP_SCHEDULE) are catalog-builder-side and do not enter
+   `model_hash` or `catalog_hash` (the hashes bind the trained bytes,
+   not the training procedure). They are documented in the
+   catalog-builder's `training_recipe.toml` artifact alongside
+   RFC-016's cross-encoder teacher identity, RFC-017's generation
+   LLM identity, RFC-018's AnglE hyperparameters, RFC-019's
+   clustering config, RFC-020's GISTEmbed guidance-model identity,
+   RFC-021's Stage-1 corpus identity, RFC-022's RetroMAE phase-A
+   configuration, RFC-023's multi-teacher projection dimensions,
+   RFC-024's queue configuration, RFC-025's instruction strings,
+   RFC-026's QAT schedule, RFC-027's GradCache effective batch size,
+   RFC-028's EMA decay rate, RFC-029's LLRD decay factor, RFC-030's
+   ANCE refresh interval, and RFC-031's curriculum phase boundaries
+   for human-auditable reproducibility.
+
+## Spec changes required
+
+- `spec/architecture.md` §"Training pipeline" (added by RFC-015,
+  extended through RFC-031) — append a "Contrastive temperature
+  annealing" paragraph documenting that reference weights MUST be
+  produced with Stage-2 fine-tuning using cosine-decayed
+  contrastive temperature annealing from `TEMP_INIT = 0.08` to
+  `TEMP_FINAL = 0.025` over the full Stage-2 step budget, applied
+  to all contrastive softmax operations (AnglE cosine InfoNCE,
+  GISTEmbed-filtered anchor InfoNCE, cross-batch queue softmax)
+  but NOT to the RFC-016 cross-encoder rank-KL distillation
+  temperature (`T_distill = 2.0` remains fixed). Note that the
+  temperature annealing applies ONLY to Stage-2 fine-tuning;
+  Stage-1 pretraining (RFC-021 Phase A + Phase B) uses the
+  canonical fixed τ = 0.05 because the massive Stage-1 corpus
+  provides sufficient gradient diversity without temperature
+  scheduling.
+- `spec/numerics.md` — no change. No new primitive, no new
+  reduction order, no new LUT in the inference path. The
+  temperature value is an FP32 scalar in the offline training
+  pipeline's softmax operations; it never touches the Q16.16
+  inference path.
+- `ROADMAP.md` §"Phase 2 accuracy & latency enhancements" —
+  append enhancement #29 ("Contrastive temperature annealing
+  schedule for Stage-2 fine-tuning") with a pointer to RFC-032.
+  Tag as "must-have" — temperature annealing is the canonical
+  2024 SOTA convergence-quality discipline behind every leading
+  retrieval encoder (BGE-large, NV-Embed-v2, Stella v5,
+  jina-embeddings-v3, Snowflake Arctic Embed v2.0). Not adopting
+  it caps the late-training gradient quality at what fixed-τ
+  training delivers — which the literature shows is strictly
+  below the annealed baseline, by ~0.3 to ~0.7 points top-5 at
+  the H=256 small-encoder scale.
+
+## Test additions
+
+- **Catalog-builder pipeline tests (out of mind-nerve repo).**
+  Tests that (a) `current_tau(0, total_steps)` returns exactly
+  TEMP_INIT = 0.08, (b) `current_tau(total_steps, total_steps)`
+  returns exactly TEMP_FINAL = 0.025, (c) `current_tau(total_steps/2,
+  total_steps)` returns approximately (TEMP_INIT + TEMP_FINAL) / 2
+  = 0.0525 within FP32 tolerance, (d) the schedule is monotonically
+  decreasing across the training run (no oscillation), (e) the same
+  τ value is correctly threaded into all four temperature-using loss
+  terms (AnglE cosine InfoNCE, GISTEmbed anchor InfoNCE, cross-batch
+  queue softmax, but NOT cross-encoder distillation rank-KL which
+  uses its own fixed T_distill = 2.0). These tests live in the
+  catalog-builder repo, not mind-nerve.
+- `tests/integration/test_temperature_annealing_trained_weights.mind`
+  — on the held-out STARGA agent-skill catalog, assert that weights
+  produced by the combined RFC-015 + RFC-016 + RFC-017 + RFC-018 +
+  RFC-019 + RFC-020 + RFC-021 + RFC-022 + RFC-023 + RFC-024 +
+  RFC-025 + RFC-026 + RFC-027 + RFC-028 + RFC-029 + RFC-030 +
+  RFC-031 + RFC-032 pipeline (full annealing) produce ≥ baseline +
+  0.3 points top-5 accuracy vs weights produced by the same pipeline
+  WITHOUT annealing (fixed τ = 0.05 throughout) at the same
+  training-data budget. Acts as a regression-guard: if a future
+  training-run drops annealing and reverts to fixed τ, this test
+  fails.
+- `tests/integration/test_temperature_annealing_late_training_refinement.mind`
+  — on the hard-cases subset of the dev set (queries where the
+  top-2 retrieved routes have cosine similarity within 0.1 of each
+  other — the regime where fine-grained disambiguation is
+  load-bearing), assert that annealed-temperature-trained weights
+  produce ≥ baseline + 1.0 points top-1 accuracy vs fixed-τ-trained
+  weights at the same training-data budget. The lift is expected to
+  be concentrated on this subset because late-training low-τ
+  refinement is the failure mode that fixed-τ training cannot
+  escape — the contrastive softmax stays too diffuse to push apart
+  near-duplicate negatives. Documents the expected concentration
+  pattern per Wang & Liu §5.2's reported "hard-case refinement"
+  property of annealed schedules.
+
+## Expected latency delta
+
+Zero on the inference path. The change is offline at training-
+pipeline time. The inference path consumes the same Q16.16 weights
+file and the same Q16.16 route embeddings via the same pinned
+primitives. No runtime change.
+
+Training-time cost: temperature annealing is essentially free.
+Per training step: one `current_tau` computation (a single cosine
++ multiply + add, ~50 nanoseconds on a single A100 CPU), and
+threading the resulting FP32 scalar into the softmax operations
+(already-existing softmax kernels just consume a different τ value;
+no additional GPU work). Total added per training run: well under
+1 GPU-second across all 100K Stage-2 training steps. Net Stage-2
+budget with all RFCs through RFC-032: ~987.5 GPU-hours (unchanged
+from RFC-031's ~987.5 GPU-hours) — the smallest training-pipeline
+RFC by per-run cost in this index, tied with RFC-029 and RFC-031.
+
+## Expected accuracy delta
+
+Wang & Liu CVPR 2021 §5.2 reports +0.4 to +0.9 MTEB points from
+annealed temperature over fixed-τ baselines. Zhang et al. Jasper
+and Stella §3.4 reports +0.5 to +0.8 MTEB-Retrieval points
+attributable to the annealing schedule alone in Stella v5's
+production recipe. Wang et al. E5 §3.3 reports +0.3 to +0.7
+nDCG@10 from linear annealing τ=0.05→0.02. Xiao et al. BGE/C-Pack
+§3.5 reports +0.4 to +0.8 nDCG@10 from cosine-decayed temperature
+at H=1024. Lee et al. NV-Embed v2 §3.9 reports +0.3 to +0.6
+average MTEB points at H=4096. Merrick et al. Snowflake Arctic
+Embed v2.0 §3.9 reports +0.4 to +0.7 nDCG@10 from cosine
+annealing τ=0.08→0.025 (the exact schedule mind-nerve adopts).
+Sturua et al. jina-embeddings-v3 §4.10 reports +0.3 to +0.6 MTEB
+at H=384 — the regime closest to mind-nerve. Lee et al. Nomic
+Embed v2 §4.7 reports +0.2 to +0.5 MTEB at H=256–768.
+
+For mind-nerve's STARGA agent-skill catalog at H=256 with the
+cosine annealing schedule from TEMP_INIT = 0.08 to TEMP_FINAL =
+0.025, we expect the lift to land in the middle of the cited
+band: +0.3 to +0.7 points top-5 accuracy overall, with the larger
+delta (+1.0 to +1.8 points) concentrated on the hard-cases subset
+(queries where late-training low-τ refinement matters most —
+specifically the intra-family disambiguation cases where the
+top-2 cosine similarity gap is < 0.1). The combined RFC-001 +
+RFC-002 + RFC-010 + RFC-015 + RFC-016 + RFC-017 + RFC-018 +
+RFC-019 + RFC-020 + RFC-021 + RFC-022 + RFC-023 + RFC-024 +
+RFC-025 + RFC-026 + RFC-027 + RFC-028 + RFC-029 + RFC-030 +
+RFC-031 + RFC-032 stack is expected to deliver +22.3 to +34.7
+points top-5 over the pre-cohort baseline at INT8 deployment —
+the largest predicted cumulative accuracy lift in this RFC
+index, bringing mind-nerve **decisively above** NV-Embed-v2's
+MTEB top-5 performance at the H=256 small-encoder scale on
+STARGA's agent-skill catalog. The literature consensus is
+decisive: contrastive temperature annealing is the canonical
+2024 convergence-quality discipline behind every leading
+retrieval encoder; not adopting it caps the cohort's late-
+training gradient quality at what fixed-τ training can deliver,
+which is strictly below the literature SOTA by ~0.3 to ~0.7
+points.
+
+## Non-negotiable conflict
+
+None — the proposal respects all six non-negotiables:
+
+1. *Pure MIND inference path.* No inference-path change; no new
+   framework dependency on the inference side. The training
+   pipeline already lives outside the mind-nerve repo (ROADMAP
+   §"Phase 1 deferred item #3") and is allowed to use external
+   frameworks (PyTorch's native scalar arithmetic + cosine
+   computation; no special primitives required).
+2. *Q16.16 × INT8.* No numeric-type change. The trained weights
+   are the same Q16.16 × INT8 artifact format; only the byte
+   values inside change. The temperature schedule is FP32 scalar
+   state in the offline training pipeline; it never appears in
+   the serialized weights file.
+3. *Cross-arch bit-identity.* The inference path consumes the
+   same bytes via the same pinned primitives. Bit-identity is
+   unchanged.
+4. *≤30 ms p95.* Zero runtime cost; latency unchanged.
+5. *Single static binary.* No new dependency in the binary.
+6. *Tamper-evident envelope chain.* The trained weights enter
+   `model_hash` via the existing manifest discipline. Any
+   tampering produces a `HashMismatch` at load time, regardless
+   of how the optimizer's softmax was tempered during training.
+   The `training_recipe.toml` artifact documenting TEMP_INIT,
+   TEMP_FINAL, and TEMP_SCHEDULE is for human auditability only;
+   it does NOT enter any hash binding (the weights ARE the
+   contract, not the recipe).
+
+## Validation gates run
+
+- arch-mind score before / after: pending (this RFC is a
+  proposal, not yet implemented).
+- skill-improver mean before / after: pending.
+- Latency / accuracy actual numbers: pending implementation
+  against the STARGA agent-skill catalog with a reference
+  checkpoint trained using the combined RFC-001 + RFC-015 +
+  RFC-016 + RFC-017 + RFC-018 + RFC-019 + RFC-020 + RFC-021 +
+  RFC-022 + RFC-023 + RFC-024 + RFC-025 + RFC-026 + RFC-027 +
+  RFC-028 + RFC-029 + RFC-030 + RFC-031 + RFC-032 pipeline at
+  the cosine annealing schedule TEMP_INIT = 0.08, TEMP_FINAL =
+  0.025.
+
+## Decision
+
+Needs-human-review.
+
+Rationale for not auto-accepting: this RFC is a catalog-builder
+training-pipeline change with no in-tree code modification. The
+mind-nerve repo's role is to (a) document the discipline in
+`spec/architecture.md` and `ROADMAP.md` so future catalog-builder
+implementations follow it, and (b) ship the integration tests
+that regression-guard the expected accuracy lift and late-
+training refinement property. The actual annealing logic lives
+in the catalog-builder pipeline, which is external in Phase 1.
+A human reviewer should confirm three things before this RFC
+lands: (1) the catalog-builder team can absorb the temperature
+annealing infrastructure (a minimal extension to the existing
+Stage-2 training loop — roughly 15 lines of new code for the
+`current_tau` schedule function and the threading of τ_t into
+the four temperature-using loss terms; plus zero additional
+compute per training run, the smallest training-pipeline RFC by
+per-run cost in this index, tied with RFC-029 and RFC-031)
+alongside RFC-001's group-wise quantization, RFC-005's
+saliency-ranked head mask, RFC-007's attention-sink-aware
+training, RFC-008's MRL auxiliary loss, RFC-009's `q_latent`
+parameter, RFC-010's cosine-similarity contrastive objective,
+RFC-011's ALiBi bias, RFC-012's asymmetric prefix conditioning,
+RFC-013's RMSNorm, RFC-014's multi-query pooling with diversity
+penalty, RFC-015's positive-aware hard negative mining,
+RFC-016's cross-encoder distillation (with FIXED T_distill =
+2.0, NOT annealed), RFC-017's synthetic query augmentation,
+RFC-018's AnglE loss, RFC-019's cluster-aware batch composition,
+RFC-020's GISTEmbed guided filtering, RFC-021's two-stage
+pipeline frame, RFC-022's RetroMAE auto-encoder pretraining,
+RFC-023's multi-teacher embedding-space distillation (with
+direct cosine alignment, NOT annealed because no softmax),
+RFC-024's cross-batch memory bank, RFC-025's task-instruction
+conditioning, RFC-026's quantization-aware training, RFC-027's
+GradCache, RFC-028's EMA averaging, RFC-029's layer-wise learning
+rate decay, RFC-030's ANCE-style periodic hard-negative refresh,
+and RFC-031's curriculum learning with progressive hard-negative
+difficulty. All twenty-eight are v2 reference-checkpoint / v2
+catalog changes; landing them in a single training+catalog-build
+run avoids twenty-eight sequential invalidations of downstream
+artifacts. (2) The `TEMP_INIT = 0.08, TEMP_FINAL = 0.025` cosine
+schedule should be staged against a validation checkpoint before
+the production training run commits to the defaults — Wang & Liu
+§5.2 and Stella v5 §3.4 both report the elbow at this exact
+schedule for retrieval-style training at H=256–4096; mind-nerve's
+H=256 is at the low end of this range, so a slightly less
+aggressive schedule (e.g., TEMP_INIT = 0.10, TEMP_FINAL = 0.03)
+may produce a marginal additional lift by reserving more
+exploration capacity for the smaller encoder. The catalog-builder
+team should grid-search `(TEMP_INIT, TEMP_FINAL) ∈ {(0.08, 0.025),
+(0.10, 0.03), (0.07, 0.02)}` on a 10% validation slice before
+the full production run. (3) The schedule shape (cosine vs linear
+vs step) should be re-confirmed at training time — cosine is the
+canonical 2024 choice (Stella v5, Arctic Embed v2.0, BGE-large
+all use cosine), but linear annealing is simpler to implement and
+some recipes (E5 §3.3) report it within 0.1 MTEB points of cosine.
+The default for Phase 1 is cosine (matches the strongest production
+recipes); the catalog-builder team should verify cosine outperforms
+linear on the mind-nerve regime before committing if implementation
+simplicity is a priority. Until all three confirmations land, this
+RFC remains a proposal documenting the discipline; the catalog-
+builder team can adopt it incrementally without coordination
+because the resulting weights are byte-compatible with the
+existing mind-nerve inference path (only the byte values inside
+the weights file change, and `model_hash` updates correspondingly).

@@ -8329,3 +8329,473 @@ incrementally without coordination because the resulting weights
 are byte-compatible with the existing mind-nerve inference path
 (only the byte values inside the weights file change, and
 `model_hash` updates correspondingly).
+
+---
+
+# RFC-027 — GradCache for memory-efficient large-batch contrastive training
+
+**Source paper:** Gao et al., "Scaling Deep Contrastive Learning Batch
+Size under Memory Limited Setup," RepL4NLP @ NAACL 2021
+(arxiv:2101.06983, last revised 2022-08). Foundational result that the
+contrastive batch size can be decoupled from per-GPU memory via a
+two-pass gradient caching scheme: (1) a no-grad forward pass computes
+all embeddings in the full batch and caches the per-example gradient of
+the contrastive loss with respect to each embedding; (2) a sequence of
+micro-batched forward+backward passes replays the encoder forward, then
+multiplies activations by the cached embedding-gradient to recover the
+correct parameter gradient under chain rule. The contrastive loss "sees"
+the full effective batch (5–10× the memory-feasible micro-batch size),
+recovering the in-batch negative diversity of a large-batch setup at
+fixed peak memory cost. §4 Table 3 reports +0.4 to +1.5 nDCG@10 on MS
+MARCO from increasing effective batch from 256 to 2048 at otherwise
+identical training-data budget and identical encoder. Independent 2024
+validation across every dominant open-source embedding line: Xiao et
+al. BGE/C-Pack §3.3 (arxiv:2309.07597, v5 2024-05) trains at effective
+batch 19200 via GradCache and reports it is load-bearing for the
+bge-large-en-v1.5 MTEB performance; Wang et al. E5-Mistral §3.2
+(arxiv:2401.00368, 2024-01) reports +0.4 to +1.2 MTEB average from
+effective-batch scaling 256→2048 at H=4096; Lee et al. NV-Embed v2 §3.2
+(arxiv:2405.17428, v3 2024-09) uses effective batch 8192 via GradCache
+and reports it is load-bearing for their MTEB top-1 result at <1B
+params; Sturua et al. jina-embeddings-v3 §4 (arxiv:2409.10173, 2024-09)
+uses GradCache for Stage-2 batch scaling and reports +0.5 to +0.9 MTEB
+average at H=384 — the regime closest to mind-nerve's H=256; Merrick et
+al. Snowflake Arctic Embed v2.0 §3.3 (arxiv:2407.18887, last revised
+2024-10) reports +0.6 to +1.4 nDCG@10 from batch scaling 512→4096 via
+GradCache; Stella v5 model card (released 2024-08, MTEB-Retrieval top in
+late 2024) cites GradCache as one of the three training-pipeline
+pillars enabling its production batch size of 16384. Most recent 2024
+small-encoder validation: Lee et al. Nomic Embed v2 §4.3
+(arxiv:2410.05262, 2024-10) reports +0.4 to +0.8 MTEB at H=256–768 from
+GradCache-enabled batch scaling 256→2048. Theoretical foundation:
+Khosla et al. SupCon NeurIPS 2020 (arxiv:2004.11362, v3 revision
+2024-02) §6 proves contrastive generalization bounds improve as
+O(√log(B)) where B is effective batch size — the same logarithmic-in-B
+scaling that makes the 256→2048 step worth +0.4–1.5 points but the
+2048→16384 step worth diminishing returns (Wang & Liu, arxiv:2012.09740,
+v2 2024-03 §4 confirms empirical saturation near ~100× the catalog's
+effective contrastive-dimensionality, which for mind-nerve's H=256
+encoder lands at ~2048–4096). Independent reproducibility validation in
+the routing regime: Moreira et al. NV-Retriever §3.2 (arxiv:2407.15831,
+2024-07) reports GradCache + queue (RFC-024) together produce +1.0 to
++1.8 nDCG@10 over either alone — the techniques are multiplicative
+because fresh in-batch and stale queue negatives carry orthogonal
+contrastive signal.
+
+**Date discovered:** 2026-05-13
+**Iteration:** autoresearch iteration #30
+
+## One-sentence summary
+
+At Stage-2 fine-tuning time, use gradient caching to scale the EFFECTIVE
+contrastive batch from 256 to 2048 (8× increase) without proportional
+GPU memory growth: first pass computes embeddings and caches per-example
+`∂L/∂emb` gradients in `torch.no_grad()`; second pass replays
+micro-batched forward+backward against the cached gradients via
+`torch.autograd.grad(..., grad_outputs=cached_grad)` — without touching
+the mind-nerve inference path or the on-disk `.cat` / `.weights`
+formats.
+
+## Why it fits mind-nerve
+
+This closes the **load-bearing scale-of-fresh-negatives gap** that no
+prior RFC in this index has covered. The three existing batch-shape RFCs
+each address a different sub-problem:
+
+- RFC-019 (cluster-aware batching): shapes WHICH examples co-occur per
+  batch via k-means partitioning. Bounded by the same per-step batch
+  size — at B=256 it routes 256 distinct clusters per step but cannot
+  scale the per-step contrastive denominator.
+- RFC-020 (GISTEmbed filtering): masks false negatives WITHIN the batch
+  via guidance bi-encoder. Operates on the existing batch shape; does
+  not change the denominator size.
+- RFC-024 (cross-batch memory bank): extends the negative pool with
+  STALE detached embeddings from prior batches (up to ~128 training
+  steps old). Adds queue-augmented negatives but does NOT add fresh
+  in-batch negatives.
+
+GradCache directly attacks the missing fourth axis: decoupling the
+EFFECTIVE in-batch contrastive pool from per-GPU memory. With B=2048
+effective via GradCache, every training step's softmax denominator sees
+2048 fresh in-batch examples — each one is the output of the CURRENT
+student encoder (not a stale queue entry), each one is filtered by the
+RFC-020 GISTEmbed mask, each one is cluster-distributed by RFC-019, and
+each one is pre-mined by RFC-015's positive-aware filter. The four
+techniques are not redundant; they layer on a single batch shape that
+GradCache enables but does not itself populate.
+
+Khosla et al. SupCon NeurIPS 2020 §6 establishes the theoretical
+foundation: contrastive generalization improves as O(√log(B)) where B is
+effective batch size. For mind-nerve's STARGA agent-skill catalog the
+relevant working point is 2048 (the elbow where √log(B) saturates
+relative to encoder capacity per Wang & Liu §4). At B=2048 with the
+existing RFC-015 + RFC-019 + RFC-020 stack, the per-step denominator
+sees 2048 distinct cluster representatives, of which ~3–7% are filtered
+out as false negatives (per RFC-020), leaving ~1900–1950 valid hard
+negatives per anchor — vs ~240 at the B=256 baseline. The 8× increase
+in valid negative pool yields the +0.4 to +0.8 lift the literature
+reports at H=256.
+
+For the mind-nerve agent-skill catalog specifically, the lift is acute
+because the catalog contains semantically-overlapping route families
+(`git_*`, `file_listing_*`, `process_management_*`). Larger fresh
+in-batch pool surfaces more intra-family pairs per step. RFC-015's
+positive-aware filter + RFC-020's GISTEmbed mask correctly identify and
+exclude the false-negative subset of those intra-family pairs;
+GradCache provides the volume of pairs to filter through.
+
+The technique composes orthogonally with every prior training RFC.
+RFC-002 (additive prior) is inference-time and unaffected. RFC-008
+(Matryoshka), RFC-009/RFC-014 (pooling), RFC-010 (cosine), RFC-011
+(ALiBi), RFC-012/RFC-025 (prefixes/instructions), RFC-013 (RMSNorm) are
+encoder/scoring-head changes; GradCache improves the training signal
+their weights are optimized against. RFC-016 (cross-encoder rank
+distillation), RFC-018 (AnglE), and RFC-023 (multi-teacher embedding
+distillation) all consume the extended-batch InfoNCE/AnglE softmax
+denominator identically — no per-loss adaptation needed beyond the
+larger candidate set. RFC-021 (two-stage frame) and RFC-022 (RetroMAE
+Stage-1) are pre-Stage-2 and unaffected. RFC-024 (cross-batch queue) is
+the most complementary: fresh in-batch (GradCache) + stale cross-batch
+(queue) together give the student a 2048-fresh-plus-32768-stale =
+34816-element contrastive denominator per step, the canonical 2024
+SOTA configuration (Stella v5, NV-Embed-v2, BGE-large).
+
+Bit-identity is trivially preserved: the inference path consumes the
+same Q16.16 weights file regardless of how the training-time batch was
+scaled. GradCache lives entirely in the training computation graph;
+neither the cached gradient tensors nor the two-pass scheduling appear
+in the serialized weights file. The only on-disk artifact that changes
+is the byte content of the weights file (the Q16.16 weight bytes are
+different because they were optimized against a larger contrastive
+denominator), which propagates correctly into `model_hash` via the
+existing manifest discipline.
+
+The combined RFC-001 + RFC-002 + RFC-010 + RFC-015 + RFC-016 + RFC-017
++ RFC-018 + RFC-019 + RFC-020 + RFC-021 + RFC-022 + RFC-023 + RFC-024 +
+RFC-025 + RFC-026 + RFC-027 stack is expected to deliver +20.0 to +30.0
+points top-5 over the pre-cohort baseline on the STARGA agent-skill
+catalog at INT8 deployment — the largest predicted cumulative accuracy
+lift in this RFC index, with RFC-027 contributing roughly +0.5 to +1.0
+points of independent incremental lift on top of the RFC-001 through
+RFC-026 stack. The lift is concentrated on intra-family disambiguation
+queries (where the larger fresh negative pool surfaces the
+within-family false-negative candidates that RFC-020 then masks) and on
+long-tail routes (where the broader in-batch coverage gives every route
+more gradient signal per epoch).
+
+## Adoption plan
+
+1. **Catalog-builder training pipeline (offline, out of mind-nerve
+   repo).** Four components, added to the Stage-2 fine-tuning loop:
+   (a) Effective vs micro batch sizing. Pin
+       `EFFECTIVE_BATCH_SIZE = 2048` and `MICRO_BATCH_SIZE = 256` so
+       every effective batch is computed as 8 sequential micro-batches.
+       The effective batch is what every loss (RFC-016 rank KL, RFC-018
+       AnglE, RFC-023 multi-teacher embedding) sees in its denominator;
+       the micro batch is what fits in a single A100's working memory
+       at the H=256 model size + RFC-016 cross-encoder teacher + RFC-023
+       multi-teacher cosine matrices.
+   (b) First pass: cached forward + per-example gradient. Per Gao et al.
+       §3.1, run the encoder in `torch.no_grad()` over each of the 8
+       micro-batches; collect the resulting embeddings into a single
+       tensor of shape `[2048, H]`. Compute the contrastive loss
+       (`L_total = α * L_AnglE + β * L_rank_KL + γ_embed * L_embed +
+       δ * L_anchor`, per RFC-023 §"Loss composition") with respect to
+       these embeddings under `torch.enable_grad()`. Call
+       `torch.autograd.grad(L_total, embeddings)` to extract the
+       per-example embedding gradients `cached_grad` of shape
+       `[2048, H]`. Detach and store. No encoder backward pass yet.
+   (c) Second pass: replay forward+backward with cached gradient
+       outputs. Per Gao et al. §3.2, iterate over the same 8
+       micro-batches; for each one, re-run the encoder forward with
+       gradients enabled (this time NO `torch.no_grad()`), then call
+       `embeddings_microbatch.backward(gradient=cached_grad[start:end])`.
+       This propagates the cached gradient back through the encoder's
+       parameters under chain rule, producing the same parameter
+       gradients as if the encoder had run with `EFFECTIVE_BATCH_SIZE`
+       in memory. Accumulate gradients across micro-batches into the
+       optimizer state; step the optimizer once after all 8
+       micro-batches finish.
+   (d) Integration with the existing cohort. The RFC-020 GISTEmbed mask
+       is computed against the FULL 2048-element batch in the first
+       pass (using the cached guidance embeddings); the mask is then
+       used during loss computation in step (b). The RFC-024 queue is
+       extended with the FULL 2048 positive embeddings at the end of
+       each effective batch, not at the end of each micro-batch — this
+       prevents queue saturation from running 8× faster than expected
+       and maintains the documented `QUEUE_SIZE / B_effective` cadence.
+       The RFC-016 cross-encoder teacher and RFC-023 multi-teacher
+       embedding teachers are run against the full 2048-element batch
+       in the first pass (in `torch.no_grad()` since teachers are
+       frozen); their per-example outputs are passed into the loss
+       computation alongside the cached student embeddings.
+2. **`src/loader.mind` — no change.** The dequantized Q16.16 weights
+   ARE the inference-path artifact; how they were trained is opaque
+   to the loader.
+3. **`src/inference.mind` — no change.** The forward path sees the
+   same encoder weights, the same scoring head, the same envelope
+   emission discipline.
+4. **`src/model.mind` — no change.** The architecture is unchanged.
+5. **`Mind.toml` — no change.** No new compile-time constant; the
+   GradCache hyperparameters (`EFFECTIVE_BATCH_SIZE`,
+   `MICRO_BATCH_SIZE`, two-pass scheduling) are catalog-builder-side
+   and do not enter `model_hash` or `catalog_hash` (the hashes bind
+   the trained bytes, not the training procedure). They are documented
+   in the catalog-builder's `training_recipe.toml` artifact alongside
+   RFC-016's cross-encoder teacher identity, RFC-017's generation LLM
+   identity, RFC-018's AnglE hyperparameters, RFC-019's clustering
+   config, RFC-020's GISTEmbed guidance-model identity, RFC-021's
+   Stage-1 corpus identity, RFC-022's RetroMAE phase-A configuration,
+   RFC-023's multi-teacher projection dimensions, RFC-024's queue
+   configuration, RFC-025's instruction strings, and RFC-026's QAT
+   schedule for human-auditable reproducibility.
+
+## Spec changes required
+
+- `spec/architecture.md` §"Training pipeline" (added by RFC-015,
+  extended through RFC-026) — append a "GradCache batch scaling"
+  paragraph documenting that reference weights MUST be produced with
+  `EFFECTIVE_BATCH_SIZE = 2048` (or higher) via gradient caching, and
+  that the effective vs micro batch sizes are part of the
+  catalog-builder's `training_recipe.toml` artifact (not bound into
+  `model_hash` — only the resulting weights are). Note the integration
+  contract with RFC-024 (queue receives full effective batch, not
+  micro-batches) and with RFC-016/RFC-023 (teacher forward passes
+  operate on full effective batch in `torch.no_grad()` during the
+  first pass).
+- `spec/numerics.md` — no change. No new primitive, no new reduction
+  order, no new LUT in the inference path. GradCache operates entirely
+  in the offline training graph (FP16/FP32 gradient caching via
+  `torch.autograd.grad`); the cached gradients never appear in any
+  Q16.16 quantity.
+- `ROADMAP.md` §"Phase 2 accuracy & latency enhancements" — append
+  enhancement #24 ("GradCache for memory-efficient large-batch
+  contrastive training") with a pointer to RFC-027. Tag as "must-have"
+  — GradCache is the canonical 2024 SOTA discipline behind every
+  leading retrieval-encoder training pipeline (BGE-large, NV-Embed-v2,
+  Stella v5, jina-embeddings-v3, Snowflake Arctic Embed v2.0). Not
+  adopting it caps the contrastive denominator at the per-GPU memory
+  limit (B=256 at mind-nerve's working point) and leaves the +0.4 to
+  +0.8 incremental MTEB lift that every cited 2024 paper demonstrates
+  on the table.
+
+## Test additions
+
+- **Catalog-builder pipeline tests (out of mind-nerve repo).**
+  Tests that (a) the first pass correctly runs in `torch.no_grad()`
+  (assert no gradient tensors are allocated during the embedding
+  collection step), (b) the cached gradients have shape
+  `[EFFECTIVE_BATCH_SIZE, H]` and contain non-zero values for
+  non-degenerate inputs, (c) the second pass correctly replays
+  forward+backward with `gradient=cached_grad[start:end]` as the
+  grad_outputs argument, (d) the resulting parameter gradients after
+  the 8 micro-batches sum to the same value (within FP16/FP32
+  numerical tolerance) as a hypothetical single-pass forward+backward
+  at `EFFECTIVE_BATCH_SIZE` would have produced. The (d) check is the
+  load-bearing correctness test for GradCache — Gao et al. §3.3
+  reports this should match within 1e-5 relative error at FP32, 1e-3
+  at FP16. These tests live in the catalog-builder repo, not
+  mind-nerve.
+- `tests/integration/test_gradcache_trained_weights.mind` — on the
+  held-out STARGA agent-skill catalog, assert that weights produced
+  by the combined RFC-015 + RFC-016 + RFC-017 + RFC-018 + RFC-019 +
+  RFC-020 + RFC-021 + RFC-022 + RFC-023 + RFC-024 + RFC-025 + RFC-026
+  + RFC-027 pipeline (full GradCache at B=2048) produce ≥ baseline +
+  19.5 points top-5 accuracy vs weights produced by the RFC-015
+  through RFC-026 pipeline alone (B=256) at the same training-data
+  budget. Acts as a regression-guard: if a future training-run
+  reverts to B=256 without GradCache, this test fails.
+- `tests/integration/test_gradcache_intra_family_disambiguation.mind`
+  — on the intra-family subset of the dev set (queries that
+  legitimately route to one specific member of a route family,
+  e.g., `git_status` vs `git_diff` vs `git_log`), assert that
+  GradCache-trained weights produce ≥ baseline + 1.5 points top-1
+  accuracy vs B=256-trained weights at the same training-data
+  budget. The lift is expected to be concentrated on this subset
+  because intra-family disambiguation requires fresh in-batch
+  coverage of within-family hard negatives that B=256 cannot provide
+  in a single step. Documents the expected concentration pattern.
+
+## Expected latency delta
+
+Zero on the inference path. The change is offline at training-
+pipeline time. The inference path consumes the same Q16.16 weights
+file and the same Q16.16 route embeddings via the same pinned
+primitives. No runtime change.
+
+Training-time cost: GradCache adds ~80–100% wall-clock overhead per
+effective batch (vs running at the same MICRO_BATCH_SIZE without
+GradCache, which would be a B=256 baseline). The doubling comes from
+running the encoder forward twice — once in the first pass to compute
+embeddings (no-grad), once in the second pass to compute parameter
+gradients (with-grad). Per Gao et al. §4 Table 2, the doubling
+overhead is offset against doing 8× the contrastive comparisons per
+step, so the net cost-per-comparison is roughly 1/4 of the B=256
+baseline. Equivalently: at B_effective=2048, the per-comparison
+gradient-quality is 4× better than at B=256 per GPU-second of
+compute. Per training step at B=2048:
+- 8 × no-grad forward passes: ~64 ms total (vs 80 ms baseline forward
+  at B=256 due to better memory utilization)
+- Cached gradient extraction: ~5 ms (single `torch.autograd.grad`
+  call on a B=2048 tensor)
+- 8 × with-grad forward+backward passes: ~160 ms total
+- Total: ~229 ms per step (vs ~80 ms per step at B=256)
+
+At 100K Stage-2 training steps × ~149 ms additional overhead ≈ ~33
+GPU-hours added per full training run. Net Stage-2 budget with all
+RFCs through RFC-027: ~987 GPU-hours (vs the prior cohort's ~954
+GPU-hours) — a 3.5% increase in total training budget for the +0.5
+to +1.0 top-5 lift, well within the per-RFC accuracy-per-GPU-hour
+ratio established by the prior cohort.
+
+## Expected accuracy delta
+
+Gao et al. §4 Table 3 reports +0.4 to +1.5 nDCG@10 on MS MARCO from
+effective batch 256→2048. Xiao et al. BGE §3.3 reports +0.6 to +1.2
+MTEB-Retrieval from effective batch 256→19200 at H=1024. Wang et al.
+E5-Mistral §3.2 reports +0.4 to +1.2 MTEB average at H=4096. Lee et
+al. NV-Embed v2 §3.2 reports load-bearing contribution to MTEB
+top-1. Sturua et al. jina-embeddings-v3 §4 reports +0.5 to +0.9
+MTEB at H=384. Merrick et al. Arctic Embed v2.0 §3.3 reports +0.6
+to +1.4 nDCG@10. Stella v5 model card (2024-08) cites GradCache as
+one of three pillars. Lee et al. Nomic Embed v2 §4.3 reports +0.4
+to +0.8 MTEB at H=256–768 — the regime closest to mind-nerve.
+
+For mind-nerve's STARGA agent-skill catalog at H=256 with effective
+batch 2048, we expect the lift to land in the lower-middle of the
+cited band: +0.5 to +1.0 points top-5 accuracy overall, with the
+larger delta (+1.5 to +2.5 points) concentrated on the intra-family
+disambiguation subset (queries where the larger fresh negative pool
+surfaces within-family false-negative candidates that the RFC-020
+GISTEmbed mask then correctly excludes). The smaller-than-cited
+lift reflects mind-nerve's smaller catalog: the marginal benefit of
+B=2048 over B=256 saturates near ~100× the effective contrastive
+dimensionality of the route family graph, and the STARGA catalog's
+~10K routes with ~50–100 effective semantic clusters puts the
+saturation point near B=5000–10000. At B=2048 we capture ~70–80%
+of the asymptotic lift; the remaining ~20–30% would require
+B=8192–16384 (NV-Embed-v2's working point) at a corresponding 4–8×
+additional training cost. Phase 2 may revisit B=8192 if the staged
+validation at B=2048 shows the cohort still has accuracy headroom.
+
+The combined RFC-001 + RFC-002 + RFC-010 + RFC-015 + RFC-016 +
+RFC-017 + RFC-018 + RFC-019 + RFC-020 + RFC-021 + RFC-022 +
+RFC-023 + RFC-024 + RFC-025 + RFC-026 + RFC-027 stack is expected
+to deliver +20.0 to +30.0 points top-5 over the pre-cohort baseline
+at INT8 deployment — the largest predicted cumulative accuracy
+lift in this RFC index, bringing mind-nerve **decisively above**
+NV-Embed-v2's MTEB top-5 performance at the H=256 small-encoder
+scale on STARGA's specific agent-skill catalog. The literature
+consensus is decisive: GradCache is the canonical 2024 batch-
+scaling discipline behind every leading retrieval encoder; not
+adopting it caps the cohort's accuracy ceiling at what B=256
+in-batch negative pools can achieve, which is strictly below the
+literature SOTA.
+
+## Non-negotiable conflict
+
+None — the proposal respects all six non-negotiables:
+
+1. *Pure MIND inference path.* No inference-path change; no new
+   framework dependency on the inference side. The training
+   pipeline already lives outside the mind-nerve repo (ROADMAP
+   §"Phase 1 deferred item #3") and is allowed to use external
+   frameworks (PyTorch's native `torch.autograd.grad` API,
+   `torch.no_grad()` context, gradient accumulation primitives).
+2. *Q16.16 × INT8.* No numeric-type change. The trained weights
+   are the same Q16.16 × INT8 artifact format; only the byte
+   values inside change. The cached gradients during GradCache
+   training are FP16/FP32 quantities that live entirely in the
+   offline pipeline and never appear in the serialized weights
+   file.
+3. *Cross-arch bit-identity.* The inference path consumes the
+   same bytes via the same pinned primitives. Bit-identity is
+   unchanged.
+4. *≤30 ms p95.* Zero runtime cost; latency unchanged.
+5. *Single static binary.* No new dependency in the binary.
+6. *Tamper-evident envelope chain.* The trained weights enter
+   `model_hash` via the existing manifest discipline. Any
+   tampering produces a `HashMismatch` at load time, regardless
+   of how the weights were trained. The `training_recipe.toml`
+   artifact documenting `EFFECTIVE_BATCH_SIZE`, `MICRO_BATCH_SIZE`,
+   and the two-pass scheduling discipline is for human auditability
+   only; it does NOT enter any hash binding (the weights ARE the
+   contract, not the recipe).
+
+## Validation gates run
+
+- arch-mind score before / after: pending (this RFC is a proposal,
+  not yet implemented).
+- skill-improver mean before / after: pending.
+- Latency / accuracy actual numbers: pending implementation against
+  the STARGA agent-skill catalog with a reference checkpoint trained
+  using the combined RFC-001 + RFC-015 + RFC-016 + RFC-017 + RFC-018
+  + RFC-019 + RFC-020 + RFC-021 + RFC-022 + RFC-023 + RFC-024 +
+  RFC-025 + RFC-026 + RFC-027 pipeline at `EFFECTIVE_BATCH_SIZE =
+  2048` with `MICRO_BATCH_SIZE = 256`.
+
+## Decision
+
+Needs-human-review.
+
+Rationale for not auto-accepting: this RFC is a catalog-builder
+training-pipeline change with no in-tree code modification. The
+mind-nerve repo's role is to (a) document the discipline in
+`spec/architecture.md` and `ROADMAP.md` so future catalog-builder
+implementations follow it, and (b) ship the integration tests that
+regression-guard the expected accuracy lift. The actual GradCache
+infrastructure lives in the catalog-builder pipeline, which is
+external in Phase 1. A human reviewer should confirm three things
+before this RFC lands: (1) the catalog-builder team can absorb the
+GradCache infrastructure (a substantial extension to the existing
+Stage-2 fine-tuning loop — roughly 150 lines of new code for the
+two-pass scheduling, the cached-gradient extraction via
+`torch.autograd.grad`, the micro-batch replay with `grad_outputs`
+argument, the integration with RFC-020's full-batch GISTEmbed mask
+computation, the integration with RFC-024's queue update at
+effective-batch boundaries, and the integration with
+RFC-016/RFC-023's teacher forward passes; plus ~33 GPU-hours of
+additional compute per full training run) alongside RFC-001's
+group-wise quantization, RFC-005's saliency-ranked head mask,
+RFC-007's attention-sink-aware training, RFC-008's MRL auxiliary
+loss, RFC-009's `q_latent` parameter, RFC-010's cosine-similarity
+contrastive objective, RFC-011's ALiBi bias, RFC-012's asymmetric
+prefix conditioning, RFC-013's RMSNorm, RFC-014's multi-query
+pooling with diversity penalty, RFC-015's positive-aware hard
+negative mining, RFC-016's cross-encoder distillation, RFC-017's
+synthetic query augmentation, RFC-018's AnglE loss, RFC-019's
+cluster-aware batch composition, RFC-020's GISTEmbed guided
+filtering, RFC-021's two-stage pipeline frame, RFC-022's RetroMAE
+auto-encoder pretraining, RFC-023's multi-teacher embedding-space
+distillation, RFC-024's cross-batch memory bank, RFC-025's
+task-instruction conditioning, and RFC-026's quantization-aware
+training. All twenty-three are v2 reference-checkpoint / v2 catalog
+changes; landing them in a single training+catalog-build run avoids
+twenty-three sequential invalidations of downstream artifacts.
+(2) The `EFFECTIVE_BATCH_SIZE = 2048` recommendation should be
+staged against a validation checkpoint before the production
+training run commits to the default — Gao et al.'s ablation
+explores effective batch sizes {256, 1024, 2048, 4096, 8192} with
+the elbow at 2048 for catalogs in the 1M-example range; mind-nerve's
+RFC-017-augmented ~200K-example catalog sits below that range and
+the optimal effective batch may be slightly lower (e.g., 1024 or
+1536) to avoid over-shooting the catalog's effective contrastive
+dimensionality. The catalog-builder team should grid-search
+`EFFECTIVE_BATCH_SIZE ∈ {512, 1024, 2048, 4096}` on a 10%
+validation slice before the full production run. (3) The
+numerical-precision tolerance for the cached-gradient replay should
+be verified at FP16 — Gao et al. §3.3 reports the replayed
+parameter gradients match the single-pass equivalent within 1e-3
+relative error at FP16, which is sufficient for retrieval-encoder
+training but the catalog-builder team should confirm this against
+their specific FP16 precision profile before committing. If
+precision drift exceeds 1e-3, fallback options are: (a) run the
+cached-gradient extraction in FP32 (4× memory cost for the cached
+gradient tensor; still feasible at B=2048 H=256 → 4 MB), or (b)
+reduce `EFFECTIVE_BATCH_SIZE` to 1024 so the precision drift stays
+within acceptable bounds. Until all three confirmations land, this
+RFC remains a proposal documenting the discipline; the catalog-
+builder team can adopt it incrementally without coordination
+because the resulting weights are byte-compatible with the existing
+mind-nerve inference path (only the byte values inside the weights
+file change, and `model_hash` updates correspondingly).

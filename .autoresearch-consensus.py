@@ -81,11 +81,54 @@ def run(cmd: list[str]) -> str:
 
 
 def latest_diff(cwd: Path) -> str:
-    """Return diff HEAD~1..HEAD, capped to keep prompts reasonable."""
-    out = run(["git", "-C", str(cwd), "diff", "HEAD~1..HEAD"])
-    if len(out) > 20000:
-        out = out[:20000] + "\n... [truncated]"
-    return out
+    """Return diff HEAD~1..HEAD, capped per-file with src/ prioritised.
+
+    Naive truncation at 20 KB starved the LLM reviewers when the diff
+    appended a giant RFC entry to `RFCs/INDEX.md` — the src/*.mind
+    changes (the part that actually matters for non-negotiable review)
+    fell off the end. We instead diff each file group separately and
+    cap each contribution, putting src/ first so it survives.
+    """
+    # Split the diff by file, prioritise src/, allocate budgets.
+    files_out = run(["git", "-C", str(cwd), "diff", "HEAD~1..HEAD", "--name-only"])
+    files = [f for f in files_out.splitlines() if f.strip()]
+
+    def diff_for(path: str) -> str:
+        return run(["git", "-C", str(cwd), "diff", "HEAD~1..HEAD", "--", path])
+
+    src_files = [f for f in files if f.startswith("src/") or f.endswith(".mind")]
+    rfc_files = [f for f in files if f.endswith("RFCs/INDEX.md")]
+    other_files = [f for f in files if f not in src_files and f not in rfc_files]
+
+    pieces: list[str] = []
+    used = 0
+    # src/ gets up to 18 KB total (most important).
+    per_src = 18000 // max(1, len(src_files)) if src_files else 0
+    for f in src_files:
+        d = diff_for(f)
+        if len(d) > per_src:
+            d = d[:per_src] + f"\n... [truncated for {f}]\n"
+        pieces.append(d)
+        used += len(d)
+    # other files get up to 6 KB total.
+    per_oth = 6000 // max(1, len(other_files)) if other_files else 0
+    for f in other_files:
+        d = diff_for(f)
+        if len(d) > per_oth:
+            d = d[:per_oth] + f"\n... [truncated for {f}]\n"
+        pieces.append(d)
+        used += len(d)
+    # RFCs/INDEX.md gets the rest, capped at 6 KB. We don't need the
+    # whole new RFC body — reviewers only need to see whether a real
+    # Status marker was added and roughly which RFC.
+    if rfc_files:
+        d = diff_for(rfc_files[0])
+        cap = 6000
+        if len(d) > cap:
+            d = d[:cap] + "\n... [truncated: RFC body omitted]\n"
+        pieces.append(d)
+
+    return "\n".join(pieces)
 
 
 def latest_commit_msg(cwd: Path) -> str:

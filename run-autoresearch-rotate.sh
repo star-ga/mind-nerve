@@ -20,7 +20,11 @@
 
 set -u
 
-CLIS_DEFAULT="claude,gemini,codex,vibe"
+# vibe is excluded by default: its programmatic mode (-p) takes the
+# prompt as argv, and our prompts (target_files + INDEX.md verbatim)
+# blow past Linux ARG_MAX (~128 KB). Override with CLIS env if you
+# want to test it with a smaller config.
+CLIS_DEFAULT="claude,gemini,codex"
 CLIS="${CLIS:-$CLIS_DEFAULT}"
 COOLDOWN_SECONDS="${COOLDOWN_SECONDS:-1800}"   # 30 min nap between full rotations
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

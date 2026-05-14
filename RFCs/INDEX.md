@@ -2501,6 +2501,43 @@ invalidations of downstream artifacts. ALiBi is the smallest of the
 seven by code footprint (one bias addition before softmax) and the
 lowest implementation risk.
 
+**Status:** IMPLEMENTED at exp11 — `src/lib.mind` adds two backwards-soft
+compile-time constants under a new `[positional-encoding]` section:
+`pub const ATTN_ALIBI_SLOPES: [Q16_16; ENCODER_HEADS as usize] =
+[16384_i32, 4096_i32, 1024_i32, 256_i32]` (the geometric ladder
+`2^(-2)`, `2^(-4)`, `2^(-6)`, `2^(-8)` in Q16.16 per Press et al. §3.1
+for ENCODER_HEADS = 4) and `pub const ATTN_ALIBI_ENABLED: u32 = 0`,
+both bound into `model_hash` via the model manifest header. In
+`src/encoder_kernels.mind::sliding_window_attention` the implementation
+follows the RFC's "Optimization (required for landing): precompute the
+bias matrix once per encoder forward pass" directive but adopts a
+smaller distance-indexed precompute layout that handles RFC-007's
+sink prepend uniformly: an `alibi_bias: [[Q16_16; n]; ENCODER_HEADS]`
+table is filled once per layer (after the Q/K/V projections, before
+the head-tiled accumulator) by a compile-time-resolvable
+`if ATTN_ALIBI_ENABLED == 1u32` block whose inner loop computes
+`alibi_bias[h][dist] = q16_neg(q16_mul(slope_h, dist << 16))` for
+`h in 0..ENCODER_HEADS, dist in 0..n`. Inside the per-(i, j) score loop
+(same compile-time guard), `abs_i = s + i`, `abs_j = if j < sink_count
+{ SINK_POSITIONS[j] as usize } else { s + (j - sink_count) }`, the
+unsigned-difference absolute distance keys into the precomputed
+table, and a single saturating `q16_add` folds the bias into
+`scores[i][j]` right after the `q16_mul(raw, ATTN_SCALE_Q16)`. The
+imports list grows by `ATTN_ALIBI_SLOPES`, `ATTN_ALIBI_ENABLED` from
+`mind_nerve` and `q16_neg` from `q16_16`. With the backwards-soft
+default `ATTN_ALIBI_ENABLED = 0` both gated blocks are statically
+unreachable, mindc constant-folds them to nothing, the precompute
+table is zero-initialised but never read, the binary stays byte-
+identical to today, and the attention output equals the pre-RFC-011
+path. Activating the bias (flipping `ATTN_ALIBI_ENABLED` to `1`)
+binds the new model_hash and MUST happen in lockstep with an
+ALiBi-trained reference checkpoint — Press et al. §3 confirms that
+mismatched training/inference settings REGRESS accuracy below the
+no-position-encoding baseline. Cross-arch bit-identity follows from
+the deterministic composition of `q16_neg` + `q16_mul` (Q16.16
+saturating primitives) and a u32 absolute-distance subtract that
+lowers identically on every backend.
+
 ---
 
 # RFC-012 — Asymmetric query/passage prefix conditioning for retrieval-aware encoding

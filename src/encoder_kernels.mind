@@ -27,12 +27,15 @@ use crate::mind_nerve::{
     ENCODER_HEAD_DIM,
     ATTN_WINDOW_SIZE,
     ATTN_WINDOW_STRIDE,
+    ATTN_ALIBI_SLOPES,
+    ATTN_ALIBI_ENABLED,
     VOCAB_SIZE,
 };
 use crate::mind_nerve::q16_16::{
     q16_abs,
     q16_add,
     q16_sub,
+    q16_neg,
     q16_mul,
     q16_div_sat,
     q16_dot_pinned,
@@ -582,6 +585,44 @@ pub fn sliding_window_attention(
     let k: tensor<Q16_16, [n, ENCODER_HIDDEN]> = project_linear(x, wk);
     let v: tensor<Q16_16, [n, ENCODER_HIDDEN]> = project_linear(x, wv);
 
+    // RFC-011: precompute the per-head ALiBi bias indexed by absolute
+    // distance. `alibi_bias[h][dist] = -slope_h * dist` in Q16.16 for
+    // dist in 0..n. Computed once per `sliding_window_attention` call
+    // (= once per encoder layer), then read inside the per-(i, j) score
+    // loop below via a single array lookup. Cost: ENCODER_HEADS * n
+    // saturating q16_mul + q16_neg ops, ~0.001 ms at n = 1024 / 4 heads
+    // / 4-core x86 3 GHz. The distance-indexed layout (vs the RFC's
+    // larger (h, i, j) matrix) handles RFC-007's sink prepend uniformly:
+    // sink rows live at absolute positions SINK_POSITIONS[..], local
+    // rows at [s, e), and the same distance table covers both.
+    //
+    // With the backwards-soft default `ATTN_ALIBI_ENABLED = 0` the
+    // compile-time predicate is statically false, the entire precompute
+    // block plus the per-(i, j) bias addition below are dead code, mindc
+    // emits zero instructions for them, and the binary stays byte-
+    // identical to the pre-RFC-011 path. The latency analysis above
+    // applies only when `ATTN_ALIBI_ENABLED = 1`.
+    let mut alibi_bias: [[Q16_16; n]; ENCODER_HEADS as usize] =
+        [[0_i32; n]; ENCODER_HEADS as usize];
+    if ATTN_ALIBI_ENABLED == 1u32 {
+        let mut h_idx: usize = 0;
+        while h_idx < ENCODER_HEADS as usize {
+            let slope: Q16_16 = ATTN_ALIBI_SLOPES[h_idx];
+            let mut dist: usize = 0;
+            while dist < n {
+                // dist as Q16.16 = dist << 16; bounded by n - 1 ≤
+                // MAX_REQUEST_TOKENS - 1 = 1023 so the shifted value
+                // (≤ 1023 * 65536 = 2^26) fits comfortably in i32
+                // without saturation.
+                let dist_q16: Q16_16 = (dist as i32) * ONE_Q16_16;
+                let weighted: Q16_16 = q16_mul(slope, dist_q16);
+                alibi_bias[h_idx][dist] = q16_neg(weighted);
+                dist = dist + 1;
+            }
+            h_idx = h_idx + 1;
+        }
+    }
+
     // Step 2: head-tiled output buffer, zero-initialised. Accumulated into
     // per-window via overlap-add. mindc lowers this allocation to the layer
     // entry; no per-window allocation inside the loop.
@@ -690,6 +731,18 @@ pub fn sliding_window_attention(
             // ATTN_SCALE_Q16 = 1/sqrt(head_dim) = 1/8 in Q16.16 (= 8192).
             // Row width kv_len = w_len + sink_count; sink_count == 0 in
             // the backwards-soft path so this is exactly w_len.
+            //
+            // RFC-011: when ATTN_ALIBI_ENABLED == 1, add the per-head
+            // distance-indexed bias from the `alibi_bias[head_i][dist]`
+            // table precomputed above. The bias uses absolute sequence
+            // positions so RFC-007's sink rows (at fixed absolute
+            // positions SINK_POSITIONS[0..sink_count], indices 0..sink_count
+            // of kw/vw) are correctly biased against the local Q position
+            // `s + i`, distinct from the within-window distance |i - j|.
+            // With the backwards-soft default the bias-add branch is
+            // statically dead and `scores[i][j]` carries only the
+            // `q16_mul(raw, ATTN_SCALE_Q16)` value, byte-identical to the
+            // pre-RFC-011 path.
             let mut scores: [[Q16_16; kv_len]; w_len] = [[0_i32; kv_len]; w_len];
             let mut i: usize = 0;
             while i < w_len {
@@ -697,6 +750,16 @@ pub fn sliding_window_attention(
                 while j < kv_len {
                     let raw: Q16_16 = q16_dot_pinned(&qw[i], &kw[j]);
                     scores[i][j] = q16_mul(raw, ATTN_SCALE_Q16);
+                    if ATTN_ALIBI_ENABLED == 1u32 {
+                        let abs_i: usize = s + i;
+                        let abs_j: usize =
+                            if j < sink_count { SINK_POSITIONS[j] as usize }
+                            else              { s + (j - sink_count) };
+                        let dist: usize =
+                            if abs_i >= abs_j { abs_i - abs_j }
+                            else              { abs_j - abs_i };
+                        scores[i][j] = q16_add(scores[i][j], alibi_bias[head_i][dist]);
+                    }
                     j = j + 1;
                 }
                 i = i + 1;

@@ -46,9 +46,10 @@ echo "[autoresearch] launching with CLI=$CLI tag=$TAG cwd=$PWD"
 # Telegram ping on session start. One message per launch (not per
 # iteration). Failure is non-fatal; the loop runs either way.
 TG_HELPER="$HOME/.openclaw/workspace/outbound/telegram_send.py"
+PROJECT="$(basename "$PWD")"
 if [ -f "$TG_HELPER" ]; then
     python3 "$TG_HELPER" msg \
-        "🔬 mind-nerve autoresearch started · CLI=$CLI · tag=$TAG · branch=autoresearch/$TAG" \
+        "🔬 [$PROJECT] autoresearch started · CLI=$CLI · tag=$TAG · branch=autoresearch/$TAG" \
         > /dev/null 2>&1 || true
 fi
 

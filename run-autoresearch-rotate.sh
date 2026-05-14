@@ -36,7 +36,8 @@ tg() {
     fi
 }
 
-tg "🔄 autoresearch rotation launcher armed — order: $CLIS"
+PROJECT="$(basename "$PWD")"
+tg "🔄 [$PROJECT] autoresearch rotation launcher armed — order: $CLIS"
 
 IFS=',' read -ra CLI_ARR <<< "$CLIS"
 ROUND=0
@@ -49,12 +50,13 @@ while :; do
         CLI="$(echo "$CLI" | xargs)"   # strip whitespace
         [ -z "$CLI" ] && continue
 
-        echo "[rotate] round=$ROUND  cli=$CLI  $(date -Iseconds)"
-        tg "▶️ autoresearch round=$ROUND · trying cli=$CLI"
+        echo "[rotate] round=$ROUND  cli=$CLI  $(date -Iseconds)  project=$PROJECT"
+        tg "▶️ [$PROJECT] autoresearch round=$ROUND · trying cli=$CLI"
 
         # Snapshot TSV size so we can detect whether any iterations
-        # actually landed on this CLI's run.
-        TSV="$HERE/autoresearch_results.tsv"
+        # actually landed on this CLI's run. TSV lives in the target
+        # repo's cwd, not in the launcher's own directory.
+        TSV="$PWD/autoresearch_results.tsv"
         before=$([ -f "$TSV" ] && wc -l < "$TSV" || echo 0)
 
         "$HERE/run-autoresearch.sh" "$CLI"
@@ -74,16 +76,16 @@ while :; do
         # Anything else (1, sigkill, etc.) is unexpected — log and rotate.
         if [ "$rc" -eq 0 ]; then
             echo "[rotate] cli=$CLI exited cleanly. Stopping."
-            tg "⏹️ autoresearch stopped cleanly (cli=$CLI, round=$ROUND)"
+            tg "⏹️ [$PROJECT] autoresearch stopped cleanly (cli=$CLI, round=$ROUND)"
             exit 0
         fi
 
-        tg "⚠️ cli=$CLI exhausted (rc=$rc, +$delta rows). Rotating."
+        tg "⚠️ [$PROJECT] cli=$CLI exhausted (rc=$rc, +$delta rows). Rotating."
     done
 
     if [ "$any_kept_this_round" -eq 0 ]; then
         echo "[rotate] full pass produced 0 kept iterations. Cooling down ${COOLDOWN_SECONDS}s."
-        tg "😴 all CLIs blocked. Sleeping ${COOLDOWN_SECONDS}s before retrying."
+        tg "😴 [$PROJECT] all CLIs blocked. Sleeping ${COOLDOWN_SECONDS}s before retrying."
         sleep "$COOLDOWN_SECONDS"
     else
         echo "[rotate] round $ROUND produced kept iterations. Looping immediately."

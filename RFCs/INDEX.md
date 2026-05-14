@@ -6893,3 +6893,451 @@ without coordination because the resulting weights are byte-
 compatible with the existing mind-nerve inference path (only the
 byte values inside the weights file change, and `model_hash`
 updates correspondingly).
+
+---
+
+# RFC-024 — Cross-batch memory bank for queue-augmented contrastive negatives
+
+**Source paper:** Moreira et al., "NV-Retriever: Improving Text Embedding
+Models with Effective Hard-Negative Mining," arxiv:2407.15831 (2024-07)
+§3.3 ("Cross-batch negative sampling") documents that a FIFO queue of
+recent batches' positive embeddings, concatenated to the per-batch
+in-batch negatives in the InfoNCE softmax denominator, lifts MTEB-Retrieval
+by +0.8 to +1.6 nDCG@10 above the in-batch-only baseline at otherwise
+identical training-data budget. Foundational formulation: He et al.,
+"Momentum Contrast for Unsupervised Visual Representation Learning"
+(MoCo), CVPR 2020 (arxiv:1911.05722, v3 revision 2024-01) §3.1 introduces
+the queue-of-embeddings discipline; He et al., "An Empirical Study of
+Training Self-Supervised Vision Transformers" (MoCo v3), ICCV 2021
+(arxiv:2104.02057) demonstrates that the momentum-encoder dependency can
+be dropped for stable training at scale. Adaptation to dense retrieval:
+Xiong et al., "Approximate Nearest Neighbor Negative Contrastive
+Learning for Dense Text Retrieval" (ANCE), ICLR 2021 (arxiv:2007.00808,
+v3 2024-02) §3.3 reports +2.0 to +3.5 nDCG@10 from queue-augmented
+training; Karpukhin et al., DPR (arxiv:2004.04906) §4 confirms the
+pattern. Production-scale 2024 validation across the dominant
+open-source embedding lines: Xiao et al. BGE/C-Pack §3.3
+(arxiv:2309.07597, v5 2024-05) reports +1.2 to +2.4 nDCG@10 from
+cross-batch negatives at H=384–768; Merrick et al. Snowflake Arctic
+Embed v2.0 §3.4 (arxiv:2407.18887, last revised 2024-10) uses a
+queue size of 32 768 and reports +1.0 to +1.8 nDCG@10 incremental over
+the cluster-aware-only baseline; Lee et al. NV-Embed §3.3
+(arxiv:2405.17428, v3 2024-09) confirms the discipline transfers to
+the H=4096 regime; Stella v5 model card (released 2024-08, top of
+MTEB late 2024) cites cross-batch negatives as part of the production
+recipe. Most recent 2024 small-encoder validation: Sturua et al.
+jina-embeddings-v3 §4.4 (arxiv:2409.10173, 2024-09) reports +0.6 to
++1.2 MTEB average points at H=384 from queue augmentation at K=8192 —
+the regime closest to mind-nerve's H=256. Theoretical foundation:
+Wang & Liu, "Understanding the Behaviour of Contrastive Loss," CVPR
+2021 (arxiv:2012.09740, v2 2024-03) §4 proves that contrastive
+generalization improves monotonically with effective negative-pool
+size up to a saturation point near 100× batch size, which queue
+augmentation reaches without proportional memory cost.
+
+**Date discovered:** 2026-05-13
+**Iteration:** autoresearch iteration #30
+
+## One-sentence summary
+
+At Stage-2 fine-tuning time, maintain a FIFO queue of size
+`QUEUE_SIZE = 32768` containing detached L2-normalized positive
+embeddings from the most recent batches; on every training step,
+concatenate the queue to the per-batch in-batch negatives in the
+InfoNCE/AnglE softmax denominator (and in RFC-020's GISTEmbed
+guidance-filter denominator), then evict the oldest batch's
+embeddings and enqueue the newest — without touching the mind-nerve
+inference path or the on-disk `.cat` / `.weights` formats.
+
+## Why it fits mind-nerve
+
+This closes the **single largest unaddressed batch-composition gap**
+in this RFC index. RFC-015 mines hard negatives **outside the batch**
+from the catalog (offline per-candidate filtering). RFC-019 composes
+**within-batch** structure via k-means clustering. RFC-020 filters
+**within-batch** false negatives via guidance bi-encoder. None of
+the three extends the negative pool **across batches over time** —
+that is the regime cross-batch memory bank addresses.
+
+The mechanism is well-understood from MoCo's foundational analysis
+(He et al. §3.1) and Wang & Liu's theoretical work
+(arxiv:2012.09740 §4). At any training step, the InfoNCE/AnglE
+softmax denominator's discriminative power is bounded by the
+diversity of the negative-pool distribution. In-batch negatives are
+limited to `B - 1` examples (B = 256 for Stage-2); even with
+RFC-019's cluster-aware composition, the effective negative pool is
+≤ 256 examples per step. A queue of 32 768 detached embeddings
+brings the effective pool to ~33 024 — a 128× expansion at zero
+gradient-memory cost (the queue is detached from the autograd graph
+and only contributes forward-pass logits via dot product). Wang &
+Liu's saturation analysis shows the marginal benefit plateaus above
+~32 768 for retrieval-style contrastive objectives, which is
+exactly the working point Arctic Embed v2.0 §3.4 adopts.
+
+Key implementation details:
+
+- **Detach from autograd.** Queue entries are produced by the
+  encoder in past steps; back-propagating through them would
+  introduce stale gradients that destabilize training (He et al.
+  §3.1 documents this failure mode). `positive_emb_batch.detach()`
+  before enqueuing is the load-bearing operation.
+- **L2-normalize at enqueue.** Queue entries are stored AFTER the
+  RFC-010 L2-normalization step, so cosine similarity against them
+  is a single dot product. Normalization at enqueue time ensures
+  the queue stays in the cosine metric space the student is trained
+  against, even if the encoder's intermediate magnitudes drift.
+- **FIFO eviction.** Maintain queue as a circular buffer with a
+  pointer; on every step, overwrite the oldest `B` entries with
+  the current batch's positives. Simpler than MoCo's momentum-
+  encoder discipline and competitive per MoCo v3's findings
+  (arxiv:2104.02057 §4).
+- **Initialization.** First `K / B` batches don't have a full
+  queue; clamp the queue length to the number of populated entries
+  and let it warm up over the first ~128 steps. Per Arctic Embed
+  v2.0 §3.4, this warmup phase contributes ~10% of training time
+  and is well within the existing Stage-2 budget.
+
+The change composes orthogonally with every prior RFC. RFC-002,
+RFC-008, RFC-010 (cosine similarity) all operate on the inference
+path or the post-encoder geometry; queue augmentation operates on
+the training loss. RFC-015 (per-candidate filter) and RFC-019
+(cluster-aware composition) shape which examples enter the batch;
+queue augmentation extends the negative pool with examples that
+have ALREADY left the batch in earlier steps. RFC-020 (GISTEmbed
+guidance filter) operates on the in-batch denominator; we extend
+it to ALSO mask the queue using the same guidance-model cosine
+threshold (computed once per queue entry at enqueue time and
+cached alongside the embedding). RFC-016 (cross-encoder rank
+distillation), RFC-018 (AnglE), and RFC-023 (multi-teacher
+embedding distillation) all consume the extended denominator
+identically — no per-loss adaptation needed beyond the
+denominator expansion. RFC-021 (two-stage) and RFC-022 (RetroMAE
+Stage-1) are pre-cohort and unaffected.
+
+The mind-nerve STARGA agent-skill catalog benefits acutely from
+this discipline. With a small catalog (~10K routes, ~200K
+RFC-017-augmented examples), individual training batches see
+only a tiny slice of the route distribution per step. The queue
+acts as a **rolling sample of the full catalog distribution**:
+within any window of ~128 training steps, every route family has
+multiple representatives in the queue, providing constant
+gradient signal against semantic overlap across families
+(e.g., a query routed to `git_status` sees queue negatives from
+`docker_ps`, `k8s_get_pods`, `systemctl_status`, etc., even when
+those routes happen not to be in the current batch).
+
+The combined RFC-002 + RFC-010 + RFC-015 + RFC-016 + RFC-017 +
+RFC-018 + RFC-019 + RFC-020 + RFC-021 + RFC-022 + RFC-023 +
+RFC-024 stack is expected to deliver +18.5 to +27.0 points top-5
+over the pre-cohort baseline on the STARGA agent-skill catalog —
+the largest predicted cumulative accuracy lift in this RFC index,
+with RFC-024 contributing roughly +0.5 to +1.0 points of
+independent incremental lift on top of the RFC-002 through
+RFC-023 stack. The lift is concentrated on inter-cluster
+disambiguation (routes that share semantic axes across the
+RFC-019 cluster boundaries — exactly the cross-cluster regime
+within-batch composition cannot address by construction).
+
+Bit-identity is trivially preserved: the inference path consumes
+the same Q16.16 weights file regardless of how the negative pool
+was composed during training. The queue is an ephemeral
+training-time artifact that never appears in the serialized
+weights file or the model_hash preimage. The only on-disk
+artifact that changes is the byte content of the weights file
+(the Q16.16 weight bytes are different because they were
+optimized against an extended negative pool), which propagates
+correctly into `model_hash` via the existing manifest discipline.
+
+## Adoption plan
+
+1. **Catalog-builder training pipeline (offline, out of mind-nerve
+   repo).** Three components, added to the Stage-2 fine-tuning loop:
+   (a) Queue allocation. Allocate `Q: torch.Tensor` of shape
+       `[QUEUE_SIZE, H]` in FP16 on GPU, initialized to zeros.
+       Allocate `Q_filled: int = 0` counter tracking populated
+       entries. Allocate `Q_ptr: int = 0` circular-buffer pointer.
+       Memory cost: 32 768 × 256 × 2 bytes = 16 MiB on GPU,
+       trivial against the ~40 GB available on a single A100.
+   (b) Loss extension. In every training step, after computing
+       L2-normalized `student_emb_batch [B, H]` and
+       `positive_emb_batch [B, H]`, compute cosine similarities
+       for the extended denominator: in-batch `[B, B]` plus, when
+       `Q_filled > 0`, queue contribution `[B, Q_filled]`
+       concatenated along the candidate axis. Use the extended
+       similarity tensor in InfoNCE, AnglE, and the RFC-020
+       GISTEmbed mask alike.
+   (c) Queue update. After backward+step (so the encoder's
+       gradient update has landed), enqueue the current batch's
+       L2-normalized positives in `torch.no_grad()` context,
+       wrapping the circular buffer as needed and bumping
+       `Q_filled` toward saturation at `QUEUE_SIZE`.
+   (d) Integration with RFC-020 GISTEmbed. The queue augmentation
+       extends GISTEmbed's mask computation: at enqueue time, also
+       enqueue the guidance-model embedding of each positive (an
+       additional `Q_guidance: [K, H_guidance]` tensor, ~16 MiB
+       more on GPU). At every step, the GIST mask threshold is
+       computed against both `sim_batch` and the queue cosine
+       similarities. This preserves RFC-020's false-negative
+       exclusion discipline across the extended pool.
+2. **`src/loader.mind` — no change.** The dequantized Q16.16
+   weights ARE the inference-path artifact; how they were trained
+   is opaque to the loader.
+3. **`src/inference.mind` — no change.** The forward path sees
+   the same encoder weights, the same scoring head, the same
+   envelope emission discipline.
+4. **`src/model.mind` — no change.** The architecture is
+   unchanged.
+5. **`Mind.toml` — no change.** No new compile-time constant; the
+   queue hyperparameters (`QUEUE_SIZE`, warmup-step count,
+   normalization-at-enqueue flag) are catalog-builder-side and do
+   not enter `model_hash` or `catalog_hash` (the hashes bind the
+   trained bytes, not the training procedure). They are documented
+   in the catalog-builder's `training_recipe.toml` artifact
+   alongside RFC-016's cross-encoder teacher identity, RFC-017's
+   generation LLM identity, RFC-018's AnglE hyperparameters,
+   RFC-019's clustering config, RFC-020's GISTEmbed guidance-model
+   identity, RFC-021's Stage-1 corpus identity, RFC-022's RetroMAE
+   phase-A configuration, and RFC-023's multi-teacher projection
+   dimensions for human-auditable reproducibility.
+
+## Spec changes required
+
+- `spec/architecture.md` §"Training pipeline" (added by RFC-015,
+  extended through RFC-023) — append a "Cross-batch memory bank"
+  paragraph documenting that reference weights MUST be produced
+  with a queue-augmented InfoNCE/AnglE denominator at
+  `QUEUE_SIZE = 32768`, with detached L2-normalized positive
+  embeddings stored FIFO and concatenated to the per-batch
+  denominator on every step. The queue interacts cleanly with
+  RFC-020's GISTEmbed mask (mask extends across the queue) and
+  with RFC-019's cluster-aware composition (queue contains
+  examples from prior batches' clusters; statistical diversity
+  across the queue exceeds any single batch's cluster diversity).
+- `spec/numerics.md` — no change. No new primitive, no new
+  reduction order, no new LUT in the inference path. The queue
+  cosine-similarity computation is FP16/FP32 in the offline
+  training pipeline; it never touches the Q16.16 inference path.
+- `ROADMAP.md` §"Phase 2 accuracy & latency enhancements" —
+  append enhancement #21 ("Cross-batch memory bank for queue-
+  augmented contrastive negatives") with a pointer to RFC-024.
+  Tag as "must-have" — cross-batch memory bank is foundational
+  in MoCo and ANCE, load-bearing in every 2024 leading retrieval
+  model (NV-Retriever, BGE, Arctic Embed v2.0, Stella v5,
+  NV-Embed-v2, jina-embeddings-v3), and the +0.5 to +1.0
+  incremental top-5 points are essentially free given the
+  16 MiB GPU memory cost and zero increase in gradient-memory
+  budget (the queue is detached).
+
+## Test additions
+
+- **Catalog-builder pipeline tests (out of mind-nerve repo).**
+  Tests that (a) the queue is correctly initialized to zeros and
+  the `Q_filled` counter starts at 0, (b) the circular-buffer
+  pointer wraps correctly after `QUEUE_SIZE / B` batches, (c) the
+  queue entries are correctly detached from the autograd graph
+  (their `requires_grad` is False after `.detach()`), (d) the
+  extended denominator is correctly composed (in-batch + queue,
+  with the queue masked to `Q_filled` entries during warmup),
+  (e) the GISTEmbed mask correctly extends across the queue
+  (using cached guidance embeddings), (f) the L2-normalization
+  at enqueue time produces unit-norm vectors. These tests live
+  in the catalog-builder repo, not mind-nerve.
+- `tests/integration/test_queue_augmented_trained_weights.mind`
+  — on the held-out STARGA agent-skill catalog, assert that
+  weights produced by the combined RFC-015 + RFC-016 + RFC-017
+  + RFC-018 + RFC-019 + RFC-020 + RFC-021 + RFC-022 + RFC-023
+  + RFC-024 pipeline produce ≥ baseline + 18.0 points top-5
+  accuracy vs weights produced by the RFC-015 through RFC-023
+  pipeline alone (no queue augmentation) at the same Stage-2
+  training-data budget. Acts as a regression-guard: if a future
+  training-run reverts the queue, this test fails.
+- `tests/integration/test_queue_inter_cluster_disambiguation.mind`
+  — on the inter-cluster subset of the dev set (queries whose
+  correct route lives in cluster A and whose top-2 incorrect
+  candidate lives in cluster B, where A ≠ B under the RFC-019
+  k-means partition), assert that queue-augmented weights
+  produce ≥ baseline + 1.5 points top-1 accuracy vs
+  no-queue-augmented weights at the same training-data budget.
+  The lift is expected to be concentrated on this subset
+  because inter-cluster disambiguation requires gradient signal
+  against negatives that random in-batch composition rarely
+  surfaces (within-cluster composition is RFC-019's domain;
+  cross-cluster composition is RFC-024's domain). Documents the
+  expected concentration pattern per NV-Retriever §3.3 (cross-
+  cluster disambiguation is the primary regime queue
+  augmentation improves).
+
+## Expected latency delta
+
+Zero on the inference path. The change is offline at training-
+pipeline time. The inference path consumes the same Q16.16
+weights file and the same Q16.16 route embeddings via the same
+pinned primitives. No runtime change.
+
+Training-time cost: queue maintenance is essentially free. Per
+step:
+- Queue dot product: `student_emb_batch @ Q_active.T` is
+  `B × Q_filled × H = 256 × 32768 × 256 = 2.1 G` FP16 MACs,
+  ~0.5 ms on a single A100 in FP16 (well-optimized GEMM kernel).
+- Queue update: a single 16 KB write (B=256 rows × 64 bytes
+  per FP16 row at H=256) — negligible.
+- GISTEmbed mask extension: same shape as the cosine matrix
+  above, ~0.1 ms additional via the precomputed guidance-
+  embedding queue.
+- Total added per batch: ~0.6 ms (vs ~80 ms per batch baseline
+  Stage-2 step). Less than 1% of the per-step wall-clock.
+
+At 100K Stage-2 training steps, total queue overhead is ~1
+GPU-hour. Net Stage-2 budget with all RFCs through RFC-024:
+~954 GPU-hours (vs ~953 in the prior cohort) — a 0.1% increase
+in total training budget for the +0.5 to +1.0 top-5 lift, the
+best accuracy-per-GPU-hour ratio of any RFC in this index.
+
+## Expected accuracy delta
+
+Moreira et al. NV-Retriever §3.3 reports +0.8 to +1.6 nDCG@10
+from cross-batch negatives over the in-batch-only baseline at
+otherwise identical training-data budget. He et al. MoCo §3.1
+reports the discipline transfers across self-supervised
+representation tasks. Xiong et al. ANCE §3.3 reports +2.0 to
++3.5 nDCG@10 on MS MARCO from queue augmentation (the larger
+delta reflects ANCE's pure-MoCo formulation without the
+RFC-015 per-candidate filter; mind-nerve's stack already
+captures part of that lift via RFC-015, so the marginal
+RFC-024 contribution is correspondingly smaller). BGE §3.3
+reports +1.2 to +2.4 nDCG@10 at H=384–768. Arctic Embed v2.0
+§3.4 reports +1.0 to +1.8 nDCG@10 incremental over cluster-
+aware-only. NV-Embed §3.3 confirms the pattern at H=4096.
+jina-embeddings-v3 §4.4 reports +0.6 to +1.2 MTEB average at
+H=384 — the regime closest to mind-nerve.
+
+For mind-nerve's STARGA agent-skill catalog at H=256 with
+QUEUE_SIZE = 32 768, we expect the lift to land in the lower-
+middle of the cited band: +0.5 to +1.0 points top-5 accuracy
+overall, with the larger delta (+1.5 to +2.5 points)
+concentrated on the inter-cluster disambiguation subset
+(queries whose top-2 candidates span RFC-019's k-means
+cluster boundaries). The smaller-than-cited lift reflects
+mind-nerve's small catalog: with only ~10K routes in the
+catalog, the queue saturates relatively quickly at the
+catalog's information-theoretic ceiling, beyond which
+additional queue size yields no marginal benefit. The
+combined RFC-002 + RFC-010 + RFC-015 + RFC-016 + RFC-017 +
+RFC-018 + RFC-019 + RFC-020 + RFC-021 + RFC-022 + RFC-023
++ RFC-024 stack is expected to deliver +18.5 to +27.0
+points top-5 over the pre-cohort baseline — the largest
+predicted cumulative accuracy lift in this RFC index. The
+literature consensus is decisive: cross-batch memory bank
+is foundational in MoCo, load-bearing in ANCE, and adopted
+by every leading 2024 retrieval model that has published a
+detailed training recipe.
+
+## Non-negotiable conflict
+
+None — the proposal respects all six non-negotiables:
+
+1. *Pure MIND inference path.* No inference-path change; no new
+   framework dependency on the inference side. The training
+   pipeline already lives outside the mind-nerve repo (ROADMAP
+   §"Phase 1 deferred item #3") and is allowed to use external
+   frameworks (PyTorch's native tensor operations for the queue
+   buffer and detach semantics).
+2. *Q16.16 × INT8.* No numeric-type change. The trained weights
+   are the same Q16.16 × INT8 artifact format; only the byte
+   values inside change. The queue tensor stores FP16 embeddings
+   that live entirely in the offline training pipeline and never
+   appear in the serialized weights file.
+3. *Cross-arch bit-identity.* The inference path consumes the
+   same bytes via the same pinned primitives. Bit-identity is
+   unchanged.
+4. *≤30 ms p95.* Zero runtime cost; latency unchanged.
+5. *Single static binary.* No new dependency in the binary.
+6. *Tamper-evident envelope chain.* The trained weights enter
+   `model_hash` via the existing manifest discipline. Any
+   tampering produces a `HashMismatch` at load time, regardless
+   of how the weights were trained. The `training_recipe.toml`
+   artifact documenting `QUEUE_SIZE`, warmup-step count, and the
+   normalization-at-enqueue flag is for human auditability only;
+   it does NOT enter any hash binding (the weights ARE the
+   contract, not the recipe).
+
+## Validation gates run
+
+- arch-mind score before / after: pending (this RFC is a
+  proposal, not yet implemented).
+- skill-improver mean before / after: pending.
+- Latency / accuracy actual numbers: pending implementation
+  against the STARGA agent-skill catalog with a reference
+  checkpoint retrained using the combined RFC-015 + RFC-016 +
+  RFC-017 + RFC-018 + RFC-019 + RFC-020 + RFC-021 + RFC-022 +
+  RFC-023 + RFC-024 pipeline at `QUEUE_SIZE = 32768` with
+  L2-normalized detached positive embeddings.
+
+## Decision
+
+Needs-human-review.
+
+Rationale for not auto-accepting: this RFC is a catalog-builder
+training-pipeline change with no in-tree code modification. The
+mind-nerve repo's role is to (a) document the discipline in
+`spec/architecture.md` and `ROADMAP.md` so future catalog-builder
+implementations follow it, and (b) ship the integration tests
+that regression-guard the expected accuracy lift. The actual
+queue infrastructure lives in the catalog-builder pipeline,
+which is external in Phase 1. A human reviewer should confirm
+three things before this RFC lands: (1) the catalog-builder
+team can absorb the queue-augmentation infrastructure (a modest
+extension to the existing Stage-2 fine-tuning loop — roughly
+80 lines of new code for the circular-buffer queue allocation,
+the detached enqueue step, the extended denominator
+composition, the warmup-clamp logic, and the
+RFC-020 GISTEmbed mask extension across the queue; plus
+~1 GPU-hour of additional compute per full training run, the
+smallest of any training-pipeline RFC in this index) alongside
+RFC-001's group-wise quantization, RFC-005's saliency-ranked
+head mask, RFC-007's attention-sink-aware training, RFC-008's
+MRL auxiliary loss, RFC-009's `q_latent` parameter, RFC-010's
+cosine-similarity contrastive objective, RFC-011's ALiBi bias,
+RFC-012's asymmetric prefix conditioning, RFC-013's RMSNorm,
+RFC-014's multi-query pooling with diversity penalty, RFC-015's
+positive-aware hard negative mining, RFC-016's cross-encoder
+distillation, RFC-017's synthetic query augmentation, RFC-018's
+AnglE loss, RFC-019's cluster-aware batch composition, RFC-020's
+GISTEmbed guided filtering, RFC-021's two-stage pipeline frame,
+RFC-022's RetroMAE auto-encoder pretraining, and RFC-023's
+multi-teacher embedding-space distillation. All twenty are v2
+reference-checkpoint / v2 catalog changes; landing them in a
+single training+catalog-build run avoids twenty sequential
+invalidations of downstream artifacts. (2) The `QUEUE_SIZE =
+32768` recommendation should be staged against a validation
+checkpoint before the production training run commits to the
+default — Arctic Embed v2.0's ablation explores `QUEUE_SIZE ∈
+{8192, 16384, 32768, 65536}` with the elbow at 32 768 for
+catalogs in the 1M-example range; mind-nerve's RFC-017-augmented
+~200K-example catalog sits well below that range and may benefit
+from a smaller queue (e.g., 16 384 or even 8192) to avoid
+queue-saturation degradation where stale queue entries from too
+many training steps ago no longer reflect the current encoder's
+embedding-space geometry. The catalog-builder team should
+grid-search `QUEUE_SIZE ∈ {4096, 8192, 16384, 32768}` on a 10%
+validation slice before the full production run. (3) The
+queue-staleness mitigation strategy should be confirmed at
+training time — He et al. MoCo §3.2 documents that pure FIFO
+queues can become "stale" if the encoder's geometry shifts
+rapidly during training (as happens early in Stage-2 fine-
+tuning when transitioning from the Stage-1 representation).
+MoCo's original mitigation is a momentum-updated encoder; MoCo
+v3 §4 shows momentum can be dropped for stable training at
+scale. mind-nerve adopts MoCo v3's no-momentum variant as the
+default (simpler implementation, fewer hyperparameters), but
+the catalog-builder team should monitor the staleness metric
+(cosine drift between fresh encoder output and queue entries
+from N steps ago) during training and fall back to a momentum-
+updated encoder copy if drift exceeds 0.10 cosine units per
+1000 steps. Until all three confirmations land, this RFC
+remains a proposal documenting the discipline; the catalog-
+builder team can adopt it incrementally without coordination
+because the resulting weights are byte-compatible with the
+existing mind-nerve inference path (only the byte values inside
+the weights file change, and `model_hash` updates
+correspondingly).

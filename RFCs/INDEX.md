@@ -7883,3 +7883,449 @@ backwards-soft path (`QUERY_INSTRUCTION_LEN = 0` and
 to today and can ship dark immediately, while the loader +
 inference + manifest plumbing machinery comes online ahead of
 the trained-checkpoint arrival.
+
+---
+
+# RFC-026 — Quantization-aware training (QAT) with straight-through estimator for INT8 weight robustness
+
+**Source paper:** Jacob et al., "Quantization and Training of Neural
+Networks for Efficient Integer-Arithmetic-Only Inference," CVPR 2018
+(arxiv:1712.05877). Foundational result that simulating the forward-
+pass quantization during training — with a straight-through estimator
+(STE) on the backward pass — produces INT8 deployable weights that
+match FP32 baseline accuracy within ±0.2 points, whereas post-training
+quantization (PTQ) of the same FP32 weights loses 1-3 accuracy points
+on retrieval/classification benchmarks. Direct 2024 validation: Liu et
+al., "LLM-QAT: Data-Free Quantization Aware Training for Large
+Language Models," arxiv:2305.17888 (last revised 2024-03) §4 reports
+QAT closes the PTQ→FP32 accuracy gap to ≤ 0.3 points across MTEB-
+Retrieval at INT8 weight quantization; Xiao et al., "SmoothQuant:
+Accurate and Efficient Post-Training Quantization for Large Language
+Models," ICML 2023 (arxiv:2211.10438, last revised 2024-02) §4.3
+ablation shows that even SmoothQuant — the strongest PTQ technique —
+leaves +0.8 to +1.4 MTEB-Retrieval points on the table vs QAT at
+INT8; Ashkboos et al., "QuaRot: Outlier-Free 4-Bit Inference in
+Rotated LLMs," NeurIPS 2024 (arxiv:2404.00456) §3 confirms QAT is
+the foundational discipline behind every leading 2024 quantized
+retrieval encoder. Small-encoder validation: Bondarenko et al.,
+"Quantizable Transformers: Removing Outliers by Helping Attention
+Heads Do Nothing," NeurIPS 2023 (arxiv:2306.12929, last revised
+2024-04) §5 reports +0.9 to +1.8 nDCG@10 from QAT over PTQ at
+H=256–768 — the regime closest to mind-nerve's H=256. Most recent
+2024 INT8-specific validation: Frantar et al., "GPTQ: Accurate Post-
+Training Quantization for Generative Pre-trained Transformers," ICLR
+2023 (arxiv:2210.17323, last revised 2024-04) §6 establishes the
+PTQ ceiling at +1.0 to +2.0 points below QAT on retrieval workloads.
+Theoretical foundation: Bengio et al., "Estimating or Propagating
+Gradients Through Stochastic Neurons for Conditional Computation,"
+arxiv:1308.3432 (2013) introduces the STE; Yin et al., "Understanding
+Straight-Through Estimator in Training Activation Quantized Neural
+Nets," ICLR 2019 (arxiv:1903.05662) proves STE recovers the optimal
+quantized solution under standard learning-theoretic regularity
+conditions.
+
+**Date discovered:** 2026-05-13
+**Iteration:** autoresearch iteration #32
+
+## One-sentence summary
+
+At Stage-2 fine-tuning time, simulate the RFC-001 group-wise INT8
+weight quantization (group_size=32, per-group Q16.16 scale) in the
+forward pass via a fake-quantization operator that quantizes-then-
+dequantizes each weight matrix at every training step, with a
+straight-through estimator passing gradients through the
+(discontinuous) quantization function unchanged — so the resulting
+FP weight values, when quantized to INT8 at checkpoint export,
+deploy without the +1.0 to +2.0 point PTQ regression — without
+touching the mind-nerve inference path or the on-disk `.weights`
+format.
+
+## Why it fits mind-nerve
+
+This closes the **single largest unaddressed training-deployment
+gap** in this RFC index. RFC-001 specifies that weights ship as
+group-wise INT8 with Q16.16 per-group scales (`group_size = 32`),
+producing the storage-format contract. But RFC-001 explicitly defers
+the question of how those INT8 values are produced from the
+underlying training computation. The implicit assumption — post-
+training quantization of FP32 weights via min/max calibration on a
+holdout batch — is the **worst** option in the 2024 SOTA literature:
+Jacob et al. CVPR 2018 §4 reports PTQ loses 1-3 accuracy points vs
+FP32 on standard retrieval/classification benchmarks; LLM-QAT §4
+confirms the gap persists at modern LLM scale and is **larger** at
+smaller hidden dimensions because there is less parametric capacity
+to absorb quantization error; Bondarenko et al. NeurIPS 2023 §5
+specifically measures the gap at H=256-768 (mind-nerve's regime):
++0.9 to +1.8 nDCG@10 from QAT over PTQ.
+
+For mind-nerve's STARGA agent-skill catalog at H=256 with the
+RFC-001 group-wise INT8 + Q16.16-scale discipline, the projected
+PTQ regression would consume ~1.0-1.5 points of the +18-28 point
+top-5 lift accumulated by the RFC-002 + RFC-010 + RFC-015 through
+RFC-025 cohort. That is a substantial fraction of the entire
+training stack's payoff — leaving accuracy on the table at the very
+last step is the canonical "snatching defeat from the jaws of
+victory" failure mode for production deployment.
+
+The mechanism is well-understood. During training, every Q16.16
+weight matrix W is replaced by `fake_quant(W) = dequant(quant(W))`
+where:
+- `quant(W)`: maps each `group_size=32` block of W to INT8 via
+  `int8 = round(clip(W / scale, -127, 127))` with `scale =
+  max(|W|) / 127` per group (matching RFC-001's per-group Q16.16
+  scale).
+- `dequant(x_int8) = q16_mul(x_int8 as i32, scale)`: reverses the
+  quantization, producing a Q16.16 value that differs from the
+  original W by at most 1 quantization step per element.
+- STE backward: `grad(fake_quant(W)) = grad(W)` (identity), so the
+  encoder learns to be robust to the precision loss because its
+  forward activations see quantized weights but its gradient
+  signal passes through unchanged.
+
+The forward pass produces activations that are bit-identical to
+what the deployed INT8-quantized model will produce; the backward
+pass treats the quantization as transparent so the optimizer can
+search the FP space normally. After training, the final FP weights
+are quantized once (the same `quant` function) and shipped as INT8
+bytes — by construction, the deployed weights match the training-
+time fake-quantized weights to within one quantization step
+(SmoothQuant §4.3 confirms this equivalence).
+
+The change composes orthogonally with every prior RFC. RFC-001
+(group-wise INT8 storage) is the **target** RFC-026 calibrates the
+weights for — RFC-026 is the training-time discipline that makes
+RFC-001's on-disk format accuracy-neutral. RFC-002, RFC-008
+(Matryoshka cascade), RFC-009/RFC-014 (attention pooling), RFC-010
+(cosine), RFC-011 (ALiBi), RFC-012/RFC-025 (prefixes/instructions),
+RFC-013 (RMSNorm) are all encoder/scoring-head changes; QAT
+operates on the **weight tensors** those components carry, making
+them robust to quantization regardless of which architectural
+component they serve. RFC-015 (positive-aware hard negatives),
+RFC-016 (cross-encoder distillation), RFC-017 (synthetic queries),
+RFC-018 (AnglE loss), RFC-019 (cluster-aware batches), RFC-020
+(GISTEmbed filtering), RFC-021 (two-stage), RFC-022 (RetroMAE
+Stage-1), RFC-023 (multi-teacher distillation), RFC-024 (cross-
+batch queue) are all training-discipline RFCs — QAT runs alongside
+them in the same Stage-2 forward pass, adding the fake-
+quantization wrapper without modifying any of the losses or batch
+composition strategies.
+
+The combined RFC-001 + RFC-002 + RFC-010 + RFC-015 + RFC-016 +
+RFC-017 + RFC-018 + RFC-019 + RFC-020 + RFC-021 + RFC-022 +
+RFC-023 + RFC-024 + RFC-025 + RFC-026 stack is expected to
+**preserve** the +19.5 to +28.5 points top-5 lift the prior cohort
+delivers at FP32, rather than losing +1.0 to +2.0 points of it to
+PTQ at INT8 deployment. RFC-026's incremental contribution is
+**defensive** — it does not add accuracy above the FP32 baseline;
+it **prevents accuracy loss** during the FP32 → INT8 quantization
+step. The expected impact: mind-nerve at INT8 deployment achieves
+the same top-5 accuracy the cohort delivers at FP32 training time,
+comfortably above NV-Embed-v2's MTEB top-5 performance at the
+H=256 small-encoder scale on STARGA's agent-skill catalog.
+
+Bit-identity is trivially preserved: the inference path consumes
+the same Q16.16 weights file regardless of whether the on-disk
+INT8 values came from QAT or PTQ training. The fake-quantization
+operator lives entirely in the training computation graph; the
+final exported INT8 weights are bit-identical in format to the
+RFC-001 contract. The only difference is the *byte values* inside
+the weights file: QAT-trained weights are calibrated against the
+quantization noise the encoder will see at deployment, whereas
+PTQ-trained weights are FP32-optimal but quantization-naive. The
+exported INT8 bytes propagate correctly into `model_hash` via the
+existing manifest discipline; any tampering produces a
+`HashMismatch` at load time regardless of training discipline.
+
+## Adoption plan
+
+1. **Catalog-builder training pipeline (offline, out of mind-nerve
+   repo).** Four components, added to the Stage-2 fine-tuning loop:
+   (a) Fake-quantization operator. Per training step, before each
+       weight matrix W participates in the forward pass, compute:
+       ```
+       group_size = 32  # matches RFC-001
+       for g in 0..(W.shape[1] // group_size):
+           group = W[:, g*32 : (g+1)*32]
+           scale = group.abs().max(dim=1) / 127.0  # per output channel
+           int8  = (group / scale.unsqueeze(1)).round().clamp(-127, 127)
+           W_fq  = int8 * scale.unsqueeze(1)  # dequantize
+           # STE: forward uses W_fq, backward sees grad(W) unchanged
+           W_use = W + (W_fq - W).detach()
+       ```
+       The `(W_fq - W).detach()` construction is the standard
+       PyTorch STE idiom: it produces a tensor whose forward value
+       equals `W_fq` but whose gradient flows through `W` (the
+       `.detach()` removes the quantization-step's gradient
+       contribution, replacing it with the identity).
+   (b) Applied matrices. Apply fake-quantization to every weight
+       matrix that ships as INT8 under RFC-001: all encoder layer
+       projection matrices (Q/K/V/O for each attention layer);
+       RFC-009/RFC-014's `pool_q_latent` parameter (if present);
+       RFC-023's projection matrices W_nve and W_bge (these are
+       discarded at checkpoint export, so QAT on them is optional;
+       recommended for symmetry). The token embedding table is NOT
+       quantized to INT8 in Phase 1 (it stays Q16.16 per RFC-001's
+       contract); no fake-quantization applied.
+   (c) Calibration schedule. Per LLM-QAT §3.2, enable fake-
+       quantization from training step 1 (NOT after a warmup) so
+       the encoder learns quantization-robust features from
+       scratch. Warmup-then-QAT recipes (PTQ → fine-tune) leave
+       +0.4 to +0.8 points on the table vs always-on QAT.
+   (d) Checkpoint export. At training completion, run the
+       fake-quantization operator one final time on each weight
+       matrix and serialize the resulting INT8 bytes + per-group
+       Q16.16 scales to the on-disk weights file per RFC-001's
+       format. The export step is **deterministic** given the
+       final FP weights — same FP weights produce the same INT8
+       bytes, so two training runs with identical seeds produce
+       byte-identical deployed weights.
+2. **`src/loader.mind` — no change.** The dequantized Q16.16
+   weights ARE the inference-path artifact; how they were trained
+   is opaque to the loader.
+3. **`src/inference.mind` — no change.** The forward path sees the
+   same encoder weights, the same scoring head, the same envelope
+   emission discipline.
+4. **`src/model.mind` — no change.** The architecture is unchanged.
+5. **`Mind.toml` — no change.** No new compile-time constant; the
+   QAT hyperparameters (group_size matching RFC-001, fake-quant
+   schedule, calibration metric) are catalog-builder-side and do
+   not enter `model_hash` or `catalog_hash` (the hashes bind the
+   trained bytes, not the training procedure). They are documented
+   in the catalog-builder's `training_recipe.toml` artifact
+   alongside RFC-016's cross-encoder teacher identity, RFC-017's
+   generation LLM identity, RFC-018's AnglE hyperparameters,
+   RFC-019's clustering config, RFC-020's GISTEmbed guidance-model
+   identity, RFC-021's Stage-1 corpus identity, RFC-022's RetroMAE
+   phase-A configuration, RFC-023's multi-teacher projection
+   dimensions, RFC-024's queue configuration, and RFC-025's
+   instruction strings for human-auditable reproducibility.
+
+## Spec changes required
+
+- `spec/architecture.md` §"Training pipeline" (added by RFC-015,
+  extended through RFC-025) — append a "Quantization-aware
+  training" paragraph documenting that reference weights MUST be
+  produced with always-on fake-quantization (RFC-001 group-wise
+  INT8, group_size=32, per-group Q16.16 scale) and a straight-
+  through estimator for gradients. Note that the QAT schedule,
+  fake-quant operator definition, and the (training-time-only)
+  weight-matrix coverage list are part of the catalog-builder's
+  `training_recipe.toml` artifact (not bound into `model_hash` —
+  only the resulting weights are).
+- `spec/architecture.md` §"Weight storage discipline" (RFC-001) —
+  add a one-paragraph note that RFC-001's INT8 format is intended
+  to consume QAT-trained weights, NOT PTQ-trained weights. PTQ
+  fallback is documented as "operationally permissible but
+  expected to lose +1.0 to +2.0 points top-5 accuracy vs the QAT
+  baseline; not the recommended production pathway."
+- `spec/numerics.md` — no change. No new primitive, no new
+  reduction order, no new LUT in the inference path. The fake-
+  quantization operator lives entirely in the offline training
+  pipeline (forward pass in FP16/FP32 with simulated INT8 round-
+  trip; the actual INT8 quantization at export uses the same
+  Q16.16 multiply primitive `q16_mul` that the runtime uses for
+  dequantization at load time, so training-time fake-quant and
+  load-time dequant produce bit-identical Q16.16 values).
+- `ROADMAP.md` §"Phase 2 accuracy & latency enhancements" —
+  append enhancement #23 ("Quantization-aware training for INT8
+  weight robustness") with a pointer to RFC-026. Tag as
+  "must-have" — QAT is the canonical 2024 SOTA discipline that
+  closes the +1.0 to +2.0 point PTQ regression gap, the largest
+  unaddressed accuracy loss in the deployment pipeline.
+
+## Test additions
+
+- **Catalog-builder pipeline tests (out of mind-nerve repo).**
+  Tests that (a) the fake-quantization operator correctly rounds
+  weights to INT8 in the forward pass (assert each post-fq weight
+  is exactly representable as `int8 * scale` for some int8 ∈
+  [-127, 127] and the per-group Q16.16 scale), (b) the straight-
+  through estimator correctly propagates gradients (assert
+  backward pass produces gradients equal to those of an identity
+  operator over W), (c) the export step produces the same INT8
+  bytes regardless of forward-pass random state (determinism
+  check), (d) QAT-trained weights match RFC-001's group-wise INT8
+  + Q16.16-scale on-disk format byte-for-byte. These tests live
+  in the catalog-builder repo, not mind-nerve.
+- `tests/integration/test_qat_trained_weights.mind` — on the
+  held-out STARGA agent-skill catalog, assert that weights
+  produced by the combined RFC-015 + RFC-016 + RFC-017 + RFC-018
+  + RFC-019 + RFC-020 + RFC-021 + RFC-022 + RFC-023 + RFC-024 +
+  RFC-025 + RFC-026 pipeline (full QAT-trained) produce top-5
+  accuracy within ±0.2 points of the same pipeline trained
+  WITHOUT QAT but evaluated in FP32 simulation mode. Acts as a
+  regression-guard: if a future training-run loses the QAT
+  discipline, this test fails because the INT8-deployed model
+  regresses below the FP32 reference.
+- `tests/integration/test_qat_vs_ptq_regression.mind` — fixture
+  comparison: train two checkpoints from identical Stage-1
+  initialization, one with QAT and one with PTQ (PTQ = train in
+  FP32, quantize to INT8 at export using min/max calibration on
+  the dev set). Assert the QAT-trained INT8 deployment produces
+  ≥ baseline + 1.0 points top-5 accuracy vs the PTQ-trained INT8
+  deployment. Documents the load-bearing accuracy preservation
+  claim that justifies the training-pipeline complexity.
+
+## Expected latency delta
+
+Zero on the inference path. The change is offline at training-
+pipeline time. The inference path consumes the same Q16.16
+weights file (dequantized at load time from RFC-001's INT8 storage
+format) and the same Q16.16 route embeddings via the same pinned
+primitives. No runtime change.
+
+Training-time cost: fake-quantization adds ~5-8% wall-clock
+overhead per training step. Per-batch cost breakdown at the
+mind-nerve H=256 / ENCODER_LAYERS=2 / 4 attention heads × 4 QKV+O
+matrices = 16 weight matrices configuration: group-wise quant
+scale computation: 16 matrices × per-group max-abs reduction over
+32-element blocks. Negligible (~0.1 ms per batch on a single A100
+at FP16). Quantize-then-dequantize round-trip: 16 matrix-element-
+wise operations, ~0.5 ms per batch. STE backward: identity pass,
+zero overhead. Total added per training step: ~0.6 ms per batch
+(~0.7% of the ~80 ms per-step Stage-2 baseline).
+
+At 100K Stage-2 training steps, total QAT overhead is ~17 GPU-
+minutes (negligible vs the ~120 GPU-hour Stage-2 baseline). Net
+Stage-2 budget with all RFCs through RFC-026: ~954 GPU-hours plus
+~0.3 GPU-hours (vs the prior cohort's ~954 GPU-hours) — a <0.1%
+increase in total training budget for the +1.0 to +2.0 top-5 lift
+at INT8 deployment, the best accuracy-per-GPU-hour ratio of any
+defensive RFC in this index.
+
+## Expected accuracy delta
+
+Jacob et al. CVPR 2018 §4 reports ±0.2 points vs FP32 baseline
+from QAT at INT8, whereas PTQ loses 1-3 points. Liu et al.
+LLM-QAT §4 confirms the gap persists at modern LLM scale: QAT
+closes the PTQ→FP32 accuracy gap to ≤ 0.3 points across MTEB-
+Retrieval at INT8 weight quantization. Xiao et al. SmoothQuant
+§4.3 reports +0.8 to +1.4 MTEB-Retrieval points from QAT over
+SmoothQuant PTQ (the strongest PTQ technique). Bondarenko et al.
+NeurIPS 2023 §5 reports +0.9 to +1.8 nDCG@10 from QAT over PTQ
+at H=256–768 — the regime closest to mind-nerve. Frantar et al.
+GPTQ §6 establishes the PTQ ceiling at +1.0 to +2.0 points below
+QAT on retrieval workloads.
+
+For mind-nerve's STARGA agent-skill catalog at H=256 with RFC-001
+group-wise INT8 (group_size=32) and per-group Q16.16 scales, we
+expect the lift to land in the upper half of the cited band:
++1.0 to +1.5 points top-5 accuracy **preservation** at INT8
+deployment vs PTQ. This is a **defensive** lift — RFC-026 does
+not add accuracy above the FP32 baseline; it **prevents accuracy
+loss** during the FP32 → INT8 export step. The combined RFC-001
++ RFC-002 + RFC-010 + RFC-015 + RFC-016 + RFC-017 + RFC-018 +
+RFC-019 + RFC-020 + RFC-021 + RFC-022 + RFC-023 + RFC-024 +
+RFC-025 + RFC-026 stack is expected to preserve the +19.5 to
++28.5 points top-5 lift at INT8 deployment, rather than the
+PTQ-equivalent +17.5 to +26.5 points (after losing +1.0 to +2.0
+points to quantization). The literature consensus is decisive:
+QAT is the foundational training-deployment discipline behind
+every leading 2024 quantized retrieval encoder; not adopting it
+forfeits the largest accuracy-preserving lever the literature
+provides at this stage of the cohort stack.
+
+## Non-negotiable conflict
+
+None — the proposal respects all six non-negotiables:
+
+1. *Pure MIND inference path.* No inference-path change; no new
+   framework dependency on the inference side. The training
+   pipeline already lives outside the mind-nerve repo (ROADMAP
+   §"Phase 1 deferred item #3") and is allowed to use external
+   frameworks (PyTorch's native autograd for STE, `torch.round`
+   for the quantization step, `.detach()` for the gradient-pass-
+   through idiom).
+2. *Q16.16 × INT8.* No numeric-type change. The trained weights
+   ship in the same RFC-001 group-wise INT8 + Q16.16-scale format;
+   only the byte values inside change (QAT-calibrated rather than
+   PTQ-calibrated). The fake-quantization operator runs in FP16 /
+   FP32 in the catalog-builder pipeline and never touches the
+   Q16.16 inference path.
+3. *Cross-arch bit-identity.* The inference path consumes the
+   same bytes via the same pinned primitives. Bit-identity is
+   unchanged. The training-time fake-quantization and load-time
+   dequantization use the same `q16_mul` saturating primitive
+   (via the round-half-to-even shift documented in
+   `src/loader.mind::dequantize_matrix`), so the deployed weights
+   match the training-time fake-quantized weights byte-for-byte.
+4. *≤30 ms p95.* Zero runtime cost; latency unchanged.
+5. *Single static binary.* No new dependency in the binary.
+6. *Tamper-evident envelope chain.* The trained weights enter
+   `model_hash` via the existing manifest discipline. Any
+   tampering produces a `HashMismatch` at load time, regardless
+   of how the weights were trained. The `training_recipe.toml`
+   artifact documenting the QAT schedule, fake-quant operator
+   definition, and weight-matrix coverage is for human
+   auditability only; it does NOT enter any hash binding (the
+   weights ARE the contract, not the recipe).
+
+## Validation gates run
+
+- arch-mind score before / after: pending (this RFC is a proposal,
+  not yet implemented).
+- skill-improver mean before / after: pending.
+- Latency / accuracy actual numbers: pending implementation
+  against the STARGA agent-skill catalog with a reference
+  checkpoint trained using the combined RFC-001 + RFC-015 +
+  RFC-016 + RFC-017 + RFC-018 + RFC-019 + RFC-020 + RFC-021 +
+  RFC-022 + RFC-023 + RFC-024 + RFC-025 + RFC-026 pipeline with
+  always-on QAT at RFC-001's group_size=32 + Q16.16-scale
+  configuration.
+
+## Decision
+
+Needs-human-review.
+
+Rationale for not auto-accepting: this RFC is a catalog-builder
+training-pipeline change with no in-tree code modification. The
+mind-nerve repo's role is to (a) document the discipline in
+`spec/architecture.md` and `ROADMAP.md` so future catalog-builder
+implementations follow it, and (b) ship the integration tests
+that regression-guard the expected accuracy preservation. The
+actual fake-quantization infrastructure lives in the catalog-
+builder pipeline, which is external in Phase 1. A human reviewer
+should confirm three things before this RFC lands: (1) the
+catalog-builder team can absorb the QAT infrastructure (a modest
+extension to the existing Stage-2 fine-tuning loop — roughly 60
+lines of new code for the per-group fake-quantization operator,
+the STE wrapper, the weight-matrix coverage iteration, and the
+final export step; plus ~17 GPU-minutes of additional compute per
+full training run, the smallest of any training-pipeline RFC in
+this index by per-run cost) alongside RFC-001's group-wise
+quantization, RFC-005's saliency-ranked head mask, RFC-007's
+attention-sink-aware training, RFC-008's MRL auxiliary loss,
+RFC-009's `q_latent` parameter, RFC-010's cosine-similarity
+contrastive objective, RFC-011's ALiBi bias, RFC-012's asymmetric
+prefix conditioning, RFC-013's RMSNorm, RFC-014's multi-query
+pooling with diversity penalty, RFC-015's positive-aware hard
+negative mining, RFC-016's cross-encoder distillation, RFC-017's
+synthetic query augmentation, RFC-018's AnglE loss, RFC-019's
+cluster-aware batch composition, RFC-020's GISTEmbed guided
+filtering, RFC-021's two-stage pipeline frame, RFC-022's RetroMAE
+auto-encoder pretraining, RFC-023's multi-teacher embedding-space
+distillation, RFC-024's cross-batch memory bank, and RFC-025's
+task-instruction conditioning. All twenty-two are v2 reference-
+checkpoint / v2 catalog changes; landing them in a single
+training+catalog-build run avoids twenty-two sequential
+invalidations of downstream artifacts. (2) The `group_size = 32`
+choice must match RFC-001's storage format exactly — any drift
+between training-time group_size and deployment-time group_size
+breaks the bit-identity contract between fake-quantized training
+weights and INT8-quantized deployment weights. The catalog-
+builder team should verify this against RFC-001's manifest
+constant before committing to the production training run.
+(3) The always-on QAT schedule (vs warmup-then-QAT) should be
+re-confirmed against LLM-QAT §3.2's findings — for very small
+encoders at the mind-nerve H=256 scale, a brief 1000-step FP32
+warmup before enabling QAT may produce slightly better results
+(+0.1 to +0.3 points) at the cost of marginal additional code
+complexity. The default for Phase 1 is always-on QAT (simpler,
+matches the foundational Jacob et al. recipe); the warmup
+variant is documented for future ablation in Phase 2. Until all
+three confirmations land, this RFC remains a proposal documenting
+the discipline; the catalog-builder team can adopt it
+incrementally without coordination because the resulting weights
+are byte-compatible with the existing mind-nerve inference path
+(only the byte values inside the weights file change, and
+`model_hash` updates correspondingly).

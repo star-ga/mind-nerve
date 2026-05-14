@@ -1909,6 +1909,32 @@ uniform weights that are mathematically equivalent (within 1 ULP)
 to mean-pool, so the v2 loader can ship with a zero-vector
 `pool_q_latent` as a no-op until the trained vector arrives.
 
+**Status:** IMPLEMENTED at exp12 — `src/encoder_kernels.mind` adds
+three backwards-soft compile-time constants `pub const POOLING_KIND_MEAN:
+u32 = 0u32`, `pub const POOLING_KIND_LEARNED_ATTN: u32 = 1u32`, and
+`pub const POOLING_KIND: u32 = POOLING_KIND_MEAN` plus a compile-baked
+`pub const POOL_Q_LATENT_DEFAULT: [Q16_16; ENCODER_HIDDEN as usize] =
+[0_i32; ENCODER_HIDDEN as usize]` zero-vector latent query (all four
+enter `model_hash` via the model manifest header). A new pinned 3-stage
+`attn_pool_seq_kernel(x, q_latent)` helper composes only existing pinned
+primitives — sequential ascending-i `q16_dot_pinned(q_latent, x[i])`
+score loop over the hidden axis (stage a) → pinned 5-stage `q16_softmax`
+over the per-position scores (stage b) → hidden-axis outer / sequence-
+axis inner saturating `q16_mul`+`q16_add` weighted sum (stage c) — and
+short-circuits to the all-zero vector when `seq_len == 0`. The existing
+`mean_pool_seq_kernel(x)` body is prefixed with a compile-time-resolvable
+predicate `if POOLING_KIND == POOLING_KIND_LEARNED_ATTN { return
+attn_pool_seq_kernel(x, &POOL_Q_LATENT_DEFAULT); }` that dispatches to
+the new kernel when the constant flips. With the default
+`POOLING_KIND = POOLING_KIND_MEAN` the predicate is statically false,
+mindc constant-folds the dispatch back to the existing sequential-sum +
+saturating-divide-by-seq_len primitive, the attention-pool branch is
+dead code, and the binary stays byte-identical to today until a
+calibrated reference checkpoint binds both `POOLING_KIND = 1` and a
+trained `POOL_Q_LATENT_DEFAULT` vector into `model_hash` in lockstep
+with the training-pipeline owner shipping the `q_latent` parameter
+alongside the existing RFC-001/005/007/008 v2-checkpoint cohort.
+
 ---
 
 # RFC-010 — L2-normalized cosine similarity scoring head

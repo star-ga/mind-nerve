@@ -92,6 +92,73 @@ pub const NORMALIZATION_KIND_RMSNORM:   u32 = 1u32;
 pub const NORMALIZATION_KIND:           u32 = NORMALIZATION_KIND_LAYERNORM;
 
 // ─────────────────────────────────────────────────────────────────────────────
+// RFC-009 — Learned single-query attention pooling dispatch.
+//
+// `mean_pool_seq_kernel` weights every token position equally — the worst-
+// of-both-worlds for routing, where high-information verbs at the start of
+// a CLI command get diluted by lower-information continuation tokens. The
+// 2024 SOTA convergence (NV-Embed §3.2, mGTE §4.1) is to replace mean-pool
+// with a learned single-latent-query attention head:
+//
+//   scores[i] = <q_latent, encoder_out[i, :]>            (pinned dot, hidden axis)
+//   probs     = softmax(scores)                          (pinned 5-stage)
+//   pooled[d] = sum_i probs[i] * encoder_out[i, d]       (pinned ascending-i)
+//
+// The new pooling kernel composes only existing pinned primitives
+// (`q16_dot_pinned`, `q16_softmax`, `q16_mul`, `q16_add`); no new reduction
+// site, no new LUT, no new numeric type. Bit-identity follows from those
+// primitives' contracts.
+//
+// Dispatch via compile-time `POOLING_KIND`:
+//
+//   POOLING_KIND_MEAN (= 0) — the pre-RFC-009 mean-pool primitive. This
+//     is the backwards-soft default: the per-token sequential sum down
+//     the seq_len axis plus saturating divide-by-seq_len yields the same
+//     byte-for-byte output today's binary produces, so the bit-identity
+//     contract holds across runs and across architectures.
+//
+//   POOLING_KIND_LEARNED_ATTN (= 1) — the learned single-latent-query
+//     attention pool. Reads the compile-baked `POOL_Q_LATENT_DEFAULT`
+//     vector as the latent query. With `POOL_Q_LATENT_DEFAULT = [0; H]`
+//     (today's default) the softmax of all-zero scores degenerates to
+//     uniform weights ≈ 1/seq_len, which produces ≈ mean-pool within
+//     Q16.16 rsqrt-LUT tolerance — but the score+softmax+weighted-sum
+//     pipeline is NOT byte-identical to the sequential-sum + divide
+//     primitive `mean_pool_seq_kernel` ships today, so flipping
+//     POOLING_KIND requires a paired calibrated checkpoint.
+//
+// Model-hash binding: both `POOLING_KIND` and `POOL_Q_LATENT_DEFAULT`
+// enter `model_hash` via the model manifest header. A silent flip from
+// 0 to 1 against a mean-pool-trained checkpoint produces a
+// `HashMismatch` at load time — the attention pool rescales which
+// position-level activations dominate the pooled query, so swapping
+// the primitive without a matching `q_latent` checkpoint would regress
+// accuracy below the mean-pool baseline. The hash binding makes that
+// regression observable rather than silent.
+//
+// Cross-arch bit-identity: every primitive composed by
+// `attn_pool_seq_kernel` is already pinned in the bit-identity
+// contract (`q16_dot_pinned`, `q16_softmax`, `q16_mul`, `q16_add`).
+// The dispatch is a single u32 compare against a compile-time
+// constant, which mindc constant-folds away under the
+// backwards-soft default.
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub const POOLING_KIND_MEAN:         u32 = 0u32;
+pub const POOLING_KIND_LEARNED_ATTN: u32 = 1u32;
+pub const POOLING_KIND:              u32 = POOLING_KIND_MEAN;
+
+// Backwards-soft compile-baked latent-query vector. All-zero produces
+// a softmax of uniform weights when `POOLING_KIND_LEARNED_ATTN` is
+// selected — mathematically equivalent to mean-pool within Q16.16
+// rsqrt-LUT tolerance (≤ 1 ULP per element on typical encoder outputs).
+// Replace with a calibrated reference-checkpoint vector at the same
+// time `POOLING_KIND` flips to `POOLING_KIND_LEARNED_ATTN`; both enter
+// `model_hash` via the model manifest header.
+pub const POOL_Q_LATENT_DEFAULT: [Q16_16; ENCODER_HIDDEN as usize] =
+    [0_i32; ENCODER_HIDDEN as usize];
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Attention score scaling.
 //
 // scores = (Q @ K.T) * (1 / sqrt(head_dim))
@@ -872,7 +939,94 @@ pub fn gated_residual(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Mean-pool over the seq_len axis.
+// RFC-009 — Learned single-latent-query attention pool kernel.
+//
+// Three pinned stages:
+//
+//   (a) scores[i] = q16_dot_pinned(q_latent, x[i, :])   ascending i
+//       (sequential left-to-right over the hidden axis inside the
+//        dot, sequential ascending i in the outer loop — both pinned)
+//
+//   (b) probs = q16_softmax(scores)
+//       (the 5-stage pinned softmax pipeline already in q16_16.mind:
+//        sequential max → centered exp-LUT → sequential sum → rsqrt-
+//        normalize → elementwise q16_mul)
+//
+//   (c) pooled[d] = sum_i q16_mul(probs[i], x[i, d])    ascending i,
+//                                                       ascending d
+//       (saturating multiply for each (i, d) pair; saturating add
+//        accumulator down the seq_len axis; outer hidden-axis loop is
+//        ascending d, inner sequence-axis loop is ascending i)
+//
+// `seq_len == 0` returns the all-zero vector (the caller in
+// `model::mean_pool_seq` enforces `seq_len ≤ MAX_REQUEST_TOKENS`
+// upstream). Bit-identity follows from the primitives' contracts:
+// `q16_dot_pinned` (sequential left-to-right), `q16_softmax` (pinned
+// 5-stage), `q16_mul` (single saturating-MAC anchor), `q16_add`
+// (widen-then-saturate).
+//
+// The latent-query vector is passed by reference so the compile-baked
+// `POOL_Q_LATENT_DEFAULT` constant does not need to be re-materialised
+// on the stack at every call.
+// ─────────────────────────────────────────────────────────────────────────────
+@[determinism(BitIdentical)]
+@[reduction_order(Pinned)]
+pub fn attn_pool_seq_kernel(
+    x:        tensor<Q16_16, [seq_len, ENCODER_HIDDEN]>,
+    q_latent: &[Q16_16; ENCODER_HIDDEN as usize],
+) -> [Q16_16; ENCODER_HIDDEN as usize] {
+    let n: usize = x.len();
+    let h: usize = ENCODER_HIDDEN as usize;
+    let mut out: [Q16_16; h] = [0_i32; h];
+    if n == 0 { return out; }
+
+    // Stage (a) — per-position scalar score against the latent query.
+    // Sequential ascending i; the inner dot is pinned over the hidden
+    // axis. The score buffer is stack-bounded by `seq_len`, which is
+    // capped at MAX_REQUEST_TOKENS upstream.
+    let mut scores: [Q16_16; n] = [0_i32; n];
+    let mut i: usize = 0;
+    while i < n {
+        scores[i] = q16_dot_pinned(q_latent, &x[i]);
+        i = i + 1;
+    }
+
+    // Stage (b) — pinned 5-stage softmax over the scores vector.
+    // Matches the `let p: [Q16_16] = q16_softmax(&...)` convention used by
+    // `sliding_window_attention` for the per-row softmax flow above.
+    let probs: [Q16_16] = q16_softmax(&scores);
+
+    // Stage (c) — value-weighted sum, hidden-axis outer, sequence-axis
+    // inner. Materialise the column as a contiguous slice so the
+    // per-position weighted multiply funnels through the same
+    // ascending-i sequence the pre-RFC-009 mean-pool kernel walks; the
+    // saturating accumulator is the pinned `q16_add` anchor.
+    let mut d: usize = 0;
+    while d < h {
+        let mut acc: Q16_16 = 0_i32;
+        let mut i: usize = 0;
+        while i < n {
+            let weighted: Q16_16 = q16_mul(probs[i], x[i][d]);
+            acc = q16_add(acc, weighted);
+            i = i + 1;
+        }
+        out[d] = acc;
+        d = d + 1;
+    }
+    return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Mean-pool over the seq_len axis — dispatches on RFC-009's `POOLING_KIND`.
+//
+// With the backwards-soft default `POOLING_KIND = POOLING_KIND_MEAN` the
+// learned-attention-pool branch is statically dead code, mindc constant-
+// folds the predicate to the existing sequential-sum + divide primitive,
+// and the returned vector is byte-identical to the pre-RFC-009 binary.
+// Flipping `POOLING_KIND` to `POOLING_KIND_LEARNED_ATTN` against a
+// calibrated `POOL_Q_LATENT_DEFAULT` activates the RFC-009 pipeline; both
+// constants enter `model_hash` via the model manifest header so the
+// dispatch and the latent-query vector swap atomically.
 //
 // Sequential sum along seq_len (pinned by `q16_sum_pinned`), then divide by
 // seq_len-as-Q16.16 with `q16_div_sat`. Returns the pooled [ENCODER_HIDDEN]
@@ -884,6 +1038,15 @@ pub fn gated_residual(
 pub fn mean_pool_seq_kernel(
     x: tensor<Q16_16, [seq_len, ENCODER_HIDDEN]>,
 ) -> [Q16_16; ENCODER_HIDDEN as usize] {
+    // RFC-009 dispatch. Compile-time-resolvable predicate; with
+    // `POOLING_KIND = POOLING_KIND_MEAN` (the default) the attention
+    // branch is statically unreachable and mindc folds the call back
+    // to the sequential-sum + divide primitive below — byte-identical
+    // to the pre-RFC-009 binary.
+    if POOLING_KIND == POOLING_KIND_LEARNED_ATTN {
+        return attn_pool_seq_kernel(x, &POOL_Q_LATENT_DEFAULT);
+    }
+
     let n: usize = x.len();
     let h: usize = ENCODER_HIDDEN as usize;
     let mut out: [Q16_16; h] = [0_i32; h];

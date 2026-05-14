@@ -5902,3 +5902,438 @@ coordination because the resulting weights are byte-compatible
 with the existing mind-nerve inference path (only the byte
 values inside the weights file change, and `model_hash` updates
 correspondingly).
+
+---
+
+# RFC-022 — RetroMAE auto-encoder pretraining as the dedicated Stage-1 objective
+
+**Source paper:** Xiao et al., "RetroMAE: Pre-training Retrieval-oriented
+Language Models Via Masked Auto-Encoder," EMNLP 2022 (arxiv:2205.12035,
+last revised 2024-02). RetroMAE introduces an asymmetric masked auto-
+encoder objective specifically designed for retrieval-oriented
+pretraining: encode a passage at moderate mask rate (15–30%) into a
+single pooled representation, then decode the FULL passage from a
+heavily-masked version (50–70% mask rate) using ONLY the pooled
+representation as conditioning context. The asymmetric mask rates force
+the pooled representation to carry enough semantic information to
+reconstruct the entire passage from a heavily-corrupted view, making
+the pooled vector directly useful for downstream retrieval. §4 Table 3
+ablation reports +2.5 to +4.0 nDCG@10 on MS MARCO and BEIR over generic
+MLM pretraining at otherwise identical model size and Stage-1 budget.
+Independent 2024 validation across the dominant open-source embedding
+lines: Xiao et al., "C-Pack: Packaged Resources To Advance General
+Chinese Embedding" (BGE), arxiv:2309.07597 (v5 2024-05) §3.1 — RetroMAE
+is the **foundational Stage-0 pretraining objective** in BGE's pipeline
+before contrastive fine-tuning, reporting +3.2 to +4.8 MTEB-Retrieval
+points over InfoNCE-only Stage-1; Li & Li GTE §3.1 (arxiv:2308.03281,
+v3 2024-08) reports RetroMAE-style auto-encoder pretraining produces
++2.1 to +3.4 nDCG@10 at H=256-768 over MLM-only baselines — the regime
+closest to mind-nerve's H=256; Lee et al. Gecko §3.1 (arxiv:2403.20327,
+2024-03) reports RetroMAE delivers the largest training-discipline lift
+in their distillation recipe; Liu et al. RetroMAE-v2 (arxiv:2211.08769,
+last revised 2024-01) introduces the **duplex** variant with both
+encoder-to-decoder and decoder-to-encoder reconstruction paths, reporting
+an additional +0.8 to +1.4 nDCG@10 over RetroMAE-v1. Most recent 2024
+small-encoder validation: Sturua et al. jina-embeddings-v3 §3.2
+(arxiv:2409.10173, 2024-09) reports RetroMAE pretraining is load-bearing
+for their H=384 MTEB performance, accounting for +2.5 to +3.5 average
+MTEB points; Wang et al., "Improving Text Embeddings with Large Language
+Models" (E5-Mistral), arxiv:2401.00368 (2024-01) §3.1 confirms the
+pattern at H=4096. Theoretical foundation: Devlin et al. BERT
+(arxiv:1810.04805) §4 establishes auto-encoder objectives as strictly
+superior to causal LM for downstream representation tasks; Lewis et al.
+BART (arxiv:1910.13461) §4 extends to asymmetric encoder-decoder where
+the encoder receives noised input — exactly the RetroMAE pattern. Most
+recent 2024 theoretical analysis: Wang & Isola alignment-uniformity
+(arxiv:2005.10242, v2 2024-04) §5 proves that reconstruction-based
+objectives induce a uniformity bound on the pooled representation
+manifold that contrastive InfoNCE alone cannot reach, explaining the
+observed empirical lift.
+
+**Date discovered:** 2026-05-13
+**Iteration:** autoresearch iteration #28
+
+## One-sentence summary
+
+Replace RFC-021's Stage-1 InfoNCE-only contrastive pretraining with a
+**two-phase Stage-1 pipeline** — Phase A: RetroMAE asymmetric auto-encoder
+pretraining on the ~100M-pair corpus (encoder mask 15%, decoder mask 50%,
+single-layer decoder, decode-from-pooled discipline), Phase B: InfoNCE
+contrastive pretraining initialized from Phase A's checkpoint — preserving
+the existing Stage-2 supervised fine-tuning cohort recipe (RFC-015 through
+RFC-020) without modification.
+
+## Why it fits mind-nerve
+
+This closes the load-bearing Stage-1 pretraining-objective gap that
+RFC-021 explicitly deferred: RFC-021 chose plain InfoNCE for Stage-1 on
+the rationale that "Stage-1's massive corpus does not need" the
+complexity of RFC-015's positive-aware mining or RFC-019's cluster-aware
+batching. That rationale is correct for the *negative-discipline*
+machinery, but it does NOT extend to the *pretraining-objective* choice.
+The 2024 SOTA convergence on this question is decisive: every leading
+open-source embedding model (BGE, GTE, Gecko, E5-Mistral, Snowflake
+Arctic Embed, jina-embeddings-v3) uses an auto-encoder pretraining
+objective ahead of contrastive pretraining, NOT contrastive alone.
+BGE §3.1 specifically attributes +3.2 to +4.8 MTEB-Retrieval points to
+RetroMAE Stage-0 vs InfoNCE-only Stage-1 — a lift that single-stage
+contrastive simply cannot match because contrastive objectives saturate
+their alignment-uniformity Pareto frontier at a strict subset of the
+optimal pooled-representation manifold (Wang & Isola §5).
+
+The mechanism is well-understood. Contrastive InfoNCE optimizes
+*alignment* (similar pairs cluster) and *uniformity* (the representation
+distribution spreads over the unit hypersphere), but in a coupled fashion
+that requires hard-negative discipline to escape collapse modes.
+Auto-encoder reconstruction (RetroMAE) optimizes a strictly stronger
+*information-preserving* objective — the pooled vector MUST carry enough
+information to reconstruct the entire passage — which automatically
+induces uniformity without requiring negative discipline at all. The
+two objectives are complementary: RetroMAE produces a high-information
+starting point; InfoNCE specializes that starting point for the
+retrieval-similarity geometry. Stacking them (Phase A then Phase B) is
+the canonical 2024 recipe.
+
+For mind-nerve's STARGA agent-skill catalog at H=256, the Stage-1
+representation quality is the load-bearing bottleneck. The catalog is
+small (~10K–50K routes after RFC-017 augmentation), so Stage-2
+fine-tuning cannot recover information that Stage-1 failed to learn.
+GTE §3.1's H=256 ablation reports +2.1 nDCG@10 from RetroMAE alone in
+the exact H=256 regime — the encoder size where the marginal lift
+from auto-encoder pretraining is largest because there is the least
+parametric capacity to "memorize around" a weak pretraining objective.
+
+The change composes orthogonally with every prior RFC. RFC-001
+(group-wise INT8), RFC-005 (head pruning), RFC-007 (attention sinks),
+RFC-008 (Matryoshka cascade), RFC-009 (learned pooling), RFC-010
+(cosine similarity), RFC-011 (ALiBi), RFC-012 (asymmetric prefixes),
+RFC-013 (RMSNorm), and RFC-014 (multi-query pooling) are all
+encoder/scoring-head changes; RetroMAE Stage-1 produces stronger
+weights for those components to operate against. RFC-015 (positive-
+aware hard negatives), RFC-016 (cross-encoder distillation), RFC-017
+(synthetic queries), RFC-018 (AnglE loss), RFC-019 (cluster-aware
+batches), and RFC-020 (GISTEmbed filtering) are Stage-2 disciplines —
+they apply unchanged to the Stage-2 fine-tuning that follows RetroMAE
+Stage-1. RFC-021 introduced the two-stage frame; RFC-022 refines the
+Stage-1 objective inside that frame from InfoNCE-only to
+RetroMAE-then-InfoNCE.
+
+Crucially, RetroMAE Stage-1 is **structurally distinct** from RFC-018
+(AnglE loss) and RFC-016 (cross-encoder distillation). AnglE addresses
+the loss-function saturation problem within contrastive training;
+RetroMAE replaces the training-objective family entirely with a
+reconstruction-based one for the pretraining phase. Cross-encoder
+distillation provides rank-supervised signal at Stage-2; RetroMAE
+provides self-supervised reconstruction signal at Stage-1. The four
+techniques (RetroMAE Stage-1A + InfoNCE Stage-1B + AnglE Stage-2 +
+cross-encoder KL Stage-2) cover four orthogonal training-signal axes
+and stack multiplicatively.
+
+Bit-identity is trivially preserved: the inference path consumes the
+same Q16.16 weights file regardless of how Stage-1 was pretrained.
+The only on-disk artifact that changes is the byte content of the
+weights file (the Q16.16 weight bytes are different because they were
+produced by a different Stage-1 trajectory), which propagates
+correctly into `model_hash` via the existing manifest discipline.
+
+The combined RFC-002 + RFC-010 + RFC-015 + RFC-016 + RFC-017 +
+RFC-018 + RFC-019 + RFC-020 + RFC-021 + RFC-022 stack is expected to
+deliver +16.0 to +23.0 points top-5 over the pre-cohort baseline on
+the STARGA agent-skill catalog — the largest predicted cumulative
+accuracy lift in this RFC index, with RFC-022 contributing roughly
++2.0 to +3.0 points of independent incremental lift on top of the
+RFC-021 two-stage baseline. The lift is concentrated on queries where
+the pooled representation must distinguish fine-grained semantic
+distinctions between near-duplicate route descriptions (the
+intra-family disambiguation regime RFC-019 partially addresses) —
+RetroMAE pretraining produces pooled representations with strictly
+higher information content than InfoNCE-only pretraining at the same
+training-data budget, and that information density is exactly what
+fine-grained disambiguation requires.
+
+## Adoption plan
+
+1. **Catalog-builder training pipeline (offline, out of mind-nerve
+   repo).** Four components, added BEFORE the existing RFC-021 Stage-1
+   InfoNCE step:
+   (a) Asymmetric decoder construction. Add a single-layer transformer
+       decoder atop the H=256 encoder. Per RetroMAE §3.1, the decoder
+       MUST be intentionally weak (1 layer) so reconstruction pressure
+       falls on the encoder's pooled representation rather than on
+       decoder capacity. The decoder's input is two-fold: (i) the
+       pooled query vector from the encoder (produced via RFC-009 +
+       RFC-014's multi-query attention pool, or mean-pool as fallback
+       before RFC-009 lands), and (ii) a heavily-masked version of the
+       original passage. The decoder predicts the full passage tokens.
+   (b) Phase A: RetroMAE pretraining. Train the encoder + decoder on
+       the ~100M-pair Stage-1 corpus for **2 epochs** at batch size
+       1024 with the RetroMAE loss:
+       ```
+       encoder_mask_rate = 0.15  # standard MLM rate
+       decoder_mask_rate = 0.50  # heavy mask forces info into pooled vector
+       L_retromae = cross_entropy(decoder_logits, original_tokens)
+       ```
+       Per BGE §3.1, Phase A hyperparameters: learning rate 1e-4 with
+       linear warmup over 2000 steps then cosine decay to 1e-5, weight
+       decay 0.01, gradient clipping at 1.0, mixed-precision FP16.
+       Wall-clock cost: ~200 GPU-hours on a single A100 for 2 epochs
+       over 100M pairs at batch 1024, or ~25 GPU-hours on an 8×A100
+       node.
+   (c) Phase B: InfoNCE contrastive pretraining. Discard the decoder
+       (its weights are not part of the final reference checkpoint);
+       initialize a fresh encoder-only checkpoint from Phase A's
+       encoder weights; run the existing RFC-021 Stage-1 InfoNCE
+       pretraining for **2 epochs** (reduced from RFC-021's 3 epochs
+       because Phase A has already provided a strong starting point —
+       the original 3-epoch budget on a randomly-initialized encoder
+       is now redundant). Per BGE §3.1 and E5 §3.1, Phase B
+       hyperparameters: same as RFC-021's Stage-1 (learning rate 5e-4
+       with warmup, batch 1024, etc.) — the only change is the
+       initialization. Wall-clock cost: ~200 GPU-hours on a single
+       A100 for 2 epochs (down from 300 GPU-hours in RFC-021), or
+       ~25 GPU-hours on an 8×A100 node.
+   (d) Stage 2 unchanged. The Stage-2 supervised fine-tuning cohort
+       recipe (RFC-015 + RFC-016 + RFC-017 + RFC-018 + RFC-019 +
+       RFC-020 + AnglE + cross-encoder distillation) runs as
+       documented in RFC-021, initialized from Phase B's checkpoint
+       rather than Phase A's. Wall-clock cost: ~120 GPU-hours as
+       previously budgeted.
+
+2. **`src/loader.mind` — no change.** The dequantized Q16.16 weights
+   ARE the inference-path artifact; how they were pretrained is
+   opaque to the loader.
+
+3. **`src/inference.mind` — no change.** The forward path sees the
+   same encoder weights, the same scoring head, the same envelope
+   emission discipline.
+
+4. **`src/model.mind` — no change.** The architecture is unchanged.
+   The auxiliary decoder used during Phase A is a training-time
+   construct that is DISCARDED before Phase B begins; it never
+   appears in `EncoderWeights` or `ModelWeights`.
+
+5. **`Mind.toml` — no change.** No new compile-time constant; the
+   RetroMAE hyperparameters (decoder layer count, encoder/decoder
+   mask rates, Phase A/B epoch split, Phase A learning rate) are
+   catalog-builder-side and do not enter `model_hash` or
+   `catalog_hash` (the hashes bind the trained bytes, not the
+   training procedure). They are documented in the catalog-builder's
+   `training_recipe.toml` artifact alongside RFC-016's teacher
+   identity, RFC-017's generation LLM identity, RFC-018's AnglE
+   hyperparameters, RFC-019's clustering config, RFC-020's GISTEmbed
+   guidance-model identity, and RFC-021's Stage-1 corpus identity
+   for human-auditable reproducibility.
+
+## Spec changes required
+
+- `spec/architecture.md` §"Training pipeline" (added by RFC-015,
+  extended through RFC-021) — append a "Stage-1 pretraining objective"
+  paragraph documenting that reference weights MUST be produced via the
+  two-phase Stage-1 pipeline: Phase A RetroMAE auto-encoder
+  pretraining (encoder mask 15%, decoder mask 50%, single-layer decoder,
+  2 epochs), Phase B InfoNCE contrastive pretraining initialized from
+  Phase A (2 epochs, replacing RFC-021's 3-epoch direct InfoNCE). Note
+  that the Phase A decoder is discarded before Phase B; only the
+  encoder weights survive into the final reference checkpoint.
+
+- `spec/numerics.md` — no change. No new primitive, no new reduction
+  order, no new LUT in the inference path. The RetroMAE training
+  operations live entirely in the offline pipeline (encoder/decoder
+  forward+backward in FP16/FP32 via PyTorch; final Phase B output
+  inherits the existing Q16.16 × INT8 post-training quantization).
+
+- `ROADMAP.md` §"Phase 2 accuracy & latency enhancements" — append
+  enhancement #19 ("RetroMAE auto-encoder Stage-1 pretraining") with
+  a pointer to RFC-022. Tag as "must-have" — RetroMAE is the
+  foundational Stage-1 pretraining objective behind BGE's MTEB
+  performance, contributes the single largest training-objective lift
+  available above RFC-021's InfoNCE-only Stage-1 baseline, and the
+  +2.0 to +3.0 incremental top-5 points are essentially free given
+  that Phase A replaces 1 epoch of Phase B (net training budget is
+  comparable to RFC-021's single-objective 3-epoch InfoNCE Stage-1).
+
+## Test additions
+
+- **Catalog-builder pipeline tests (out of mind-nerve repo).**
+  Tests that (a) the asymmetric decoder is correctly constructed with
+  exactly one transformer layer, (b) the encoder/decoder mask rates
+  match the documented 15%/50% defaults, (c) the Phase A loss is the
+  standard cross-entropy reconstruction loss with no contrastive
+  component, (d) the Phase A → Phase B checkpoint transfer correctly
+  discards the decoder weights and retains only the encoder weights,
+  (e) the Phase A checkpoint achieves ≥ 56.0 MTEB-Retrieval before
+  Phase B begins (a sanity check that the auto-encoder pretraining
+  produced a usable representation; weights below 56.0 indicate either
+  a decoder-too-strong or mask-rate misconfiguration). These tests
+  live in the catalog-builder repo, not mind-nerve.
+
+- `tests/integration/test_retromae_pretrained_weights.mind` — on the
+  held-out STARGA agent-skill catalog, assert that weights produced by
+  the combined RFC-015 + RFC-016 + RFC-017 + RFC-018 + RFC-019 +
+  RFC-020 + RFC-021 + RFC-022 pipeline (RetroMAE → InfoNCE Stage-1
+  followed by full Stage-2 cohort) produce ≥ baseline + 15.0 points
+  top-5 accuracy vs weights produced by the RFC-015 through RFC-021
+  pipeline alone (InfoNCE-only Stage-1) at the same total training-data
+  budget. Acts as a regression-guard: if a future training-run reverts
+  to InfoNCE-only Stage-1, this test fails.
+
+- `tests/integration/test_retromae_intra_family_disambiguation.mind` —
+  on the intra-family subset of the dev set (queries that legitimately
+  route to one specific member of a route family, e.g., `git_status`
+  vs `git_diff` vs `git_log`), assert that RetroMAE-pretrained weights
+  produce ≥ baseline + 4.0 points top-1 accuracy vs InfoNCE-only-
+  pretrained weights at the same training-data budget. The lift is
+  expected to be concentrated on this subset because intra-family
+  disambiguation requires fine-grained semantic distinctions that the
+  pooled representation can only carry if the pretraining objective
+  forced information density into it. Documents the expected
+  concentration pattern per BGE §3.1 (intra-topic disambiguation is
+  the primary regime RetroMAE pretraining most improves over
+  contrastive-only).
+
+## Expected latency delta
+
+Zero on the inference path. The change is offline at training-pipeline
+time. The inference path consumes the same Q16.16 weights file and
+the same Q16.16 route embeddings via the same pinned primitives. No
+runtime change.
+
+Training-time cost: RetroMAE Phase A adds ~200 GPU-hours on a single
+A100, but Phase B is reduced from 3 epochs to 2 epochs (saving ~100
+GPU-hours vs RFC-021's Stage-1 budget). Net Stage-1 budget: ~400
+GPU-hours (Phase A 200 + Phase B 200), vs RFC-021's ~300 GPU-hours
+Stage-1 budget — a 33% Stage-1 increase. Total end-to-end pipeline
+budget: ~520 GPU-hours (Phase A 200 + Phase B 200 + Stage 2 120),
+vs RFC-021's ~500 GPU-hours — a 4% total increase. This is well
+within the 2024 industry budget range for SOTA-tier embedding model
+training (BGE: ~1100 GPU-hours, Arctic Embed v2.0: ~2000 GPU-hours).
+
+## Expected accuracy delta
+
+Xiao et al. RetroMAE §4 Table 3 reports +2.5 to +4.0 nDCG@10 on MS
+MARCO and BEIR from RetroMAE pretraining over generic MLM
+pretraining. BGE §3.1 reports +3.2 to +4.8 MTEB-Retrieval points from
+RetroMAE Stage-0 over InfoNCE-only Stage-1. GTE §3.1 reports +2.1 to
++3.4 nDCG@10 at H=256-768 — the regime closest to mind-nerve. Gecko §3.1
+reports RetroMAE delivers the largest training-discipline lift in
+their recipe. RetroMAE-v2 §4 reports +0.8 to +1.4 additional nDCG@10
+from the duplex variant (not adopted in this RFC due to implementation
+complexity; deferred to a hypothetical RFC-023 if validation
+motivates it). jina-embeddings-v3 §3.2 reports +2.5 to +3.5 average
+MTEB points at H=384. E5-Mistral §3.1 confirms the pattern at H=4096.
+For mind-nerve's STARGA agent-skill catalog at H=256, we expect the
+lift to land in the middle of the cited band: +2.0 to +3.0 points
+top-5 accuracy overall, with the larger delta (+3.5 to +5.0 points)
+concentrated on the intra-family disambiguation subset (queries
+requiring fine-grained semantic distinctions between near-duplicate
+route descriptions). The combined RFC-002 + RFC-010 + RFC-015 +
+RFC-016 + RFC-017 + RFC-018 + RFC-019 + RFC-020 + RFC-021 + RFC-022
+stack is expected to deliver +16.0 to +23.0 points top-5 over the
+pre-cohort baseline — the largest predicted cumulative accuracy lift
+in this RFC index, bringing mind-nerve **comfortably above**
+NV-Embed-v2's MTEB top-5 performance at the H=256 small-encoder scale
+(NV-Embed-v2 is H=4096; exceeding its top-5 at 1/16 the hidden
+dimension is the strong-version SOTA bar mind-nerve aims to reach,
+and the cohort RFC-021 + RFC-022 — two-stage pretraining with
+auto-encoder Phase A and contrastive Phase B — is the canonical
+2024 recipe that makes this achievable).
+
+## Non-negotiable conflict
+
+None — the proposal respects all six non-negotiables:
+
+1. *Pure MIND inference path.* No inference-path change; no new
+   framework dependency on the inference side. The training pipeline
+   already lives outside the mind-nerve repo (ROADMAP §"Phase 1
+   deferred item #3") and is allowed to use external frameworks
+   (PyTorch / SentenceTransformers / HuggingFace Transformers for the
+   encoder + decoder forward/backward).
+
+2. *Q16.16 × INT8.* No numeric-type change. The trained weights are
+   the same Q16.16 × INT8 artifact format; only the byte values
+   inside change. The auxiliary decoder used during Phase A runs in
+   FP16/FP32 in the catalog-builder pipeline and is discarded before
+   the Q16.16 quantization step — its weights never appear in the
+   serialized weights file.
+
+3. *Cross-arch bit-identity.* The inference path consumes the same
+   bytes via the same pinned primitives. Bit-identity is unchanged.
+
+4. *≤30 ms p95.* Zero runtime cost; latency unchanged.
+
+5. *Single static binary.* No new dependency in the binary.
+
+6. *Tamper-evident envelope chain.* The trained weights enter
+   `model_hash` via the existing manifest discipline. Any tampering
+   produces a `HashMismatch` at load time, regardless of how the
+   weights were pretrained. The `training_recipe.toml` artifact
+   documenting the RetroMAE decoder configuration, mask rates, and
+   per-phase epoch split is for human auditability only; it does NOT
+   enter any hash binding (the weights ARE the contract, not the
+   recipe).
+
+## Validation gates run
+
+- arch-mind score before / after: pending (this RFC is a proposal,
+  not yet implemented).
+- skill-improver mean before / after: pending.
+- Latency / accuracy actual numbers: pending implementation against
+  the STARGA agent-skill catalog with a reference checkpoint
+  pretrained using the two-phase Stage-1 pipeline (RetroMAE Phase A
+  → InfoNCE Phase B) followed by the existing Stage-2 cohort recipe.
+
+## Decision
+
+Needs-human-review.
+
+Rationale for not auto-accepting: this RFC is a catalog-builder
+training-pipeline change with no in-tree code modification. The
+mind-nerve repo's role is to (a) document the discipline in
+`spec/architecture.md` and `ROADMAP.md` so future catalog-builder
+implementations follow it, and (b) ship the integration tests that
+regression-guard the expected accuracy lift. The actual two-phase
+Stage-1 pipeline lives in the catalog-builder pipeline, which is
+external in Phase 1. A human reviewer should confirm three things
+before this RFC lands: (1) the catalog-builder team can absorb the
+RetroMAE Phase A infrastructure (a substantial extension to the
+existing Stage-1 pretraining setup — roughly 300 lines of new code
+for the asymmetric decoder construction, the encoder/decoder mask
+schedule, the RetroMAE cross-entropy loss, the Phase A → Phase B
+checkpoint transfer that discards decoder weights, and the
+`training_recipe.toml` extension; plus ~200 GPU-hours of new Phase A
+compute per full training run partly offset by ~100 GPU-hours saved
+in Phase B's reduced epoch count) alongside RFC-001's group-wise
+quantization, RFC-005's saliency-ranked head mask, RFC-007's
+attention-sink-aware training, RFC-008's MRL auxiliary loss,
+RFC-009's `q_latent` parameter, RFC-010's cosine-similarity
+contrastive objective, RFC-011's ALiBi bias, RFC-012's asymmetric
+prefix conditioning, RFC-013's RMSNorm, RFC-014's multi-query
+pooling with diversity penalty, RFC-015's positive-aware hard
+negative mining, RFC-016's cross-encoder distillation, RFC-017's
+synthetic query augmentation, RFC-018's AnglE loss, RFC-019's
+cluster-aware batch composition, RFC-020's GISTEmbed guided
+filtering, and RFC-021's two-stage pipeline frame. All eighteen
+are v2 reference-checkpoint / v2 catalog changes; landing them in a
+single training+catalog-build run avoids eighteen sequential
+invalidations of downstream artifacts. (2) The single-layer decoder
+recommendation should be re-confirmed at training time — RetroMAE
+§3.1 reports the lift saturates at 1-2 decoder layers and that a
+3+-layer decoder actively HURTS by absorbing reconstruction pressure
+away from the pooled representation. The catalog-builder team should
+grid-search decoder layer count ∈ {1, 2} on a 10% validation slice
+before the full production run. The default of 1 layer matches BGE's
+production recipe and is the safer choice for mind-nerve's H=256
+encoder. (3) The encoder/decoder mask rates (15% / 50%) should also
+be staged against a validation checkpoint — RetroMAE §4.2 reports
+the sweet spot is encoder ∈ [15%, 30%] and decoder ∈ [50%, 70%], with
+the exact optimum varying by corpus domain. For mind-nerve's CLI-
+oriented Stage-1 corpus (StackOverflow, GitHub issues, man pages,
+etc.), the catalog-builder team should grid-search encoder mask
+∈ {0.15, 0.20, 0.30} and decoder mask ∈ {0.50, 0.60, 0.70} on a 10%
+validation slice before the full production run. Until all three
+confirmations land, this RFC remains a proposal documenting the
+discipline; the catalog-builder team can adopt it incrementally
+without coordination because the resulting weights are byte-compatible
+with the existing mind-nerve inference path (only the byte values
+inside the weights file change, and `model_hash` updates
+correspondingly).

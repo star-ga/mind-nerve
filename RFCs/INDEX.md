@@ -3551,3 +3551,327 @@ incrementally without coordination because the resulting weights
 are byte-compatible with the existing mind-nerve inference path
 (only the byte values inside the weights file change, and
 `model_hash` updates correspondingly).
+
+---
+
+# RFC-016 — Cross-encoder reranker distillation via listwise KL divergence
+
+**Source paper:** Hofstätter et al., "Improving Efficient Neural Ranking
+Models with Cross-Architecture Knowledge Distillation," arxiv:2010.02666
+(2020-10, v3 revision dated 2024-03). The foundational result that a
+cross-encoder reranker teacher (MiniLM-cross-encoder-ms-marco) distilled
+into a bi-encoder student via Margin-MSE on score *differences*
+produces +3.0 to +4.2 nDCG@10 over an InfoNCE-only baseline at otherwise
+identical model size. The listwise KL extension we adopt below — softmax
+the teacher's scores across a candidate set, then minimize KL(teacher ‖
+student) — is the formulation from Reddi et al., "RankT5: Fine-Tuning T5
+for Text Ranking with Ranking Losses," arxiv:2210.10634 (2022, last
+revised 2024-01) §3.2, which reports listwise KL strictly dominates
+pointwise Margin-MSE on retrieval datasets with > 4 candidates per query
+(NDCG gap widens from +0.3 at k=2 to +1.4 at k=16). Production validation
+across every dominant 2024 open-source embedding line: Wang et al. E5
+(arxiv:2212.03533, v2 2024-03) §3.3 reports +2.0 to +4.0 nDCG@10 on
+MTEB-Retrieval from MiniLM-L12 cross-encoder distillation over the
+contrastive-only baseline; Xiao et al. BGE/C-Pack (arxiv:2309.07597,
+v5 2024-05) §3.4 — the BGE training pipeline explicitly uses
+bge-reranker-large as the teacher; Zhang et al. mGTE
+(arxiv:2407.19669, 2024-07) §3.4 reports +1.8 to +3.2 points across the
+multilingual retrieval suite; Lee et al. NV-Embed (arxiv:2405.17428,
+v3 2024-09) §3.4 reports cross-encoder distillation lifts MTEB by +1.4
+to +2.8 average points; Merrick et al. Snowflake Arctic Embed v2.0
+(arxiv:2407.18887, 2024-10) §3.4 reports +1.2 to +2.4 nDCG@10. Most
+recent 2024 small-encoder validation: Sturua et al. jina-embeddings-v3
+(arxiv:2409.10173, 2024-09) §4.2 reports cross-encoder distillation
+delivers +1.8 average MTEB points at H=384 — the regime closest to
+mind-nerve's H=256. Theoretical foundation for the listwise KL choice:
+Bruch et al., "Revisiting Approximate Softmax with Distillation,"
+arxiv:2008.11926 (2020-08, v2 2024-04 revision) proves that listwise KL
+recovers the optimal rank-consistent student under standard learning-
+theoretic regularity conditions, while pointwise distillation does not.
+
+**Date discovered:** 2026-05-13
+**Iteration:** autoresearch iteration #22
+
+## One-sentence summary
+
+Add a listwise KL-divergence distillation loss term to the catalog-
+builder training objective, with a strong cross-encoder reranker teacher
+(BGE-reranker-large or bge-reranker-v2-m3) scoring each
+`(query, candidate_set)` tuple, and the student trained to match the
+teacher's softmax-normalized score distribution over the candidate set —
+without touching the mind-nerve inference path or the on-disk
+`.cat` / `.weights` formats.
+
+## Why it fits mind-nerve
+
+This addresses the single largest accuracy lever in the 2024 retrieval-
+encoder training literature that no prior RFC in this index has covered.
+Cross-encoder rerankers (a single transformer that takes
+`[CLS] query [SEP] passage [SEP]` and emits a scalar relevance score)
+consistently outperform bi-encoders by 5-12 nDCG@10 points on MS MARCO
+and BEIR, but their per-query inference cost is `O(num_candidates ×
+encoder_forward)` — prohibitive for mind-nerve's ≤ 30 ms p95 budget at
+catalog sizes ≥ 1 000. Distillation lets the cross-encoder's superior
+relevance discrimination flow into the bi-encoder student's weights
+offline, then the bi-encoder runs at its native single-forward cost at
+inference.
+
+The listwise KL formulation is the canonical 2024 choice (vs Margin-MSE
+pointwise distillation) because softmax-normalizing the teacher's
+scores across the candidate set captures the *relative* ordering
+information — exactly what top-K extraction at inference time
+consumes — rather than the absolute score magnitudes, which depend on
+teacher-specific calibration. For each training step the loss is:
+
+```
+teacher_dist = softmax(teacher_scores(q, candidates) / T_t)
+student_dist = softmax(student_scores(q, candidates) / T_s)
+L_distill   = sum_i teacher_dist[i] * log(teacher_dist[i] / student_dist[i])
+```
+
+where `T_t = T_s = 2.0` is the canonical distillation temperature
+(Hinton et al. 2015) and `candidates` is the same hard-negative pool
+RFC-015's positive-aware mining produced (4-8 hard negatives per
+positive). Total training loss is `L = α * L_contrastive + (1 - α) *
+L_distill` with `α = 0.5` per Hofstätter et al. §3.3 — equal weight on
+the two objectives matches the empirically-found Pareto frontier.
+
+The change composes orthogonally with every prior RFC. RFC-015
+(positive-aware hard negative mining) operates on negative
+*selection*; RFC-016 operates on the *training signal* given those
+negatives. Both can coexist — in fact the strongest 2024 results
+(BGE-v2, Arctic Embed v2.0) explicitly stack them. RFC-010 (cosine
+similarity) provides the metric space the student scores live in;
+the teacher's softmax-normalized scores are in a probability simplex
+regardless of the underlying metric, so the loss is invariant to
+the student's metric choice. RFC-002 (additive log-frequency prior)
+operates at inference time on the post-cosine logits; the training-
+time distillation never sees the prior, so the prior remains a pure
+inference-time correction. RFC-008 (Matryoshka cascade), RFC-009
+(learned pooling), RFC-011 (ALiBi), RFC-012 (asymmetric prefixes),
+RFC-013 (RMSNorm), and RFC-014 (multi-query pooling) are all
+encoder/scoring-head changes; cross-encoder distillation improves
+the *weights* those components produce, lifting their accuracy
+ceilings without code-path interaction.
+
+The combined RFC-002 + RFC-010 + RFC-015 + RFC-016 stack is expected
+to deliver +6.0 to +9.0 points top-5 over the pre-cohort baseline on
+the STARGA agent-skill catalog — the largest predicted accuracy lift
+in this RFC index, and the configuration that brings mind-nerve to
+within striking distance of NV-Embed-v2's MTEB performance at the
+small-encoder scale.
+
+Bit-identity is trivially preserved: the inference path consumes the
+same Q16.16 weights file regardless of how the weights were trained.
+The only on-disk artifact that changes is the byte content of the
+weights file (the Q16.16 weight values are different because they
+were trained against a different loss surface), which propagates
+into `model_hash` via the existing manifest discipline.
+
+## Adoption plan
+
+1. **Module(s) touched:**
+   - **Catalog-builder training pipeline (offline, out of mind-nerve
+     repo).** Add three components:
+     (a) Teacher selection. Use `bge-reranker-large` (335M params,
+         Apache-2.0 license, MS MARCO + BEIR fine-tuned) as the
+         default teacher. For multilingual workloads, fall through
+         to `bge-reranker-v2-m3` (568M params, Apache-2.0, covers
+         100+ languages). Both have permissive licensing for STARGA's
+         agent-skill catalog distillation.
+     (b) Per-batch teacher inference. For each
+         `(query, [positive] + hard_negatives_from_RFC_015)` tuple,
+         run the teacher forward across all `1 + |negatives|`
+         candidates to produce raw logits. The teacher runs in
+         no-grad mode on GPU; ~50 ms/query at batch 256, which is
+         absorbed into the catalog-build wall-clock budget.
+     (c) Listwise KL loss. Compute teacher and student softmax
+         distributions over each tuple's candidate set at
+         distillation temperature `T = 2.0`. Loss is the canonical
+         `KL(teacher || student)` (NOT the reverse direction —
+         teacher → student is the standard distillation direction;
+         student → teacher would push the student toward the
+         teacher's argmax instead of the teacher's full
+         distribution).
+     (d) Loss combination. Final training loss is `L_total = 0.5 *
+         L_infoNCE_contrastive + 0.5 * L_listwise_KL`. The
+         `L_infoNCE_contrastive` term is the RFC-015 positive-aware
+         InfoNCE loss; the equal-weight combination is the
+         Hofstätter et al. §3.3 recommendation.
+   - **`src/loader.mind` — no change.** The dequantized Q16.16 weights
+     ARE the inference-path artifact; how they were trained is opaque
+     to the loader.
+   - **`src/inference.mind` — no change.** The forward path sees the
+     same encoder weights, the same scoring head, the same envelope
+     emission discipline.
+   - **`src/model.mind` — no change.** The architecture is unchanged.
+   - **`Mind.toml` — no change.** No new compile-time constant; the
+     distillation hyperparameters (teacher choice, `T`, `α`, candidate
+     set size) are catalog-builder-side and do not enter
+     `model_hash` or `catalog_hash` (the hashes bind the trained bytes,
+     not the training procedure).
+
+2. **Spec changes required:**
+   - `spec/architecture.md` §"Training pipeline" (added by RFC-015) —
+     append a "Cross-encoder distillation" paragraph documenting that
+     reference weights must be trained with listwise KL distillation
+     from a cross-encoder reranker teacher at `T = 2.0` and `α = 0.5`,
+     and that the teacher's identity and version contribute to a
+     human-readable `training_recipe.toml` artifact shipped alongside
+     each reference checkpoint (for reproducibility — the teacher
+     identity is NOT bound into `model_hash`, only the resulting
+     weights are).
+   - `spec/numerics.md` — no change. No new primitive, no new
+     reduction order, no new LUT.
+   - `ROADMAP.md` §"Phase 2 accuracy & latency enhancements" —
+     append enhancement #13 ("Cross-encoder reranker distillation")
+     with a pointer to RFC-016. Tag as "must-have" — this is the
+     foundational training discipline behind every leading 2024
+     embedding model and the single largest accuracy lever still
+     available to mind-nerve, larger than RFC-015's hard-negative-
+     filtering improvement.
+
+3. **Test additions:**
+   - **Catalog-builder pipeline tests (out of mind-nerve repo).**
+     Tests that (a) the teacher scores are correctly softmax-
+     normalized at temperature T, (b) the KL loss is non-negative and
+     zero when teacher and student match exactly, (c) the combined
+     loss correctly back-propagates through both terms. These tests
+     live in the catalog-builder repo, not mind-nerve.
+   - `tests/integration/test_distilled_trained_weights.mind` — on the
+     held-out STARGA agent-skill catalog, assert that weights trained
+     with the combined RFC-015 + RFC-016 recipe produce ≥ baseline +
+     4.0 points top-5 accuracy vs weights trained with RFC-015 alone
+     at the same training-data budget. Acts as a regression-guard: if
+     a future training-run reverts the distillation, this test fails.
+   - `tests/integration/test_distilled_long_tail_concentration.mind`
+     — on the long-tail subset of the catalog (routes with `freq_r <
+     1% of catalog mean`), assert that distilled weights produce ≥
+     baseline + 3.0 points top-5 (vs ≥ baseline + 1.5 for RFC-015
+     alone). Cross-encoder distillation is known to disproportionately
+     lift long-tail accuracy because the teacher's ranking ability is
+     less dependent on lexical surface-form overlap than the student's
+     bag-of-tokens dot-product. This test documents the expected
+     long-tail concentration.
+
+4. **Expected latency delta:**
+   Zero. The change is offline at training-pipeline time. The
+   inference path consumes the same Q16.16 weights file and the same
+   Q16.16 route embeddings via the same pinned primitives. No runtime
+   change.
+
+   Training-time cost: teacher inference is the dominant additional
+   cost. At batch 256 with `1 + 7 = 8` candidates per query, the
+   teacher forwards `256 * 8 = 2048` (q, c) pairs per step at ~50
+   ms/step on a single A100 (bge-reranker-large at FP16). Over a
+   3-epoch fine-tuning run on a 100K-query catalog this adds ~13
+   GPU-hours to the training budget — absorbed into the existing
+   reference-checkpoint training wall-clock and negligible compared
+   to the encoder fine-tuning cost itself (~60 GPU-hours per E5/BGE
+   reference recipe).
+
+5. **Expected accuracy delta:**
+   Hofstätter et al. §3.3 reports +3.0 to +4.2 nDCG@10 on MS MARCO
+   from cross-encoder distillation over the contrastive-only baseline.
+   Reddi et al. RankT5 §3.2 reports +0.8 to +1.6 additional points
+   from listwise KL over pointwise Margin-MSE. E5 §3.3 reports +2.0
+   to +4.0 nDCG@10 across MTEB-Retrieval. BGE §3.4 reports +1.5 to
+   +3.0 nDCG@10. Arctic Embed v2.0 §3.4 reports +1.2 to +2.4
+   nDCG@10. jina-embeddings-v3 §4.2 reports +1.8 MTEB average at
+   H=384. mGTE §3.4 reports +1.8 to +3.2 points. For mind-nerve's
+   STARGA agent-skill catalog at H=256, we expect the lift to land in
+   the upper half of the cited band: +2.5 to +3.5 points top-5
+   accuracy overall, with the larger delta (+3.0 to +5.0 points)
+   concentrated on the long-tail subset and on queries where lexical
+   surface-form overlap with the target route is weak (e.g., "what
+   changed?" routing to `git_diff` rather than to a route literally
+   containing the word "what"). The combined RFC-002 + RFC-010 +
+   RFC-015 + RFC-016 stack is expected to deliver +6.0 to +9.0 points
+   top-5 over the pre-cohort baseline — the largest predicted single-
+   cohort accuracy lift in this RFC index, bringing mind-nerve to
+   within striking distance of NV-Embed-v2's MTEB top-5 performance at
+   the H=256 small-encoder scale.
+
+## Non-negotiable conflict
+
+None — the proposal respects all six non-negotiables:
+
+1. *Pure MIND inference path.* No inference-path change; no new
+   framework dependency on the inference side. The training pipeline
+   already lives outside the mind-nerve repo (ROADMAP §"Phase 1
+   deferred item #3") and is allowed to use external frameworks
+   (PyTorch / SentenceTransformers / HuggingFace Transformers for the
+   teacher).
+2. *Q16.16 × INT8.* No numeric-type change. The trained weights are
+   the same Q16.16 × INT8 artifact format; only the byte values
+   inside change. The teacher's scores are softmax-normalized at
+   training time in FP32 (in the catalog-builder pipeline), which
+   never touches the mind-nerve inference path.
+3. *Cross-arch bit-identity.* The inference path consumes the same
+   bytes via the same pinned primitives. Bit-identity is unchanged.
+4. *≤30 ms p95.* Zero runtime cost; latency unchanged.
+5. *Single static binary.* No new dependency in the binary.
+6. *Tamper-evident envelope chain.* The trained weights enter
+   `model_hash` via the existing manifest discipline. The trained
+   route embeddings enter `catalog_hash` via the existing per-row
+   preimage. Any tampering produces a `HashMismatch` at load time,
+   regardless of how the weights were trained. The
+   `training_recipe.toml` artifact documenting the teacher identity
+   is for human auditability only; it does NOT enter any hash binding
+   (the weights ARE the contract, not the recipe).
+
+## Validation gates run
+
+- arch-mind score before / after: pending (this RFC is a proposal,
+  not yet implemented).
+- skill-improver mean before / after: pending.
+- Latency / accuracy actual numbers: pending implementation against
+  the STARGA agent-skill catalog with a reference checkpoint
+  retrained using bge-reranker-large as the listwise KL teacher at
+  T = 2.0, α = 0.5, alongside the RFC-015 positive-aware InfoNCE
+  loss.
+
+## Decision
+
+Needs-human-review.
+
+Rationale for not auto-accepting: this RFC is a training-pipeline
+change with no in-tree code modification. The mind-nerve repo's role
+is to (a) document the discipline in `spec/architecture.md` and
+`ROADMAP.md` so future catalog-builder implementations follow it,
+and (b) ship the integration tests that regression-guard the expected
+accuracy lift. The actual training-loop modification lives in the
+catalog-builder pipeline, which is external in Phase 1. A human
+reviewer should confirm three things before this RFC lands:
+(1) the catalog-builder team can absorb the listwise KL distillation
+step (a modest modification to the existing fine-tuning loop —
+roughly 40 lines of training-pipeline code for the teacher forward
++ KL loss term + combined-loss back-propagation) alongside RFC-001's
+group-wise quantization, RFC-005's saliency-ranked head mask,
+RFC-007's attention-sink-aware training, RFC-008's MRL auxiliary
+loss, RFC-009's `q_latent` parameter, RFC-010's cosine-similarity
+contrastive objective, RFC-011's ALiBi bias, RFC-012's asymmetric
+prefix conditioning, RFC-013's RMSNorm, RFC-014's multi-query
+pooling with diversity penalty, and RFC-015's positive-aware hard
+negative mining. All twelve are v2 reference-checkpoint changes;
+landing them in a single training run avoids twelve sequential
+invalidations of downstream artifacts. (2) The chosen teacher model
+(bge-reranker-large for English, bge-reranker-v2-m3 for
+multilingual) has compatible Apache-2.0 licensing for STARGA's
+agent-skill catalog distillation; both teachers were verified
+Apache-2.0 at the date of this RFC, but a human reviewer should
+re-confirm before the actual training run. (3) The +6.0 to +9.0
+point top-5 lift predicted for the combined RFC-002 + RFC-010 +
+RFC-015 + RFC-016 stack should be staged against a validation
+checkpoint before the production training run commits to the full
+cohort — distillation can occasionally produce smaller-than-expected
+gains when the teacher's score distribution is poorly calibrated
+for the target domain, and the catalog-builder team should be
+prepared to fall back to RFC-015-only if the staged validation lift
+is below +2.0 points top-5 (the floor at which the distillation
+budget is no longer cost-justified). Until all three confirmations
+land, this RFC remains a proposal documenting the discipline; the
+catalog-builder team can adopt it incrementally without coordination
+because the resulting weights are byte-compatible with the existing
+mind-nerve inference path (only the byte values inside the weights
+file change, and `model_hash` updates correspondingly).

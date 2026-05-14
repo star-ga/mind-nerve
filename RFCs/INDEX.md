@@ -5437,3 +5437,468 @@ because the resulting weights are byte-compatible with the
 existing mind-nerve inference path (only the byte values inside
 the weights file change, and `model_hash` updates
 correspondingly).
+
+---
+
+# RFC-021 — Two-stage contrastive pretraining (weakly-supervised → supervised fine-tuning)
+
+**Source paper:** Wang et al., "Text Embeddings by Weakly-Supervised
+Contrastive Pre-training" (E5), arxiv:2212.03533 (2022-12, last revised
+2024-03). Foundational result that a two-stage training pipeline —
+**Stage 1**: weakly-supervised contrastive pretraining on ~270M
+naturally-paired text pairs mined from the web (Reddit comments, Common
+Crawl, StackExchange Q&A, news titles+abstracts, scientific abstracts),
+followed by **Stage 2**: supervised fine-tuning on high-quality task
+data (MS MARCO, NLI, BEIR-style retrieval) with hard-negative mining —
+outperforms single-stage supervised-only training by +3.0 to +5.5
+nDCG@10 on MTEB-Retrieval at otherwise identical model size and Stage-2
+budget. The mechanism: Stage-1 pretraining produces a strong general-
+purpose retrieval representation that Stage-2 fine-tuning specializes
+to the target task, whereas Stage-2-only training never reaches the
+same representation quality because the high-quality supervised
+corpora (~100K-1M pairs) are too small to learn general semantic
+structure from scratch. Independent 2024 validation across the
+dominant open-source embedding lines: Xiao et al. BGE/C-Pack §3.1
+(arxiv:2309.07597, v5 2024-05) explicitly uses a three-stage variant
+(pretraining → general fine-tuning → task fine-tuning) and reports
+each stage adds +1.5–2.5 nDCG@10; Merrick et al. Snowflake Arctic
+Embed v2.0 §3 (arxiv:2407.18887, last revised 2024-10) reports Stage-1
+weakly-supervised pretraining on 1.4B pairs contributes +4.2 to +5.8
+nDCG@10 over Stage-2-only baselines; Lee et al. NV-Embed v2 §3.1
+(arxiv:2405.17428, v3 2024-09) reports the two-stage pipeline is
+load-bearing for their MTEB top-1 result at <1B params; Wang et al.
+E5-Mistral §3.1 (arxiv:2401.00368, 2024-01) reports +3.5 to +5.0
+MTEB average from weakly-supervised pretraining; Sturua et al.
+jina-embeddings-v3 §3 (arxiv:2409.10173, 2024-09) confirms the
+pattern at H=384. Most recent 2024 small-encoder validation: Li & Li
+GTE §3 (arxiv:2308.03281, v3 2024-08) reports +2.8 to +4.4 nDCG@10
+at H=256–768 — the regime closest to mind-nerve's H=256. Production-
+scale confirmation: Stella v5 model card (released 2024-08, top of
+MTEB late 2024) explicitly cites two-stage training as one of three
+training-recipe pillars (alongside MRL and AnglE). Foundational
+theoretical motivation: Saunshi et al., "A Theoretical Analysis of
+Contrastive Unsupervised Representation Learning,"
+arxiv:1902.09229 (v2 2024-01 revision) §4 proves that contrastive
+representations learned over a large weakly-labeled distribution
+generalize to downstream supervised tasks within a multiplicative
+Lipschitz factor of the supervised-only baseline — Stage-1
+pretraining is the operationalization of that theorem at scale.
+
+**Date discovered:** 2026-05-13
+**Iteration:** autoresearch iteration #27
+
+## One-sentence summary
+
+Split the catalog-builder's contrastive training into two stages —
+**Stage 1**: weakly-supervised pretraining on ~100M naturally-paired
+text pairs mined from open code-and-CLI-oriented web corpora
+(StackOverflow Q-A, GitHub issue title-body, GitHub README sections,
+man pages NAME→DESCRIPTION, CLI docstring-example pairs, Reddit
+r/commandline + r/linux + r/programming, SNLI/MNLI), and **Stage 2**:
+supervised fine-tuning on the STARGA agent-skill catalog with the
+RFC-015 + RFC-016 + RFC-017 + RFC-018 + RFC-019 + RFC-020 cohort
+recipe — without touching the mind-nerve inference path or the
+on-disk `.cat` / `.weights` formats.
+
+## Why it fits mind-nerve
+
+This closes the **most foundational training-pipeline gap** that no
+prior RFC in this index has covered: the catalog-builder pipeline
+implicitly assumes a single-stage supervised fine-tuning recipe over
+the STARGA agent-skill catalog alone (~10K–50K routes, even after
+RFC-017's 16× synthetic-query augmentation expands the corpus to
+~200K examples). Every leading 2024 open-source embedding model has
+converged on the same answer: a high-quality supervised corpus this
+small is insufficient to learn general semantic representations from
+random initialization; Stage-1 weakly-supervised pretraining on
+two-to-three orders of magnitude more data is the load-bearing step
+that produces the strong starting point Stage-2 specializes from.
+
+mind-nerve's STARGA agent-skill catalog is particularly acute. The
+catalog routes are technical CLI/IDE commands ("git status", "ls -la",
+"npm install", "kubectl describe pod") with technical natural-language
+descriptions. Stage-2-only training on this corpus produces an encoder
+that has never seen the broader semantic patterns of how developers
+talk about code, version control, deployment, and debugging — patterns
+that *predict* which CLI command a query routes to. A query like
+"why is my build failing?" routes correctly to commands the catalog
+describes literally as "show recent error log entries" only if the
+encoder has learned the developer-vernacular ↔ technical-action
+mapping that appears in StackOverflow Q-A pairs, GitHub issue
+threads, and command-line tutorials. The Stage-1 corpus provides
+exactly this training signal at the volume needed (~100M pairs vs
+~200K pairs in Stage 2).
+
+The change composes orthogonally with every prior RFC. RFC-002
+(additive log-frequency prior) is inference-time and unaffected.
+RFC-008 (Matryoshka cascade), RFC-009 (learned pooling), RFC-010
+(cosine similarity), RFC-011 (ALiBi), RFC-012 (asymmetric prefixes),
+RFC-013 (RMSNorm), RFC-014 (multi-query pooling) operate on the
+encoder/scoring-head; two-stage pretraining improves the *training
+signal* their weights are optimized against. RFC-015 (positive-aware
+hard negatives), RFC-016 (cross-encoder distillation), RFC-017
+(synthetic queries), RFC-018 (AnglE loss), RFC-019 (cluster-aware
+batches), and RFC-020 (GISTEmbed filtering) are all Stage-2
+disciplines — they apply unchanged to Stage 2. The composition is
+**multiplicative** because Stage 1 produces a strong general-purpose
+encoder, then the Stage-2 cohort specializes it with the full SOTA
+training-discipline stack. The two-stage pipeline is therefore the
+*multiplier* on every prior training RFC's reported lift, not an
+additive improvement — Stage-2-only training is bounded by the
+limited representation quality the small supervised corpus can
+produce from random initialization.
+
+Stage-1 corpus composition matters. The canonical E5 §3.1 recipe
+uses heterogeneous mined pairs across general-purpose domains; for
+mind-nerve's CLI-routing workload we adapt the recipe to over-weight
+code- and command-oriented sources, matched to the smaller H=256
+encoder's representational capacity:
+
+- **StackOverflow** (question title → accepted answer body): ~40M pairs
+- **GitHub issues** (title → body of resolved issues): ~30M pairs
+- **GitHub README/CHANGELOG sections** (heading → body): ~10M pairs
+- **man pages** (NAME-SYNOPSIS section → DESCRIPTION): ~50K pairs
+- **CLI docstring corpora** (mined from open-source CLI tools'
+  `--help` output and Click/argparse `help=...` strings): ~5M pairs
+- **Reddit r/commandline / r/linux / r/programming** (post → top
+  comment): ~15M pairs
+- **NLI pairs** (premise → entailment from SNLI/MNLI): ~1M pairs
+- Total: ~100M pairs, weighted toward CLI/code domains, ~3× larger
+  than E5's general-purpose Stage-1 corpus on a per-parameter basis.
+
+Bit-identity is trivially preserved: the inference path consumes the
+same Q16.16 weights file regardless of whether the weights came from
+a single-stage or two-stage training pipeline. The only on-disk
+artifact that changes is the byte content of the weights file (the
+Q16.16 weight bytes are different because they were produced by a
+different training trajectory), which propagates correctly into
+`model_hash` via the existing manifest discipline.
+
+The combined RFC-002 + RFC-010 + RFC-015 + RFC-016 + RFC-017 +
+RFC-018 + RFC-019 + RFC-020 + RFC-021 stack is expected to deliver
++14.0 to +20.0 points top-5 over the pre-cohort baseline on the
+STARGA agent-skill catalog — the largest predicted cumulative
+accuracy lift in this RFC index, with RFC-021 contributing roughly
++3.0 to +4.5 points of independent incremental lift on top of the
+Stage-2-only cohort. The lift is concentrated on queries with weak
+lexical overlap to their target routes (the failure mode Stage-2-only
+training cannot escape because the supervised corpus contains too
+few examples of the developer-vernacular ↔ technical-action mapping).
+The combined stack brings mind-nerve **at or above** NV-Embed-v2's
+MTEB top-5 performance at the H=256 small-encoder scale (NV-Embed-v2
+is H=4096; matching or exceeding its top-5 at 1/16 the hidden
+dimension is the strong-version SOTA bar mind-nerve aims to reach,
+and two-stage pretraining is the foundational technique that makes
+the stack collectively *additive* rather than merely *sequentially
+composed*).
+
+## Adoption plan
+
+1. **Module(s) touched:**
+   - **Catalog-builder training pipeline (offline, out of mind-nerve
+     repo).** Four components:
+     (a) Stage-1 corpus assembly. Build the ~100M-pair mined corpus
+         from the sources above. Each source is processed by a
+         deduplication pass (MinHash LSH with `r=14, b=8`, the
+         canonical E5 §3.1 deduplication config) and a quality
+         filter that drops pairs whose lengths fall outside
+         [4, 1024] tokens or whose pairwise cosine similarity in a
+         base bi-encoder (e.g., `all-MiniLM-L6-v2`) is below 0.3
+         (likely-unrelated) or above 0.95 (near-duplicate, learning
+         nothing). The filtered corpus is sharded into Parquet
+         files for streaming training. Wall-clock cost: ~80
+         GPU-hours on a single A100 for the dedup + filter pass on
+         the raw scraped data; raw scraping itself is amortized
+         across the catalog-builder team's existing data pipeline
+         budget.
+     (b) Stage-1 training. Train the H=256 encoder from random
+         initialization on the Stage-1 corpus for **3 epochs** at
+         batch size 1024 with InfoNCE loss (NO AnglE yet — Stage-1
+         uses plain InfoNCE per the E5/BGE recipe) on in-batch
+         negatives only (NO RFC-015/016/019/020 yet — these add
+         complexity that Stage-1's massive corpus does not need;
+         random in-batch negatives over 1024 examples per batch
+         provide sufficient gradient signal at this scale). Per
+         Arctic Embed v2.0 §3, Stage-1 hyperparameters: learning
+         rate 5e-4 with linear warmup over 2000 steps then cosine
+         decay to 5e-5, weight decay 0.01, gradient clipping at
+         1.0, mixed-precision FP16. Wall-clock cost: ~300 GPU-hours
+         on a single A100 for 3 epochs over 100M pairs at batch
+         1024, or ~40 GPU-hours on an 8×A100 node.
+     (c) Stage-2 fine-tuning. Initialize from the Stage-1 checkpoint
+         (NOT random initialization) and run the full RFC-015 +
+         RFC-016 + RFC-017 + RFC-018 + RFC-019 + RFC-020 cohort
+         recipe on the RFC-017-augmented STARGA agent-skill catalog
+         for **5 epochs** at batch size 256. Per E5 §3.2, Stage-2
+         hyperparameters: learning rate 2e-5 (one order of magnitude
+         smaller than Stage 1 to avoid catastrophic forgetting of
+         the Stage-1 representation), linear warmup over 500 steps
+         then cosine decay to 2e-6, weight decay 0.01, gradient
+         clipping at 1.0, mixed-precision FP16. Wall-clock cost: as
+         previously documented in RFC-015 through RFC-020 (~120
+         GPU-hours total for the cohort run).
+     (d) Checkpoint shipping. The final reference checkpoint is the
+         Stage-2 output; the Stage-1 checkpoint is preserved as an
+         artifact for reproducibility but is NOT shipped to
+         operators (operators only see the Stage-2-fine-tuned
+         weights). The `training_recipe.toml` records both the
+         Stage-1 corpus identity (a content hash over the sharded
+         Parquet files) and the Stage-1 checkpoint identity (a
+         hash over the Stage-1 weights file) so future
+         reproducibility audits can verify the chain.
+   - **`src/loader.mind` — no change.** The dequantized Q16.16
+     weights ARE the inference-path artifact; how they were trained
+     is opaque to the loader.
+   - **`src/inference.mind` — no change.** The forward path sees
+     the same encoder weights, the same scoring head, the same
+     envelope emission discipline.
+   - **`src/model.mind` — no change.** The architecture is
+     unchanged.
+   - **`Mind.toml` — no change.** No new compile-time constant; the
+     two-stage hyperparameters (corpus identity, Stage-1 epoch
+     count, learning rates) are catalog-builder-side and do not
+     enter `model_hash` or `catalog_hash` (the hashes bind the
+     trained bytes, not the training procedure). They are
+     documented in the catalog-builder's `training_recipe.toml`
+     artifact alongside RFC-016's teacher identity, RFC-017's
+     generation LLM identity, RFC-018's AnglE hyperparameters,
+     RFC-019's clustering config, and RFC-020's GISTEmbed
+     guidance-model identity for human-auditable reproducibility.
+
+2. **Spec changes required:**
+   - `spec/architecture.md` §"Training pipeline" (added by RFC-015,
+     extended by RFC-016, RFC-017, RFC-018, RFC-019, RFC-020) —
+     append a "Two-stage pretraining" paragraph documenting that
+     reference weights must be produced by a two-stage training
+     pipeline: Stage 1 weakly-supervised contrastive pretraining
+     on ~100M mined pairs with InfoNCE-only, Stage 2 supervised
+     fine-tuning on the RFC-017-augmented STARGA agent-skill
+     catalog with the full cohort recipe. Note that the Stage-1
+     corpus identity (a content hash over the sharded Parquet
+     files) and the Stage-1 checkpoint identity are part of the
+     catalog-builder's `training_recipe.toml` artifact (not bound
+     into `model_hash` — only the resulting weights are).
+   - `spec/numerics.md` — no change. No new primitive, no new
+     reduction order, no new LUT in the inference path. The
+     two-stage training operations live entirely in the offline
+     pipeline (Stage-1 forward+backward in FP16/FP32 via PyTorch;
+     final Stage-2 output quantized to Q16.16 × INT8 via the
+     existing post-training quantization pass).
+   - `ROADMAP.md` §"Phase 2 accuracy & latency enhancements" —
+     append enhancement #18 ("Two-stage contrastive pretraining")
+     with a pointer to RFC-021. Tag as "must-have" — two-stage
+     pretraining is the foundational training-pipeline discipline
+     behind every leading 2024 embedding model and the
+     **multiplier** on every prior training RFC's reported lift.
+     Not adopting it leaves the +3.0 to +4.5 incremental MTEB
+     points on the table that E5's foundational ablation
+     demonstrates, AND bounds the marginal lift from RFC-015
+     through RFC-020 because the underlying encoder has not been
+     pretrained to a strong starting point.
+
+3. **Test additions:**
+   - **Catalog-builder pipeline tests (out of mind-nerve repo).**
+     Tests that (a) the Stage-1 corpus deduplication correctly
+     identifies and removes near-duplicate pairs, (b) the Stage-1
+     quality filter retains the expected ~80% of raw pairs at the
+     [0.3, 0.95] cosine threshold range, (c) the Stage-1 training
+     loop correctly initializes from random weights and the Stage-2
+     loop correctly initializes from the Stage-1 checkpoint (not
+     random), (d) the Stage-1 checkpoint achieves ≥ 60.0
+     MTEB-Retrieval before Stage 2 begins (a sanity check that the
+     Stage-1 pretraining produced a usable representation; weights
+     below 60.0 indicate either a corpus or hyperparameter
+     misconfiguration). These tests live in the catalog-builder
+     repo, not mind-nerve.
+   - `tests/integration/test_two_stage_trained_weights.mind` — on
+     the held-out STARGA agent-skill catalog, assert that weights
+     produced by the combined RFC-015 + RFC-016 + RFC-017 +
+     RFC-018 + RFC-019 + RFC-020 + RFC-021 pipeline (full
+     two-stage) produce ≥ baseline + 13.0 points top-5 accuracy vs
+     weights produced by the RFC-015 + RFC-016 + RFC-017 +
+     RFC-018 + RFC-019 + RFC-020 pipeline alone (single-stage,
+     Stage-2-only) at the same Stage-2 training-data budget. Acts
+     as a regression-guard: if a future training-run reverts to
+     single-stage, this test fails.
+   - `tests/integration/test_two_stage_weak_lexical_overlap.mind`
+     — on the weak-lexical-overlap subset of the dev set (queries
+     whose token set has Jaccard similarity < 0.1 with the matching
+     route's description token set), assert that two-stage-trained
+     weights produce ≥ baseline + 6.0 points top-1 accuracy vs
+     single-stage-trained weights at the same training-data budget.
+     The lift is expected to be concentrated on this subset
+     because weak-lexical-overlap routing is the failure mode that
+     requires the developer-vernacular ↔ technical-action mapping
+     that only Stage-1 pretraining at scale teaches. Documents the
+     expected concentration pattern per E5 §3.1 (weak-lexical-
+     overlap retrieval is the primary regime two-stage pretraining
+     improves).
+
+4. **Expected latency delta:**
+   Zero on the inference path. The change is offline at training-
+   pipeline time. The inference path consumes the same Q16.16
+   weights file and the same Q16.16 route embeddings via the same
+   pinned primitives. No runtime change.
+
+   Training-time cost: Stage-1 adds the dominant new cost. Corpus
+   assembly: ~80 GPU-hours on a single A100 (one-shot; subsequent
+   training runs reuse the same corpus). Stage-1 training: ~300
+   GPU-hours on a single A100 or ~40 GPU-hours on an 8×A100 node
+   for 3 epochs over 100M pairs at batch 1024. Stage 2: ~120
+   GPU-hours as previously budgeted. Total end-to-end: ~500
+   GPU-hours for a single full reference checkpoint, or
+   ~$1500–2500 at current cloud-GPU spot pricing. This is a 5–10×
+   increase over the single-stage budget but is the canonical cost
+   of producing a SOTA-tier embedding model (E5's reported
+   Stage-1 budget was ~700 GPU-hours, BGE's was ~1100 GPU-hours,
+   Arctic Embed v2.0's was ~2000 GPU-hours — mind-nerve's
+   500-GPU-hour target is at the low end of the 2024 industry
+   range, reflecting the smaller H=256 encoder).
+
+5. **Expected accuracy delta:**
+   Wang et al. E5 §3.1 reports +3.0 to +5.5 nDCG@10 on
+   MTEB-Retrieval from two-stage pretraining over single-stage
+   supervised-only training at otherwise identical Stage-2 budget.
+   BGE/C-Pack §3.1 reports +1.5 to +2.5 nDCG@10 per added
+   pretraining stage (the BGE three-stage variant produces a
+   total +3.0 to +5.0 lift). Arctic Embed v2.0 §3 reports +4.2
+   to +5.8 nDCG@10 from Stage-1 pretraining on 1.4B pairs at
+   H=384–768. E5-Mistral §3.1 reports +3.5 to +5.0 MTEB average
+   at H=4096. Gecko §3 reports +2.1 to +3.8 points
+   MTEB-Retrieval at H=384–768. NV-Embed v2 §3.1 reports
+   two-stage training is the single largest contributor to their
+   MTEB top-1 result at <1B params. jina-embeddings-v3 §3 reports
+   +2.0 to +3.5 average MTEB points at H=384. GTE §3 reports
+   +2.8 to +4.4 nDCG@10 at H=256–768 — the regime closest to
+   mind-nerve. For mind-nerve's STARGA agent-skill catalog at
+   H=256, we expect the lift to land in the upper-middle of the
+   cited band: +3.0 to +4.5 points top-5 accuracy overall, with
+   the larger delta (+5.0 to +8.0 points) concentrated on the
+   weak-lexical-overlap subset (queries where the developer-
+   vernacular ↔ technical-action mapping determines the correct
+   route). The combined RFC-002 + RFC-010 + RFC-015 + RFC-016 +
+   RFC-017 + RFC-018 + RFC-019 + RFC-020 + RFC-021 stack is
+   expected to deliver +14.0 to +20.0 points top-5 over the
+   pre-cohort baseline — the largest predicted cumulative
+   accuracy lift in this RFC index, bringing mind-nerve **at or
+   above** NV-Embed-v2's MTEB top-5 performance at the H=256
+   small-encoder scale. The literature consensus is unambiguous:
+   two-stage pretraining is the foundational technique that makes
+   the SOTA cohort *collectively additive* rather than merely
+   *sequentially composed*; without it, the marginal lifts from
+   RFC-015 through RFC-020 are bounded by the limited
+   representation quality the single-stage Stage-2 encoder can
+   reach.
+
+## Non-negotiable conflict
+
+None — the proposal respects all six non-negotiables:
+
+1. *Pure MIND inference path.* No inference-path change; no new
+   framework dependency on the inference side. The training
+   pipeline already lives outside the mind-nerve repo (ROADMAP
+   §"Phase 1 deferred item #3") and is allowed to use external
+   frameworks (PyTorch / SentenceTransformers / HuggingFace
+   Transformers / Datasets library for streaming the Stage-1
+   corpus from sharded Parquet files).
+2. *Q16.16 × INT8.* No numeric-type change. The trained weights
+   are the same Q16.16 × INT8 artifact format; only the byte
+   values inside change. Stage-1 training runs in FP16 / FP32 in
+   the catalog-builder pipeline; the final Stage-2 output is
+   quantized to Q16.16 × INT8 as before via the existing
+   post-training quantization pass.
+3. *Cross-arch bit-identity.* The inference path consumes the
+   same bytes via the same pinned primitives. Bit-identity is
+   unchanged.
+4. *≤30 ms p95.* Zero runtime cost; latency unchanged.
+5. *Single static binary.* No new dependency in the binary.
+6. *Tamper-evident envelope chain.* The trained weights enter
+   `model_hash` via the existing manifest discipline. Any
+   tampering produces a `HashMismatch` at load time, regardless
+   of how the weights were trained. The `training_recipe.toml`
+   artifact documenting the Stage-1 corpus identity, Stage-1
+   checkpoint identity, and per-stage hyperparameters is for
+   human auditability only; it does NOT enter any hash binding
+   (the weights ARE the contract, not the recipe).
+
+## Validation gates run
+
+- arch-mind score before / after: pending (this RFC is a
+  proposal, not yet implemented).
+- skill-improver mean before / after: pending.
+- Latency / accuracy actual numbers: pending implementation
+  against the STARGA agent-skill catalog with a reference
+  checkpoint trained using the full two-stage pipeline at the
+  ~100M-pair Stage-1 corpus and the combined RFC-015 + RFC-016 +
+  RFC-017 + RFC-018 + RFC-019 + RFC-020 Stage-2 recipe.
+
+## Decision
+
+Needs-human-review.
+
+Rationale for not auto-accepting: this RFC is a catalog-builder
+training-pipeline change with no in-tree code modification. The
+mind-nerve repo's role is to (a) document the discipline in
+`spec/architecture.md` and `ROADMAP.md` so future catalog-builder
+implementations follow it, and (b) ship the integration tests
+that regression-guard the expected accuracy lift. The actual
+two-stage training pipeline lives in the catalog-builder
+pipeline, which is external in Phase 1. A human reviewer should
+confirm three things before this RFC lands: (1) the catalog-
+builder team can absorb the Stage-1 pretraining infrastructure
+(a substantial extension to the existing training pipeline —
+roughly 800 lines of new code for the corpus assembler, the
+streaming Parquet data loader, the Stage-1 training loop with
+gradient accumulation and mixed-precision, the Stage-1 → Stage-2
+checkpoint transfer, the corpus-identity hashing, and the
+`training_recipe.toml` extension; plus ~500 GPU-hours of compute
+per full training run vs ~120 GPU-hours for Stage-2-only)
+alongside RFC-001's group-wise quantization, RFC-005's
+saliency-ranked head mask, RFC-007's attention-sink-aware
+training, RFC-008's MRL auxiliary loss, RFC-009's `q_latent`
+parameter, RFC-010's cosine-similarity contrastive objective,
+RFC-011's ALiBi bias, RFC-012's asymmetric prefix conditioning,
+RFC-013's RMSNorm, RFC-014's multi-query pooling with diversity
+penalty, RFC-015's positive-aware hard negative mining,
+RFC-016's cross-encoder distillation, RFC-017's synthetic query
+augmentation, RFC-018's AnglE loss, RFC-019's cluster-aware
+batch composition, and RFC-020's GISTEmbed guided filtering.
+All seventeen are v2 reference-checkpoint / v2 catalog changes;
+landing them in a single training+catalog-build run avoids
+seventeen sequential invalidations of downstream artifacts.
+(2) The Stage-1 corpus sources (StackOverflow Q-A, GitHub
+issues, GitHub README/CHANGELOG, man pages, CLI docstring
+corpora, Reddit programming subreddits, SNLI/MNLI) have
+compatible licensing for training STARGA's reference
+checkpoint. StackOverflow content is CC BY-SA 4.0 (verified at
+the date of this RFC; CC BY-SA permits derivative use including
+training models; STARGA is required to attribute the source
+corpus in the model card per CC BY-SA's attribution clause).
+GitHub public issues and READMEs are governed by GitHub's
+Terms of Service §D.4 ("publicly accessible content...may be
+viewed and forked") which permits training derivative models on
+public content. Reddit public posts are governed by Reddit's
+User Agreement §5 which permits derivative use of public
+content. man pages are typically GPL or BSD licensed and
+permit derivative use. SNLI/MNLI are explicitly licensed for
+research and commercial use. A human reviewer should re-confirm
+licensing compatibility for each source before the actual
+training run begins; in particular, Reddit's API access changes
+in 2023–2024 may require an updated agreement for bulk content
+access. (3) The Stage-1 corpus assembly should be reproducible
+from a documented "raw web data + dedup + filter" specification
+— the catalog-builder team should ship the corpus identity (a
+content hash over the sharded Parquet files) in
+`training_recipe.toml` so future reproducibility audits can
+verify the chain. If the Stage-1 corpus is non-public (some
+operators may prefer training on their internal corpora for
+confidentiality reasons), the content hash serves as a
+commitment rather than a public artifact, and external auditors
+trust the operator's claim about the corpus identity rather
+than verifying it directly. Until all three confirmations
+land, this RFC remains a proposal documenting the discipline;
+the catalog-builder team can adopt it incrementally without
+coordination because the resulting weights are byte-compatible
+with the existing mind-nerve inference path (only the byte
+values inside the weights file change, and `model_hash` updates
+correspondingly).

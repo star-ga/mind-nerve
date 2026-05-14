@@ -717,6 +717,8 @@ builder ships the RSJ scaling, mind-nerve continues to read the
 unscaled embeddings without any code-level surprise — there is no
 fallback path to bypass.
 
+**Status:** SKIPPED — Training/catalog-builder-side only (zero in-tree inference change per the RFC's own "Adoption plan": `src/loader.mind`, `src/inference.mind`, `src/model.mind` all "no change"); the multiplicative RSJ scaling is absorbed offline into the pre-scaled embedding bytes. Additionally deprecated by RFC-010, which moves long-tail correction to a post-cosine additive parametrization (RFC-002 prior) that mGTE §3.3 and Lassance et al. SPLADE-v3 §4 show matches or beats pre-cosine multiplicative IDF on long-tail routing benchmarks. Belongs in the catalog-builder repo.
+
 ---
 
 # RFC-005 — Compile-time attention-head pruning via saliency-ranked static bitmask

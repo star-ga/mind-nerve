@@ -29,6 +29,7 @@ use crate::mind_nerve::{
     VOCAB_SIZE,
 };
 use crate::mind_nerve::q16_16::{
+    q16_abs,
     q16_add,
     q16_sub,
     q16_mul,
@@ -49,6 +50,102 @@ use crate::mind_nerve::q16_16::{
 // which is exactly 8192. Precomputed as a const; no FP, no runtime rsqrt.
 // ─────────────────────────────────────────────────────────────────────────────
 pub const ATTN_SCALE_Q16: Q16_16 = 8192_i32;   // 1/8 in Q16.16 = ONE_Q16_16 / 8
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RFC-003 — Content-fingerprinted adaptive window stride.
+//
+// A single Q16.16 scalar fingerprint, computed from the first
+// STRIDE_FP_WINDOW = 16 token embeddings' leading dimension, dispatches
+// the window stride to one of three compile-baked values
+// {STRIDE_LOW, STRIDE_MID, STRIDE_HIGH}. Tighter overlap (STRIDE_LOW = 96)
+// for high-information inputs (multi-clause queries); wider stride
+// (STRIDE_HIGH = 256) for low-information inputs (terse CLI commands);
+// STRIDE_MID = 192 matches today's compile-time ATTN_WINDOW_STRIDE and
+// is the backwards-soft default.
+//
+// Determinism: the fingerprint is a pinned ascending-i sum of saturating
+// q16_abs values; the dispatch is two i32 compares. Both primitives are
+// already in the bit-identity contract — no new reduction site, no new
+// LUT, no new numeric type.
+//
+// Backwards-soft default: STRIDE_FP_T_LOW = MIN_Q16_16 and
+// STRIDE_FP_T_HIGH = MAX_Q16_16. Because q16_abs returns a non-negative
+// value and q16_add saturates at MAX_Q16_16, the fingerprint is bounded
+// in [0, MAX_Q16_16]; both threshold comparisons are therefore always
+// false, and select_stride() returns STRIDE_MID = ATTN_WINDOW_STRIDE for
+// every input. The resulting attention output is byte-identical to the
+// pre-RFC-003 path until calibrated thresholds (T_LOW, T_HIGH) ship from
+// the catalog-builder pipeline; flipping the constants requires no
+// further mind-nerve change.
+//
+// Latency: 16 q16_abs + 16 q16_add = 32 saturating-i32 ops per inference,
+// ≈ 0.001 ms on a 4-core x86 at 3 GHz. Well under 0.01% of the 30 ms p95
+// budget.
+//
+// Model-hash binding: every constant below is part of the compile-time
+// model manifest. Cross-arch bit-identity follows from the deterministic
+// integer composition; any silent perturbation of the threshold table
+// changes model_hash via the manifest preimage.
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub const STRIDE_LOW:        u32    = 96;
+pub const STRIDE_MID:        u32    = 192;          // = ATTN_WINDOW_STRIDE (compile-time default)
+pub const STRIDE_HIGH:       u32    = 256;
+pub const STRIDE_FP_WINDOW:  u32    = 16;
+
+// Backwards-soft sentinels: the i32 boundary values make the
+// fingerprint never cross either threshold, so the runtime stride is
+// always STRIDE_MID. Replace with calibrated values (derived offline
+// from the catalog-builder's request-length distribution) to activate
+// the adaptive dispatch without any further mind-nerve code change.
+pub const STRIDE_FP_T_LOW:   Q16_16 = -2147483648_i32;  // = MIN_Q16_16
+pub const STRIDE_FP_T_HIGH:  Q16_16 =  2147483647_i32;  // = MAX_Q16_16
+
+// Pinned ascending-i reduction over q16_abs of the leading dimension of
+// the first min(STRIDE_FP_WINDOW, seq_len) token embeddings. Returns
+// the resulting Q16.16 scalar fingerprint. For seq_len = 0 returns 0.
+@[determinism(BitIdentical)]
+@[reduction_order(Pinned)]
+pub fn compute_stride_fingerprint(
+    token_embeddings: tensor<Q16_16, [seq_len, ENCODER_HIDDEN]>,
+) -> Q16_16 {
+    let n: usize = token_embeddings.len();
+    let fpw: usize = STRIDE_FP_WINDOW as usize;
+    let cap: usize = if fpw < n { fpw } else { n };
+    let mut acc: Q16_16 = 0_i32;
+    let mut i: usize = 0;
+    while i < cap {
+        // Leading-dimension activation only. Keeps the cost tiny while
+        // tying the fingerprint to the dominant semantic axis of the
+        // embedding. q16_abs of MIN_Q16_16 saturates to MAX_Q16_16,
+        // keeping the function total even on pathological inputs.
+        let v: Q16_16 = q16_abs(token_embeddings[i][0]);
+        acc = q16_add(acc, v);
+        i = i + 1;
+    }
+    return acc;
+}
+
+// Three-way dispatch on the fingerprint scalar. Mapping:
+//   fingerprint > STRIDE_FP_T_HIGH -> STRIDE_LOW  (high-info, tight overlap)
+//   fingerprint < STRIDE_FP_T_LOW  -> STRIDE_HIGH (low-info, wider stride)
+//   otherwise                      -> STRIDE_MID  (default)
+//
+// With backwards-soft defaults both conditional branches are
+// statically unreachable (see the section header above). The branches
+// remain present as live code so the dispatch activates the moment
+// calibrated thresholds bind into model_hash — there is no separate
+// "feature flag" to flip; the constants ARE the flag.
+@[determinism(BitIdentical)]
+pub fn select_stride(fingerprint: Q16_16) -> u32 {
+    if fingerprint > STRIDE_FP_T_HIGH {
+        return STRIDE_LOW;
+    }
+    if fingerprint < STRIDE_FP_T_LOW {
+        return STRIDE_HIGH;
+    }
+    return STRIDE_MID;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Window iteration math.
@@ -221,6 +318,14 @@ pub fn project_linear(
 //         accumulation order is fixed by the ascending window loop.
 //   3. Output projection wo over the head-tiled buffer.
 // ─────────────────────────────────────────────────────────────────────────────
+// RFC-003: the `stride` parameter replaces the compile-time
+// ATTN_WINDOW_STRIDE in the per-window loop. The attention_kind
+// annotation continues to reference ATTN_WINDOW_STRIDE because that
+// remains the compile-time default; the runtime selection produces
+// stride ∈ {STRIDE_LOW, STRIDE_MID, STRIDE_HIGH} from
+// `select_stride(compute_stride_fingerprint(...))`, with the
+// backwards-soft default pinning the runtime value at STRIDE_MID =
+// ATTN_WINDOW_STRIDE = 192 until calibrated thresholds ship.
 @[determinism(BitIdentical)]
 @[reduction_order(Pinned)]
 @[attention_kind(SlidingWindow(window = ATTN_WINDOW_SIZE, stride = ATTN_WINDOW_STRIDE))]
@@ -230,13 +335,14 @@ pub fn sliding_window_attention(
     wk: tensor<Q16_16, [ENCODER_HIDDEN, ENCODER_HIDDEN]>,
     wv: tensor<Q16_16, [ENCODER_HIDDEN, ENCODER_HIDDEN]>,
     wo: tensor<Q16_16, [ENCODER_HIDDEN, ENCODER_HIDDEN]>,
+    stride: u32,
 ) -> tensor<Q16_16, [seq_len, ENCODER_HIDDEN]> {
     let n: usize = x.len();
     let h: usize = ENCODER_HIDDEN as usize;
     let heads: usize = ENCODER_HEADS as usize;
     let hd:    usize = ENCODER_HEAD_DIM as usize;
     let win:   usize = ATTN_WINDOW_SIZE as usize;
-    let stride: usize = ATTN_WINDOW_STRIDE as usize;
+    let stride_usz: usize = stride as usize;
 
     // Step 1: Q, K, V projections. These are pre-norm activations in, Q16.16
     // saturating mac over the hidden axis. Bit-identical per `project_linear`.
@@ -337,8 +443,10 @@ pub fn sliding_window_attention(
 
         // Advance to the next window. Ascending start-index iteration; the
         // last window may not advance by a full stride if the tail is short.
+        // `stride_usz` is the RFC-003 runtime-selected stride; backwards-
+        // soft default is STRIDE_MID = ATTN_WINDOW_STRIDE = 192.
         if e >= n { break; }
-        s = s + stride;
+        s = s + stride_usz;
     }
 
     // Step 3: output projection. Linear [seq, H] @ [H, H].

@@ -61,6 +61,19 @@ where
         let mut x: tensor<Q16_16, [n, ENCODER_HIDDEN]> =
             encoder_kernels::token_embedding_lookup(&token_ids[b], weights.token_embedding);
 
+        // RFC-003: content-fingerprinted adaptive window stride. Computed
+        // ONCE per inference against the embedded sequence; the selected
+        // stride is constant across both encoder layers within this
+        // inference (so the fingerprint is computed once, not per layer).
+        // With backwards-soft default thresholds (STRIDE_FP_T_LOW =
+        // MIN_Q16_16, STRIDE_FP_T_HIGH = MAX_Q16_16), `select_stride`
+        // always returns STRIDE_MID = ATTN_WINDOW_STRIDE = 192, producing
+        // byte-identical attention output to today. Calibrated thresholds
+        // bound into model_hash flip the binary into the adaptive regime
+        // without any further mind-nerve code change.
+        let stride_fp: Q16_16 = encoder_kernels::compute_stride_fingerprint(x);
+        let stride:    u32    = encoder_kernels::select_stride(stride_fp);
+
         // 2-layer sliding-window encoder (loop bound = ENCODER_LAYERS).
         // Pre-norm; no FFN sublayer.
         let mut layer_i: u32 = 0;
@@ -76,10 +89,11 @@ where
             // Sliding-window self-attention. Q/K/V projections, per-window
             // softmax-attention, window overlap-add accumulation, output
             // projection. Bit-identical reduction order pinned by ascending
-            // window iteration and pinned softmax/sum kernels.
+            // window iteration and pinned softmax/sum kernels. The `stride`
+            // argument is the RFC-003 runtime-selected per-inference stride.
             let attn: tensor<Q16_16, [n, ENCODER_HIDDEN]> =
                 encoder_kernels::sliding_window_attention(
-                    ln, w.wq, w.wk, w.wv, w.wo,
+                    ln, w.wq, w.wk, w.wv, w.wo, stride,
                 );
 
             // Gated residual replaces the FFN sublayer:

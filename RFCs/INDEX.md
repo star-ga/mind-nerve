@@ -501,6 +501,30 @@ reviewer should confirm the calibration step lands before
 as `i32::MIN, i32::MAX` which preserves the current behavior
 (stride = 192 for all inputs) at compile time.
 
+**Status:** IMPLEMENTED at exp2 — `src/encoder_kernels.mind` now exposes
+`STRIDE_LOW = 96`, `STRIDE_MID = 192`, `STRIDE_HIGH = 256`,
+`STRIDE_FP_WINDOW = 16`, and the backwards-soft sentinel thresholds
+`STRIDE_FP_T_LOW = MIN_Q16_16` / `STRIDE_FP_T_HIGH = MAX_Q16_16`, plus a
+pinned ascending-`i` `q16_abs` + `q16_add` `compute_stride_fingerprint`
+reduction over the first `STRIDE_FP_WINDOW` token embeddings' leading
+dimension and a three-way `select_stride` dispatch
+(`fingerprint > STRIDE_FP_T_HIGH → STRIDE_LOW`,
+`fingerprint < STRIDE_FP_T_LOW → STRIDE_HIGH`, else `STRIDE_MID`).
+`sliding_window_attention` accepts a runtime `stride: u32` parameter
+that replaces the compile-time `ATTN_WINDOW_STRIDE` in the per-window
+loop, and `src/model.mind::encoder` computes the fingerprint once per
+inference (post-embedding-lookup, pre-layer-norm) and threads the
+selected stride into both encoder layers' attention calls. Because
+`q16_abs` is non-negative and `q16_add` saturates at `MAX_Q16_16`, the
+fingerprint is bounded in `[0, MAX_Q16_16]`; with the default sentinel
+thresholds neither comparison can fire, `select_stride` returns
+`STRIDE_MID = ATTN_WINDOW_STRIDE = 192` for every input, and the
+attention output is byte-identical to the pre-RFC-003 path. The
+fingerprint/dispatch infrastructure is dark code until calibrated
+`(T_LOW, T_HIGH)` thresholds ship from the catalog-builder pipeline;
+flipping the constants activates the adaptive regime without any
+further mind-nerve change.
+
 ---
 
 # RFC-004 — Smoothed Robertson-Spärck Jones IDF for per-route embedding scaling

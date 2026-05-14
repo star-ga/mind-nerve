@@ -10083,6 +10083,8 @@ with the existing mind-nerve inference path (only the byte
 values inside the weights file change, and `model_hash`
 updates correspondingly).
 
+**Status:** SKIPPED — Training/catalog-builder-side only. The RFC's own "Adoption plan" §2-§5 enumerates `src/loader.mind`, `src/inference.mind`, `src/model.mind`, and `Mind.toml` as "no change"; the entire LLRD discipline (per-depth-group learning-rate scaling `lr_group = base_lr * LLRD_DECAY^(max_depth - depth)` at `LLRD_DECAY = 0.95` across the 6 depth groups — token embedding, layer 0, layer 1, final layer norm, plus the RFC-023-discarded W_nve / W_bge projection matrices receiving base_lr — wired into AdamW via `param_groups`) lives entirely in the offline catalog-builder Stage-2 fine-tuning loop outside the mind-nerve repo. The resulting depth-aware-LR-trained weight bytes are absorbed into the Q16.16 × INT8 weight values via `model_hash` without touching the inference surface; the per-group LR multipliers, the depth-group enumeration, and the AdamW `param_groups` construction are FP32 optimizer state discarded after Stage-2 export and never enter the mind-nerve binary. Belongs in the catalog-builder repo.
+
 ---
 
 # RFC-030 — ANCE-style periodic hard-negative refresh during Stage-2 training
@@ -10581,6 +10583,8 @@ existing mind-nerve inference path (only the byte values inside
 the weights file change, and `model_hash` updates
 correspondingly).
 
+**Status:** SKIPPED — Training/catalog-builder-side only. The RFC's own "Adoption plan" §2-§5 enumerates `src/loader.mind`, `src/inference.mind`, `src/model.mind`, and `Mind.toml` as "no change"; the entire ANCE refresh discipline (every `REFRESH_INTERVAL_STEPS = 5000` Stage-2 steps: pause optimizer → recompute L2-normalized embeddings of the full RFC-017-augmented corpus with the current student encoder in FP16/no-grad → rebuild `faiss.IndexHNSWFlat(H=256, M=32)` with `ef_construction = 200` / `ef_search = 64` → re-mine top-`REFRESH_K = 128` nearest neighbors per (query, positive) anchor with RFC-015 positive-aware α=0.90 filter → swap negative pool for the next 5000-step window) lives entirely in the offline catalog-builder Stage-2 fine-tuning loop outside the mind-nerve repo. The resulting fresh-hard-negative-trained weight bytes are absorbed into the Q16.16 × INT8 weight values via `model_hash` without touching the inference surface; the FAISS HNSW index, the periodic refresh state, and the per-window negative pool are all FP16/FP32 training-pipeline artifacts discarded after Stage-2 export and never enter the mind-nerve binary. Belongs in the catalog-builder repo.
+
 ---
 
 # RFC-031 — Curriculum learning with progressive hard-negative difficulty for Stage-2 fine-tuning
@@ -11069,6 +11073,8 @@ can adopt it incrementally without coordination because the
 resulting weights are byte-compatible with the existing
 mind-nerve inference path (only the byte values inside the
 weights file change, and `model_hash` updates correspondingly).
+
+**Status:** SKIPPED — Training/catalog-builder-side only. The RFC's own "Adoption plan" §2-§5 enumerates `src/loader.mind`, `src/inference.mind`, `src/model.mind`, and `Mind.toml` as "no change"; the entire curriculum-learning discipline (Phase 1 [steps 0–30K]: random in-batch negatives only with full RFC-017/RFC-019/RFC-020 stack; Phase 2a [steps 30K–50K]: 50/50 mix of random in-batch + BM25 hard negatives; Phase 2b [steps 50K–70K]: 50/50 mix of BM25 + RFC-015 positive-aware cross-encoder-filtered hard negatives; Phase 3 [steps 70K+]: pure RFC-015 hard negatives with RFC-030 ANCE refresh at 5000-step cadence; loss-temperature schedule cooling from `τ = 0.05` at step 0 to `τ = 0.02` by step 70K) lives entirely in the offline catalog-builder Stage-2 fine-tuning loop outside the mind-nerve repo. The resulting curriculum-trained weight bytes are absorbed into the Q16.16 × INT8 weight values via `model_hash` without touching the inference surface; the phase-boundary sampler state, the mixed-phase ratio scheduler, and the per-phase negative-pool construction are FP32 sampling-policy state discarded after Stage-2 export and never enter the mind-nerve binary. Belongs in the catalog-builder repo.
 
 ---
 

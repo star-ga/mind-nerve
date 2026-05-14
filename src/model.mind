@@ -27,6 +27,13 @@ use crate::mind_nerve::q16_16::q16_dot_pinned;
 // directly; model.mind does not call them.
 mod encoder_kernels;
 
+// Re-export RFC-005's HEAD_MASK_BYTES at the model module path so external
+// callers (`loader.mind`, tests) can size the bitmask field on
+// `EncoderWeights` without reaching into the private encoder_kernels
+// submodule. The constant is fully determined by the compile-time
+// ENCODER_LAYERS × ENCODER_HEADS parameters.
+pub use encoder_kernels::HEAD_MASK_BYTES;
+
 // Encoder: 2 layers (ENCODER_LAYERS), sliding-window self-attention
 // (window=256, stride=192), gated residual, no FFN sublayer.
 //
@@ -91,9 +98,14 @@ where
             // projection. Bit-identical reduction order pinned by ascending
             // window iteration and pinned softmax/sum kernels. The `stride`
             // argument is the RFC-003 runtime-selected per-inference stride.
+            // RFC-005: `&weights.head_mask` + `layer_i` carry the saliency-
+            // ranked head bitmask into the kernel; with the backwards-soft
+            // all-alive default every head runs and the output is byte-
+            // identical to the pre-RFC-005 path.
             let attn: tensor<Q16_16, [n, ENCODER_HIDDEN]> =
                 encoder_kernels::sliding_window_attention(
                     ln, w.wq, w.wk, w.wv, w.wo, stride,
+                    &weights.head_mask, layer_i,
                 );
 
             // Gated residual replaces the FFN sublayer:
@@ -237,4 +249,13 @@ pub struct EncoderWeights {
     pub layers:          [EncoderLayerWeights; ENCODER_LAYERS],
     pub final_ln_gain:   tensor<Q16_16, [ENCODER_HIDDEN]>,
     pub final_ln_bias:   tensor<Q16_16, [ENCODER_HIDDEN]>,
+    // RFC-005: saliency-ranked attention-head bitmask. `bit_pos =
+    // layer_idx * ENCODER_HEADS + head_i`; alive iff the corresponding
+    // bit is 1. Loader populates this with [0xFFu8; HEAD_MASK_BYTES] for
+    // every weights file today (every head alive), making the kernel
+    // byte-identical to the pre-RFC-005 path. Once a saliency-calibrated
+    // bitmask ships from the offline training pipeline (along with a
+    // weights-file format bump), the loader will read it from disk and
+    // mind-nerve will start skipping the dead heads automatically.
+    pub head_mask:       [u8; HEAD_MASK_BYTES],
 }

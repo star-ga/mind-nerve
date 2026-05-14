@@ -21,6 +21,7 @@
 use crate::mind_nerve::{
     Q16_16,
     ONE_Q16_16,
+    ENCODER_LAYERS,
     ENCODER_HIDDEN,
     ENCODER_HEADS,
     ENCODER_HEAD_DIM,
@@ -145,6 +146,76 @@ pub fn select_stride(fingerprint: Q16_16) -> u32 {
         return STRIDE_HIGH;
     }
     return STRIDE_MID;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RFC-005 — Compile-time attention-head pruning via saliency-ranked static
+// bitmask.
+//
+// Per-encoder bitmask packing layout (little-endian, layer-major):
+//
+//   bit_pos    = layer_idx * ENCODER_HEADS + head_i
+//   byte_index = bit_pos / 8
+//   bit_index  = bit_pos % 8
+//   alive      = (mask[byte_index] >> bit_index) & 1
+//
+// At ENCODER_LAYERS = 2 and ENCODER_HEADS = 4 the total bitmask is 8 bits
+// (1 byte). Layer 0 occupies bits 0..3 (low nibble); layer 1 occupies bits
+// 4..7. Future architectures with more layers or heads scale linearly:
+// HEAD_MASK_BYTES = ceil(ENCODER_LAYERS * ENCODER_HEADS / 8).
+//
+// Backwards-soft default: callers populate `head_mask` with
+// `[0xFFu8; HEAD_MASK_BYTES]` (every head alive) so `is_head_alive` returns
+// true for every bit and the per-head loop in `sliding_window_attention`
+// runs unmodified. The attention output is byte-identical to the
+// pre-RFC-005 path until a saliency-calibrated bitmask ships from the
+// offline training pipeline — flipping the corresponding bits to zero
+// activates pruning without any further mind-nerve code change.
+//
+// Determinism: `is_head_alive` composes only integer arithmetic and a
+// bit-extract on a compile-time-loaded byte array. The mask is read once
+// at load time and never mutated, so mindc can fold the predicate into
+// the per-layer attention emission when the manifest is known. Bit-
+// identity follows from the deterministic byte read; no Q16.16 arithmetic
+// is involved.
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub const HEAD_MASK_BITS_PER_LAYER: u32   = ENCODER_HEADS;
+pub const HEAD_MASK_TOTAL_BITS:     u32   = ENCODER_LAYERS * ENCODER_HEADS;
+pub const HEAD_MASK_BYTES:          usize = ((HEAD_MASK_TOTAL_BITS + 7u32) / 8u32) as usize;
+
+// Backwards-soft default: every head alive. With this mask the
+// `is_head_alive` predicate returns true for every (layer_idx, head_i)
+// in [0, ENCODER_LAYERS) × [0, ENCODER_HEADS); the short-circuit branch
+// in `sliding_window_attention` is statically unreachable and the
+// per-head body runs exactly as it did pre-RFC-005. Loaders that have
+// no saliency-calibrated bitmask in the weights manifest populate
+// `EncoderWeights.head_mask` with this constant.
+pub const HEAD_MASK_DEFAULT_ALL_ALIVE: [u8; HEAD_MASK_BYTES] =
+    [0xFFu8; HEAD_MASK_BYTES];
+
+// Pure integer bit-extract over the compile-baked head bitmask. Returns
+// true iff the (layer_idx, head_i) head is alive (the corresponding bit
+// is 1). Out-of-range (layer, head) pairs return true defensively so a
+// future loop accidentally iterating past `HEAD_MASK_TOTAL_BITS` would
+// compute attention rather than silently drop work; the loop bounds in
+// `sliding_window_attention` keep that defence unreachable in
+// well-formed inputs. `pub` because `sliding_window_attention` (same
+// module) and the call-site in `model::encoder` both reference it; the
+// surface stays inside the `encoder_kernels` submodule (which is
+// `mod encoder_kernels;` from `model.mind`, i.e. private to model).
+@[determinism(BitIdentical)]
+pub fn is_head_alive(mask: &[u8], layer_idx: u32, head_i: u32) -> bool {
+    if layer_idx >= ENCODER_LAYERS || head_i >= ENCODER_HEADS {
+        return true;
+    }
+    let bit_pos:    u32   = layer_idx * ENCODER_HEADS + head_i;
+    let byte_index: usize = (bit_pos / 8u32) as usize;
+    if byte_index >= mask.len() {
+        return true;
+    }
+    let bit_index:  u32   = bit_pos % 8u32;
+    return ((mask[byte_index] >> bit_index) & 1u8) == 1u8;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -326,6 +397,19 @@ pub fn project_linear(
 // `select_stride(compute_stride_fingerprint(...))`, with the
 // backwards-soft default pinning the runtime value at STRIDE_MID =
 // ATTN_WINDOW_STRIDE = 192 until calibrated thresholds ship.
+// RFC-005: the `head_mask: &[u8]` and `layer_idx: u32` parameters carry
+// the per-encoder bitmask and the current layer index from the caller in
+// `model::encoder`. Inside the per-head loop the kernel short-circuits
+// dead heads (where `is_head_alive(...)` returns false), skipping the
+// Q/K/V slice materialisation, the scores matrix, the softmax, and the
+// value-weighted sum. Skipped heads contribute exactly zero to the
+// head-tiled accumulator — `attended_tiled[s+i, head_off+d]` is zero-
+// initialised at the start of the kernel and `q16_add(_, 0)` is the
+// saturating identity, so a dead head's slice of the buffer stays
+// zero through the entire window loop and the final output projection
+// produces the same bytes as if the head had emitted all zeros. With
+// the backwards-soft default head_mask = [0xFFu8; HEAD_MASK_BYTES],
+// every head is alive and the kernel runs unchanged.
 @[determinism(BitIdentical)]
 @[reduction_order(Pinned)]
 @[attention_kind(SlidingWindow(window = ATTN_WINDOW_SIZE, stride = ATTN_WINDOW_STRIDE))]
@@ -336,6 +420,8 @@ pub fn sliding_window_attention(
     wv: tensor<Q16_16, [ENCODER_HIDDEN, ENCODER_HIDDEN]>,
     wo: tensor<Q16_16, [ENCODER_HIDDEN, ENCODER_HIDDEN]>,
     stride: u32,
+    head_mask: &[u8],
+    layer_idx: u32,
 ) -> tensor<Q16_16, [seq_len, ENCODER_HIDDEN]> {
     let n: usize = x.len();
     let h: usize = ENCODER_HIDDEN as usize;
@@ -364,6 +450,21 @@ pub fn sliding_window_attention(
         // head's slice of attended_tiled[s:e, head_offset:head_offset+hd].
         let mut head_i: usize = 0;
         while head_i < heads {
+            // RFC-005: dead-head short-circuit. When the saliency-ranked
+            // bitmask marks this head as pruned, skip the entire per-head
+            // body. The head's slice of `attended_tiled` was zero-
+            // initialised at kernel entry and `q16_add(_, 0)` is the
+            // saturating-add identity, so the dead head contributes
+            // exactly zero to the head-tiled output across every window
+            // — matching the "skipped heads contribute exactly zero"
+            // contract in the RFC. With the backwards-soft default
+            // `head_mask = [0xFFu8; HEAD_MASK_BYTES]`, `is_head_alive`
+            // always returns true and this branch never fires; the
+            // attention output is byte-identical to the pre-RFC-005 path.
+            if !is_head_alive(head_mask, layer_idx, head_i as u32) {
+                head_i = head_i + 1;
+                continue;
+            }
             let head_off: usize = head_i * hd;
 
             // Build qw, kw, vw views: [w_len, hd] slices of q, k, v over the

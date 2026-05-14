@@ -199,6 +199,7 @@ use crate::mind_nerve::inference::{
 use crate::mind_nerve::model::{
     EncoderWeights,
     EncoderLayerWeights,
+    HEAD_MASK_BYTES,
 };
 use crate::mind_nerve::sha256::sha256;
 use crate::mind_nerve::runtime_ffi::read_file as fs_read_raw;
@@ -745,6 +746,18 @@ pub fn parse_weights(bytes: &[u8]) -> Result<ModelWeights, LoaderError> {
             layers:          layers,
             final_ln_gain:   final_ln_gain,
             final_ln_bias:   final_ln_bias,
+            // RFC-005: backwards-soft default — every head alive.
+            // v1/v2 weights files do not yet carry the saliency-ranked
+            // bitmask; populating `[0xFFu8; HEAD_MASK_BYTES]` makes
+            // `is_head_alive(...)` return true for every (layer_idx,
+            // head_i) pair, the `sliding_window_attention` per-head
+            // short-circuit never fires, and the attention output is
+            // byte-identical to the pre-RFC-005 path. A future v3
+            // weights file will carry the calibrated bitmask in the
+            // per-encoder header (RFC-005 §"Adoption plan") and the
+            // loader will read it from disk; until then the bitmask
+            // is built here.
+            head_mask:       [0xFFu8; HEAD_MASK_BYTES],
         },
         model_hash:     model_hash,
         tokenizer_hash: tokenizer_hash,

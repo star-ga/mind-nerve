@@ -929,6 +929,34 @@ avoids a second invalidation later). Until the calibration pipeline
 ships, the bitmask byte can default to 0xFF (all heads alive), which
 makes the v2 loader produce attention output bit-identical to v1.
 
+**Status:** IMPLEMENTED at exp4 — `src/encoder_kernels.mind` adds the
+RFC-005 bitmask discipline: `HEAD_MASK_BITS_PER_LAYER`,
+`HEAD_MASK_TOTAL_BITS`, `HEAD_MASK_BYTES` (= 1 at ENCODER_LAYERS=2,
+ENCODER_HEADS=4 — 8 bits cover all 8 heads), plus an `is_head_alive`
+helper that does the pure-integer bit-extract `((mask[bit_pos / 8] >>
+(bit_pos % 8)) & 1) == 1` over the compile-baked bytemask.
+`sliding_window_attention` now takes `head_mask: &[u8]` and
+`layer_idx: u32` parameters; the per-head loop short-circuits dead
+heads via `if !is_head_alive(...) { head_i += 1; continue; }`, skipping
+the Q/K/V slice materialisation, the score matrix, the softmax, and
+the value-weighted sum. Dead heads contribute exactly zero to the
+head-tiled accumulator because the buffer is zero-initialised at
+kernel entry and `q16_add(_, 0)` is the saturating-add identity.
+`src/model.mind` re-exports `HEAD_MASK_BYTES` via `pub use` and adds a
+`head_mask: [u8; HEAD_MASK_BYTES]` field to `EncoderWeights`; the
+`encoder` function threads `&weights.head_mask` and the current
+`layer_i` into both encoder layers' `sliding_window_attention` calls.
+`src/loader.mind` imports `HEAD_MASK_BYTES` and populates the field
+with `[0xFFu8; HEAD_MASK_BYTES]` for every parsed weights file (v1
+and v2), i.e. every head alive. Under this all-ones default
+`is_head_alive` always returns true, the short-circuit guard never
+fires, and the attention output is byte-identical to the pre-RFC-005
+path. A future v3 weights file shipping a saliency-calibrated
+bitmask in the per-encoder header — coordinated with the offline
+training pipeline alongside RFC-001's group-wise quantization — will
+flip the corresponding bits to zero and activate pruning without any
+further mind-nerve code change.
+
 ---
 
 # RFC-006 — Margin-gated adaptive top-K with confidence trimming

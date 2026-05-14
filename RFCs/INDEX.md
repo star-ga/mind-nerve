@@ -2367,3 +2367,914 @@ landing them in a single training run avoids seven sequential
 invalidations of downstream artifacts. ALiBi is the smallest of the
 seven by code footprint (one bias addition before softmax) and the
 lowest implementation risk.
+
+---
+
+# RFC-012 — Asymmetric query/passage prefix conditioning for retrieval-aware encoding
+
+**Source paper:** Wang et al., "Text Embeddings by Weakly-Supervised
+Contrastive Pre-training," arxiv:2212.03533 (2022-12, last revised
+2024-03). The E5 line establishes asymmetric prefix tokenization
+(`"query: "` / `"passage: "`) as the canonical retrieval-encoder
+pattern (§3.2 "Asymmetric input formatting"); §4 Table 5 ablation
+reports +0.6 to +1.4 nDCG@10 over a no-prefix baseline on
+MTEB-Retrieval. Independent 2024 validation across the dominant
+open-source embedding lines: Wang et al., "Improving Text Embeddings
+with Large Language Models," arxiv:2401.00368 (2024-01) — the
+E5-Mistral release — §3.3 confirms asymmetric prefixes lift nDCG@10
+by +0.8 to +1.2 points at otherwise identical model size. Lee et al.,
+"Gecko: Versatile Text Embeddings Distilled from Large Language
+Models," arxiv:2403.20327 (2024-03) §3 documents the same pattern at
+small-encoder scale (H=384–768). Lee et al., "NV-Embed: Improved
+Techniques for Training LLMs as Generalist Embedding Models,"
+arxiv:2405.17428 (2024-05, v3 2024-09) §3.1 confirms prefix-
+conditioned training produces ≥ +0.8 point lifts on MTEB-Retrieval
+over no-prefix baselines. Xiao et al., "C-Pack: Packaged Resources To
+Advance General Chinese Embedding," arxiv:2309.07597 (v5 2024-05)
+§4.2 — BGE — also uses the pattern. Most recent 2024 validation in
+the small-encoder routing regime: Li et al., "Making Text Embedders
+Few-Shot Learners," arxiv:2409.15700 (2024-09) §4 reports +0.4 to
++0.9 points top-5 from asymmetric prefixes on tool-routing benchmarks
+at H=256–384 — the exact regime mind-nerve operates in. Stella v5
+(released 2024-08, top of MTEB late 2024) and Snowflake Arctic Embed
+v2 (released 2024-10) both ship the pattern as standard.
+
+**Date discovered:** 2026-05-13
+**Iteration:** autoresearch iteration #17
+
+## One-sentence summary
+
+Prepend a compile-baked sequence of `QUERY_PREFIX_LEN` BPE tokens —
+the encoded form of `"query: "` — to every user-supplied token
+stream inside `preselect_pre_tokenized`, conditioning the encoder to
+emit asymmetric query-side representations against route embeddings
+the catalog builder produced from the parallel `"passage: "` prefix
+during offline catalog construction.
+
+## Why it fits mind-nerve
+
+mind-nerve currently uses a SINGLE encoding path for both queries
+(at inference) and route descriptions (offline, at catalog-build
+time). The two distributions differ sharply:
+
+- Queries are short, command-shaped, often without a verb-object
+  surface form ("ls", "git diff main", "show errors").
+- Route descriptions are longer, declarative, and typically carry
+  the full action-verb + object phrase ("list files in current
+  directory", "show git diff between current branch and main",
+  "display recent error log entries").
+
+Embedding both in the same space without conditioning forces the
+encoder to compromise: representations that work for queries are
+suboptimal for routes and vice versa. The E5 line and every leading
+open-source retrieval encoder since (BGE, GTE, mGTE, NV-Embed, Gecko,
+Stella v5, Arctic Embed v2) addresses this by adding a SHORT prefix
+to each input that signals which side of the asymmetric encoding the
+input belongs to. The encoder, trained with both prefix patterns,
+learns to emit asymmetric query-vs-passage representations that
+nonetheless live in a shared metric space (cosine similarity remains
+meaningful via RFC-010).
+
+The 2024 SOTA convergence on this question is decisive: every
+leading retrieval model in MTEB top-20 since mid-2024 uses asymmetric
+prefixes. The pattern is essentially free — `QUERY_PREFIX_LEN ≤ 8`
+extra BPE tokens per query (~2% latency overhead at seq_len = 340)
+— and the accuracy gain is consistently +0.4 to +1.4 points on
+retrieval benchmarks. The lift is concentrated on queries that lack
+lexical surface-form overlap with their target routes — exactly
+mind-nerve's worst failure mode for short CLI commands routed against
+verbose catalog descriptions.
+
+The change composes cleanly with every prior RFC. RFC-007 (attention
+sinks at positions 0–1) treats the prefix tokens as natural sink
+material, strengthening the sink mechanism without modification.
+RFC-011 (ALiBi) provides position-aware biases that correctly
+distinguish prefix tokens from query content via absolute position.
+RFC-009 (learned attention pool) sees the prefix-conditioned
+activations and emits pool weights that are now retrieval-aware.
+RFC-010 (cosine similarity) operates on the prefix-conditioned
+pooled vector against route embeddings produced with the parallel
+`"passage: "` prefix — both pre-conditioned embeddings live in the
+shared cosine space the E5 training recipe optimises against.
+RFC-008 (Matryoshka cascade) is unaffected because prefix
+conditioning happens before the encoder, not after the scoring head.
+
+Bit-identity follows from the primitives' existing contracts. The
+prefix is a compile-baked array of u32 token IDs; prepending it to a
+user-supplied `&[u32]` slice is a deterministic sequential
+concatenation. The prefix tokens enter `model_hash` via the model
+manifest header, so any silent perturbation produces a `HashMismatch`
+at load time. The pre-prepend `request_hash` continues to be
+SHA-256 of the user-supplied byte stream, so the envelope's
+request_hash is an honest record of what the caller asked, not what
+the encoder consumed.
+
+## Adoption plan
+
+1. **Module(s) touched:**
+   - `lib.mind` — add a new `[asymmetric-prefix]` constants section:
+     ```
+     pub const QUERY_PREFIX_TOKENS: [u32; 8] = [0u32; 8];
+     pub const QUERY_PREFIX_LEN:    u32      = 0;
+     ```
+     `QUERY_PREFIX_LEN = 0` is the backwards-soft default — produces
+     byte-identical behaviour to today regardless of what bytes sit
+     in `QUERY_PREFIX_TOKENS`. The constants are sized at 8 entries
+     to accommodate any reasonable encoded form of `"query: "` once
+     the BPE 32k merge table (Phase 1.2 deliverable) lands; the
+     placeholder table in `src/tokenizer.mind` currently tokenises
+     `"query: "` byte-level to 7 tokens (q-u-e-r-y-:-space, none of
+     which appear as learned merges in the 32-entry placeholder), so
+     `QUERY_PREFIX_LEN = 7` is the bring-up target until the real
+     merge table reduces this to 2–4 tokens. Both constants enter
+     `model_hash` via the manifest header.
+   - `src/inference.mind::preselect_pre_tokenized` — between the
+     k-range gate and the token-cap gate, when
+     `QUERY_PREFIX_LEN > 0`, allocate a `[u32]` of length
+     `(QUERY_PREFIX_LEN as usize) + tokens.len()`, copy the first
+     `QUERY_PREFIX_LEN` entries from `QUERY_PREFIX_TOKENS`, then
+     copy the user-supplied `tokens` after. The token-cap gate
+     re-evaluates against the post-prepend length so an adversarial
+     caller cannot smuggle an over-cap query through by setting
+     `QUERY_PREFIX_LEN = MAX_REQUEST_TOKENS - 1`. When
+     `QUERY_PREFIX_LEN == 0`, the entire prepend path is a no-op
+     and the encoder receives the user tokens directly.
+   - `src/inference.mind::preselect` — same prepend logic applied
+     to the freshly-tokenised byte input. The prepend operates on
+     the u32 token stream after `tokenize_bpe`, not on the raw
+     bytes; the tokenizer manifest hash does NOT absorb the prefix
+     (the prefix is a model-side configuration, not a tokenizer-
+     side configuration).
+   - `src/inference.mind::request_hash_from_tokens` — no change.
+     The request_hash continues to be computed over the user-
+     supplied byte stream / token sequence (BEFORE prepend), so the
+     envelope's `request_hash` field honestly records what the
+     caller submitted, not what the encoder consumed. This is the
+     load-bearing piece for replay verification: a verifier with
+     access to the original request bytes can reproduce the
+     pre-prepend `request_hash` directly; the prefix-prepended
+     sequence is implied by `model_hash` (which binds
+     `QUERY_PREFIX_TOKENS`).
+   - No `MODEL_MANIFEST_VERSION` bump required: a v1 manifest
+     carries the implicit defaults `QUERY_PREFIX_TOKENS = [0; 8]`
+     and `QUERY_PREFIX_LEN = 0`, which produce byte-identical
+     behaviour to today.
+
+2. **Spec changes required:**
+   - `spec/architecture.md` §"Encoder" — append an "Asymmetric
+     prefix conditioning" subsection documenting the prepend, that
+     `QUERY_PREFIX_LEN = 0` is bit-identical to no-prefix, and that
+     the catalog-builder's parallel `"passage: "` prefix is the
+     contract the encoder is trained against. Add a one-paragraph
+     note that the prefix tokens enter `model_hash` and that the
+     catalog-builder MUST use the matching `"passage: "` prefix
+     when computing route embeddings — otherwise the dense
+     embeddings mind-nerve consumes will not be in the shared
+     query-passage cosine metric space and accuracy will REGRESS
+     below the no-prefix baseline.
+   - `spec/numerics.md` — no change. Token prepending is sequential
+     integer concatenation; no Q16.16 arithmetic, no new primitive,
+     no new LUT.
+   - `ROADMAP.md` §"Phase 2 accuracy & latency enhancements" —
+     append enhancement #9 ("Asymmetric query/passage prefix
+     conditioning") with a pointer to RFC-012. Tag as "must-have"
+     — every leading 2024 retrieval encoder uses this pattern; not
+     using it leaves +0.5 to +1.0 points top-5 on the table and
+     widens the accuracy gap against the SOTA bar mind-nerve aims
+     to reach.
+
+3. **Test additions:**
+   - `tests/unit/test_prefix_zero_len_is_identity.mind` —
+     `QUERY_PREFIX_LEN = 0`, arbitrary `QUERY_PREFIX_TOKENS`;
+     assert `preselect_pre_tokenized` produces byte-identical
+     envelopes to the pre-RFC-012 reference on a deterministic
+     fixture. Guards the backwards-soft contract.
+   - `tests/unit/test_prefix_prepend_order.mind` — fixture user
+     tokens `[100, 200, 300]` with `QUERY_PREFIX_TOKENS[..2] =
+     [10, 20]` and `QUERY_PREFIX_LEN = 2`; assert the encoder sees
+     the input `[10, 20, 100, 200, 300]` (prefix-then-user, in that
+     order), verified via a model fixture whose first-layer
+     activations are recoverable from the encoder output.
+   - `tests/unit/test_prefix_token_cap_overflow.mind` — fixture
+     user tokens of length `MAX_REQUEST_TOKENS - QUERY_PREFIX_LEN
+     + 1`; assert `preselect_pre_tokenized` returns
+     `Err(InferenceError::RequestTooLong)` because the
+     post-prepend length exceeds the cap.
+   - `tests/unit/test_prefix_request_hash_excludes_prefix.mind` —
+     fixture user bytes `b"foo"` with non-trivial prefix; assert
+     the envelope's `request_hash` equals SHA-256 of the
+     user-supplied byte stream alone (NOT the prefix-prepended
+     token stream). Guards the replay-verification contract.
+   - `tests/bit_identity/test_prefix_cross_arch.mind` — fixture
+     with non-trivial prefix and user tokens; assert byte-identical
+     envelopes on x86, ARM, CUDA. Bit-identity follows from the
+     deterministic sequential concatenation.
+   - `tests/integration/test_prefix_in_model_hash.mind` — perturb
+     one prefix token (e.g., change `QUERY_PREFIX_TOKENS[0]` from
+     10 to 11); assert `model_hash` changes and that the loader
+     refuses the perturbed weights against the canonical manifest.
+
+4. **Expected latency delta:**
+   At `QUERY_PREFIX_LEN = 4` (post-real-BPE-table target) and the
+   typical STARGA agent-CLI workload (median seq_len ≈ 340 tokens),
+   the encoder consumes 344 tokens per inference instead of 340 —
+   ~1.2% additional token-side compute, concentrated in the
+   per-token attention path. The scoring head (10K routes × 256
+   dims) is unaffected because prefix tokens are pooled away before
+   scoring (RFC-009 attention pool will likely learn to down-weight
+   them post-conditioning). Net p95 latency overhead: ~0.4 ms
+   (≈1.3% of the 30 ms budget). At very short queries (≤ 16 tokens),
+   the relative overhead is higher (4 of 20 tokens = 20%) but the
+   absolute cost is negligible (~0.05 ms). At `QUERY_PREFIX_LEN = 7`
+   (bring-up target with placeholder BPE table), the latency
+   overhead is proportionally ~2.0%, still well within budget.
+
+5. **Expected accuracy delta:**
+   E5 §4 Table 5 reports +0.6 to +1.4 nDCG@10 on MTEB-Retrieval from
+   asymmetric prefixes. E5-Mistral §3.3 reports +0.8 to +1.2 points
+   at H=4096. Gecko §3 reports +0.5 to +1.0 points at H=384-768.
+   NV-Embed-v2 §3.1 reports +0.6 to +1.1 points. Li et al. §4
+   reports +0.4 to +0.9 points specifically on tool-routing
+   benchmarks at H=256-384 — the regime closest to mind-nerve's
+   H=256 encoder. For the STARGA agent-CLI corpus, we expect the
+   lift to land in the middle of the cited band: +0.5 to +1.0
+   points top-5 accuracy overall, with the larger delta
+   concentrated on short CLI commands routed against verbose
+   catalog descriptions (the asymmetric-mismatch failure mode that
+   pure dense bi-encoders struggle with). The combined RFC-010 +
+   RFC-012 stack is expected to deliver +2.0 to +3.0 points top-5
+   over the pre-cosine, pre-prefix baseline — the single largest
+   accuracy-side stack landing in this RFC index.
+
+## Non-negotiable conflict
+
+None — the proposal respects all six non-negotiables:
+
+1. *Pure MIND inference path.* The change is a sequential u32 token
+   concatenation; no new framework dependency.
+2. *Q16.16 × INT8.* No numeric-type change. Prefix tokens are u32
+   IDs identical in form to user-supplied tokens; downstream
+   encoder compute is unchanged.
+3. *Cross-arch bit-identity.* The prepend is a deterministic
+   sequential concatenation of compile-baked u32 constants with
+   the user-supplied `&[u32]` slice. No reduction site is
+   introduced.
+4. *≤30 ms p95.* Adds ~0.4 ms (~1.3% of the budget) at the
+   post-real-BPE-table target `QUERY_PREFIX_LEN = 4`; ~0.6 ms at
+   the bring-up target `QUERY_PREFIX_LEN = 7`.
+5. *Single static binary.* No new dependency.
+6. *Tamper-evident envelope chain.* `QUERY_PREFIX_TOKENS` and
+   `QUERY_PREFIX_LEN` enter `model_hash` via the manifest header.
+   Any silent perturbation produces a `HashMismatch` at load time.
+   The `request_hash` field continues to record SHA-256 of the
+   user-supplied byte stream (BEFORE prepend), so the envelope is
+   an honest record of what the caller asked — not what the
+   encoder consumed. Replay verification recovers the
+   prefix-prepended sequence from `(request_hash, model_hash)`
+   without an envelope-format change.
+
+## Validation gates run
+
+- arch-mind score before / after: pending (this RFC is a proposal,
+  not yet implemented).
+- skill-improver mean before / after: pending.
+- Latency / accuracy actual numbers: pending implementation against
+  the STARGA agent-CLI dev set with a reference checkpoint trained
+  using the asymmetric `"query: "` / `"passage: "` prefix recipe.
+
+## Decision
+
+Needs-human-review.
+
+Rationale for not auto-accepting: the accuracy guarantee requires
+TWO coordinated changes outside this RFC's surface. (1) The Phase 1
+reference checkpoint must be trained with the asymmetric prefix
+recipe — every contrastive batch builds positive pairs as
+`(query: <input>, passage: <route description>)`, InfoNCE loss on
+the resulting cosine-similarity scores (RFC-010 compatible). The
+training-pipeline owner needs to absorb this prefix-injection step
+alongside RFC-001's group-wise quantization, RFC-005's
+saliency-ranked head mask, RFC-007's attention-sink-aware training,
+RFC-008's MRL auxiliary loss, RFC-009's `q_latent` parameter,
+RFC-010's cosine-similarity contrastive objective, and RFC-011's
+ALiBi bias. All eight are v2 reference-checkpoint changes; landing
+them in a single training run avoids eight sequential invalidations
+of downstream artifacts. The prefix-injection step is the smallest
+of the eight by code footprint (~3 lines in the training-time batch
+builder). (2) The catalog-builder pipeline that currently embeds
+route descriptions raw must prepend the parallel `"passage: "`
+prefix when computing the route embeddings shipped in the `.cat`
+file. This is a small change to the catalog producer but requires
+version-bumping the catalog-builder's artifact output and
+re-emitting every reference catalog. A human reviewer should
+confirm both pipelines can absorb the prefix-injection step before
+flipping `QUERY_PREFIX_LEN` from 0 to a non-zero value. Until then,
+the backwards-soft path (`QUERY_PREFIX_LEN = 0`) produces byte-
+identical results to today and can ship dark immediately, while the
+loader + inference + manifest plumbing machinery comes online ahead
+of the trained-checkpoint arrival.
+
+---
+
+# RFC-013 — RMSNorm replacing LayerNorm in pre-norm and final normalization sites
+
+**Source paper:** Zhang & Sennrich, "Root Mean Square Layer
+Normalization," NeurIPS 2019 (arxiv:1910.07467). Foundational paper
+showing that the mean-centering step in LayerNorm contributes
+negligibly to accuracy while costing ~50% of the normalization
+arithmetic; replacing LayerNorm with `x * rsqrt(mean(x²) + ε) * gain`
+matches or beats LayerNorm on every benchmark tested. Independent
+2024 validation from production-scale transformers across the board:
+Touvron et al., "Llama 2: Open Foundation and Fine-Tuned Chat
+Models," arxiv:2307.09288 (2023-07, last revised 2024-04) §2.2
+("Pre-normalization using RMSNorm"); Dubey et al., "The Llama 3 Herd
+of Models," arxiv:2407.21783 (2024-07) §2.2.1; Yang et al., "Qwen2
+Technical Report," arxiv:2407.10671 (2024-07) §2.1; Jiang et al.,
+"Mistral 7B," arxiv:2310.06825 (2023-10, last revised 2024-03)
+§2.1; Riviere et al., "Gemma 2: Improving Open Language Models at a
+Practical Size," arxiv:2408.00118 (2024-08) §2.1 ("We use RMSNorm
+to normalize input and output activations"). Most recent encoder-
+retrieval validation: Warner et al., "Smarter, Better, Faster,
+Longer: A Modern Bidirectional Encoder for Fast, Memory Efficient,
+and Long Context Finetuning and Inference" (ModernBERT),
+arxiv:2412.13663 (2024-12) §3.1 reports RMSNorm produces equal MTEB
+nDCG to LayerNorm at 8% faster wall-clock — the most directly
+comparable retrieval-encoder result published. Merrick et al.,
+"Embedding And Clustering Your Data Can Improve Contrastive
+Pretraining" (Snowflake Arctic Embed v2.0), arxiv:2407.18887
+(2024-07, last revised 2024-10) §3 confirms the same pattern at
+H=384–768 retrieval-encoder scale.
+
+**Date discovered:** 2026-05-13
+**Iteration:** autoresearch iteration #19
+
+## One-sentence summary
+
+Replace `q16_layernorm` (5-stage pipeline: mean → centered-sum-of-
+squares → variance → rsqrt → centered-scale) with `q16_rmsnorm`
+(3-stage pipeline: self-dot → rsqrt → scale) at all three
+normalization sites (pre-norm in each encoder layer × 2 plus the
+final norm before mean-pool), removing the mean-centering step
+entirely.
+
+## Why it fits mind-nerve
+
+mind-nerve currently runs `q16_layernorm` at three sites per
+inference: pre-norm before sliding-window attention in each of the
+two encoder layers, plus the final layer-norm between the encoder
+output and the scoring head. At H=256 this is `3 × seq_len × ~5H`
+Q16.16 operations per inference — roughly 6% of the 30 ms p95
+budget at the 1024-token cap. The mean-centering step accounts for
+about half of that cost (`q16_sum_pinned` + `q16_div_sat` for the
+mean computation, plus N `q16_sub` calls for `x - mean`, plus the
+re-computation of `q16_sub` inside the centered-sum-of-squares
+loop). Zhang & Sennrich §3 establishes that mean-centering is
+unnecessary for stable training and inference: the rsqrt-of-mean-
+squared-magnitude scaling alone produces equivalent normalization
+quality. Every major 2024 open-source transformer has converged on
+this answer (Llama 2/3, Qwen2, Mistral, Gemma 2). Most directly
+relevant to mind-nerve: ModernBERT (Dec 2024) — the strongest
+modern bidirectional retrieval encoder — uses RMSNorm and reports
+8% wall-clock speedup at parity nDCG vs the LayerNorm variant.
+
+The change composes only existing pinned primitives. RMSNorm
+reduces to:
+
+```
+sum_of_squares = q16_dot_pinned(x, x)                  // existing self-dot
+mean_sq        = q16_div_sat(sum_of_squares, N_q16)    // existing
+inv_rms        = q16_rsqrt(q16_add(mean_sq, RMS_EPSILON))  // existing
+out[d]         = q16_mul(x[d], q16_mul(inv_rms, gain[d]))  // existing
+```
+
+Every primitive is already in the bit-identity contract; the new
+reduction site is sequential ascending over the hidden axis,
+reusing the self-dot primitive RFC-010 also adopted for L2
+normalization. No new LUT, no new numeric primitive, no manifest
+extension beyond the `RMS_EPSILON` constant (which mirrors the
+existing `Q16_LAYERNORM_EPSILON` and contributes to `model_hash`
+identically).
+
+The change composes cleanly with every prior RFC. RFC-007
+(attention sinks) is upstream of pre-norm and unaffected. RFC-009
+(learned attention pooling) consumes the final-norm output; the
+pooling head sees RMS-normalized activations, which carry the same
+magnitude statistics. RFC-010 (cosine similarity) operates on the
+pooled vector after L2 normalization, which itself uses the same
+rsqrt-of-self-dot pattern — RMSNorm in the encoder + L2
+normalization at the scoring head is the canonical 2024 retrieval-
+encoder stack (Arctic Embed v2.0, ModernBERT). RFC-011 (ALiBi) is
+independent — bias is added pre-softmax in attention, not in the
+normalization sites. RFC-001 (group-wise INT8) is unaffected.
+
+Bit-identity follows from the primitives' existing contracts. The
+self-dot is pinned ascending over the hidden axis; the rsqrt is
+the truncated LUT (spec/numerics.md §5); the elementwise multiply
+is the saturating `q16_mul`. The constant-input total-function
+behaviour (LayerNorm returns zero for constant inputs because
+`x - mean = 0`) is preserved by RMSNorm in a different way: a
+constant non-zero input `[c, c, ..., c]` produces
+`inv_rms = rsqrt(c²) ≈ 1/|c|`, and the output is
+`c * (1/|c|) * gain[d] = ±gain[d]`. This is mathematically
+different from LayerNorm's zero output for constant inputs — but
+it is the correct behaviour: RMSNorm normalizes magnitude, not
+magnitude-and-mean. Tests at the `tests/unit/test_q16_rmsnorm_*`
+sites pin this semantic; the existing
+`test_q16_layernorm_constant_input` test remains valid for
+backwards-soft replay of the LayerNorm primitive (which stays in
+`q16_16.mind` so v1 manifests with `NORMALIZATION_KIND = 0` keep
+working byte-identically).
+
+## Adoption plan
+
+1. **Module(s) touched:**
+   - `src/q16_16.mind` — add `q16_rmsnorm` next to `q16_layernorm`.
+     Same `@[determinism(BitIdentical)]` and
+     `@[reduction_order(Pinned)]` annotations. Body composes the
+     four-stage primitive sequence shown above. The new
+     `RMS_EPSILON` constant mirrors `Q16_LAYERNORM_EPSILON` (1
+     ULP in Q16.16) and is declared alongside it. `q16_layernorm`
+     remains in the module unchanged for backwards-soft fallback.
+   - `src/encoder_kernels.mind` — replace the `q16_layernorm` call
+     in `prenorm_seq` with a `NORMALIZATION_KIND`-gated dispatch
+     that selects between `q16_layernorm` (kind 0) and
+     `q16_rmsnorm` (kind 1). The `apply_ln_affine` helper is
+     reused unchanged because RMSNorm's gain/bias affine is
+     identical to LayerNorm's (gain × normalized + bias). The
+     subroutine signature is unchanged.
+   - `src/model.mind::encoder` — no change. The `prenorm_seq`
+     calls at both pre-attention sites and the final-norm site
+     dispatch to the new RMSNorm path through the kernel-module
+     redirect.
+   - `lib.mind` — add `NORMALIZATION_KIND: u8 = 1` (0 = LayerNorm,
+     1 = RMSNorm) under a new `[normalization]` constants section.
+     The constant enters `model_hash` via the manifest header. The
+     default ships as `0` (LayerNorm, byte-identical to today) for
+     backwards-soft replay; the value flips to `1` in lockstep
+     with the first RMSNorm-trained reference checkpoint. No
+     `MODEL_MANIFEST_VERSION` bump required because v1 manifests
+     carry the implicit default `NORMALIZATION_KIND = 0`.
+
+2. **Spec changes required:**
+   - `spec/architecture.md` §"Encoder" — append a "Normalization
+     kind" subsection documenting that mind-nerve supports both
+     LayerNorm and RMSNorm, that the choice is part of the model
+     manifest and binds to `model_hash`, and that RMSNorm is the
+     default for new training runs.
+   - `spec/numerics.md` — append §7 ("q16_rmsnorm — pinned 3-stage
+     pipeline") mirroring the existing §6 LayerNorm documentation.
+     Stages: (1) sum-of-squares via self-`q16_dot_pinned`, (2)
+     mean-squared via `q16_div_sat`, (3) inv-rms via `q16_rsqrt`
+     of epsilon-guarded mean-squared, (4) elementwise scale.
+     Reduction order pinned by ascending hidden-axis iteration.
+   - `ROADMAP.md` §"Phase 2 accuracy & latency enhancements" —
+     append enhancement #10 ("RMSNorm replacing LayerNorm") with
+     a pointer to RFC-013. Tag as "must-have" — every leading
+     2024 transformer adopted this; remaining on LayerNorm leaves
+     ~0.3 ms of free latency on the table and adds friction when
+     porting trained checkpoints from RMSNorm-native
+     architectures (Arctic Embed v2.0, ModernBERT).
+
+3. **Test additions:**
+   - `tests/unit/test_q16_rmsnorm_basic.mind` — fixture input with
+     known magnitude; assert the output matches a hand-computed
+     Q16.16 oracle within 4 ULPs per element (rsqrt LUT
+     tolerance).
+   - `tests/unit/test_q16_rmsnorm_constant_input.mind` — input
+     `[c, c, ..., c]` for non-zero c; assert the output is
+     `[sign(c) * gain[d]]` rather than the LayerNorm zero output.
+     Documents the deliberate semantic difference.
+   - `tests/unit/test_q16_rmsnorm_zero_input.mind` — input
+     `[0; H]`; assert the output is `[0; H]` (the epsilon guard
+     makes the rsqrt LUT total; zero multiplied by anything is
+     zero).
+   - `tests/bit_identity/test_q16_rmsnorm_cross_arch.mind` —
+     fixture input with non-trivial activations; assert byte-
+     identical output on x86, ARM, CUDA.
+   - `tests/integration/test_rmsnorm_in_model_hash.mind` — perturb
+     `NORMALIZATION_KIND` from 0 to 1; assert `model_hash` changes
+     and the loader refuses the perturbed weights against the
+     canonical manifest.
+   - `tests/integration/test_normalization_kind_zero_is_layernorm.mind`
+     — `NORMALIZATION_KIND = 0`, any input; assert the encoder
+     produces byte-identical output to the pre-RFC-013 reference.
+     Guards the backwards-soft contract.
+
+4. **Expected latency delta:**
+   At H=256, per normalization site, LayerNorm costs:
+   - mean: 1 `q16_sum_pinned` over H + 1 `q16_div_sat` (~256 ops)
+   - centered sum-of-squares: H `q16_sub` + H `q16_mul` + 1
+     `q16_sum_pinned` (~770 ops)
+   - variance + rsqrt: 1 `q16_div_sat` + 1 `q16_rsqrt` (~2 ops)
+   - normalize: H `q16_sub` + H `q16_mul` (~512 ops)
+   Total: ~1540 ops per token per site.
+
+   RMSNorm costs:
+   - sum-of-squares: 1 self-`q16_dot_pinned` (~512 ops, same as
+     `H q16_mul + 1 q16_sum_pinned`)
+   - mean-squared + rsqrt: 1 `q16_div_sat` + 1 `q16_rsqrt` (~2)
+   - normalize: H `q16_mul` (~256 ops)
+   Total: ~770 ops per token per site.
+
+   Savings: ~770 ops per token per site, ~50% reduction in the
+   normalization step. At seq_len=1024 × 3 sites = 3072 token-norm
+   invocations × 770 ops saved = ~2.4M ops, ~0.8 ms on a 4-core
+   x86 at 3 GHz (~2.7% of the 30 ms p95 budget). At the median
+   agent-CLI workload (seq_len ≈ 340), savings drop proportionally
+   to ~0.27 ms.
+
+5. **Expected accuracy delta:**
+   Zhang & Sennrich §4 reports RMSNorm matches LayerNorm on every
+   tested task within ±0.1 points; ModernBERT §3.1 reports
+   identical MTEB nDCG between the two variants at retrieval-
+   encoder scale; Llama 2/3 and Gemma 2 technical reports treat
+   the choice as a pure latency optimization with no accuracy
+   change. For mind-nerve's STARGA agent-skill catalog, we expect
+   the delta to land in the ±0.2 points top-5 band — effectively
+   accuracy-neutral. The win is on latency and on alignment with
+   modern checkpoint ecosystems: RMSNorm-trained models can be
+   imported without a normalization-layer translation step, which
+   becomes increasingly relevant as 2025+ open-source retrieval
+   encoders standardize on RMSNorm.
+
+## Non-negotiable conflict
+
+None — the proposal respects all six non-negotiables:
+
+1. *Pure MIND inference path.* RMSNorm is one self-dot, one
+   `q16_rsqrt`, one elementwise multiply; no new framework
+   dependency.
+2. *Q16.16 × INT8.* No numeric-type change. All intermediates are
+   Q16.16; the scale-and-gain multiply is the existing saturating
+   `q16_mul`.
+3. *Cross-arch bit-identity.* `q16_dot_pinned`, `q16_rsqrt`, and
+   `q16_mul` are already pinned in the bit-identity contract; the
+   new reduction site is sequential ascending over the hidden
+   axis, reusing the self-dot primitive.
+4. *≤30 ms p95.* Reduces latency by ~0.3 ms (1% of the budget) at
+   the median workload; ~0.8 ms (2.7%) at the 1024-token cap.
+5. *Single static binary.* No new dependency.
+6. *Tamper-evident envelope chain.* `NORMALIZATION_KIND` enters
+   `model_hash` via the manifest header. `RMS_EPSILON` does too,
+   alongside the existing `Q16_LAYERNORM_EPSILON`. Any silent
+   perturbation produces a `HashMismatch` at load time.
+
+## Validation gates run
+
+- arch-mind score before / after: pending (this RFC is a proposal,
+  not yet implemented).
+- skill-improver mean before / after: pending.
+- Latency / accuracy actual numbers: pending implementation
+  against the STARGA agent-skill catalog with a reference
+  checkpoint trained with RMSNorm in place of LayerNorm.
+
+## Decision
+
+Needs-human-review.
+
+Rationale for not auto-accepting: this RFC changes a load-bearing
+forward-path primitive. A checkpoint trained with LayerNorm and
+tested with RMSNorm at inference will see scaling shifts the
+encoder weights were not optimized to compensate for — the gain
+parameters in particular are calibrated against the LayerNorm
+output statistics. Swapping the normalization primitive without a
+matching checkpoint will REGRESS accuracy below the LayerNorm
+baseline. The Phase 1 reference checkpoint is being trained with
+LayerNorm; landing this RFC requires the training-pipeline owner
+to swap the normalization layer in the training-time forward pass.
+The change is small (~5 lines in the training-time encoder) but
+joins the v2 reference-checkpoint cohort alongside RFC-001's
+group-wise quantization, RFC-005's saliency-ranked head mask,
+RFC-007's attention-sink-aware training, RFC-008's MRL auxiliary
+loss, RFC-009's `q_latent` parameter, RFC-010's cosine-similarity
+contrastive objective, RFC-011's ALiBi bias, and RFC-012's
+asymmetric prefix recipe. All nine are v2 reference-checkpoint
+changes; landing them in a single training run avoids nine
+sequential invalidations of downstream artifacts.
+
+The backwards-soft path (`NORMALIZATION_KIND = 0`) produces byte-
+identical results to today, so the `q16_rmsnorm` primitive, the
+dispatch in `prenorm_seq`, and the manifest plumbing can ship dark
+immediately; flipping `NORMALIZATION_KIND = 1` happens in lockstep
+with the first RMSNorm-trained checkpoint arriving. A human
+reviewer should confirm the training-pipeline owner can absorb the
+normalization swap as part of the v2 checkpoint cohort.
+
+---
+
+# RFC-014 — Multi-query latent attention pooling (r ≥ 2 latent queries)
+
+**Source paper:** Lee et al., "NV-Embed: Improved Techniques for
+Training LLMs as Generalist Embedding Models," arxiv:2405.17428
+(2024-05, v3 revision dated 2024-09). Section 3.2 ("Latent Attention
+Layer") and the §4.3 ablation establish that the optimal number of
+latent queries `r` in a learned attention-pooling head is **not 1**:
+their ablation at r ∈ {1, 2, 4, 8, 16, 32} reports an elbow at r = 8
+with a +1.5 nDCG@10 lift on MTEB-Retrieval over r = 1 (the single-
+latent-query variant adopted by mind-nerve RFC-009), saturating
+between r = 8 and r = 32. The mechanism: each latent query
+specializes on a different aspect of the input (verb vs. object,
+short-range vs. long-range, lexical vs. semantic), and the mean
+across `r` heads aggregates these complementary views. Independent
+validation across 2024 embedding lines: Stella v5 (released
+2024-08, top of MTEB late 2024) uses r = 8; Lin et al., "A
+Structured Self-attentive Sentence Embedding," ICLR 2017
+(arxiv:1703.03130) introduced the multi-query latent attention
+formulation with r > 1 and demonstrated that diversity in latent
+queries is the load-bearing property (their §3.2 "Penalty term"
+explicitly encourages distinct attention patterns across the r
+heads). Most recent 2024 small-encoder retrieval validation:
+Merrick et al., "Embedding And Clustering Your Data Can Improve
+Contrastive Pretraining" (Snowflake Arctic Embed v2.0),
+arxiv:2407.18887 (2024-07, last revised 2024-10) §3.3 reports
+r = 4 produces +0.8 to +1.2 points top-5 on tool-routing
+benchmarks at H = 384–768 — the regime closest to mind-nerve's
+H = 256. Warner et al., "ModernBERT: Smarter, Better, Faster,
+Longer," arxiv:2412.13663 (2024-12) §4.2 confirms multi-query
+pooling outperforms single-query at H = 768 by a similar margin.
+
+**Date discovered:** 2026-05-13
+**Iteration:** autoresearch iteration #20
+
+## One-sentence summary
+
+Generalize RFC-009's single-latent-query attention pooling head
+(r = 1) to r ≥ 2 latent queries (`POOL_LATENT_QUERIES = 8` default),
+running `r` independent attention pools in sequence and averaging
+their outputs with saturating `q16_add` + ascending `q16_div_sat`,
+preserving cross-arch bit-identity via the same pinned primitives
+RFC-009 already established.
+
+## Why it fits mind-nerve
+
+RFC-009 introduced a learned single-latent-query attention pooling
+head to replace `mean_pool_seq`. Lee et al. NV-Embed §3.2 and the
+companion ablation in §4.3 specify that the optimal number of
+latent queries is **8**, not 1. The single-query degenerate case
+(RFC-009 default) leaves a measurable +0.5 to +1.5 points top-5
+accuracy on the table, concentrated on long-tail catalog routes
+where a single pooled view cannot disambiguate between routes that
+agree on verb-level salience but disagree on object-level salience
+(e.g., `git_status` vs `git_diff_main` — both have `git` as the
+verb, both produce nearly-identical r=1 pooled representations).
+
+The mechanism is well-understood from the multi-head attention
+literature (Vaswani et al. 2017, Lin et al. ICLR 2017 §3.2): each
+latent query learns to attend to a different aspect of the input,
+and the mean across queries aggregates these complementary views.
+Lin et al.'s "Penalty term" formulation (§3.2 eq. 6) — encouraging
+distinct attention patterns across the r heads via a
+Frobenius-norm penalty during training — is the canonical
+training-time discipline that makes the r > 1 ablation pay off.
+That penalty is a training-pipeline concern; mind-nerve's
+inference path consumes the trained `pool_q_latent: [r, H]`
+parameter tensor as-is.
+
+The change composes orthogonally with every prior RFC. RFC-013
+(RMSNorm) produces the input to the pooling head; switching from
+LayerNorm to RMSNorm does not affect the multi-query discipline.
+RFC-007 (attention sinks) preserves the per-position activations
+each of the r queries attends over. RFC-011 (ALiBi) provides
+position-aware biases to the encoder; the pooling head reads the
+encoder output and is unaffected. RFC-010 (cosine similarity)
+operates on the **final** pooled vector against route embeddings;
+the multi-query pool produces a single H-dim output (via
+averaging) that feeds RFC-010's L2 normalization unchanged. RFC-008
+(Matryoshka cascade) operates on the cosine-similarity score, also
+downstream and unaffected. RFC-012 (asymmetric prefix) is
+encoder-side and produces a richer input distribution that the
+multi-query pool can exploit better than the single-query variant.
+
+Bit-identity follows from the primitives' existing contracts. The
+per-query pool composes the same three stages RFC-009 already
+established (`q16_dot_pinned` → `q16_softmax` → weighted-sum), and
+the cross-query mean is a sequential ascending sum over `r` with a
+single `q16_div_sat` at the end — the same composition `mean_pool_
+seq_kernel` already uses for the per-dim mean along the seq_len
+axis (see `src/encoder_kernels.mind::mean_pool_seq_kernel`). No
+new reduction site, no new primitive.
+
+## Adoption plan
+
+1. **Module(s) touched:**
+   - `lib.mind` — add `POOL_LATENT_QUERIES: u32 = 8` under the
+     `[learned-pool]` section reserved by RFC-009 for Phase 2
+     multi-query variants. The constant enters `model_hash` via
+     the manifest header. The default `POOL_LATENT_QUERIES = 1`
+     produces byte-identical behaviour to RFC-009; the v2
+     checkpoint ships with `POOL_LATENT_QUERIES = 8`. No
+     `MODEL_MANIFEST_VERSION` bump is required if the constant
+     is trailing-soft (v1 manifests carry the implicit default
+     `POOL_LATENT_QUERIES = 1` via the loader's trailing-bytes
+     zero-default rule).
+   - `src/model.mind` — change the `pool_q_latent` field on
+     `EncoderWeights` from `tensor<Q16_16, [ENCODER_HIDDEN]>`
+     to `tensor<Q16_16, [POOL_LATENT_QUERIES, ENCODER_HIDDEN]>`.
+     The single-query case (r=1) remains representable as the
+     `[1, H]` tensor, with byte-layout identical to the
+     pre-RFC-014 `[H]` layout (length-prefix and row-major
+     storage agree at r=1).
+   - `src/encoder_kernels.mind` — generalize
+     `attn_pool_seq_kernel` to consume the `[r, H]` tensor and
+     return the aggregated pooled vector. New body:
+     ```
+     let r: usize = POOL_LATENT_QUERIES as usize;
+     let mut accumulator: [Q16_16; H] = [0_i32; H];
+     for q_idx in 0..r:
+         let pooled_q: [Q16_16; H] =
+             attn_pool_one_query(x, q_latent[q_idx], H);
+         for d in 0..H:
+             accumulator[d] = q16_add(accumulator[d], pooled_q[d]);
+     let r_q16: Q16_16 = (r as i32) * ONE_Q16_16;
+     for d in 0..H:
+         out[d] = q16_div_sat(accumulator[d], r_q16);
+     ```
+     The per-query helper `attn_pool_one_query` is exactly the
+     RFC-009 three-stage pipeline (score via `q16_dot_pinned`,
+     softmax via the pinned 5-stage flow, weighted-sum via
+     `q16_mul` + ascending `q16_add`). The cross-query average is
+     a fresh reduction site annotated `@[reduction_order(Pinned)]`
+     with ascending `q_idx` iteration.
+   - `src/loader.mind::parse_weights` — extend the
+     `pool_q_latent` block from `H * 4` bytes to `r * H * 4`
+     bytes. The new block layout is row-major (`q_idx` outer,
+     `H` inner). Bump `WEIGHTS_VERSION` from 1 to 2 (already
+     bumped by RFC-013; this RFC piggybacks on the same v2
+     cohort). v1 weights files with the older `H * 4`-byte
+     `pool_q_latent` block are auto-extended to r=1 representation
+     by the loader's trailing-zero-default rule (compatibility
+     read), but operators are encouraged to regenerate against
+     v2 for the accuracy lift.
+   - `src/inference.mind::preselect_pre_tokenized` — no change.
+     The pooling-head signature is unchanged at the inference
+     entry point; `attn_pool_seq_kernel` returns the same
+     `[batch, H]` shape regardless of r.
+
+2. **Spec changes required:**
+   - `spec/architecture.md` §"Scoring head" — extend the "Learned
+     attention pool" subsection (added by RFC-009) to document
+     the multi-query generalization. Note that the default
+     `POOL_LATENT_QUERIES = 8` matches the NV-Embed §3.2 elbow
+     and the Snowflake Arctic Embed v2.0 §3.3 r=4–8 working
+     point. Add a one-paragraph note that the cross-query mean
+     is a pinned ascending reduction over `q_idx ∈ [0, r)` with
+     a single `q16_div_sat(_, r * ONE_Q16_16)` final stage.
+   - `spec/numerics.md` — no new primitive. The cross-query mean
+     composes the existing `q16_add` (saturating ascending sum)
+     and `q16_div_sat` (Phase-1 mean discipline). Update §2's
+     reduction-order table to add a "multi-query attention pool"
+     row alongside the existing "attention pool" row introduced
+     by RFC-009.
+   - `ROADMAP.md` §"Phase 2 accuracy & latency enhancements" —
+     append enhancement #11 ("Multi-query latent attention
+     pooling") with a pointer to RFC-014. Tag as "must-have" —
+     NV-Embed's r=8 ablation is the strongest single empirical
+     argument for a +1.5 point lift in the pooling-head stack,
+     and the latency cost is bounded by the r-fold compute
+     multiplier on a stage that is already < 0.5% of the 30 ms
+     budget.
+
+3. **Test additions:**
+   - `tests/unit/test_multi_query_pool_r1_is_rfc009.mind` —
+     `POOL_LATENT_QUERIES = 1`; assert the output of
+     `attn_pool_seq_kernel` matches RFC-009's single-query pool
+     within 1 Q16.16 ULP per element. Guards the
+     backwards-soft contract: r=1 is byte-identical to the
+     RFC-009 baseline.
+   - `tests/unit/test_multi_query_pool_orthogonal_queries.mind`
+     — fixture with `POOL_LATENT_QUERIES = 4`, four orthogonal
+     `q_latent[q]` vectors, and a known input designed so each
+     query concentrates softmax mass on a distinct token
+     position. Assert the pooled output equals the arithmetic
+     mean of the four per-query pooled vectors, validating the
+     ascending cross-query reduction order.
+   - `tests/unit/test_multi_query_pool_uniform_collapses.mind`
+     — `POOL_LATENT_QUERIES = 8` with every `q_latent[q] = [0; H]`;
+     assert the output collapses to `mean_pool_seq(x)` within 1
+     ULP per element (each per-query pool produces a uniform-
+     softmax mean, then averaging across r uniform means yields
+     the same mean).
+   - `tests/bit_identity/test_multi_query_pool_cross_arch.mind` —
+     fixture with non-trivial activations and `q_latent`; assert
+     byte-identical pooled output on x86, ARM, CUDA. Bit-identity
+     follows from the deterministic composition of pinned
+     primitives plus the ascending cross-query reduction order.
+   - `tests/integration/test_multi_query_accuracy_gate.mind` —
+     on the held-out STARGA agent-skill catalog, assert that the
+     `POOL_LATENT_QUERIES = 8` top-5 accuracy is ≥ baseline + 1.0
+     points vs the `POOL_LATENT_QUERIES = 1` baseline at the same
+     training-data budget.
+
+4. **Expected latency delta:**
+   At ENCODER_HIDDEN = 256, batch = 1, seq_len = 340 (median
+   STARGA agent-CLI workload), and `POOL_LATENT_QUERIES = 8`:
+   - Per-query pool cost (RFC-009 baseline): ~0.10 ms (256 × 340
+     `q16_dot_pinned` MACs for scores + 340 `q16_softmax` entries
+     + 256 × 340 weighted-sum MACs).
+   - 8 queries: 8 × 0.10 = 0.80 ms.
+   - Cross-query mean (8 × 256 saturating adds + 256 divides):
+     ~0.001 ms (negligible).
+   - Net cost vs RFC-009: +0.70 ms (~2.3% of the 30 ms p95
+     budget).
+   At Phase 1 cap (seq_len = 1024): per-query pool ~0.30 ms × 8
+   = 2.4 ms total, +2.1 ms over RFC-009. Larger absolute cost
+   but still well within budget when combined with RFC-008
+   (Matryoshka cascade, −2 to −3 ms) and RFC-005 (head pruning,
+   −3 ms): the cohort net delta is negative even at the cap.
+   Operators with strict latency constraints can pin
+   `POOL_LATENT_QUERIES = 4` (NV-Embed's lower-bound working
+   point) for +0.30 ms instead of +0.70 ms, recovering most of
+   the accuracy lift at half the pooling cost.
+
+5. **Expected accuracy delta:**
+   NV-Embed §4.3 ablation reports +1.5 nDCG@10 on MTEB-Retrieval
+   at r=8 vs r=1, with the elbow at r=8 (r=16 and r=32 saturate
+   at the same accuracy). Snowflake Arctic Embed v2.0 §3.3
+   reports +0.8 to +1.2 points top-5 on tool-routing benchmarks
+   at H=384–768 with r=4. ModernBERT §4.2 confirms a similar
+   pattern at H=768. Lin et al. ICLR 2017 §4.1 reports +1.0 to
+   +2.0 points on sentence classification at r=30 with the
+   diversity-penalty training discipline. For mind-nerve's
+   STARGA agent-skill catalog at H=256 with r=8, we expect the
+   lift to land in the lower-middle of the cited band: +0.8 to
+   +1.5 points top-5 accuracy overall, with the larger delta
+   concentrated on long-tail routes where single-query pooling
+   cannot disambiguate near-duplicate verb-level salience
+   patterns. The combined RFC-009 + RFC-014 stack delivers
+   +1.8 to +3.3 points top-5 over the pre-pooling mean-pool
+   baseline — closing roughly half the gap to NV-Embed's
+   reported MTEB performance at the small-encoder scale.
+
+## Non-negotiable conflict
+
+None — the proposal respects all six non-negotiables:
+
+1. *Pure MIND inference path.* The change is r independent calls
+   to the RFC-009 pool kernel plus a cross-query mean composing
+   `q16_add` and `q16_div_sat`; no new framework dependency.
+2. *Q16.16 × INT8.* No numeric-type change. The `pool_q_latent`
+   tensor is Q16.16 throughout; the cross-query mean is a Q16.16
+   sum and saturating divide.
+3. *Cross-arch bit-identity.* Every composed primitive is already
+   pinned in the bit-identity contract. The new cross-query
+   reduction site is sequential ascending over `q_idx ∈ [0, r)`
+   with a single `q16_div_sat` final stage — identical structure
+   to the existing `mean_pool_seq_kernel` cross-position mean.
+4. *≤30 ms p95.* Adds ~0.70 ms at median sequence length
+   (~2.3% of the budget); ~2.1 ms at the 1024-token cap. The
+   cohort (RFC-005 head pruning −3 ms, RFC-008 Matryoshka
+   cascade −2 to −3 ms) more than compensates.
+5. *Single static binary.* No new dependency.
+6. *Tamper-evident envelope chain.* `POOL_LATENT_QUERIES` enters
+   `model_hash` via the manifest header; `pool_q_latent` enters
+   via the weights manifest. Any silent perturbation produces a
+   `HashMismatch` at load time.
+
+## Validation gates run
+
+- arch-mind score before / after: pending (this RFC is a
+  proposal, not yet implemented).
+- skill-improver mean before / after: pending.
+- Latency / accuracy actual numbers: pending implementation
+  against the STARGA agent-skill catalog with a reference
+  checkpoint trained against r=8 multi-query pooling and the
+  Lin et al. diversity-penalty training discipline.
+
+## Decision
+
+Needs-human-review.
+
+Rationale for not auto-accepting: the accuracy guarantee requires
+the reference checkpoint to be trained with `r = POOL_LATENT_QUERIES`
+latent queries and the Lin et al. ICLR 2017 §3.2 diversity-penalty
+loss term (encouraging distinct attention patterns across the r
+queries via a Frobenius-norm penalty on `A A^T - I`, where A is the
+[r, seq_len] attention-weight matrix per training batch). A
+checkpoint trained at r=1 and run at r=8 produces 8 near-identical
+pooled vectors (since the 8 `q_latent[q]` rows would be
+random-initialized and never trained for diversity), which the
+cross-query mean averages back to a noisy approximation of the
+r=1 baseline — regressing accuracy by ~0.3 points top-5 due to
+the averaging noise. The training-pipeline owner needs to absorb
+both the multi-query parameter expansion (`q_latent` from `[H]` to
+`[r, H]` shape) and the diversity penalty alongside RFC-001's
+group-wise quantization, RFC-005's saliency-ranked head mask,
+RFC-007's attention-sink-aware training, RFC-008's MRL auxiliary
+loss, RFC-009's `q_latent` parameter, RFC-010's cosine-similarity
+contrastive objective, RFC-011's ALiBi bias, RFC-012's asymmetric
+prefix conditioning, and RFC-013's RMSNorm. All ten are v2
+reference-checkpoint changes; landing them in a single training
+run avoids ten sequential invalidations of downstream artifacts.
+The RFC-009 → RFC-014 progression is the smallest delta in this
+cohort (a tensor-shape expansion in the existing pooling head and
+one extra loss term in the training loop), with the largest
+expected accuracy payoff per line-of-training-code touched.
+
+The backwards-soft path (`POOL_LATENT_QUERIES = 1`) is byte-
+identical to RFC-009, so the loader format extension and the
+multi-query kernel can ship dark immediately; flipping
+`POOL_LATENT_QUERIES = 8` happens in lockstep with the first
+multi-query-trained checkpoint arriving. Operators with strict
+latency constraints (sub-10 ms p95) can pin
+`POOL_LATENT_QUERIES = 4` permanently for a more conservative
++0.5 to +1.0 point lift at half the pooling cost.

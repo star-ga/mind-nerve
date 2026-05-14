@@ -17,6 +17,8 @@ use crate::mind_nerve::{
     ROUTE_EMBEDDING_DIM,
     MATRYOSHKA_COARSE_DIM,
     K_COARSE_MULTIPLIER,
+    QUERY_PREFIX_TOKENS,
+    QUERY_PREFIX_LEN,
     ATTESTATION_VERSION,
     ATTESTATION_BYTES,
     NUMERICS_WIRE_VERSION,
@@ -258,10 +260,64 @@ pub fn preselect_pre_tokenized(
         return Err(InferenceError::InvalidK);
     }
 
-    // (2) Token-cap gate. The wire handshake should have rejected oversize
-    //     requests already; this is defence-in-depth for callers that bypass
-    //     the wire layer (in-process tests, single-binary CLI).
+    // (1a) RFC-012: Asymmetric query/passage prefix conditioning.
+    //      When `QUERY_PREFIX_LEN > 0`, prepend the first QUERY_PREFIX_LEN
+    //      entries of QUERY_PREFIX_TOKENS to the user-supplied token stream
+    //      before any downstream gate. The encoder sees the asymmetric
+    //      query-side conditioning prefix, paired with route embeddings
+    //      that the offline catalog-builder produced with the matching
+    //      `"passage: "` prefix on the catalog side. With the backwards-
+    //      soft default `QUERY_PREFIX_LEN = 0` the compile-time predicate
+    //      is statically false, the prepend branch is dead code, mindc
+    //      constant-folds the dispatch back to the direct user-supplied
+    //      tokens slice, and the binary stays byte-identical to today
+    //      until a calibrated reference checkpoint binds a non-zero
+    //      QUERY_PREFIX_LEN into `model_hash`.
+    //
+    //      Important: the `request_hash` field continues to record
+    //      SHA-256 of the user-supplied byte / token stream — NOT the
+    //      prefix-prepended sequence. That preserves the envelope's
+    //      "honest record of what the caller asked" contract; the
+    //      prefix-prepended sequence is implied by (request_hash,
+    //      model_hash) for any replay verifier.
+    //
+    //      The pre-prepend `tokens.len() > MAX_REQUEST_TOKENS` check is
+    //      kept as a fast-fail before any allocation; the post-prepend
+    //      check below catches the boundary case where the user supplied
+    //      a slice of length `MAX_REQUEST_TOKENS - QUERY_PREFIX_LEN + 1`
+    //      that would silently overflow the cap.
     if tokens.len() > (MAX_REQUEST_TOKENS as usize) {
+        return Err(InferenceError::RequestTooLong);
+    }
+    let prefix_len: usize = QUERY_PREFIX_LEN as usize;
+    let total_len:  usize = prefix_len + tokens.len();
+    if total_len > (MAX_REQUEST_TOKENS as usize) {
+        return Err(InferenceError::RequestTooLong);
+    }
+    let effective_tokens: [u32] = if QUERY_PREFIX_LEN > 0u32 {
+        let mut concat: [u32] = [];
+        let mut pp: usize = 0;
+        while pp < prefix_len {
+            concat.push(QUERY_PREFIX_TOKENS[pp]);
+            pp = pp + 1;
+        }
+        let mut tt: usize = 0;
+        while tt < tokens.len() {
+            concat.push(tokens[tt]);
+            tt = tt + 1;
+        }
+        concat
+    } else {
+        tokens.to_owned()
+    };
+
+    // (2) Token-cap gate (post-prepend, defence-in-depth). The wire
+    //     handshake should have rejected oversize requests already; the
+    //     check above already gated against the user-supplied slice
+    //     exceeding the cap, and the post-prepend gate further above
+    //     gated against the prefix pushing the sequence past the cap.
+    //     This is the canonical cap check that callers downstream rely on.
+    if effective_tokens.len() > (MAX_REQUEST_TOKENS as usize) {
         return Err(InferenceError::RequestTooLong);
     }
 
@@ -275,7 +331,7 @@ pub fn preselect_pre_tokenized(
     //     batch == 1: wrap the flat token slice into a [1, n] tensor view
     //     so the model.mind signatures (which carry the batch axis on the
     //     public surface for Phase 2 compatibility) stay typed.
-    let token_ids: tensor<u32, [1, tokens.len()]> = [tokens.to_owned()];
+    let token_ids: tensor<u32, [1, effective_tokens.len()]> = [effective_tokens.clone()];
     let enc_out      = model::encoder(token_ids, weights.encoder);
     let pooled_query = model::mean_pool_seq(enc_out);
 

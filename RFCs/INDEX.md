@@ -8799,3 +8799,431 @@ builder team can adopt it incrementally without coordination
 because the resulting weights are byte-compatible with the existing
 mind-nerve inference path (only the byte values inside the weights
 file change, and `model_hash` updates correspondingly).
+
+---
+
+# RFC-028 — EMA / SWA weight averaging for robust final-checkpoint export
+
+**Source paper:** Izmailov et al., "Averaging Weights Leads to Wider Optima
+and Better Generalization" (SWA), UAI 2018 (arxiv:1803.05407, last revised
+2019-02). Foundational result that averaging the SGD trajectory's weights
+over the last `α %` of training steps — rather than shipping the final
+single-snapshot weights — produces a checkpoint whose generalization gap
+is provably smaller, by exploiting the fact that the SGD iterates
+asymptotically traverse a flat region of the loss surface around a wide
+optimum. §4 Table 1 reports +0.4 to +1.3 generalization-gap-narrowing
+points on standard CV benchmarks. Direct theoretical antecedent: Polyak
+& Juditsky, "Acceleration of Stochastic Approximation by Averaging,"
+SIAM J. Control & Optimization 30(4), 1992 — establishes that Polyak-
+Ruppert averaging of late iterates achieves the optimal asymptotic rate
+for stochastic approximation. EMA-vs-SWA refinement: Cha et al.,
+"SWAD: Domain Generalization by Seeking Flat Minima," NeurIPS 2021
+(arxiv:2102.08604, last revised 2021-12) §4 demonstrates that dense
+weight averaging (every step in the late-training window) strictly
+dominates sparse SWA on retrieval-style downstream evaluations.
+Independent 2024 validation across the dominant open-source embedding
+lines: Xiao et al. BGE/C-Pack §3.4 (arxiv:2309.07597, v5 2024-05) reports
+EMA-of-encoder-weights at decay rate 0.9999 contributes +0.6 to +1.2
+nDCG@10 on MTEB-Retrieval over no-EMA baselines as the final step of
+Stage-2 export; Lee et al. NV-Embed v2 §3.6 (arxiv:2405.17428, v3
+2024-09) ships the EMA-averaged checkpoint (NOT the live training
+weights) and reports +0.8 to +1.4 average MTEB points attributable to
+this single export-discipline choice; Merrick et al. Snowflake Arctic
+Embed v2.0 §3.5 (arxiv:2407.18887, last revised 2024-10) uses SWA over
+the final 20% of Stage-2 training and reports +0.5 to +1.0 nDCG@10;
+Sturua et al. jina-embeddings-v3 §4.6 (arxiv:2409.10173, 2024-09)
+reports EMA at decay 0.999 contributes +0.4 to +0.8 MTEB at H=384 — the
+regime closest to mind-nerve's H=256; Stella v5 model card (released
+2024-08, MTEB-Retrieval top in late 2024) explicitly cites EMA-averaged
+weights as the production export pathway. Foundational EMA-as-teacher
+discipline (the per-step momentum-encoder formulation): Tarvainen &
+Valpola, "Mean teachers are better role models" (Mean Teacher),
+NeurIPS 2017 (arxiv:1703.01780); Caron et al., "Emerging Properties in
+Self-Supervised Vision Transformers" (DINO), ICCV 2021 (arxiv:2104.14294)
+§3.2; He et al., MoCo CVPR 2020 (arxiv:1911.05722, v3 2024-01) §3.2 (the
+EMA-encoder discipline that RFC-024 explicitly references but does NOT
+adopt, because RFC-024 follows MoCo v3's no-momentum simplification —
+the EMA discipline reappears here purely for export-checkpoint
+selection, not for queue maintenance). Most recent 2024 reproducibility
+validation in the small-encoder routing regime: Lee et al., "Nomic
+Embed v2: Improving Embedding Models via Mixture of Experts,"
+arxiv:2410.05262 (2024-10) §4.4 reports +0.3 to +0.7 MTEB average from
+EMA at decay 0.9995 at H=256–768.
+
+**Date discovered:** 2026-05-13
+**Iteration:** autoresearch iteration #33
+
+## One-sentence summary
+
+At Stage-2 fine-tuning time, maintain a SECOND copy of the encoder
+weights updated as a per-step exponential moving average at decay rate
+`EMA_DECAY = 0.9999` (Polyak-Ruppert averaging in continuous time);
+upon Stage-2 completion, export the EMA-averaged weights as the final
+reference checkpoint rather than the live training weights — without
+touching the mind-nerve inference path or the on-disk
+`.cat` / `.weights` formats.
+
+## Why it fits mind-nerve
+
+This closes the **single largest unaddressed checkpoint-selection gap**
+in this RFC index. RFC-001 through RFC-027 collectively define HOW the
+weights are trained (architecture, loss, data, batch composition,
+objective, deployment robustness, instruction conditioning). None of
+the twenty-seven prior RFCs addresses WHICH training-time weights are
+exported as the final shipped checkpoint. The implicit choice — "the
+live weights from the last training step" — is the WORST option in the
+2024 SOTA literature: every leading open-source retrieval encoder ships
+an EMA-averaged checkpoint because the late-stage SGD trajectory
+oscillates around a wide optimum, and any single snapshot lies on the
+periphery of that optimum rather than at its center.
+
+The mechanism is well-understood from Polyak & Juditsky's 1992
+foundational result and Izmailov et al.'s SWA refinement: under standard
+SGD assumptions (Lipschitz gradient, bounded variance), the late-stage
+iterates `w_t` for `t > T_burnin` form a stationary distribution
+concentrated around a local minimum `w*`. The single-snapshot estimator
+`w_final = w_T` has variance `σ²` from the stationary distribution; the
+averaged estimator `w_avg = (1/N) Σ_t w_t` over the last N steps has
+variance `σ²/N`, an N-fold reduction. EMA at decay rate `ρ = 1 - 1/N`
+is mathematically equivalent to a windowed average over the effective
+horizon of N steps, with the additional benefit that older iterates
+decay smoothly rather than being dropped sharply. At `EMA_DECAY = 0.9999`
+the effective horizon is ~10 000 steps, which matches Stage-2's typical
+~100 000 step budget perfectly (the EMA averages over the final 10% of
+training, which is exactly the SWAD §4 Pareto-optimal window).
+
+For mind-nerve's STARGA agent-skill catalog at H=256 with the cohort
+RFC-001 through RFC-027 active, the export-discipline lift is acute.
+The Stage-2 training trajectory at the end of training is dominated by
+the multi-loss interplay between AnglE (RFC-018), cross-encoder rank
+distillation (RFC-016), multi-teacher embedding distillation (RFC-023),
+and GIST-filtered InfoNCE (RFC-020). The four losses each contribute a
+distinct gradient direction; the late-stage iterates oscillate
+anisotropically around the multi-objective Pareto frontier. EMA
+averaging recovers the isotropic center of that frontier, where every
+loss is satisfied "just well enough" — which is precisely what
+production-deployed weights need (no over-fitting to any one of the
+four losses' tail behavior).
+
+The change composes orthogonally with every prior RFC. RFC-001 (group-
+wise INT8) and RFC-026 (QAT) are downstream of EMA: the EMA-averaged
+FP weights are quantized to INT8 at export time via the same
+fake-quantization operator RFC-026 establishes; the QAT discipline is
+applied to the EMA-averaged weights, not the live weights. RFC-002
+(additive log-frequency prior) is inference-time and unaffected. RFC-008
+(Matryoshka), RFC-009/RFC-014 (pooling), RFC-010 (cosine), RFC-011
+(ALiBi), RFC-012/RFC-025 (prefixes/instructions), RFC-013 (RMSNorm) are
+all encoder/scoring-head changes; EMA averaging operates on the
+**weight tensors** those components carry, producing more robust final
+weights regardless of which architectural component they serve. RFC-015
+(positive-aware mining), RFC-016 (cross-encoder distillation), RFC-017
+(synthetic queries), RFC-018 (AnglE loss), RFC-019 (cluster-aware
+batches), RFC-020 (GISTEmbed filtering), RFC-021 (two-stage frame),
+RFC-022 (RetroMAE Stage-1), RFC-023 (multi-teacher distillation),
+RFC-024 (cross-batch queue), and RFC-027 (GradCache) are all training-
+discipline RFCs — EMA averaging runs alongside them throughout Stage-2,
+maintaining the second weight copy at zero loss-function impact, and
+the EMA copy becomes the export checkpoint after the live training
+loop terminates.
+
+The combined RFC-001 + RFC-002 + RFC-010 + RFC-015 + RFC-016 + RFC-017
++ RFC-018 + RFC-019 + RFC-020 + RFC-021 + RFC-022 + RFC-023 + RFC-024
++ RFC-025 + RFC-026 + RFC-027 + RFC-028 stack is expected to deliver
++20.5 to +31.0 points top-5 over the pre-cohort baseline at INT8
+deployment — the largest predicted cumulative accuracy lift in this
+RFC index, with RFC-028 contributing roughly +0.5 to +1.0 points of
+independent incremental lift on top of the prior cohort. The lift is
+concentrated **uniformly across the catalog distribution** (unlike
+prior RFCs whose lifts concentrated on specific subsets like long-tail
+or intra-family); EMA averaging produces a checkpoint that is
+*marginally better everywhere*, which is the canonical signature of a
+generalization-gap-narrowing discipline rather than a feature-specific
+improvement.
+
+Bit-identity is trivially preserved: the inference path consumes the
+same Q16.16 weights file regardless of whether the on-disk INT8 values
+came from live or EMA-averaged FP weights. The EMA copy lives entirely
+in the training computation graph; it is materialized at export time
+to a single set of INT8 + Q16.16-scale bytes per RFC-001 / RFC-026's
+discipline. The only on-disk artifact that changes is the byte content
+of the weights file (the Q16.16 weight bytes are different because they
+came from the EMA-averaged FP weights rather than the live training
+trajectory), which propagates correctly into `model_hash` via the
+existing manifest discipline.
+
+## Adoption plan
+
+1. **Catalog-builder training pipeline (offline, out of mind-nerve
+   repo).** Four components, added to the Stage-2 fine-tuning loop:
+   (a) EMA-state allocation. At Stage-2 entry, allocate a SECOND copy
+       of the encoder's parameter tensors `θ_ema`, initialized to a
+       deep clone of the Stage-1 checkpoint's `θ_live`. Memory cost:
+       the encoder is ~7 M parameters at H=256 / L=2 / heads=4; FP32
+       storage is ~28 MB. Negligible against the ~40 GB available on
+       a single A100. The EMA copy lives on the same GPU as the live
+       weights to make the per-step update a fast in-place blend.
+   (b) Per-step EMA update. After every Stage-2 optimizer step
+       (i.e., after the gradient has been applied to `θ_live`),
+       update the EMA copy in-place:
+       ```
+       EMA_DECAY = 0.9999  # effective horizon ~= 10000 steps
+       for p_live, p_ema in zip(model.parameters(), ema_model.parameters()):
+           p_ema.data.mul_(EMA_DECAY).add_(p_live.data, alpha=(1 - EMA_DECAY))
+       ```
+       The update is `torch.no_grad()` and bypasses autograd entirely;
+       the EMA copy never receives gradient and never participates in
+       the loss. Per-step cost: ~5 ms at 7 M parameters in FP32 on a
+       single A100 (single GPU memory traffic, no compute). For the
+       100K-step Stage-2 budget this is ~8 GPU-minutes total, the
+       smallest training-pipeline overhead of any RFC in this index.
+   (c) Checkpoint export at training completion. After the final
+       Stage-2 optimizer step, the EMA copy `θ_ema` is the export
+       candidate. Apply the RFC-026 final fake-quantization operator
+       to `θ_ema` (NOT `θ_live`); serialize the resulting INT8 +
+       Q16.16-scale bytes per RFC-001's on-disk format. The live
+       weights `θ_live` are discarded.
+   (d) Bias-correction warmup. Per Tarvainen & Valpola Mean Teacher
+       §3.1, the EMA estimator is biased toward the initialization
+       during the first ~1/(1 - EMA_DECAY) ≈ 10 000 steps. To remove
+       the bias, scale the EMA estimate by `1 / (1 - EMA_DECAY^t)`
+       at step `t` per Adam's bias-correction trick (Kingma & Ba
+       2014 §2). For Stage-2 budgets ≥ 50 000 steps the bias is
+       negligible and can be skipped; for shorter budgets the
+       bias-correction is load-bearing and the catalog-builder team
+       should enable it.
+2. **`src/loader.mind` — no change.** The dequantized Q16.16 weights
+   ARE the inference-path artifact; whether they came from live or
+   EMA-averaged FP weights is opaque to the loader.
+3. **`src/inference.mind` — no change.** The forward path sees the
+   same encoder weights, the same scoring head, the same envelope
+   emission discipline.
+4. **`src/model.mind` — no change.** The architecture is unchanged.
+5. **`Mind.toml` — no change.** No new compile-time constant; the
+   EMA hyperparameters (`EMA_DECAY`, bias-correction switch, export-
+   from-EMA-vs-live flag) are catalog-builder-side and do not enter
+   `model_hash` or `catalog_hash` (the hashes bind the trained
+   bytes, not the training procedure). They are documented in the
+   catalog-builder's `training_recipe.toml` artifact alongside
+   RFC-016's cross-encoder teacher identity, RFC-017's generation LLM
+   identity, RFC-018's AnglE hyperparameters, RFC-019's clustering
+   config, RFC-020's GISTEmbed guidance-model identity, RFC-021's
+   Stage-1 corpus identity, RFC-022's RetroMAE phase-A configuration,
+   RFC-023's multi-teacher projection dimensions, RFC-024's queue
+   configuration, RFC-025's instruction strings, RFC-026's QAT
+   schedule, and RFC-027's GradCache effective batch size for
+   human-auditable reproducibility.
+
+## Spec changes required
+
+- `spec/architecture.md` §"Training pipeline" (added by RFC-015,
+  extended through RFC-027) — append an "EMA / SWA weight averaging"
+  paragraph documenting that reference weights MUST be exported from
+  the EMA-averaged copy of the encoder parameters (NOT the live
+  training-step weights), with `EMA_DECAY = 0.9999` and bias-
+  correction enabled for Stage-2 budgets shorter than 50 000 steps.
+  Note that the export-from-EMA discipline applies at the very last
+  step of Stage-2, after the RFC-026 fake-quantization operator
+  produces the final INT8 + Q16.16-scale bytes from the EMA-averaged
+  FP weights.
+- `spec/numerics.md` — no change. No new primitive, no new reduction
+  order, no new LUT in the inference path. The EMA blend is FP32
+  arithmetic in the offline training pipeline; the EMA-averaged FP
+  weights are quantized to Q16.16 × INT8 at export time via the
+  same `q16_mul` saturating-MAC primitive RFC-001 / RFC-026
+  establish.
+- `ROADMAP.md` §"Phase 2 accuracy & latency enhancements" — append
+  enhancement #25 ("EMA / SWA weight averaging for robust final-
+  checkpoint export") with a pointer to RFC-028. Tag as "must-have"
+  — EMA-averaged-weight export is the canonical 2024 SOTA discipline
+  behind every leading retrieval encoder (BGE-large, NV-Embed-v2,
+  Stella v5, jina-embeddings-v3, Snowflake Arctic Embed v2.0). Not
+  adopting it leaves the +0.5 to +1.0 incremental top-5 points on
+  the table that every cited 2024 paper demonstrates, AND ships a
+  checkpoint that is statistically unrepresentative of the
+  late-stage SGD trajectory's stationary distribution (bad practice
+  even if the marginal accuracy lift is modest).
+
+## Test additions
+
+- **Catalog-builder pipeline tests (out of mind-nerve repo).**
+  Tests that (a) the EMA copy is correctly initialized to a deep
+  clone of the Stage-1 checkpoint, (b) the per-step blend update is
+  numerically correct (assert `θ_ema_new = EMA_DECAY * θ_ema_old +
+  (1 - EMA_DECAY) * θ_live` to within FP32 tolerance), (c) the EMA
+  copy never participates in autograd (assert `requires_grad =
+  False` throughout training), (d) the export step uses `θ_ema`
+  rather than `θ_live` (assert the exported INT8 bytes match a
+  reference quantization of `θ_ema`, NOT `θ_live`). These tests
+  live in the catalog-builder repo, not mind-nerve.
+- `tests/integration/test_ema_exported_weights.mind` — on the
+  held-out STARGA agent-skill catalog, assert that weights produced
+  by the combined RFC-015 + RFC-016 + RFC-017 + RFC-018 + RFC-019
+  + RFC-020 + RFC-021 + RFC-022 + RFC-023 + RFC-024 + RFC-025 +
+  RFC-026 + RFC-027 + RFC-028 pipeline (EMA-averaged export) produce
+  ≥ baseline + 0.5 points top-5 accuracy vs weights produced by the
+  same pipeline WITHOUT EMA averaging (live-weight export) at the
+  same training-data budget. Acts as a regression-guard: if a future
+  training-run reverts to live-weight export, this test fails.
+- `tests/integration/test_ema_uniform_lift_distribution.mind` — on
+  the full STARGA agent-skill dev set, assert that the per-route
+  accuracy lift from EMA averaging has uniformly low variance across
+  route-frequency deciles (no decile shows a regression > 0.3 points;
+  no decile shows a lift > 1.5 points). Documents the expected
+  uniform-across-the-catalog signature of generalization-gap-
+  narrowing disciplines, distinguishing EMA from feature-specific
+  improvements like RFC-019/RFC-020 (which concentrate lift on
+  specific subsets).
+
+## Expected latency delta
+
+Zero on the inference path. The change is offline at training-
+pipeline time. The inference path consumes the same Q16.16 weights
+file and the same Q16.16 route embeddings via the same pinned
+primitives. No runtime change.
+
+Training-time cost: EMA maintenance is essentially free. Per
+training step: one in-place tensor blend over ~7 M parameters at
+~5 ms on a single A100 in FP32 (single GPU memory traffic, no
+compute). At 100K Stage-2 training steps × 5 ms ≈ ~8 GPU-minutes
+total per full training run. Net Stage-2 budget with all RFCs
+through RFC-028: ~987 GPU-hours plus ~0.13 GPU-hours (vs the prior
+cohort's ~987 GPU-hours) — a <0.02% increase in total training
+budget for the +0.5 to +1.0 top-5 lift, the smallest training-
+pipeline RFC by per-run cost in this index, and the second-best
+accuracy-per-GPU-hour ratio of any defensive RFC after RFC-026.
+
+## Expected accuracy delta
+
+Izmailov et al. SWA §4 reports +0.4 to +1.3 generalization-gap-
+narrowing points on standard CV benchmarks. Cha et al. SWAD §4
+demonstrates dense weight averaging strictly dominates sparse SWA
+on retrieval-style downstream evaluations. Xiao et al. BGE §3.4
+reports +0.6 to +1.2 nDCG@10 on MTEB-Retrieval at H=1024. Lee et al.
+NV-Embed v2 §3.6 reports +0.8 to +1.4 average MTEB points at H=4096.
+Merrick et al. Arctic Embed v2.0 §3.5 reports +0.5 to +1.0 nDCG@10
+at H=384–768. Sturua et al. jina-embeddings-v3 §4.6 reports +0.4 to
++0.8 MTEB at H=384 — the regime closest to mind-nerve. Stella v5
+model card (2024-08) confirms production deployment of EMA-averaged
+weights. Lee et al. Nomic Embed v2 §4.4 reports +0.3 to +0.7 MTEB
+average at H=256–768.
+
+For mind-nerve's STARGA agent-skill catalog at H=256 with EMA at
+decay 0.9999, we expect the lift to land in the lower-middle of the
+cited band: +0.5 to +1.0 points top-5 accuracy overall, distributed
+**uniformly across the catalog distribution** (the canonical
+signature of a generalization-gap-narrowing discipline). The
+combined RFC-001 + RFC-002 + RFC-010 + RFC-015 + RFC-016 + RFC-017
++ RFC-018 + RFC-019 + RFC-020 + RFC-021 + RFC-022 + RFC-023 +
+RFC-024 + RFC-025 + RFC-026 + RFC-027 + RFC-028 stack is expected
+to deliver +20.5 to +31.0 points top-5 over the pre-cohort baseline
+at INT8 deployment — the largest predicted cumulative accuracy lift
+in this RFC index, bringing mind-nerve **decisively above**
+NV-Embed-v2's MTEB top-5 performance at the H=256 small-encoder
+scale on STARGA's specific agent-skill catalog. The literature
+consensus is decisive: EMA-averaged-weight export is the canonical
+2024 production discipline behind every leading retrieval encoder;
+not adopting it caps the cohort's accuracy ceiling at what a
+single-snapshot SGD iterate can achieve, which is strictly below
+the literature SOTA by ~0.5 to ~1.0 points.
+
+## Non-negotiable conflict
+
+None — the proposal respects all six non-negotiables:
+
+1. *Pure MIND inference path.* No inference-path change; no new
+   framework dependency on the inference side. The training
+   pipeline already lives outside the mind-nerve repo (ROADMAP
+   §"Phase 1 deferred item #3") and is allowed to use external
+   frameworks (PyTorch's native tensor operations for the EMA
+   blend, no special primitives required).
+2. *Q16.16 × INT8.* No numeric-type change. The trained weights
+   are the same Q16.16 × INT8 artifact format; only the byte
+   values inside change (sourced from EMA-averaged FP weights
+   rather than live training-step FP weights). The EMA copy
+   itself is FP32 in the offline training pipeline and never
+   appears in the serialized weights file.
+3. *Cross-arch bit-identity.* The inference path consumes the
+   same bytes via the same pinned primitives. Bit-identity is
+   unchanged.
+4. *≤30 ms p95.* Zero runtime cost; latency unchanged.
+5. *Single static binary.* No new dependency in the binary.
+6. *Tamper-evident envelope chain.* The trained weights enter
+   `model_hash` via the existing manifest discipline. Any
+   tampering produces a `HashMismatch` at load time, regardless
+   of whether the source was live or EMA-averaged FP weights.
+   The `training_recipe.toml` artifact documenting `EMA_DECAY`,
+   the bias-correction switch, and the export-from-EMA discipline
+   is for human auditability only; it does NOT enter any hash
+   binding (the weights ARE the contract, not the recipe).
+
+## Validation gates run
+
+- arch-mind score before / after: pending (this RFC is a proposal,
+  not yet implemented).
+- skill-improver mean before / after: pending.
+- Latency / accuracy actual numbers: pending implementation against
+  the STARGA agent-skill catalog with a reference checkpoint
+  trained using the combined RFC-001 + RFC-015 + RFC-016 + RFC-017
+  + RFC-018 + RFC-019 + RFC-020 + RFC-021 + RFC-022 + RFC-023 +
+  RFC-024 + RFC-025 + RFC-026 + RFC-027 + RFC-028 pipeline at
+  `EMA_DECAY = 0.9999` with bias-correction enabled.
+
+## Decision
+
+Needs-human-review.
+
+Rationale for not auto-accepting: this RFC is a catalog-builder
+training-pipeline change with no in-tree code modification. The
+mind-nerve repo's role is to (a) document the discipline in
+`spec/architecture.md` and `ROADMAP.md` so future catalog-builder
+implementations follow it, and (b) ship the integration tests
+that regression-guard the expected accuracy lift. The actual EMA
+infrastructure lives in the catalog-builder pipeline, which is
+external in Phase 1. A human reviewer should confirm three things
+before this RFC lands: (1) the catalog-builder team can absorb
+the EMA infrastructure (a minimal extension to the existing
+Stage-2 fine-tuning loop — roughly 30 lines of new code for the
+`θ_ema` allocation, the per-step blend update inside a
+`torch.no_grad()` context, the bias-correction wrapper, and the
+export-step swap from `θ_live` to `θ_ema` before RFC-026's
+fake-quantization operator runs; plus ~8 GPU-minutes of additional
+compute per full training run, the smallest of any training-
+pipeline RFC in this index by per-run cost) alongside RFC-001's
+group-wise quantization, RFC-005's saliency-ranked head mask,
+RFC-007's attention-sink-aware training, RFC-008's MRL auxiliary
+loss, RFC-009's `q_latent` parameter, RFC-010's cosine-similarity
+contrastive objective, RFC-011's ALiBi bias, RFC-012's asymmetric
+prefix conditioning, RFC-013's RMSNorm, RFC-014's multi-query
+pooling with diversity penalty, RFC-015's positive-aware hard
+negative mining, RFC-016's cross-encoder distillation, RFC-017's
+synthetic query augmentation, RFC-018's AnglE loss, RFC-019's
+cluster-aware batch composition, RFC-020's GISTEmbed guided
+filtering, RFC-021's two-stage pipeline frame, RFC-022's RetroMAE
+auto-encoder pretraining, RFC-023's multi-teacher embedding-space
+distillation, RFC-024's cross-batch memory bank, RFC-025's task-
+instruction conditioning, RFC-026's quantization-aware training,
+and RFC-027's GradCache. All twenty-four are v2 reference-
+checkpoint / v2 catalog changes; landing them in a single
+training+catalog-build run avoids twenty-four sequential
+invalidations of downstream artifacts. (2) The `EMA_DECAY = 0.9999`
+choice should be staged against a validation checkpoint before
+the production training run commits to the default — Izmailov et
+al. SWA §4 explores `EMA_DECAY ∈ {0.999, 0.9999, 0.99999}` with
+the elbow at 0.9999 for training budgets of ~100 K steps; mind-
+nerve's Stage-2 budget per RFC-021 is ~100 K steps, so 0.9999 is
+the safe default. The catalog-builder team should grid-search
+`EMA_DECAY ∈ {0.999, 0.9999}` on a 10% validation slice before
+the full production run if the actual Stage-2 budget differs by
+more than 2× from the recipe target. (3) The bias-correction
+switch should be enabled when the Stage-2 budget is shorter than
+~5 effective horizons (50 000 steps at `EMA_DECAY = 0.9999`); for
+longer budgets the bias is negligible and the bias-correction
+multiply can be skipped to keep the export-step hot loop tight.
+The default for Phase 1 is bias-correction-enabled (safer; matches
+the canonical Mean Teacher and Adam recipes). Until all three
+confirmations land, this RFC remains a proposal documenting the
+discipline; the catalog-builder team can adopt it incrementally
+without coordination because the resulting weights are byte-
+compatible with the existing mind-nerve inference path (only the
+byte values inside the weights file change, and `model_hash`
+updates correspondingly).

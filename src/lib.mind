@@ -108,6 +108,48 @@ module mind_nerve {
     pub const CHAIN_RESET_CATALOG_CHANGED: u16 = 2;
     pub const CHAIN_RESET_CLOCK_RESET:     u16 = 3;
 
+    // ------------------------------------------------------------------
+    // Backwards-soft architecture switches (autoresearch IMPLEMENT phase).
+    //
+    // Each constant below is bound into `model_hash` via the manifest
+    // header. The defaults are chosen so the binary stays byte-identical
+    // to the pre-RFC build until a calibrated reference checkpoint flips
+    // a flag. Flipping a flag is therefore a versioned architecture
+    // change (new `model_hash`), never a runtime knob.
+    //
+    // The corresponding kernels / scoring helpers live in
+    // `encoder_kernels.mind`, `model.mind`, `inference.mind`, and
+    // `top_k.mind`; they `use crate::mind_nerve::{...}` to read these
+    // constants. Keep the names + types in sync.
+
+    // RFC-008 — Matryoshka coarse-to-fine route scoring. Default coarse
+    // dim == full embedding dim disables the cascade; `K_COARSE_MULTIPLIER
+    // = 1` keeps the shortlist == full route set when somehow active.
+    pub const MATRYOSHKA_COARSE_DIM:  u32 = ROUTE_EMBEDDING_DIM;
+    pub const K_COARSE_MULTIPLIER:    u32 = 1;
+
+    // RFC-010 — L2-normalized cosine similarity scoring head.
+    // 0 = unnormalized dot-product (today's behaviour).
+    pub const COSINE_SCORING_ENABLED: u32 = 0;
+
+    // RFC-011 — ALiBi per-head linear attention bias.
+    // Default slopes follow Press et al. geometric ladder
+    // (2^(-2), 2^(-4), 2^(-6), 2^(-8)) encoded in Q16.16:
+    // 1/4 ≈ 16384, 1/16 ≈ 4096, 1/64 ≈ 1024, 1/256 ≈ 256.
+    // The default-disabled gate makes the bias path dead until a
+    // reference checkpoint flips `ATTN_ALIBI_ENABLED = 1`.
+    pub const ATTN_ALIBI_ENABLED: u32 = 0;
+    pub const ATTN_ALIBI_SLOPES:  [Q16_16; ENCODER_HEADS as usize] =
+        [16384_i32, 4096_i32, 1024_i32, 256_i32];
+
+    // RFC-012 — Asymmetric query / passage prefix conditioning.
+    // 8 reserved BPE token slots (matches the catalog-builder convention).
+    // Default `QUERY_PREFIX_LEN = 0` makes the prepend path dead and
+    // the request stream byte-identical to today.
+    pub const QUERY_PREFIX_LEN:    u32        = 0;
+    pub const QUERY_PREFIX_TOKENS: [u32; 8]   = [0u32, 0u32, 0u32, 0u32,
+                                                  0u32, 0u32, 0u32, 0u32];
+
     pub mod runtime_ffi;
     pub mod q16_16;
     pub mod sha256;

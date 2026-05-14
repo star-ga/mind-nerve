@@ -64,12 +64,17 @@ fn q16_raw(raw: i32) -> Q16_16 {
 // Used for extract_top_k tests that pre-validate the id uniqueness externally.
 fn make_catalog(ids: [str], scores: [Q16_16]) -> RouteCatalog {
     let route_ids: [RouteId] = ids.map(|id| route_id_of(id));
+    // `scores` is shadowed by the embedding scoring head in production; in
+    // top-K unit tests we feed extract_top_k a precomputed logit vector
+    // directly, so this fixture only needs to populate the catalog's
+    // identity + structural fields. Embeddings and route_prior are
+    // zero-initialised (the RFC-002 backwards-soft additive identity).
+    let n = ids.len();
     RouteCatalog {
-        ids:        route_ids,
-        scores:     scores,
-        // Embeddings not exercised in top-K unit tests; zero-initialised.
-        embeddings: tensor::zeros::<Q16_16, [ids.len(), ROUTE_EMBEDDING_DIM]>(),
-        hash:       sha256(route_ids.as_bytes()),
+        ids:         route_ids,
+        embeddings:  tensor::zeros::<Q16_16, [n, ROUTE_EMBEDDING_DIM]>(),
+        route_prior: tensor::zeros::<Q16_16, [n]>(),
+        hash:        sha256(route_ids.as_bytes()),
     }
 }
 

@@ -271,14 +271,47 @@ first inference runs.
 - Not a tool execution engine. mind-nerve emits route IDs; the host calls the
   tool.
 
+## Backwards-soft architecture switches (Phase 1, autoresearch IMPLEMENT)
+
+12 architecture refinements have landed as compile-time switches in
+`src/lib.mind` and the kernel/scoring modules. Every switch defaults to
+a value that keeps the binary byte-identical to the pre-RFC build until
+a calibrated reference checkpoint flips it. Flipping a switch is a
+versioned architecture change (new `model_hash`), never a runtime knob.
+
+| RFC | Switch (default) | Implemented in | Effect when flipped |
+|---|---|---|---|
+| RFC-001 | `WEIGHTS_VERSION_V2 = 2`; `GROUP_SIZE = 32` (v1 default) | `loader.mind` | Group-wise INT8 weight quantization with shared Q16.16 scales (AWQ-style). |
+| RFC-002 | Catalog format v2 trailing prior block (v1 default) | `loader.mind`, `inference.mind` | Q16.16 per-route log-frequency / PMI prior added to logits before top-K. |
+| RFC-003 | `STRIDE_LOW = 96`, `STRIDE_MID = 192`, `STRIDE_HIGH = 256` (thresholds disabled) | `encoder_kernels.mind`, `model.mind` | Content-fingerprinted three-way adaptive window stride. |
+| RFC-005 | `HEAD_MASK_DEFAULT_ALL_ALIVE` (all heads alive) | `encoder_kernels.mind` | Compile-time bitmask zeros dead attention heads' contribution. |
+| RFC-007 | `NUM_SINK_TOKENS = 0` | `encoder_kernels.mind` | StreamingLLM-style attention sinks at fixed absolute positions. |
+| RFC-008 | `MATRYOSHKA_COARSE_DIM = ROUTE_EMBEDDING_DIM`, `K_COARSE_MULTIPLIER = 1` (cascade disabled) | `lib.mind`, `model.mind`, `inference.mind`, `top_k.mind` | Two-pass scoring: coarse dot over first `D'` dims → top-`αk` shortlist → full rerank. |
+| RFC-009 | `POOLING_KIND = POOLING_KIND_MEAN` | `encoder_kernels.mind` | Learned single-latent-query attention pooling replaces mean-pool. |
+| RFC-010 | `COSINE_SCORING_ENABLED = 0` | `lib.mind`, `model.mind`, `inference.mind` | Pooled query is L2-normalized before the scoring head (cosine sim). |
+| RFC-011 | `ATTN_ALIBI_ENABLED = 0`; slopes `[1/4, 1/16, 1/64, 1/256]` in Q16.16 | `lib.mind`, `encoder_kernels.mind` | Per-head linear distance bias on attention scores (ALiBi). |
+| RFC-012 | `QUERY_PREFIX_LEN = 0` (8 reserved slots) | `lib.mind`, `inference.mind` | Asymmetric query / passage prefix conditioning (INSTRUCTOR-style). |
+| RFC-013 | `NORMALIZATION_KIND = NORMALIZATION_KIND_LAYERNORM` | `q16_16.mind`, `encoder_kernels.mind` | RMSNorm replaces LayerNorm at pre-norm + final-norm sites. |
+| RFC-014 | `POOL_LATENT_QUERIES = 1` (single query, byte-identical to RFC-009 default-on) | `encoder_kernels.mind` | Multi-query latent attention pooling (NV-Embed-style, `r ≥ 2`). |
+
+23 further RFCs were drafted by the loop and SKIPPED — they describe
+training-time disciplines (loss formulations, hard-negative mining,
+curriculum, distillation, EMA, SAM, R-Drop, ANCE refresh, GradCache,
+RetroMAE pretraining, etc.) and are absorbed into the offline catalog-
+builder's INT8 weight + Q16.16 scale bytes via `model_hash` /
+`catalog_hash` without touching the inference surface.
+
+The full draft index, including SKIP rationale per RFC and source-paper
+citations, lives at `RFCs/INDEX.md`.
+
 ## Open questions, Phase 1
 
 These are explicitly unresolved and will be answered by Phase 1 implementation:
 
-1. Whether 12 encoder layers with no FFN sublayer are sufficient at the
-   sliding-window receptive field, or whether 16 layers become necessary to
-   hit accuracy targets on long requests where intent depends on cross-
-   window context
+1. Whether 2 encoder layers with no FFN sublayer are sufficient at the
+   sliding-window receptive field at calibrated accuracy targets, or
+   whether 3-4 layers become necessary on long requests where intent
+   depends on cross-window context
 2. Whether 32k BPE vocabulary is sufficient for Russian intent classification,
    or whether a 48k vocabulary becomes necessary at the cost of embedding
    table size

@@ -285,6 +285,14 @@ pub const ATTN_SCALE_Q16: Q16_16 = 8192_i32;   // 1/8 in Q16.16 = ONE_Q16_16 / 8
 // changes model_hash via the manifest preimage.
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Master gate. With STRIDE_FP_ENABLED = 0 the model dispatches
+// directly to ATTN_WINDOW_STRIDE and never computes the fingerprint
+// — strict byte-identity to the pre-RFC-003 binary, without relying
+// on mindc to DCE the unused fingerprint compute. Flip to 1 only
+// when calibrated thresholds (STRIDE_FP_T_LOW / STRIDE_FP_T_HIGH)
+// have been bound into model_hash.
+pub const STRIDE_FP_ENABLED: u32    = 0;
+
 pub const STRIDE_LOW:        u32    = 96;
 pub const STRIDE_MID:        u32    = 192;          // = ATTN_WINDOW_STRIDE (compile-time default)
 pub const STRIDE_HIGH:       u32    = 256;
@@ -749,6 +757,12 @@ pub fn sliding_window_attention(
     // emits zero instructions for them, and the binary stays byte-
     // identical to the pre-RFC-011 path. The latency analysis above
     // applies only when `ATTN_ALIBI_ENABLED = 1`.
+    // Backwards-soft default `ATTN_ALIBI_ENABLED = 0`: mindc proves the
+    // gate is statically false, dead-code-eliminates this allocation and
+    // the per-(i, j) bias-add site below, and the binary stays byte-
+    // identical to the pre-RFC-011 path. Audit note (2026-05-14):
+    // verify mindc actually elides the alloc once mindc build runs; if
+    // not, restructure to compute the bias inline at the add site.
     let mut alibi_bias: [[Q16_16; n]; ENCODER_HEADS as usize] =
         [[0_i32; n]; ENCODER_HEADS as usize];
     if ATTN_ALIBI_ENABLED == 1u32 {

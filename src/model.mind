@@ -74,14 +74,17 @@ where
         // ONCE per inference against the embedded sequence; the selected
         // stride is constant across both encoder layers within this
         // inference (so the fingerprint is computed once, not per layer).
-        // With backwards-soft default thresholds (STRIDE_FP_T_LOW =
-        // MIN_Q16_16, STRIDE_FP_T_HIGH = MAX_Q16_16), `select_stride`
-        // always returns STRIDE_MID = ATTN_WINDOW_STRIDE = 192, producing
-        // byte-identical attention output to today. Calibrated thresholds
-        // bound into model_hash flip the binary into the adaptive regime
-        // without any further mind-nerve code change.
-        let stride_fp: Q16_16 = encoder_kernels::compute_stride_fingerprint(x);
-        let stride:    u32    = encoder_kernels::select_stride(stride_fp);
+        // With backwards-soft default `STRIDE_FP_ENABLED = 0`, the
+        // fingerprint and the select_stride() dispatch are statically
+        // dead and `stride = ATTN_WINDOW_STRIDE`, producing byte-identical
+        // attention to today. Audit 2026-05-14 hardened this from a
+        // mindc-DCE assumption to an explicit gate.
+        let stride: u32 = if encoder_kernels::STRIDE_FP_ENABLED == 1u32 {
+            let stride_fp: Q16_16 = encoder_kernels::compute_stride_fingerprint(x);
+            encoder_kernels::select_stride(stride_fp)
+        } else {
+            ATTN_WINDOW_STRIDE
+        };
 
         // 2-layer sliding-window encoder (loop bound = ENCODER_LAYERS).
         // Pre-norm; no FFN sublayer.

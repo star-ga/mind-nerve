@@ -150,6 +150,18 @@ module mind_nerve {
     pub const QUERY_PREFIX_TOKENS: [u32; 8]   = [0u32, 0u32, 0u32, 0u32,
                                                   0u32, 0u32, 0u32, 0u32];
 
+    // Audit follow-up F1: model_hash binding gate.
+    // 0 = legacy: loader reads model_hash from disk as opaque (today's
+    //     behaviour, byte-identical to pre-RFC builds).
+    // 1 = strict: loader computes SHA-256 over the canonical compile-time
+    //     constant preimage and rejects the bundle with HashMismatch if
+    //     the on-disk model_hash doesn't match.
+    // Flip to 1 once the offline catalog-builder pipeline emits weights
+    // files whose model_hash is the SHA-256 of `compute_model_hash()`'s
+    // canonical preimage. Until then, leave at 0 to preserve compatibility
+    // with already-produced reference checkpoints.
+    pub const MODEL_HASH_BIND_ENABLED: u32 = 0;
+
     pub mod runtime_ffi;
     pub mod q16_16;
     pub mod sha256;

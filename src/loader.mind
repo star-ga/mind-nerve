@@ -187,9 +187,24 @@ use crate::mind_nerve::{
     Q16_16,
     ENCODER_LAYERS,
     ENCODER_HIDDEN,
+    ENCODER_HEADS,
+    ATTN_WINDOW_SIZE,
+    ATTN_WINDOW_STRIDE,
     VOCAB_SIZE,
+    MAX_REQUEST_TOKENS,
     ROUTE_EMBEDDING_DIM,
     Q16_FRAC_BITS,
+    WEIGHT_BITS,
+    ACTIVATION_BITS,
+    NUMERICS_WIRE_VERSION,
+    MODEL_HASH_BIND_ENABLED,
+    MATRYOSHKA_COARSE_DIM,
+    K_COARSE_MULTIPLIER,
+    COSINE_SCORING_ENABLED,
+    ATTN_ALIBI_ENABLED,
+    ATTN_ALIBI_SLOPES,
+    QUERY_PREFIX_LEN,
+    QUERY_PREFIX_TOKENS,
 };
 use crate::mind_nerve::inference::{
     RouteCatalog,
@@ -579,6 +594,120 @@ pub fn parse_catalog(bytes: &[u8]) -> Result<RouteCatalog, LoaderError> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// compute_model_hash — audit follow-up F1 (2026-05-14)
+//
+// SHA-256 over a canonical byte preimage built from the compile-time
+// constants that fully describe the inference architecture and every
+// backwards-soft RFC switch landed in the autoresearch IMPLEMENT phase.
+//
+// Two invariants:
+//   1. Producers (the offline catalog-builder pipeline) compute the same
+//      preimage with the same constant values and write the resulting
+//      digest into the weights file's `model_hash` field at offset 8.
+//   2. Consumers (parse_weights, when MODEL_HASH_BIND_ENABLED == 1)
+//      recompute it and reject with HashMismatch on disagreement.
+//
+// Wire format of the preimage (every field is little-endian, lengths in
+// bytes after each tag's u32 length-prefix where applicable):
+//
+//   tag       length     payload
+//   ---       ------     -------
+//   "MNMH"    4          magic
+//   u32       4          ENCODER_LAYERS
+//   u32       4          ENCODER_HIDDEN
+//   u32       4          ENCODER_HEADS
+//   u32       4          ATTN_WINDOW_SIZE
+//   u32       4          ATTN_WINDOW_STRIDE
+//   u32       4          VOCAB_SIZE
+//   u32       4          MAX_REQUEST_TOKENS
+//   u32       4          ROUTE_EMBEDDING_DIM
+//   u8        1          WEIGHT_BITS
+//   u8        1          ACTIVATION_BITS
+//   u8        1          NUMERICS_WIRE_VERSION
+//   u8        1          Q16_FRAC_BITS as u8
+//
+//   u32       4          MATRYOSHKA_COARSE_DIM
+//   u32       4          K_COARSE_MULTIPLIER
+//   u32       4          COSINE_SCORING_ENABLED
+//   u32       4          ATTN_ALIBI_ENABLED
+//   ENCODER_HEADS * 4    ATTN_ALIBI_SLOPES (Q16.16 i32-LE, ascending head)
+//   u32       4          QUERY_PREFIX_LEN
+//   8 * 4     32         QUERY_PREFIX_TOKENS (u32-LE, ascending slot)
+//
+// Constants from `encoder_kernels` and elsewhere that affect runtime
+// behaviour are folded into the preimage at the call site by importing
+// them through `model::HEAD_MASK_BYTES` (already exported) and
+// `encoder_kernels::*` follow-up exports as those are added.
+//
+// The preimage is self-describing: each field's byte width is fixed,
+// so a future addition (e.g. RFC-015 group-quant scale dtype) appends
+// at the bottom of the layout above with a corresponding `MNMH` magic
+// version bump, never reorders or rewrites earlier fields.
+
+@[determinism(BitIdentical)]
+pub fn compute_model_hash() -> [u8; 32] {
+    let mut preimage: Vec<u8> = Vec::new();
+
+    // Magic.
+    preimage.push(0x4Du8); preimage.push(0x4Eu8);
+    preimage.push(0x4Du8); preimage.push(0x48u8);
+
+    // Helper: push a u32 little-endian.
+    fn push_u32_le(v: u32, p: &mut Vec<u8>) {
+        p.push(( v        & 0xFFu32) as u8);
+        p.push(((v >> 8 ) & 0xFFu32) as u8);
+        p.push(((v >> 16) & 0xFFu32) as u8);
+        p.push(((v >> 24) & 0xFFu32) as u8);
+    }
+    // Helper: push a Q16.16 (i32) little-endian.
+    fn push_i32_le(v: i32, p: &mut Vec<u8>) {
+        p.push(( v        & 0xFFi32) as u8);
+        p.push(((v >> 8 ) & 0xFFi32) as u8);
+        p.push(((v >> 16) & 0xFFi32) as u8);
+        p.push(((v >> 24) & 0xFFi32) as u8);
+    }
+
+    // Fixed architecture.
+    push_u32_le(ENCODER_LAYERS,       &mut preimage);
+    push_u32_le(ENCODER_HIDDEN,       &mut preimage);
+    push_u32_le(ENCODER_HEADS,        &mut preimage);
+    push_u32_le(ATTN_WINDOW_SIZE,     &mut preimage);
+    push_u32_le(ATTN_WINDOW_STRIDE,   &mut preimage);
+    push_u32_le(VOCAB_SIZE,           &mut preimage);
+    push_u32_le(MAX_REQUEST_TOKENS,   &mut preimage);
+    push_u32_le(ROUTE_EMBEDDING_DIM,  &mut preimage);
+    preimage.push(WEIGHT_BITS);
+    preimage.push(ACTIVATION_BITS);
+    preimage.push(NUMERICS_WIRE_VERSION);
+    preimage.push(Q16_FRAC_BITS as u8);
+
+    // RFC-008 — Matryoshka coarse-to-fine scoring.
+    push_u32_le(MATRYOSHKA_COARSE_DIM, &mut preimage);
+    push_u32_le(K_COARSE_MULTIPLIER,   &mut preimage);
+
+    // RFC-010 — Cosine scoring head.
+    push_u32_le(COSINE_SCORING_ENABLED, &mut preimage);
+
+    // RFC-011 — ALiBi attention bias.
+    push_u32_le(ATTN_ALIBI_ENABLED, &mut preimage);
+    let mut h_idx: usize = 0;
+    while h_idx < ENCODER_HEADS as usize {
+        push_i32_le(ATTN_ALIBI_SLOPES[h_idx], &mut preimage);
+        h_idx = h_idx + 1;
+    }
+
+    // RFC-012 — Query prefix.
+    push_u32_le(QUERY_PREFIX_LEN, &mut preimage);
+    let mut t_idx: usize = 0;
+    while t_idx < 8usize {
+        push_u32_le(QUERY_PREFIX_TOKENS[t_idx], &mut preimage);
+        t_idx = t_idx + 1;
+    }
+
+    sha256(preimage.as_slice())
+}
+
 @[determinism(BitIdentical)]
 pub fn parse_weights(bytes: &[u8]) -> Result<ModelWeights, LoaderError> {
     // (1) Header.
@@ -612,6 +741,17 @@ pub fn parse_weights(bytes: &[u8]) -> Result<ModelWeights, LoaderError> {
         model_hash[h]     = bytes[8  + h];
         tokenizer_hash[h] = bytes[40 + h];
         h = h + 1;
+    }
+
+    // Audit follow-up F1: when MODEL_HASH_BIND_ENABLED == 1, recompute
+    // the architecture-constant SHA-256 and reject the bundle if the
+    // producer's model_hash field disagrees. Under the default `= 0` the
+    // check is dead and the legacy opaque-bytes path is preserved.
+    if MODEL_HASH_BIND_ENABLED == 1u32 {
+        let recomputed: [u8; 32] = compute_model_hash();
+        if !hash_eq_32(model_hash, recomputed) {
+            return Err(LoaderError::HashMismatch);
+        }
     }
 
     let encoder_layers: u32 = read_u32_le(bytes, 72);

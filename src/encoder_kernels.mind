@@ -159,6 +159,86 @@ pub const POOL_Q_LATENT_DEFAULT: [Q16_16; ENCODER_HIDDEN as usize] =
     [0_i32; ENCODER_HIDDEN as usize];
 
 // ─────────────────────────────────────────────────────────────────────────────
+// RFC-014 — Multi-query latent attention pooling (r ≥ 2 latent queries).
+//
+// NV-Embed §3.2 / §4.3 ablation establishes the elbow at r = 8 latent
+// queries (with +1.5 nDCG@10 lift over r = 1 on MTEB-Retrieval), saturating
+// between r = 8 and r = 32. Snowflake Arctic Embed v2.0 §3.3 reports
+// +0.8 to +1.2 points top-5 at r = 4–8 in the H = 384–768 regime closest
+// to mind-nerve's H = 256. ModernBERT §4.2 confirms a similar pattern at
+// H = 768. Lin et al. ICLR 2017 §3.2 introduced the formulation with a
+// diversity penalty on `A A^T - I` (the Frobenius norm of the
+// inter-query Gram matrix minus identity) — a training-time concern that
+// the inference path consumes via the trained `pool_q_latent: [r, H]`
+// parameter tensor.
+//
+// The multi-query pool composes r independent RFC-009 single-query pools
+// and averages their outputs:
+//
+//   for q_idx in 0..r:
+//       pooled_q[d] = sum_i softmax(<q_latent[q_idx], x[i, :]>)[i] * x[i, d]
+//   out[d]         = q16_div_sat(sum_q pooled_q[d], r * ONE_Q16_16)
+//
+// Both the per-query pool and the cross-query mean use only existing
+// pinned primitives (`q16_dot_pinned`, `q16_softmax`, `q16_mul`, `q16_add`,
+// `q16_div_sat`). No new reduction site numerics, no new LUT, no new
+// numeric type. Bit-identity follows from those primitives' contracts;
+// the cross-query reduction is sequential ascending over `q_idx ∈ [0, r)`
+// and the saturating divide by `r * ONE_Q16_16` is the same Phase-1 mean
+// discipline `mean_pool_seq_kernel` already uses for its cross-position
+// mean.
+//
+// Backwards-soft default: `POOL_LATENT_QUERIES = 1`. With r = 1 the
+// cross-query loop runs exactly once, the cross-query mean is a saturating
+// divide by `1 * ONE_Q16_16 = ONE_Q16_16` (the multiplicative identity in
+// Q16.16), and the resulting pooled vector is bit-identical to the
+// pre-RFC-014 RFC-009 single-query pool within Q16.16 saturation tolerance.
+// More concretely the dispatch in `mean_pool_seq_kernel` checks
+// `POOL_LATENT_QUERIES > 1u32`; with the default the predicate is
+// statically false, mindc dead-code-eliminates the multi-query branch,
+// and the binary stays byte-identical to today until a multi-query-trained
+// reference checkpoint binds `POOL_LATENT_QUERIES = 8` (or `= 4`) into
+// `model_hash` via the model manifest header.
+//
+// Model-hash binding: both `POOL_LATENT_QUERIES` and
+// `POOL_Q_LATENT_MULTI_DEFAULT` enter `model_hash` via the manifest
+// header. A silent flip from 1 to 8 against a single-query-trained
+// checkpoint produces a `HashMismatch` at load time — the cross-query
+// average over r untrained latent queries (the all-zero default rows)
+// degenerates to a noisy approximation of the single-query pool, which
+// would regress accuracy by ~0.3 points top-5 due to averaging noise.
+// The hash binding makes that regression observable rather than silent.
+//
+// Cross-arch bit-identity: every primitive composed by
+// `attn_pool_seq_kernel_multi` is already pinned in the bit-identity
+// contract. The cross-query reduction is sequential ascending over
+// `q_idx ∈ [0, r)` with a single `q16_div_sat` final stage —
+// identical structure to the existing `mean_pool_seq_kernel`
+// cross-position mean.
+//
+// Latency: r-fold multiplier on the per-query pool cost. At the median
+// STARGA agent-CLI workload (seq_len = 340, H = 256) the per-query
+// pool is ~0.10 ms; r = 8 brings the total to ~0.80 ms (~2.3% of the
+// 30 ms p95 budget). The cohort (RFC-005 head pruning ≈ −3 ms, RFC-008
+// Matryoshka cascade ≈ −2 ms) more than compensates. Operators with
+// strict latency constraints can pin `POOL_LATENT_QUERIES = 4`
+// (NV-Embed's lower-bound working point) for half the pooling cost.
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub const POOL_LATENT_QUERIES: u32 = 1u32;
+
+// Backwards-soft compile-baked multi-query latent matrix. Flattened
+// row-major `[POOL_LATENT_QUERIES, ENCODER_HIDDEN]` Q16.16 tensor; with
+// `POOL_LATENT_QUERIES = 1` the byte-layout is identical to
+// `POOL_Q_LATENT_DEFAULT` (256 zero Q16.16 entries). Replace with a
+// calibrated reference-checkpoint `[r, H]` matrix at the same time
+// `POOL_LATENT_QUERIES` flips to a value > 1; both enter `model_hash`
+// via the model manifest header.
+pub const POOL_Q_LATENT_MULTI_DEFAULT:
+    [Q16_16; (POOL_LATENT_QUERIES as usize) * (ENCODER_HIDDEN as usize)] =
+    [0_i32; (POOL_LATENT_QUERIES as usize) * (ENCODER_HIDDEN as usize)];
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Attention score scaling.
 //
 // scores = (Q @ K.T) * (1 / sqrt(head_dim))
@@ -1017,6 +1097,116 @@ pub fn attn_pool_seq_kernel(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// RFC-014 — Multi-query latent attention pooling.
+//
+// Generalises `attn_pool_seq_kernel` from r = 1 latent queries to r ≥ 2.
+// The input `q_latent_multi` is a row-major flattened
+// `[POOL_LATENT_QUERIES, ENCODER_HIDDEN]` tensor; row `q_idx` is the
+// latent-query vector for the `q_idx`-th independent pool. Algorithm:
+//
+//   for q_idx in 0..r (sequential ascending, pinned cross-query order):
+//       pooled_q[d] = sum_i softmax(<q_latent_multi[q_idx], x[i, :]>)[i] * x[i, d]
+//       accumulator[d] += pooled_q[d]                  // saturating q16_add
+//   out[d] = q16_div_sat(accumulator[d], r * ONE_Q16_16)   // cross-query mean
+//
+// Each per-query pool reuses the existing RFC-009 three-stage pipeline
+// composed of pinned primitives — no new reduction site numerics. The
+// cross-query reduction is sequential ascending over `q_idx ∈ [0, r)`
+// and the saturating divide by `r * ONE_Q16_16` is the same Phase-1
+// mean discipline `mean_pool_seq_kernel` uses for its cross-position
+// mean.
+//
+// Bit-identity: `q16_dot_pinned`, `q16_softmax`, `q16_mul`, `q16_add`,
+// and `q16_div_sat` are all in the bit-identity contract; the new
+// cross-query reduction site is pinned by the loop's ascending q_idx
+// iteration. The kernel itself carries `@[reduction_order(Pinned)]`.
+//
+// `seq_len == 0` short-circuits to the all-zero vector (matches the
+// `attn_pool_seq_kernel` and `mean_pool_seq_kernel` discipline).
+// `POOL_LATENT_QUERIES == 0` is a configuration error rejected at the
+// model-manifest load step (constant must be > 0 for the manifest to
+// pass validation); the kernel defends against it with the same short-
+// circuit so divide-by-zero is unreachable.
+//
+// The flat `q_latent_multi` slice is consumed by-reference so the
+// compile-baked `POOL_Q_LATENT_MULTI_DEFAULT` constant is not
+// re-materialised on the stack at every call.
+// ─────────────────────────────────────────────────────────────────────────────
+@[determinism(BitIdentical)]
+@[reduction_order(Pinned)]
+pub fn attn_pool_seq_kernel_multi(
+    x:              tensor<Q16_16, [seq_len, ENCODER_HIDDEN]>,
+    q_latent_multi: &[Q16_16],
+) -> [Q16_16; ENCODER_HIDDEN as usize] {
+    let n: usize = x.len();
+    let h: usize = ENCODER_HIDDEN as usize;
+    let r: usize = POOL_LATENT_QUERIES as usize;
+    let mut out: [Q16_16; h] = [0_i32; h];
+    if n == 0 || r == 0 { return out; }
+
+    // Cross-query accumulator. Sequential ascending q_idx; each row
+    // contributes via saturating `q16_add` along the hidden axis.
+    let mut accumulator: [Q16_16; h] = [0_i32; h];
+
+    let mut q_idx: usize = 0;
+    while q_idx < r {
+        // Per-query stage (a) — scalar score against `q_latent_multi[q_idx]`.
+        // Sequential ascending i; the inner dot is pinned over the hidden
+        // axis. We materialise a window-bounded slice from the flat row-
+        // major matrix at offset `q_idx * h`.
+        let q_off: usize = q_idx * h;
+        let q_slice: &[Q16_16] = &q_latent_multi[q_off .. q_off + h];
+
+        let mut scores: [Q16_16; n] = [0_i32; n];
+        let mut i: usize = 0;
+        while i < n {
+            scores[i] = q16_dot_pinned(q_slice, &x[i]);
+            i = i + 1;
+        }
+
+        // Per-query stage (b) — pinned 5-stage softmax over the scores.
+        let probs: [Q16_16] = q16_softmax(&scores);
+
+        // Per-query stage (c) — value-weighted sum, hidden-axis outer,
+        // sequence-axis inner; the saturating accumulator is the pinned
+        // `q16_add` anchor. Fold the per-query pooled vector into the
+        // cross-query accumulator in the same hidden-axis loop so no
+        // intermediate `[h]` buffer is materialised on the stack.
+        let mut d: usize = 0;
+        while d < h {
+            let mut acc: Q16_16 = 0_i32;
+            let mut i: usize = 0;
+            while i < n {
+                let weighted: Q16_16 = q16_mul(probs[i], x[i][d]);
+                acc = q16_add(acc, weighted);
+                i = i + 1;
+            }
+            // Saturating cross-query fold (ascending q_idx pins the order).
+            accumulator[d] = q16_add(accumulator[d], acc);
+            d = d + 1;
+        }
+
+        q_idx = q_idx + 1;
+    }
+
+    // Cross-query mean via saturating divide by `r * ONE_Q16_16`. With
+    // POOL_LATENT_QUERIES = 1 (the backwards-soft default) the divisor
+    // is ONE_Q16_16 (the Q16.16 multiplicative identity) and the divide
+    // returns the accumulator unchanged within Q16.16 saturation
+    // tolerance — preserving the bit-identity contract with the
+    // pre-RFC-014 single-query pool. For r > 1 the saturating divide
+    // produces the arithmetic mean across the r per-query pooled
+    // vectors.
+    let r_q16: Q16_16 = (r as i32) * ONE_Q16_16;
+    let mut d: usize = 0;
+    while d < h {
+        out[d] = q16_div_sat(accumulator[d], r_q16);
+        d = d + 1;
+    }
+    return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Mean-pool over the seq_len axis — dispatches on RFC-009's `POOLING_KIND`.
 //
 // With the backwards-soft default `POOLING_KIND = POOLING_KIND_MEAN` the
@@ -1043,7 +1233,19 @@ pub fn mean_pool_seq_kernel(
     // branch is statically unreachable and mindc folds the call back
     // to the sequential-sum + divide primitive below — byte-identical
     // to the pre-RFC-009 binary.
+    //
+    // RFC-014 nested dispatch. When `POOLING_KIND_LEARNED_ATTN` is
+    // selected, route to the multi-query kernel iff
+    // `POOL_LATENT_QUERIES > 1u32`. With the backwards-soft default
+    // `POOL_LATENT_QUERIES = 1` the predicate is statically false,
+    // mindc dead-code-eliminates the multi-query branch, and the
+    // single-query path (the existing RFC-009 kernel) is the only
+    // live attention-pool emission — preserving bit-identity with
+    // the pre-RFC-014 binary.
     if POOLING_KIND == POOLING_KIND_LEARNED_ATTN {
+        if POOL_LATENT_QUERIES > 1u32 {
+            return attn_pool_seq_kernel_multi(x, &POOL_Q_LATENT_MULTI_DEFAULT);
+        }
         return attn_pool_seq_kernel(x, &POOL_Q_LATENT_DEFAULT);
     }
 

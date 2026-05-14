@@ -3528,6 +3528,33 @@ latency constraints (sub-10 ms p95) can pin
 `POOL_LATENT_QUERIES = 4` permanently for a more conservative
 +0.5 to +1.0 point lift at half the pooling cost.
 
+**Status:** IMPLEMENTED at exp14 — `src/encoder_kernels.mind` adds a
+backwards-soft compile-time constant `pub const POOL_LATENT_QUERIES:
+u32 = 1u32` plus a row-major flattened `POOL_Q_LATENT_MULTI_DEFAULT:
+[Q16_16; (POOL_LATENT_QUERIES as usize) * (ENCODER_HIDDEN as usize)]
+= [0_i32; ...]` matrix (both bound into `model_hash` via the model
+manifest header). A new pinned `attn_pool_seq_kernel_multi(x,
+q_latent_multi)` kernel composes only existing pinned primitives —
+per-query stages (a) `q16_dot_pinned(q_slice, &x[i])` score loop,
+(b) pinned 5-stage `q16_softmax(&scores)`, (c) hidden-axis outer /
+sequence-axis inner saturating `q16_mul`+`q16_add` weighted sum —
+folded into a cross-query `accumulator: [Q16_16; H]` via saturating
+`q16_add` in ascending `q_idx ∈ [0, POOL_LATENT_QUERIES)`, finalised
+by an ascending-d `q16_div_sat(accumulator[d], r * ONE_Q16_16)`
+cross-query mean. The `mean_pool_seq_kernel` dispatch is extended
+with a nested compile-time-resolvable predicate `if POOLING_KIND ==
+POOLING_KIND_LEARNED_ATTN { if POOL_LATENT_QUERIES > 1u32 {
+attn_pool_seq_kernel_multi } else { attn_pool_seq_kernel } } else
+{ mean-pool primitive }`. With the backwards-soft default
+`POOL_LATENT_QUERIES = 1` the multi-query predicate is statically
+false, mindc constant-folds the dispatch back to the existing
+RFC-009 single-query pool, the saturating divisor collapses to
+`ONE_Q16_16` (the Q16.16 multiplicative identity), and the binary
+stays byte-identical to today until a multi-query-trained reference
+checkpoint binds `POOL_LATENT_QUERIES = 8` (or `= 4`) into
+`model_hash` alongside a calibrated `POOL_Q_LATENT_MULTI_DEFAULT`
+matrix.
+
 ---
 
 # RFC-015 — Positive-aware hard negative mining with teacher-based false-positive filtering for catalog training
@@ -4142,6 +4169,34 @@ catalog-builder team can adopt it incrementally without coordination
 because the resulting weights are byte-compatible with the existing
 mind-nerve inference path (only the byte values inside the weights
 file change, and `model_hash` updates correspondingly).
+
+**Status:** SKIPPED — Training/catalog-builder-side only. The RFC's
+own "Adoption plan" lists `src/loader.mind`, `src/inference.mind`,
+`src/model.mind`, and `Mind.toml` as **no change**: the listwise KL
+distillation against a cross-encoder reranker teacher
+(bge-reranker-large / bge-reranker-v2-m3) at `T = 2.0`, `α = 0.5`
+runs inside the offline catalog-builder fine-tuning loop; the
+mind-nerve inference path consumes the resulting Q16.16 × INT8
+weights file byte-for-byte identically regardless of how those
+bytes were trained. The "Expected latency delta" is explicitly
+**zero** ("The change is offline at training-pipeline time. The
+inference path consumes the same Q16.16 weights file and the same
+Q16.16 route embeddings via the same pinned primitives. No runtime
+change.") and bit-identity is "trivially preserved" because no
+in-tree numerics change. The accuracy claim (+2.5 to +3.5 points
+top-5 from the +6.0 to +9.0 point combined RFC-002 + RFC-010 +
+RFC-015 + RFC-016 stack) is empirically grounded in the cited 2024
+embedding lines (E5, BGE, mGTE, NV-Embed, Arctic Embed v2.0,
+jina-embeddings-v3) but the gain materialises in the offline
+training run, not in `src/`. Belongs in the catalog-builder repo
+alongside RFC-015 (positive-aware hard-negative mining), RFC-017
+(LLM-generated synthetic queries), RFC-018 (AnglE loss), and the
+rest of the training-side cohort. The integration tests cited in
+the RFC (`tests/integration/test_distilled_trained_weights.mind`,
+`tests/integration/test_distilled_long_tail_concentration.mind`)
+are accuracy regression-guards that depend on a v2 reference
+checkpoint shipped through the offline pipeline; they cannot be
+satisfied by changes to inference code.
 
 ---
 

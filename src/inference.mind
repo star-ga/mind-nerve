@@ -27,6 +27,8 @@ use crate::mind_nerve::chain_log;
 use crate::mind_nerve::chain_log::ChainLog;
 use crate::mind_nerve::tokenizer;
 use crate::mind_nerve::sha256::sha256 as sha256_impl;
+// RFC-002: route-prior elementwise add before top-K extraction.
+use crate::mind_nerve::q16_16::q16_add;
 use crate::mind_nerve::top_k::{
     self,
     RouteId            as TopKRouteId,
@@ -273,7 +275,24 @@ pub fn preselect_pre_tokenized(
     let token_ids: tensor<u32, [1, tokens.len()]> = [tokens.to_owned()];
     let enc_out      = model::encoder(token_ids, weights.encoder);
     let pooled_query = model::mean_pool_seq(enc_out);
-    let logits       = model::score_against_routes(pooled_query, catalog.embeddings);
+    let mut logits   = model::score_against_routes(pooled_query, catalog.embeddings);
+
+    // (4b) RFC-002: add the per-route log-frequency catalog co-occurrence
+    //      prior elementwise to the logits BEFORE top-K extraction. The
+    //      prior is a Q16.16 column carried in `catalog.route_prior`,
+    //      shipped by the offline catalog-builder pipeline when the .cat
+    //      file is v2. For v1 catalogs the prior is the all-zero vector
+    //      (additive identity) so this loop is a no-op and the resulting
+    //      logits remain byte-identical to the pre-RFC-002 path. The
+    //      reduction site is pinned by ascending r; the operation is a
+    //      single saturating `q16_add` per route (≤ 10K iterations at the
+    //      Phase 1 catalog ceiling — well under 0.1% of the 30 ms p95
+    //      budget).
+    let mut pr: usize = 0;
+    while pr < num_routes {
+        logits[0][pr] = q16_add(logits[0][pr], catalog.route_prior[pr]);
+        pr = pr + 1;
+    }
 
     // (5) Deterministic top-K with SHA-256 (route_id) tie-break.
     //     extract_top_k saturates at num_routes when k > num_routes, so

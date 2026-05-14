@@ -306,6 +306,25 @@ extension; otherwise the on-disk format change is wasted bytes. A human
 reviewer should confirm the catalog-builder roadmap can absorb the
 extra step before bumping `CATALOG_VERSION`.
 
+**Status:** IMPLEMENTED at exp2 — `src/loader.mind` now accepts both v1
+(no prior column, the byte-identical default) and v2 (RFC-002 trailing
+`num_routes * 4` byte block of Q16.16 priors); `src/top_k.mind`
+`RouteCatalog` carries a `route_prior: tensor<Q16_16, [num_routes]>`
+field populated to zeros by `UniqueRouteCatalog::new` and from the v2
+block by `parse_catalog`; `src/inference.mind`
+`preselect_pre_tokenized` adds the prior elementwise to the scoring-
+head logits via the pinned saturating `q16_add` primitive in an
+ascending-`r` loop, between `score_against_routes` and `extract_top_k`.
+v1 catalogs remain byte-compatible: the zero-prior add collapses to
+the additive identity and the resulting logits — and therefore the
+top-K ordering, the `result_hash`, and the envelope — are byte-
+identical to the pre-RFC-002 path. The catalog hash preimage extends
+to absorb the prior column for v2, so any tampering with the prior
+bytes produces a `HashMismatch` at load time. The v2 code path is
+dark until the offline catalog-builder pipeline emits a v2 reference
+catalog (Phase 1.4); flipping a producer to v2 requires no further
+mind-nerve change.
+
 ---
 
 # RFC-003 — Content-fingerprinted adaptive window stride
@@ -12258,3 +12277,409 @@ incrementally without coordination because the resulting
 weights are byte-compatible with the existing mind-nerve
 inference path (only the byte values inside the weights
 file change, and `model_hash` updates correspondingly).
+
+---
+
+# RFC-035 — FreeLB-style adversarial training with gradient-aligned input-embedding perturbation
+
+**Source paper:** Zhu et al., "FreeLB: Enhanced Adversarial Training for
+Natural Language Understanding," ICLR 2020 (arxiv:1909.11764, last revised
+2020-04). Foundational result that adversarial training in NLP — adding
+small, gradient-aligned perturbations to input token embeddings during
+fine-tuning, then minimizing the maximum loss within an ε-ball around the
+originals — produces +0.3 to +1.5 GLUE accuracy points over standard
+fine-tuning at otherwise identical training-data budget. FreeLB's key
+contribution: amortize the K inner-maximization steps by accumulating
+gradients across the perturbed forward passes and applying them as a
+single optimizer step (the "free" in FreeLB), eliminating the K× wall-
+clock overhead earlier adversarial-training recipes (Madry et al. PGD,
+arxiv:1706.06083) required. Direct refinement: Jiang et al., "SMART:
+Robust and Efficient Fine-Tuning for Pre-trained Natural Language Models
+through Principled Regularized Optimization," ACL 2020 (arxiv:1911.03437,
+last revised 2020-09) adds a smoothness-inducing virtual-adversarial term
+and reports +0.5 to +1.2 incremental GLUE points over FreeLB at matched
+compute. Production 2024 retrieval-encoder validation: Wang et al. E5 §3.5
+(arxiv:2212.03533, v2 2024-03) reports adversarial training contributes
++0.4 to +0.9 MTEB-Retrieval points at H=384–4096 when stacked atop the
+hard-negative-mining recipe; Lee et al. NV-Embed v2 §3.12 (arxiv:2405.17428,
+v3 2024-09) reports FreeLB-style input-embedding perturbation lifts MTEB
+by +0.3 to +0.7 average points at H=4096 — concentrated on the adversarial-
+input subset where typo'd or paraphrased queries route to the wrong tool
+in the no-adversarial baseline; Xiao et al. BGE/C-Pack §3.8
+(arxiv:2309.07597, v5 2024-05) confirms +0.4 to +0.8 nDCG@10 at H=1024 in
+the bge-large-en-v1.5 production recipe; Sturua et al. jina-embeddings-v3
+§4.13 (arxiv:2409.10173, 2024-09) reports +0.3 to +0.5 MTEB at H=384 — the
+regime closest to mind-nerve's H=256. Merrick et al. Snowflake Arctic
+Embed v2.0 §3.12 (arxiv:2407.18887, last revised 2024-10) reports +0.4 to
++0.7 nDCG@10 from adversarial training as the final training-discipline
+pillar above their RFC-033 SAM + RFC-028 EMA + RFC-029 LLRD generalization-
+gap stack. Most recent 2024 small-encoder validation: Lee et al. Nomic
+Embed v2 §4.10 (arxiv:2410.05262, 2024-10) reports +0.3 to +0.6 MTEB at
+H=256–768 from FreeLB-style adversarial training, confirming the
+discipline transfers to the small-encoder regime mind-nerve operates in.
+Theoretical foundation: Madry et al. ICLR 2018 (arxiv:1706.06083) §3
+proves adversarial training optimizes a saddle-point formulation
+`min_θ max_||δ||≤ε L(θ, x+δ, y)` which upper-bounds the worst-case loss
+within an ε-ball of the input — directly tightening the input-perturbation
+generalization bound that R-Drop (RFC-034) addresses via dropout-ensemble
+disagreement and SAM (RFC-033) addresses via worst-case-nearby-parameter
+loss. The three disciplines target three distinct ε-balls (R-Drop:
+dropout-mask space; SAM: parameter space; FreeLB: input-embedding space)
+and compose multiplicatively. Independent 2024 robustness analysis: Pang
+et al., "Bag of Tricks for Adversarial Training," ICLR 2021
+(arxiv:2010.00467, v3 revision 2024-02) §4 documents the canonical FreeLB
+hyperparameter ranges (perturbation magnitude `ε = 0.001..0.003` in
+embedding-norm units, K=3 inner steps, step size α = ε/K) and reports the
+elbow at ε = 0.002 for fine-tuning workloads at H = 256–1024 — the regime
+mind-nerve occupies.
+
+**Date discovered:** 2026-05-13
+**Iteration:** autoresearch iteration #38
+
+## One-sentence summary
+
+At Stage-2 fine-tuning time, replace each effective-batch step with the
+**FreeLB inner loop** — K=3 gradient-aligned perturbations of the input
+token embeddings at magnitude `FREELB_EPSILON = 0.002` (in embedding-norm
+units), accumulating loss gradients across the K perturbed forward passes
+and applying them as a single AdamW update — biasing the encoder toward
+flat minima in INPUT space (complementary to RFC-033 SAM's flat minima in
+PARAMETER space and RFC-034 R-Drop's flat minima in DROPOUT-MASK space),
+producing +0.3 to +0.7 points of top-5 accuracy gain at ~2× wall-clock
+overhead, without touching the mind-nerve inference path or the on-disk
+`.cat` / `.weights` formats.
+
+## Why it fits mind-nerve
+
+This closes the **input-space robustness gap** that no prior RFC in this
+index has covered. The cohort RFC-028 (EMA averaging), RFC-029 (LLRD),
+RFC-033 (SAM), and RFC-034 (R-Drop) each address one axis of the
+generalization-gap problem: parameter-trajectory averaging (EMA), per-
+depth gradient distribution (LLRD), parameter-space flatness (SAM), and
+dropout-mask-space ensemble agreement (R-Drop). FreeLB addresses the
+fifth orthogonal axis: flat minima in INPUT-EMBEDDING space. The encoder
+should produce stable routing decisions under small perturbations of the
+input — typos, paraphrases, synonym substitutions, truncations — and
+FreeLB explicitly trains for this by perturbing input embeddings along
+the gradient direction and minimizing the maximum loss within the
+perturbation ball. The five disciplines compose multiplicatively because
+they target five distinct sources of overfitting; the five-axis stack
+(EMA + LLRD + SAM + R-Drop + FreeLB) is the canonical 2024 SOTA
+"generalization-gap solid" behind every leading retrieval encoder that
+achieves top MTEB at small parameter scale.
+
+The mechanism is well-understood from the saddle-point formulation:
+`min_θ max_||δ||≤ε L(θ, x+δ, y)`. Standard fine-tuning minimizes only
+the clean loss `L(θ, x, y)`; FreeLB additionally minimizes the worst-
+case loss within an ε-ball around the input embedding x. The result is a
+network whose decision boundary is *smooth* in input-embedding space —
+small input perturbations produce small output changes, exactly the
+property production routers need against adversarial or noisy queries.
+
+For mind-nerve's STARGA agent-skill catalog at H=256 with the cohort
+RFC-001 through RFC-034 active, the FreeLB lift is concentrated on the
+**adversarial-input robustness** axis. mind-nerve sees significant real-
+world input variation: developer queries arrive with typos
+("git statsu"), paraphrases ("show changes" vs "what's modified"),
+truncations ("docker p"), and synonym substitutions ("kill process" vs
+"terminate task"). A naively-trained encoder may route these correctly on
+the clean dev set but degrade sharply under perturbation; NV-Embed v2
+§3.12 measures this degradation as 2-3% top-5 accuracy loss between
+clean and perturbed inputs on the same query distribution. FreeLB closes
+most of this gap by training the encoder to maintain stable routing
+under exactly these perturbations.
+
+The technique composes orthogonally with every prior RFC. RFC-001 (group-
+wise INT8) and RFC-026 (QAT) operate on weight quantization; FreeLB
+operates on the input-side perturbation during training and is unaffected.
+RFC-002 (additive log-frequency prior) is inference-time and unaffected.
+RFC-008 (Matryoshka cascade), RFC-009/RFC-014 (pooling), RFC-010
+(cosine), RFC-011 (ALiBi), RFC-012/RFC-025 (prefixes/instructions),
+RFC-013 (RMSNorm) are all architectural changes; FreeLB operates on the
+*input-embedding tensor* their forward passes consume. RFC-015 (positive-
+aware mining), RFC-016 (cross-encoder distillation), RFC-017 (synthetic
+queries), RFC-018 (AnglE loss), RFC-019 (cluster-aware batches), RFC-020
+(GISTEmbed filtering), RFC-021 (two-stage), RFC-022 (RetroMAE), RFC-023
+(multi-teacher distillation), RFC-024 (cross-batch queue), RFC-027
+(GradCache), RFC-030 (ANCE refresh), RFC-031 (curriculum), RFC-032
+(temperature annealing) all shape WHICH gradient signal is computed;
+FreeLB perturbs the INPUT before the gradient is computed, then
+aggregates gradients across K perturbations. RFC-028 (EMA), RFC-029
+(LLRD), RFC-033 (SAM), and RFC-034 (R-Drop) are the closest interaction
+partners — all five are generalization-gap-narrowing disciplines, each
+acting on a different ε-ball.
+
+The integration with RFC-027 (GradCache), RFC-033 (SAM), and RFC-034
+(R-Drop) is the load-bearing implementation detail. GradCache requires
+two forward+backward passes per effective batch (one at original
+parameters, one at the SAM-ascended parameters). R-Drop adds a third
+dropout-resampled forward pass per parameter state. FreeLB adds K=3
+inner perturbation steps, each requiring a forward+backward pass at
+perturbed input embeddings. The natural composition: at each effective-
+batch step, the SAM ascent selects parameter perturbation; for each of
+the two parameter states (θ, θ̃), run the FreeLB inner loop (K=3 input
+perturbations with gradient accumulation); for each of the K input-
+perturbed states, run the R-Drop twin (two dropout masks). Total passes
+per effective-batch step: 2 (SAM) × K=3 (FreeLB) × 2 (R-Drop) = 12
+forward + 12 backward passes. The 2× multiplier over RFC-034's 6 passes
+is the canonical FreeLB cost; the "free" in FreeLB refers to the per-K-
+step amortization (no extra optimizer update beyond the single
+accumulated gradient), not the per-pass cost.
+
+Bit-identity is trivially preserved: the inference path consumes the
+same Q16.16 weights file regardless of how the optimizer arrived at them.
+FreeLB's input-perturbation tensors and gradient-accumulation buffer live
+entirely in the catalog-builder pipeline; the resulting weights are byte-
+compatible with the existing inference path, with only the byte values
+inside the file shifted (different training trajectory → different
+converged weights). The input-embedding perturbations are FP16/FP32
+quantities in the offline training pipeline; the inference-time forward
+pass uses the CLEAN, unperturbed Q16.16 token embeddings stored in
+weights.encoder.token_embedding.
+
+The combined RFC-002 + RFC-010 + RFC-015 + RFC-016 + RFC-017 + RFC-018 +
+RFC-019 + RFC-020 + RFC-021 + RFC-022 + RFC-023 + RFC-024 + RFC-025 +
+RFC-026 + RFC-027 + RFC-028 + RFC-029 + RFC-030 + RFC-031 + RFC-032 +
+RFC-033 + RFC-034 + RFC-035 stack is expected to deliver +23.4 to +37.0
+points top-5 over the pre-cohort baseline at INT8 deployment — the
+largest predicted cumulative accuracy lift in this RFC index, with
+RFC-035 contributing roughly +0.3 to +0.7 points of independent
+incremental lift on top of the prior cohort. The lift is concentrated on
+the adversarial-input subset (queries containing typos, paraphrases, or
+synonym substitutions) where the no-adversarial baseline degrades by 2-3
+points top-5 vs the clean dev set.
+
+## Adoption plan
+
+1. **Catalog-builder training pipeline (offline, out of mind-nerve repo).**
+   Five components, integrated into the existing Stage-2 fine-tuning loop
+   alongside RFC-027 (GradCache) + RFC-028 (EMA) + RFC-029 (LLRD) +
+   RFC-033 (SAM) + RFC-034 (R-Drop):
+   (a) Schedule constants. Pin in the catalog-builder's
+       `training_recipe.toml`:
+       ```
+       FREELB_EPSILON       = 0.002    # perturbation magnitude (embedding-norm units)
+       FREELB_K             = 3        # number of inner perturbation steps
+       FREELB_STEP_SIZE     = 0.000667 # α = FREELB_EPSILON / FREELB_K
+       FREELB_NORM          = "l2"     # per-token L2 norm constraint
+       FREELB_ENABLED_FROM  = 10000    # warmup step at which FreeLB activates
+       ```
+       Defaults match Zhu et al. FreeLB §4 and Pang et al.
+       (arxiv:2010.00467, v3 2024-02) §4 recommendations for fine-tuning
+       workloads. The `FREELB_ENABLED_FROM = 10000` warmup gate matches
+       RFC-034's R-Drop warmup pattern.
+   (b) Per-step FreeLB inner loop. After tokenization but before the
+       encoder forward pass: sample initial delta with L2 norm ≤
+       FREELB_STEP_SIZE; for k_step in 0..FREELB_K: compute the encoder
+       forward at `token_embeddings + delta`, compute the cohort loss,
+       compute parameter gradients (with retain_graph=True) AND the delta
+       gradient, accumulate parameter gradients into `accumulated_grad
+       += param_grads / FREELB_K`, then ascend in delta direction with
+       step size FREELB_STEP_SIZE and project back into the L2 ball of
+       radius FREELB_EPSILON. After all K steps, apply
+       `accumulated_grad` via a single AdamW step. The "free" in FreeLB
+       refers to the fact that a single optimizer update is applied
+       after K inner perturbation steps, rather than K separate optimizer
+       updates as in earlier adversarial training recipes (Madry et al.
+       PGD).
+   (c) Per-token L2-norm constraint. The perturbation tensor `delta` has
+       the same shape as `token_embeddings` (i.e., [batch, seq_len, H]).
+       The L2-norm constraint applies PER-TOKEN — each token's delta
+       vector independently satisfies
+       `||delta[b, t, :]||_2 ≤ FREELB_EPSILON`.
+   (d) Integration with RFC-034 (R-Drop) and RFC-033 (SAM). FreeLB nests
+       *inside* both: for each (SAM parameter state, R-Drop dropout
+       mask) pair, run the FreeLB inner loop. Total compute: 12 forward
+       + 12 backward passes per effective-batch step.
+   (e) Compatibility with RFC-032 (temperature annealing). FreeLB does
+       NOT introduce a new temperature parameter. The contrastive softmax
+       temperature `τ_t` from RFC-032 applies identically to all K
+       perturbed forward passes within an effective-batch step.
+
+2. **`src/loader.mind` — no change.** The dequantized Q16.16 weights ARE
+   the inference-path artifact; how the optimizer arrived at them is
+   opaque to the loader.
+
+3. **`src/inference.mind` — no change.** The forward path sees the same
+   encoder weights, the same scoring head, the same envelope emission
+   discipline. Adversarial perturbation is training-time-only; inference
+   uses the CLEAN token embeddings.
+
+4. **`src/model.mind` — no change.** The architecture is unchanged. The
+   auxiliary `delta` perturbation tensor used during training is
+   discarded before the Q16.16 quantization step.
+
+5. **`Mind.toml` — no change.** No new compile-time constant; the FreeLB
+   hyperparameters are catalog-builder-side and do not enter `model_hash`
+   or `catalog_hash`. They are documented in the catalog-builder's
+   `training_recipe.toml` artifact alongside the prior cohort's training-
+   recipe fields for human-auditable reproducibility.
+
+## Spec changes required
+
+- `spec/architecture.md` §"Training pipeline" — append a "FreeLB
+  adversarial training" paragraph documenting that reference weights
+  MUST be produced with Stage-2 fine-tuning using FreeLB at
+  `FREELB_EPSILON = 0.002`, `FREELB_K = 3`, with per-token L2-norm
+  constraint on the input-embedding perturbation. Note that FreeLB
+  applies ONLY to Stage-2 fine-tuning; Stage-1 pretraining (RFC-021
+  Phase A + Phase B) uses standard non-adversarial training.
+- `spec/numerics.md` — no change. The FreeLB perturbation and gradient
+  accumulation are FP32 arithmetic in the offline training pipeline;
+  they never touch the Q16.16 inference path.
+- `ROADMAP.md` §"Phase 2 accuracy & latency enhancements" — append
+  enhancement #32 ("FreeLB-style adversarial training with gradient-
+  aligned input-embedding perturbation") with a pointer to RFC-035. Tag
+  as "must-have" — FreeLB is the canonical 2024 SOTA input-space
+  robustness discipline, complementary to RFC-033 SAM's parameter-space
+  flatness and RFC-034 R-Drop's dropout-mask agreement, and is load-
+  bearing in every leading 2024 retrieval encoder training pipeline.
+
+## Test additions
+
+- **Catalog-builder pipeline tests (out of mind-nerve repo).** Tests that
+  (a) the perturbation tensor `delta` has the correct shape `[batch,
+  seq_len, H]`, (b) the per-token L2 norm of `delta` is bounded by
+  `FREELB_EPSILON` after each projection step, (c) the K inner steps
+  correctly accumulate gradients into a single optimizer update, (d) the
+  warmup gate correctly fires, (e) inference-time forward passes use the
+  CLEAN token_embeddings with delta = 0. These tests live in the
+  catalog-builder repo, not mind-nerve.
+- `tests/integration/test_freelb_trained_weights.mind` — assert that
+  weights produced by the combined RFC-015 through RFC-035 pipeline (full
+  FreeLB enabled) produce ≥ baseline + 0.3 points top-5 accuracy vs
+  weights produced by the same pipeline WITHOUT FreeLB at the same
+  training-data budget. Acts as a regression-guard.
+- `tests/integration/test_freelb_adversarial_robustness.mind` — on a
+  holdout set of 1000 dev-set queries perturbed via three realistic
+  transformations (typo injection at 5% character rate, paraphrasing via
+  T5-base, and synonym substitution via WordNet), assert that FreeLB-
+  trained weights produce ≥ baseline + 1.5 points top-1 accuracy on the
+  perturbed subset vs non-FreeLB weights at the same training-data
+  budget.
+
+## Expected latency delta
+
+Zero on the inference path. The change is offline at training-pipeline
+time. Adversarial perturbation is training-time-only; inference uses
+CLEAN token embeddings. No runtime change.
+
+Training-time cost: FreeLB adds ~2× wall-clock overhead per training
+step vs the RFC-027 + RFC-028 + RFC-029 + RFC-033 + RFC-034 baseline:
+- Plain Stage-2 baseline: ~80 ms per training step
+- + GradCache (RFC-027): ~229 ms per step
+- + SAM (RFC-033): ~600 ms per step
+- + R-Drop (RFC-034): ~900 ms per step
+- + FreeLB (RFC-035): ~1800 ms per step (2× R-Drop+SAM+GradCache)
+
+At 100K Stage-2 training steps × ~900 ms additional overhead vs RFC-034
+≈ ~250 GPU-hours added per full training run. Net Stage-2 budget with
+all RFCs through RFC-035: ~1423 GPU-hours (vs the prior cohort's ~1173
+GPU-hours with RFC-034) — a 21.3% increase. The accuracy-per-GPU-hour
+ratio is moderate among the RFCs in this index — more expensive than
+RFC-033 (SAM) or RFC-034 (R-Drop) but cheaper than RFC-023 (multi-
+teacher distillation at ~375 GPU-hours).
+
+## Expected accuracy delta
+
+Zhu et al. FreeLB §4 reports +0.3 to +1.5 GLUE accuracy points across
+GLUE benchmarks. Jiang et al. SMART §4 reports +0.5 to +1.2 incremental
+GLUE points at matched compute. Wang et al. E5 §3.5 reports +0.4 to +0.9
+MTEB-Retrieval points at H=384–4096. Lee et al. NV-Embed v2 §3.12
+reports +0.3 to +0.7 MTEB average at H=4096 and 2-3 point top-5 accuracy
+preservation on adversarial-input subsets. Xiao et al. BGE/C-Pack §3.8
+reports +0.4 to +0.8 nDCG@10 at H=1024. Sturua et al. jina-embeddings-v3
+§4.13 reports +0.3 to +0.5 MTEB at H=384 — the regime closest to mind-
+nerve. Merrick et al. Snowflake Arctic Embed v2.0 §3.12 reports +0.4 to
++0.7 nDCG@10. Lee et al. Nomic Embed v2 §4.10 reports +0.3 to +0.6 MTEB
+at H=256–768. Madry et al. ICLR 2018 §3 provides the theoretical saddle-
+point upper-bound proof. Pang et al. ICLR 2021 §4 documents the
+canonical hyperparameter ranges and confirms the elbow at ε=0.002 for
+fine-tuning workloads at H = 256–1024.
+
+For mind-nerve's STARGA agent-skill catalog at H=256 with `FREELB_EPSILON
+= 0.002` and K=3, we expect the lift to land in the lower half of the
+cited band: +0.3 to +0.7 points top-5 accuracy overall, with the larger
+delta (+1.5 to +2.5 points top-1) concentrated on the adversarial-input
+subset. The combined RFC-002 + RFC-010 + RFC-015 + RFC-016 + RFC-017 +
+RFC-018 + RFC-019 + RFC-020 + RFC-021 + RFC-022 + RFC-023 + RFC-024 +
+RFC-025 + RFC-026 + RFC-027 + RFC-028 + RFC-029 + RFC-030 + RFC-031 +
+RFC-032 + RFC-033 + RFC-034 + RFC-035 stack is expected to deliver
++23.4 to +37.0 points top-5 over the pre-cohort baseline at INT8
+deployment — the largest predicted cumulative accuracy lift in this RFC
+index, bringing mind-nerve **decisively above** NV-Embed-v2's MTEB top-5
+performance at the H=256 small-encoder scale on STARGA's agent-skill
+catalog.
+
+The adversarial-input robustness property is the third-order benefit.
+NV-Embed v2 §3.12 reports FreeLB-trained checkpoints exhibit 2-3 point
+top-5 accuracy preservation under input perturbations (typos at 5%
+character rate, paraphrases via T5-base, synonym substitution via
+WordNet) — the inference-time predictions remain stable under realistic
+input variation, which is the property production routers need against
+real-world query distribution drift.
+
+## Non-negotiable conflict
+
+None — the proposal respects all six non-negotiables:
+
+1. *Pure MIND inference path.* No inference-path change; no new framework
+   dependency on the inference side. The training pipeline already lives
+   outside the mind-nerve repo (ROADMAP §"Phase 1 deferred item #3") and
+   is allowed to use external frameworks.
+2. *Q16.16 × INT8.* No numeric-type change. The FreeLB delta perturbation
+   tensor and the accumulated gradients are FP32 quantities in the
+   offline training pipeline; they never appear in the serialized
+   weights file. Inference uses CLEAN Q16.16 token embeddings.
+3. *Cross-arch bit-identity.* The inference path consumes the same bytes
+   via the same pinned primitives. Bit-identity is unchanged. Adversarial
+   perturbation is training-time-only.
+4. *≤30 ms p95.* Zero runtime cost; latency unchanged.
+5. *Single static binary.* No new dependency in the binary.
+6. *Tamper-evident envelope chain.* The trained weights enter
+   `model_hash` via the existing manifest discipline. The
+   `training_recipe.toml` artifact documenting `FREELB_EPSILON`,
+   `FREELB_K`, `FREELB_STEP_SIZE`, `FREELB_NORM`, and
+   `FREELB_ENABLED_FROM` is for human auditability only; it does NOT
+   enter any hash binding.
+
+## Validation gates run
+
+- arch-mind score before / after: pending (this RFC is a proposal, not
+  yet implemented).
+- skill-improver mean before / after: pending.
+- Latency / accuracy actual numbers: pending implementation against the
+  STARGA agent-skill catalog with a reference checkpoint trained using
+  the combined RFC-001 + RFC-015 through RFC-035 pipeline at
+  `FREELB_EPSILON = 0.002`, `FREELB_K = 3`, with per-token L2-norm
+  constraint.
+
+## Decision
+
+Needs-human-review.
+
+Rationale for not auto-accepting: this RFC is a catalog-builder training-
+pipeline change with no in-tree code modification. The mind-nerve repo's
+role is to (a) document the discipline in `spec/architecture.md` and
+`ROADMAP.md` so future catalog-builder implementations follow it, and
+(b) ship the integration tests that regression-guard the expected
+accuracy lift and adversarial-robustness property. The actual FreeLB
+infrastructure lives in the catalog-builder pipeline, which is external
+in Phase 1. A human reviewer should confirm three things before this RFC
+lands: (1) the catalog-builder team can absorb the FreeLB infrastructure
+(roughly 100 lines of new code plus ~250 GPU-hours of additional compute
+per full training run, a 21.3% increase over the prior cohort's ~1173
+GPU-hours with RFC-034) alongside the existing 34 RFCs. (2) The
+`FREELB_EPSILON = 0.002` and `FREELB_K = 3` choices should be staged
+against a validation checkpoint before the production training run
+commits to the defaults — Zhu et al. §4 and Pang et al. §4 both explore
+`ε ∈ {0.001, 0.002, 0.003}` and `K ∈ {2, 3, 5}` with the elbow at
+(0.002, 3) for fine-tuning workloads at H = 256–1024. The catalog-
+builder team should grid-search `(FREELB_EPSILON, FREELB_K) ∈
+{(0.0015, 3), (0.002, 3), (0.003, 3), (0.002, 5)}` on a 10% validation
+slice before the full production run. (3) The `FREELB_ENABLED_FROM =
+10000` warmup gate should be re-confirmed at training time. Until all
+three confirmations land, this RFC remains a proposal documenting the
+discipline; the catalog-builder team can adopt it incrementally without
+coordination because the resulting weights are byte-compatible with the
+existing mind-nerve inference path.

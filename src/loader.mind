@@ -255,7 +255,17 @@ pub enum LoaderError {
 const MNC1_MAGIC: [u8; 4] = [0x4Du8, 0x4Eu8, 0x43u8, 0x31u8]; // "MNC1"
 const MNW1_MAGIC: [u8; 4] = [0x4Du8, 0x4Eu8, 0x57u8, 0x31u8]; // "MNW1"
 
-const CATALOG_VERSION: u16 = 1;
+// Catalog file version range. v1 = embeddings only, no prior column (the
+// original 2026 layout); v2 = RFC-002 log-frequency prior column trailing
+// the embeddings (one Q16.16 prior per route). The loader accepts both
+// formats; v1 remains the default and produces byte-identical inference
+// behaviour to today because the v1 prior implicitly defaults to all
+// zeros (the additive identity for the prior add step in `inference`).
+// A v2 reference catalog requires the offline catalog-builder pipeline
+// to emit the empirical-Bayes-shrunken `log(1 + freq_r)` column — see
+// RFC-002 §"Adoption plan" for the per-route formula.
+const CATALOG_VERSION_V1: u16 = 1;
+const CATALOG_VERSION_V2: u16 = 2;
 
 // Weights file version range. v1 = per-output-channel INT8 scales (the
 // original 2026 layout); v2 = group-wise INT8 scales per RFC-001
@@ -339,9 +349,15 @@ pub fn parse_catalog(bytes: &[u8]) -> Result<RouteCatalog, LoaderError> {
     }
 
     let version: u16 = read_u16_le(bytes, 4);
-    if version != CATALOG_VERSION {
+    if version != CATALOG_VERSION_V1 && version != CATALOG_VERSION_V2 {
         return Err(LoaderError::UnsupportedVersion);
     }
+    // RFC-002 log-frequency prior column when v2. v1 keeps the original
+    // embeddings-only layout and `inference::preselect_pre_tokenized`
+    // observes an implicit zero prior — byte-identical to today's
+    // reference catalog. v2 catalogs carry an explicit Q16.16 prior
+    // per route, parsed below.
+    let has_prior: bool = (version == CATALOG_VERSION_V2);
 
     let reserved: u16 = read_u16_le(bytes, 6);
     if reserved != 0u16 {
@@ -423,6 +439,26 @@ pub fn parse_catalog(bytes: &[u8]) -> Result<RouteCatalog, LoaderError> {
         r = r + 1;
     }
 
+    // (4b) Route-prior section (RFC-002, v2 only). For v1 catalogs the
+    //      prior defaults to all zeros (additive identity) so the
+    //      inference path's prior-add step is a no-op. For v2 the block
+    //      is `num_routes * 4` bytes of Q16.16 i32-LE values immediately
+    //      following the embeddings.
+    let prior_bytes: usize = if has_prior { n * 4usize } else { 0usize };
+    let prior_offset: usize = embeddings_end;
+    let prior_end:    usize = prior_offset + prior_bytes;
+    if bytes.len() < prior_end {
+        return Err(LoaderError::TruncatedFile);
+    }
+    let mut route_prior: tensor<Q16_16, [n]> = [0_i32; n];
+    if has_prior {
+        let mut pr: usize = 0;
+        while pr < n {
+            route_prior[pr] = read_i32_le(bytes, prior_offset + pr * 4usize);
+            pr = pr + 1;
+        }
+    }
+
     // (5) Recompute canonical catalog hash and compare against stored.
     //     Preimage: per route (sorted file-order, which is canonical ascending
     //     by the producer's contract):
@@ -460,6 +496,22 @@ pub fn parse_catalog(bytes: &[u8]) -> Result<RouteCatalog, LoaderError> {
             preimage.push(((v >> 24) & 0xFFi32) as u8);
             c2 = c2 + 1;
         }
+        // RFC-002 prior column (v2 only). The hash absorbs the prior bytes
+        // alongside the embedding row, preserving the existing self-
+        // describing length-prefix discipline: u32-LE length=4 followed by
+        // the Q16.16 i32-LE prior value. v1 catalogs skip this block so
+        // their canonical hash is byte-identical to today.
+        if has_prior {
+            preimage.push(4u8);
+            preimage.push(0u8);
+            preimage.push(0u8);
+            preimage.push(0u8);
+            let p: i32 = route_prior[s];
+            preimage.push(( p        & 0xFFi32) as u8);
+            preimage.push(((p >> 8 ) & 0xFFi32) as u8);
+            preimage.push(((p >> 16) & 0xFFi32) as u8);
+            preimage.push(((p >> 24) & 0xFFi32) as u8);
+        }
         s = s + 1;
     }
     let recomputed: [u8; 32] = sha256(preimage.as_slice());
@@ -478,7 +530,7 @@ pub fn parse_catalog(bytes: &[u8]) -> Result<RouteCatalog, LoaderError> {
     //     that each entry is a u16-LE length followed by that many UTF-8
     //     bytes, with the total walk landing exactly at the offset of the
     //     trailer-offset field itself (= bytes.len() - 4).
-    if bytes.len() < embeddings_end + 4usize {
+    if bytes.len() < prior_end + 4usize {
         return Err(LoaderError::TruncatedFile);
     }
     let trailer_offset_field: usize = bytes.len() - 4usize;
@@ -486,8 +538,10 @@ pub fn parse_catalog(bytes: &[u8]) -> Result<RouteCatalog, LoaderError> {
     let trailer_off_usz: usize = trailer_offset as usize;
 
     // Trailer offset MUST point to the start of the external_id_table,
-    // which immediately follows the embeddings section.
-    if trailer_off_usz != embeddings_end {
+    // which immediately follows the embeddings section (v1) or the
+    // route_prior block (v2, RFC-002). `prior_end` collapses to
+    // `embeddings_end` when has_prior is false.
+    if trailer_off_usz != prior_end {
         return Err(LoaderError::TruncatedFile);
     }
 
@@ -517,9 +571,10 @@ pub fn parse_catalog(bytes: &[u8]) -> Result<RouteCatalog, LoaderError> {
     }
 
     Ok(RouteCatalog {
-        ids:        route_ids,
-        embeddings: embeddings,
-        hash:       recomputed,
+        ids:         route_ids,
+        embeddings:  embeddings,
+        route_prior: route_prior,
+        hash:        recomputed,
     })
 }
 

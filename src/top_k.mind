@@ -84,9 +84,20 @@ pub struct TopK {
 
 // Plain catalog — accepted by extract_top_k. Uniqueness of route_ids is the
 // caller's responsibility; use UniqueRouteCatalog at load time to enforce it.
+//
+// `route_prior` is the RFC-002 log-frequency catalog co-occurrence prior:
+// a per-route Q16.16 scalar added elementwise to the scoring-head logits in
+// `inference::preselect_pre_tokenized` BEFORE `extract_top_k`. For v1 .cat
+// files (and any catalog produced before the offline catalog-builder grew
+// the prior column) the field defaults to all zeros, which is the additive
+// identity — byte-identical behaviour to today. v2 .cat files carry an
+// explicit Q16.16 prior per route; loaders populate this field from the
+// trailing prior block. The catalog hash preimage absorbs the prior bytes
+// so any tampering produces a HashMismatch at load time.
 pub struct RouteCatalog {
     pub ids:         [RouteId],
     pub embeddings:  tensor<Q16_16, [num_routes, ROUTE_EMBEDDING_DIM]>,
+    pub route_prior: tensor<Q16_16, [num_routes]>,
     pub hash:        [u8; 32],
 }
 
@@ -130,11 +141,13 @@ impl UniqueRouteCatalog {
         // passthrough path at the integration layer.
         if n == 0 {
             let empty_ids: [RouteId; 0] = [];
+            let empty_prior: tensor<Q16_16, [0]> = [];
             return Ok(UniqueRouteCatalog {
                 inner: RouteCatalog {
-                    ids:        empty_ids,
-                    embeddings: tensor::zeros::<Q16_16, [0, ROUTE_EMBEDDING_DIM]>(),
-                    hash:       sha256(b""),
+                    ids:         empty_ids,
+                    embeddings:  tensor::zeros::<Q16_16, [0, ROUTE_EMBEDDING_DIM]>(),
+                    route_prior: empty_prior,
+                    hash:        sha256(b""),
                 },
             });
         }
@@ -158,11 +171,21 @@ impl UniqueRouteCatalog {
 
         let canonical_hash = sha256(route_ids.as_bytes());
 
+        // RFC-002: callers that build a catalog through this typed
+        // constructor never supply a prior (the constructor's input is
+        // external string ids + diagnostic scores). The prior defaults to
+        // all zeros — the additive identity, byte-identical to pre-RFC-002
+        // behaviour. The `.cat` file path produced by `loader::parse_catalog`
+        // is what populates the prior with non-zero values once a v2
+        // catalog from the catalog-builder pipeline arrives.
+        let zero_prior: tensor<Q16_16, [n]> = [0_i32; n];
+
         Ok(UniqueRouteCatalog {
             inner: RouteCatalog {
-                ids:        route_ids,
-                embeddings: tensor::zeros::<Q16_16, [n, ROUTE_EMBEDDING_DIM]>(),
-                hash:       canonical_hash,
+                ids:         route_ids,
+                embeddings:  tensor::zeros::<Q16_16, [n, ROUTE_EMBEDDING_DIM]>(),
+                route_prior: zero_prior,
+                hash:        canonical_hash,
             },
         })
     }

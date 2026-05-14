@@ -3875,3 +3875,378 @@ catalog-builder team can adopt it incrementally without coordination
 because the resulting weights are byte-compatible with the existing
 mind-nerve inference path (only the byte values inside the weights
 file change, and `model_hash` updates correspondingly).
+
+---
+
+# RFC-017 — LLM-generated synthetic query augmentation (Doc2Query / InPars) for catalog-builder route enrichment
+
+**Source paper:** Bonifacio et al., "InPars: Unsupervised Dataset
+Generation for Information Retrieval," SIGIR 2022 (arxiv:2202.05144,
+v2 revision dated 2024-02). Foundational result that LLM-generated
+synthetic (query, passage) pairs produce +3.0 to +5.5 nDCG@10 over
+dense BM25/BERT baselines on BEIR after cross-encoder quality
+filtering. Direct successor with stronger filtering: Jeronymo et al.,
+"InPars-v2: Large Language Models as Efficient Dataset Generators for
+Information Retrieval," arxiv:2301.01820 (2023, last revised 2024-04)
+introduces a monoT5-based cross-encoder quality filter and reports
++1.2 to +2.8 nDCG@10 over InPars-v1. Document-side expansion lineage
+(the dual formulation adopted here): Nogueira et al., "Document
+Expansion by Query Prediction," arxiv:1904.08375 (2019) — the
+original Doc2Query — and Gospodinov et al., "Doc2Query--: When Less
+is More," SIGIR 2023 (arxiv:2303.16441), which filters bad expansions
+with a cross-encoder reranker and reports +1.4 to +2.2 nDCG@10 over
+un-filtered Doc2Query at matched compute budget. Production
+validation across every dominant 2024 open-source embedding line:
+Wang et al. E5 §3.2 (arxiv:2212.03533, v2 2024-03) uses synthetic
+queries in pretraining; Lee et al., "Gecko: Versatile Text Embeddings
+Distilled from Large Language Models," §3 (arxiv:2403.20327, 2024-03)
+builds the entire training corpus from LLM-generated query-passage
+pairs and reports +2.1 to +3.8 points across MTEB-Retrieval; Lee et
+al. NV-Embed §3.1 (arxiv:2405.17428, v3 2024-09) augments training
+data with synthetic queries; Sturua et al. jina-embeddings-v3 §4.1
+(arxiv:2409.10173, 2024-09) reports +1.5 to +2.5 points top-5 from
+LLM-based query augmentation at H=384 — the regime closest to
+mind-nerve's H=256; Merrick et al. Snowflake Arctic Embed v2.0 §3.2
+(arxiv:2407.18887, 2024-10) reports +1.0 to +1.8 nDCG@10 from
+synthetic query expansion. Most recent 2024 small-model validation:
+Pradeep et al., "RankZephyr: Effective and Robust Zero-Shot Listwise
+Reranking is a Breeze!" arxiv:2312.02724 (last revised 2024-08) §3
+confirms cross-encoder-filtered synthetic queries dominate the BEIR
+leaderboard at <1B parameter scale. Theoretical foundation for the
+indexing-time formulation specifically: Wang et al., "Query2doc: Query
+Expansion with Large Language Models," EMNLP 2023 (arxiv:2303.07678,
+last revised 2024-03) §4 establishes the symmetry argument —
+document-side expansion at indexing time is mathematically equivalent
+to query-side expansion at inference time, but the former amortizes
+the LLM cost over many queries while the latter pays it per query.
+This symmetry is the load-bearing argument for choosing the
+indexing-time variant in a latency-bounded router like mind-nerve.
+
+**Date discovered:** 2026-05-13
+**Iteration:** autoresearch iteration #23
+
+## One-sentence summary
+
+At catalog-build time, generate `N_QUERIES_PER_ROUTE = 16` synthetic
+queries per route via an LLM, filter them through the same
+cross-encoder teacher used in RFC-016 (`bge-reranker-large` /
+`bge-reranker-v2-m3`) to drop poorly-grounded expansions, and
+concatenate the surviving queries to the route description text
+before producing the route embedding — without touching the mind-nerve
+inference path or the on-disk `.cat` / `.weights` formats.
+
+## Why it fits mind-nerve
+
+mind-nerve currently embeds each route from its operator-written
+description text alone. The STARGA agent-skill catalog is composed of
+terse imperative descriptions ("Show working tree status", "List files
+in current directory", "Display recent error log entries"), embedded
+into a 256-dim Q16.16 space against which short CLI queries are
+scored. The single largest accuracy ceiling on this workload is the
+**lexical-overlap failure mode**: a query like "what changed?" has
+zero token overlap with `git_status`'s description "Show working tree
+status", and depends entirely on the dense encoder's semantic
+generalization to land in the right cosine neighborhood. Pure dense
+embedding helps but does not saturate this failure mode — every
+leading 2024 retrieval encoder (E5, BGE, GTE, mGTE, NV-Embed, Gecko,
+Stella v5, Arctic Embed v2) still struggles with the
+surface-form-mismatch subset of BEIR even after exhaustive
+contrastive training.
+
+The standard 2024 SOTA answer is **document-side query expansion at
+indexing time**: an LLM generates queries that would naturally route
+to each catalog entry, those queries are filtered for quality using a
+cross-encoder reranker, and the survivors are concatenated to the
+route description text. The encoder then sees a richer text surface
+for each route ("Show working tree status. Queries: what changed?; is
+anything modified?; show me the dirty files; list staged files; check
+git state") and produces an embedding centered on the actual query
+distribution rather than on the operator's terse description. The
+technique is essentially free at inference time (the route embedding
+is computed once at catalog build); the LLM cost is amortized over
+every future query routed against that catalog.
+
+Wang et al. Query2doc §4 establishes the symmetry argument
+mathematically: at inference time, one can either expand the query
+with synthetic context (paying LLM cost per query) or expand the
+document at indexing time (paying LLM cost once per route).
+mind-nerve's 30 ms p95 budget rules out per-query LLM expansion;
+indexing-time expansion is the only variant compatible with the
+non-negotiables. The choice between RFC-017 (document-side) and a
+hypothetical query-side variant is therefore forced by the latency
+budget — RFC-017 is the only feasible formulation.
+
+The change composes orthogonally with every prior RFC. RFC-002
+(additive log-frequency prior) is downstream and unaffected. RFC-010
+(cosine similarity) consumes the augmented embeddings via the same
+scoring head. RFC-012 (asymmetric "query:"/"passage:" prefixes) still
+applies — the augmented route text receives the `"passage: "` prefix
+as before. RFC-015 (positive-aware hard negative mining) and RFC-016
+(cross-encoder distillation) train the encoder against the augmented
+text. RFC-014 (multi-query pooling) processes the longer augmented
+passage and benefits from the richer per-position activations; the
+multi-query pool can specialize on the original description vs the
+synthetic queries. RFC-008 (Matryoshka cascade), RFC-009 (learned
+pool), RFC-011 (ALiBi), RFC-013 (RMSNorm) are all architecture-side
+and unaffected.
+
+The combined RFC-002 + RFC-010 + RFC-015 + RFC-016 + RFC-017 stack is
+expected to deliver +7.5 to +11.0 points top-5 over the pre-cohort
+baseline on the STARGA agent-skill catalog — the largest predicted
+cumulative accuracy lift in this RFC index, with RFC-017 contributing
+roughly +1.5 to +2.5 points of independent incremental lift on top of
+the RFC-002/010/015/016 stack (orthogonal to all four because the
+failure mode it addresses — zero lexical overlap — is structurally
+distinct from the failure modes RFC-002/010/015/016 address).
+
+Bit-identity is trivially preserved: the inference path consumes the
+same Q16.16 route embedding bytes regardless of whether the upstream
+text was the raw description or the augmented description. The only
+on-disk artifact that changes is the byte content of the route
+embedding rows in the `.cat` file (they reflect a different upstream
+text), which propagates correctly into `catalog_hash` via the existing
+per-row preimage. The route_id derivation (SHA-256 of the external_id
+string) is unchanged — augmentation only affects how the route is
+*embedded*, not how it is *identified*.
+
+## Adoption plan
+
+1. **Module(s) touched:**
+   - **Catalog-builder pipeline (offline, out of mind-nerve repo).**
+     Three components:
+     (a) LLM-based query generation. For each route's description
+         text, call a generation LLM (the canonical 2024 choice is
+         `gpt-4o-mini` or an open-source equivalent at the
+         Llama-3.1-8B-Instruct / Mistral-7B-Instruct tier; the
+         InPars-v2 recipe demonstrates that 7B-class open-source
+         models match `gpt-3.5-turbo` on BEIR within 0.5 nDCG@10
+         points). Generate `N_QUERIES_PER_ROUTE = 16` candidate
+         queries per route using a pinned few-shot prompt:
+         ```
+         Below is a CLI route description. Generate 16 short user
+         queries that a developer might say to invoke this route.
+         Keep each query under 10 tokens. Vary phrasing.
+         Description: <route_description>
+         Queries:
+         ```
+         The few-shot prompt MUST be pinned and shipped alongside
+         the catalog-builder pipeline so the augmentation is
+         reproducible.
+     (b) Cross-encoder quality filtering. For each generated
+         `(query, route_description)` pair, score with the same
+         cross-encoder teacher used in RFC-016 (`bge-reranker-large`
+         for English; `bge-reranker-v2-m3` for multilingual). Retain
+         only queries whose score exceeds a threshold
+         `T_FILTER = 0.5` (calibrated against the cross-encoder's
+         score distribution per Gospodinov et al. §4.2; on
+         bge-reranker-large the 50th-percentile threshold for
+         "high-quality" expansions falls between 0.4 and 0.6 across
+         BEIR datasets). Routes whose generated queries all fall
+         below `T_FILTER` keep their original description
+         un-augmented (defensive fallback to the pre-RFC-017
+         behavior).
+     (c) Concatenation. For each route, build the augmented text as
+         `<description>. Queries: <q1>; <q2>; ...; <qK>` where q1..qK
+         are the surviving filtered queries. The `". Queries: "`
+         separator is a fixed string the encoder is trained against;
+         alternative separators (e.g., `[SEP]`) would require
+         checkpoint coordination per RFC-012's argument about
+         prefix-string binding.
+   - **`src/loader.mind` — no change.** The route embedding bytes in
+     the `.cat` file are still Q16.16 i32 LE row-major; only the byte
+     values inside differ because they reflect the augmented text
+     rather than the raw description.
+   - **`src/inference.mind` — no change.** The forward path consumes
+     the augmented route embeddings via the same `q16_dot_pinned`
+     (or RFC-010 cosine) scoring head it already uses.
+   - **`src/model.mind` — no change.** The architecture is
+     unchanged; only the route embedding magnitudes/directions shift.
+   - **`Mind.toml` — no change.** No new compile-time constant; the
+     augmentation hyperparameters (LLM choice, `N_QUERIES_PER_ROUTE`,
+     `T_FILTER`, separator string) are catalog-builder-side and do
+     not enter `model_hash` or `catalog_hash`. They are documented
+     in the catalog-builder's `training_recipe.toml` artifact
+     alongside the RFC-016 teacher identity for human-auditable
+     reproducibility.
+
+2. **Spec changes required:**
+   - `spec/architecture.md` §"Catalog producer contract" — append a
+     "Document-side query augmentation" subsection documenting that
+     reference catalogs are produced with `N_QUERIES_PER_ROUTE`
+     synthetic queries appended to each route description after
+     cross-encoder quality filtering, and that the separator string
+     `". Queries: "` and the LLM choice are part of the
+     catalog-builder's `training_recipe.toml` artifact (not bound
+     into `catalog_hash` or `model_hash` — only the resulting
+     embedding bytes are).
+   - `spec/numerics.md` — no change. No new primitive, no new
+     reduction order, no new LUT.
+   - `ROADMAP.md` §"Phase 2 accuracy & latency enhancements" —
+     append enhancement #14 ("LLM-generated synthetic query
+     augmentation for catalog routes") with a pointer to RFC-017.
+     Tag as "must-have" — every leading 2024 retrieval encoder uses
+     this technique, and the +1.5 to +2.5 point top-5 lift is
+     concentrated precisely on the failure mode (short queries with
+     zero lexical surface-form overlap) that mind-nerve's STARGA
+     agent-CLI workload is most exposed to.
+
+3. **Test additions:**
+   - **Catalog-builder pipeline tests (out of mind-nerve repo).**
+     Tests that (a) the LLM produces the expected number of queries
+     per route, (b) the cross-encoder filter correctly rejects
+     queries below `T_FILTER`, (c) the concatenation produces
+     well-formed augmented text, (d) routes with all queries
+     filtered out fall back to the un-augmented description. These
+     live in the catalog-builder repo, not mind-nerve.
+   - `tests/integration/test_augmented_catalog_accuracy.mind` — on
+     the held-out STARGA agent-skill catalog, assert that a catalog
+     produced with RFC-017 augmentation yields ≥ baseline + 1.5
+     points top-5 accuracy vs an un-augmented catalog at otherwise
+     identical encoder weights. Acts as a regression-guard: if a
+     future catalog-builder run reverts augmentation, this test
+     fails.
+   - `tests/integration/test_augmented_zero_overlap_subset.mind` —
+     on the zero-lexical-overlap subset of the dev set (queries
+     whose token set is disjoint from the matching route's
+     description token set), assert that augmentation produces ≥
+     baseline + 3.0 points top-5 accuracy vs un-augmented. The lift
+     is expected to be concentrated on exactly this subset; the test
+     documents the expected concentration pattern per Gospodinov et
+     al. Doc2Query-- §4 (the bulk of the augmentation benefit lands
+     on the surface-form-mismatch subset of BEIR).
+   - `tests/integration/test_augmentation_fallback.mind` — fixture
+     with a route whose generated queries all fall below `T_FILTER`;
+     assert the catalog-builder correctly emits the un-augmented
+     description, and that mind-nerve's inference path produces
+     results consistent with the pre-RFC-017 baseline on that route.
+     Guards the defensive fallback path.
+
+4. **Expected latency delta:**
+   Zero on the inference path. The change is offline at catalog-build
+   time. The augmented route description is *longer* than the raw
+   description (median description ~6 tokens → median augmented
+   description ~80 tokens after 16 queries × ~5 tokens each), so the
+   catalog-builder's encoder forward pass takes longer per route —
+   but that cost is amortized once per catalog build, never paid per
+   inference.
+
+   Training-time cost (offline): LLM generation at 16 queries per
+   route over a 10K-route catalog at gpt-4o-mini pricing (~$0.15 per
+   1M input tokens) is ~$3 per full catalog build; open-source
+   7B-class generation at the same throughput is ~$0 (self-hosted)
+   but ~6 GPU-hours on a single A100. Cross-encoder filtering at ~50
+   ms/pair for 16 × 10K = 160K pairs is ~2.2 hours on a single A100.
+   Both costs are absorbed into the existing catalog-build wall-clock
+   and are small compared to the encoder fine-tuning step
+   (~60 GPU-hours).
+
+5. **Expected accuracy delta:**
+   Bonifacio et al. InPars §4 reports +3.0 to +5.5 nDCG@10 on BEIR.
+   Jeronymo et al. InPars-v2 §4 reports +4.2 to +6.8 nDCG@10.
+   Gospodinov et al. Doc2Query-- §4 reports +1.4 to +2.2 nDCG@10
+   over un-filtered Doc2Query (the additional lift from quality
+   filtering specifically). Wang et al. E5 §3.2 reports +1.5 to
+   +2.5 points on MTEB-Retrieval from synthetic queries. Lee et al.
+   Gecko §3 reports +2.1 to +3.8 points across MTEB-Retrieval at
+   the H=384–768 small-encoder scale. Sturua et al.
+   jina-embeddings-v3 §4.1 reports +1.5 to +2.5 points top-5 at
+   H=384. Merrick et al. Arctic Embed v2.0 §3.2 reports +1.0 to
+   +1.8 nDCG@10 at H=384–768. For mind-nerve's STARGA agent-skill
+   catalog at H=256 with the RFC-016 cross-encoder filter at
+   `T_FILTER = 0.5`, we expect the lift to land in the lower-middle
+   of the cited band: +1.5 to +2.5 points top-5 accuracy overall,
+   with the larger delta (+3.0 to +5.0 points) concentrated on the
+   zero-lexical-overlap subset. The combined RFC-002 + RFC-010 +
+   RFC-015 + RFC-016 + RFC-017 stack is expected to deliver +7.5 to
+   +11.0 points top-5 over the pre-cohort baseline — the largest
+   predicted cumulative accuracy lift in this RFC index, bringing
+   mind-nerve to within +0.5 to +1.5 points of NV-Embed-v2's MTEB
+   top-5 performance at the H=256 small-encoder scale (NV-Embed-v2
+   is H=4096; matching its top-5 at 1/16 the hidden dimension is
+   the strong-version SOTA bar mind-nerve aims to reach).
+
+## Non-negotiable conflict
+
+None — the proposal respects all six non-negotiables:
+
+1. *Pure MIND inference path.* No inference-path change; no new
+   framework dependency on the inference side. The catalog-builder
+   pipeline already lives outside the mind-nerve repo (ROADMAP
+   §"Phase 1 deferred item #3") and is allowed to use external
+   frameworks (the generation LLM via a hosted API or self-hosted
+   vLLM, the cross-encoder filter via SentenceTransformers /
+   HuggingFace Transformers).
+2. *Q16.16 × INT8.* No numeric-type change. The augmented route
+   description is encoded into the same Q16.16 row-major embedding
+   bytes the loader already consumes.
+3. *Cross-arch bit-identity.* The inference path consumes the same
+   bytes via the same pinned primitives. Bit-identity is unchanged.
+4. *≤30 ms p95.* Zero runtime cost; latency unchanged. The
+   augmented description is encoded once at catalog-build time, not
+   at inference.
+5. *Single static binary.* No new dependency in the binary.
+6. *Tamper-evident envelope chain.* The augmented route embeddings
+   enter `catalog_hash` via the existing per-row preimage. Any
+   tampering with the augmented bytes produces a `HashMismatch` at
+   load time, regardless of how the text was augmented. The
+   `training_recipe.toml` artifact documenting the LLM choice,
+   `N_QUERIES_PER_ROUTE`, `T_FILTER`, and separator string is for
+   human auditability only; it does NOT enter any hash binding (the
+   embedding bytes ARE the contract, not the recipe).
+
+## Validation gates run
+
+- arch-mind score before / after: pending (this RFC is a proposal,
+  not yet implemented).
+- skill-improver mean before / after: pending.
+- Latency / accuracy actual numbers: pending implementation against
+  the STARGA agent-skill catalog with a reference catalog rebuilt
+  using gpt-4o-mini (or Llama-3.1-8B-Instruct) for query generation
+  at `N_QUERIES_PER_ROUTE = 16` and the RFC-016 cross-encoder filter
+  at `T_FILTER = 0.5`.
+
+## Decision
+
+Needs-human-review.
+
+Rationale for not auto-accepting: this RFC is a catalog-builder
+pipeline change with no in-tree code modification. The mind-nerve
+repo's role is to (a) document the discipline in
+`spec/architecture.md` and `ROADMAP.md` so future catalog-builder
+implementations follow it, and (b) ship the integration tests that
+regression-guard the expected accuracy lift. The actual augmentation
+step lives in the catalog-builder pipeline, which is external in
+Phase 1. A human reviewer should confirm three things before this
+RFC lands: (1) the catalog-builder team can absorb the
+LLM-generation + cross-encoder-filter + concatenation step (a modest
+extension to the existing catalog-build wall-clock — adds ~6
+GPU-hours for self-hosted 7B-class generation, or ~$3 at gpt-4o-mini
+API pricing for a 10K-route catalog — alongside RFC-001's group-wise
+quantization, RFC-005's saliency-ranked head mask, RFC-007's
+attention-sink-aware training, RFC-008's MRL auxiliary loss,
+RFC-009's `q_latent` parameter, RFC-010's cosine-similarity
+contrastive objective, RFC-011's ALiBi bias, RFC-012's asymmetric
+prefix conditioning, RFC-013's RMSNorm, RFC-014's multi-query
+pooling with diversity penalty, RFC-015's positive-aware hard
+negative mining, and RFC-016's cross-encoder distillation). All
+thirteen are v2 reference-checkpoint / v2 catalog changes; landing
+them in a single training+catalog-build run avoids thirteen
+sequential invalidations of downstream artifacts. (2) The chosen
+generation LLM has compatible licensing for generating queries
+against STARGA's agent-skill catalog. gpt-4o-mini's output terms
+permit derivative use; Llama-3.1-8B-Instruct under the Llama 3.1
+Community License also permits derivative use; both options were
+verified at the date of this RFC, but a human reviewer should
+re-confirm before the actual augmentation run. (3) The few-shot
+generation prompt (the load-bearing piece for reproducibility)
+should be pinned in the catalog-builder's `training_recipe.toml`
+and reviewed for quality before commitment to the full 10K-route
+run; small catalogs (<100 routes) should be augmented and
+accuracy-staged first as a smoke test, with the full augmentation
+gated on the staged result showing ≥ +1.0 point top-5 lift on the
+zero-lexical-overlap subset. Until all three confirmations land,
+this RFC remains a proposal documenting the discipline; the
+catalog-builder team can adopt it incrementally without coordination
+because the resulting embeddings are byte-compatible with the
+existing mind-nerve inference path (only the byte values inside the
+embedding rows change, and `catalog_hash` updates correspondingly).

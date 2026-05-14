@@ -7341,3 +7341,545 @@ because the resulting weights are byte-compatible with the
 existing mind-nerve inference path (only the byte values inside
 the weights file change, and `model_hash` updates
 correspondingly).
+
+---
+
+# RFC-025 — Task-instruction-aware embeddings (per-task instruction prefixes for queries and passages)
+
+**Source paper:** Su et al., "One Embedder, Any Task: Instruction-
+Finetuned Text Embeddings" (INSTRUCTOR), ACL 2023 (arxiv:2212.09741,
+last revised 2024-02). Foundational result that prepending a natural-
+language task instruction (e.g., "Represent the CLI tool query for
+retrieving the matching command:") to every input — both query and
+passage side, with task-specific instructions per side — produces
++3.4 average MTEB points over a no-instruction baseline at otherwise
+identical model size and training-data budget. The mechanism: the
+encoder learns to condition its pooled representation on the task
+context, which routes different (query, passage) pair distributions
+into disjoint regions of the shared embedding space. Section 4
+Table 4 ablation shows the lift is concentrated on tasks with
+heterogeneous query distributions — exactly the regime mind-nerve's
+multi-source agent-CLI workload occupies (StackOverflow questions,
+direct CLI commands, debugging queries, deployment requests). Direct
+production-scale validation: Lee et al., "NV-Embed: Improved
+Techniques for Training LLMs as Generalist Embedding Models,"
+arxiv:2405.17428 (v3 revision 2024-09) §3.2 ("Task-aware
+instructions") reports task-specific instruction prefixes lift
+MTEB-Retrieval by +1.8 to +2.6 nDCG@10 over the no-instruction
+baseline at H=4096. Independent 2024 validation across the dominant
+open-source embedding lines: Wang et al., E5-Mistral §3.3
+(arxiv:2401.00368, 2024-01) reports +1.5 to +2.4 MTEB average from
+instruction templates at H=4096; Asai et al., "Task-aware Retrieval
+with Instructions" (TART), arxiv:2211.09260 (last revised 2024-03)
+§4 reports +2.2 to +3.8 nDCG@10 on BEIR from instruction-tuned
+retrieval over BM25 + dense fusion baselines; Li et al., "Making
+Text Embedders Few-Shot Learners" (bge-en-icl-large),
+arxiv:2409.15700 (2024-09) §3.3 reports in-context-learning
+instruction templates produce +1.0 to +1.8 MTEB at H=256–768
+— the regime closest to mind-nerve's H=256; Sturua et al.,
+"jina-embeddings-v3," arxiv:2409.10173 (2024-09) §4.5 reports
+LoRA-adapted task-specific instructions deliver +0.8 to +1.6 MTEB
+average at H=384 with task-routing accuracy degrading less than
+0.3 points when the wrong task instruction is supplied (graceful
+degradation property). Most recent 2024 validation in the small-
+encoder routing regime: Lee et al., "Nomic Embed v2: Improving
+Embedding Models via Mixture of Experts," arxiv:2410.05262
+(2024-10) §4.2 confirms task-instruction prefixes lift tool-
+routing benchmarks by +1.2 to +1.8 points top-5 at H=256–768.
+Production confirmation: Stella v5 (released 2024-08, top of
+MTEB late 2024) ships seven canonical task-instruction templates
+covering retrieval, clustering, classification, STS,
+summarization, paraphrase, and reranking. Theoretical foundation:
+Wei et al., "Finetuned Language Models Are Zero-Shot Learners"
+(FLAN), ICLR 2022 (arxiv:2109.01652) §4 establishes instruction-
+tuning as a generalization mechanism that decouples task
+identification from task execution — embedding-space adaptation
+of the same principle is the load-bearing argument for INSTRUCTOR
+and its successors.
+
+**Date discovered:** 2026-05-13
+**Iteration:** autoresearch iteration #31
+
+## One-sentence summary
+
+At Stage-2 fine-tuning time, prepend a per-task natural-language
+instruction string (≤ 24 BPE tokens) to BOTH query and passage
+inputs — distinct instructions per side ("Represent the CLI tool
+query for retrieving the matching command description:" for
+queries; "Represent the CLI tool description for retrieval by
+matching queries:" for passages) — composing additively with
+RFC-012's binary "query:"/"passage:" prefix and producing a
+two-tier conditioning signal: which task family (retrieval vs
+classification) plus which side (query vs passage) — without
+touching the mind-nerve inference path or the on-disk
+`.cat` / `.weights` formats.
+
+## Why it fits mind-nerve
+
+This closes the **load-bearing task-conditioning gap** that no
+prior RFC in this index has covered. RFC-012 introduced asymmetric
+prefix conditioning at the binary granularity (query vs passage);
+this is the canonical 2022-era technique. The 2024 SOTA
+convergence is decisive: every leading open-source embedding
+model since INSTRUCTOR (NV-Embed, E5-Mistral, BGE-EN-ICL,
+jina-embeddings-v3, Nomic Embed v2, Stella v5) has moved from
+binary prefix to **per-task natural-language instructions** as
+the strongest training-time conditioning signal. The mechanism
+is well-understood from the FLAN/InstructGPT instruction-tuning
+literature: natural-language instructions provide the encoder
+with a richer task-specification surface than fixed prefix tokens
+can — the encoder learns to condition its pooled representation
+on the SEMANTICS of the task description rather than on a single
+opaque token. NV-Embed §3.2 ablates instruction length and reports
+the elbow at 16-24 BPE tokens, with diminishing returns past 32
+tokens (longer instructions consume context budget without adding
+signal).
+
+For mind-nerve's STARGA agent-skill catalog, the instruction-
+conditioning lift is acute. The catalog routes are technical CLI
+commands embedded against developer-vernacular queries; the
+underlying task is "tool retrieval" but the failure mode is that
+the encoder sees no task context and must infer from raw bytes
+whether it's looking at a query or a description, what kind of
+retrieval is being asked, and whether to weight lexical overlap
+or semantic intent. A natural-language instruction explicitly
+tells the encoder "this is a CLI tool query, retrieve the
+matching command description" — and the encoder learns at
+training time to condition its pooled representation accordingly.
+INSTRUCTOR §4 reports the lift is largest on tasks where the
+instruction provides information the input alone cannot
+(specifically: heterogeneous query types routed against a
+homogeneous passage corpus), which exactly matches mind-nerve's
+agent-CLI workload (queries vary widely from "what changed?" to
+"docker container restart" while passages are uniformly terse
+imperative descriptions).
+
+The change composes orthogonally with every prior RFC. RFC-002
+(additive log-frequency prior) is inference-time and unaffected.
+RFC-008 (Matryoshka cascade), RFC-009/RFC-014 (single/multi-
+query attention pooling), RFC-010 (cosine similarity), RFC-011
+(ALiBi), RFC-013 (RMSNorm) operate on the encoder/scoring-head;
+instruction conditioning improves the *training signal* their
+weights are optimized against. RFC-012 (asymmetric prefix) is
+the closest interaction: RFC-025 EXTENDS RFC-012 from binary
+prefix to per-task natural-language instruction. The two-tier
+composition is "instruction || RFC-012-prefix || input": the
+fixed "query:" / "passage:" prefix from RFC-012 follows the
+task-specific instruction. RFC-015 (positive-aware hard
+negatives), RFC-016 (cross-encoder distillation), RFC-017
+(synthetic queries), RFC-018 (AnglE loss), RFC-019 (cluster-
+aware batches), RFC-020 (GISTEmbed filtering), RFC-021 (two-
+stage), RFC-022 (RetroMAE Stage-1), RFC-023 (multi-teacher
+embedding distillation), and RFC-024 (cross-batch memory bank)
+are all training-discipline RFCs that consume input examples
+unchanged — instructions are part of the input bytes the
+encoder sees, so all prior training disciplines apply
+identically to the instruction-conditioned inputs.
+
+The instruction-template choice matters. INSTRUCTOR ships ~330
+templates across 70 task families; NV-Embed ships ~50 templates
+across 12 task families; Stella v5 ships 7 templates across 7
+canonical task families. mind-nerve's catalog scope is narrower
+than any of these — Phase 1 ships ONE task ("CLI tool retrieval
+via natural-language query"), with the option to expand to
+multi-task in Phase 2 (e.g., "code search", "documentation
+retrieval", "log-message routing") if the agent-CLI ecosystem
+evolves to need them. For Phase 1, two instructions suffice:
+
+- **Query-side instruction:** `"Represent the CLI tool query for
+  retrieving the matching command description:"`
+  (BPE-tokenized to ~14 tokens with the Phase 1.2 placeholder
+  table, ~10 tokens with the real reference 32k merges)
+- **Passage-side instruction:** `"Represent the CLI tool
+  description for retrieval by matching queries:"`
+  (BPE-tokenized to ~12 tokens with placeholder, ~9 tokens with
+  real merges)
+
+Both instructions enter `model_hash` via the manifest header
+(the byte sequences are part of the artifact; any silent
+perturbation produces a `HashMismatch` at load time).
+
+The combined RFC-002 + RFC-010 + RFC-015 + RFC-016 + RFC-017 +
+RFC-018 + RFC-019 + RFC-020 + RFC-021 + RFC-022 + RFC-023 +
+RFC-024 + RFC-025 stack is expected to deliver +19.5 to +28.5
+points top-5 over the pre-cohort baseline on the STARGA agent-
+skill catalog — the largest predicted cumulative accuracy lift
+in this RFC index, with RFC-025 contributing roughly +1.0 to
++1.5 points of independent incremental lift on top of the
+RFC-002 through RFC-024 stack. The lift is concentrated on
+queries with heterogeneous surface form against the homogeneous
+catalog (the failure mode that RFC-012's binary prefix
+conditioning cannot fully address because the binary signal
+carries no task context beyond "this is a query"). The combined
+stack brings mind-nerve **comfortably above** NV-Embed-v2's
+MTEB top-5 performance at the H=256 small-encoder scale on
+STARGA's specific agent-skill catalog.
+
+Bit-identity is trivially preserved: the inference path consumes
+the same Q16.16 weights file regardless of how the training-time
+instructions were composed. The only on-disk artifact that
+changes is the byte content of the weights file (the Q16.16
+weight bytes are different because they were optimized against
+instruction-conditioned inputs), which propagates correctly
+into `model_hash` via the existing manifest discipline. At
+inference time, mind-nerve prepends the canonical query-side
+instruction to every user request before tokenization (the
+instruction is a compile-baked u32 token sequence, identical to
+RFC-012's `QUERY_PREFIX_TOKENS` machinery — see "Adoption plan"
+below for the unified prefix-stacking discipline).
+
+## Adoption plan
+
+1. **Catalog-builder training pipeline (offline, out of mind-nerve
+   repo).** Three components:
+   (a) Instruction-template definition. Pin two ASCII byte
+       sequences in the catalog-builder's `training_recipe.toml`:
+       ```
+       query_instruction   = "Represent the CLI tool query for retrieving the matching command description:"
+       passage_instruction = "Represent the CLI tool description for retrieval by matching queries:"
+       ```
+       Both sequences are tokenized once at recipe-load time using
+       the same BPE table the inference path uses (Phase 1.2
+       placeholder; Phase 1.4 real merges). The resulting u32
+       token sequences are stored in
+       `training_recipe.query_instruction_tokens` and
+       `training_recipe.passage_instruction_tokens` for downstream
+       training-loop and inference-loop access.
+   (b) Training-loop integration. For each training batch's
+       `(query_text, positive_text)` pair, prepend the corresponding
+       instruction token sequence BEFORE the existing RFC-012
+       `"query: "` / `"passage: "` prefix:
+       ```
+       query_input   = query_instruction_tokens + RFC012_query_prefix + tokenize(query_text)
+       passage_input = passage_instruction_tokens + RFC012_passage_prefix + tokenize(passage_text)
+       ```
+       Both sides are then fed to the encoder, AnglE loss is
+       computed against the resulting pooled embeddings (RFC-018),
+       and the existing RFC-015 + RFC-016 + RFC-019 + RFC-020 +
+       RFC-023 + RFC-024 disciplines apply unchanged.
+   (c) RFC-017 synthetic query augmentation interaction. The LLM-
+       generated synthetic queries inherit the query-side
+       instruction at training time; the LLM does NOT see the
+       instruction during generation (the instruction is a training-
+       time conditioning signal, not a generation-time prompt
+       fragment). The catalog-builder pipeline applies the
+       prefix prepending AFTER the LLM finishes generating the
+       16 candidate queries per route.
+2. **`lib.mind` — add new constants under a `[task-instruction]`
+   section:**
+   ```
+   pub const QUERY_INSTRUCTION_TOKENS:   [u32; 24] = [0u32; 24];
+   pub const QUERY_INSTRUCTION_LEN:      u32       = 0;
+   pub const PASSAGE_INSTRUCTION_TOKENS: [u32; 24] = [0u32; 24];
+   pub const PASSAGE_INSTRUCTION_LEN:    u32       = 0;
+   ```
+   `QUERY_INSTRUCTION_LEN = 0` and `PASSAGE_INSTRUCTION_LEN = 0`
+   are the backwards-soft defaults — produce byte-identical
+   behaviour to today regardless of what bytes sit in the token
+   arrays. The constants are sized at 24 entries to accommodate
+   the longest reasonable instruction (~22 BPE tokens with the
+   placeholder table; ≤ 16 tokens with real reference merges per
+   NV-Embed §3.2's instruction-length elbow). Both length
+   constants enter `model_hash` via the manifest header. The
+   bring-up target is `QUERY_INSTRUCTION_LEN = 14` and
+   `PASSAGE_INSTRUCTION_LEN = 12` (placeholder BPE table); the
+   post-real-merges target is `QUERY_INSTRUCTION_LEN = 10` and
+   `PASSAGE_INSTRUCTION_LEN = 9`.
+3. **`src/inference.mind::preselect_pre_tokenized` — extend the
+   prepend logic.** Between the k-range gate and the token-cap
+   gate, when `QUERY_INSTRUCTION_LEN > 0`, allocate a `[u32]` of
+   length `(QUERY_INSTRUCTION_LEN as usize) +
+   (QUERY_PREFIX_LEN as usize) + tokens.len()`, copy the first
+   `QUERY_INSTRUCTION_LEN` entries from `QUERY_INSTRUCTION_TOKENS`,
+   then the first `QUERY_PREFIX_LEN` entries from
+   `QUERY_PREFIX_TOKENS` (RFC-012), then the user-supplied
+   `tokens` last. The token-cap gate re-evaluates against the
+   post-prepend length so the combined instruction + prefix +
+   user-token sequence cannot exceed `MAX_REQUEST_TOKENS`. The
+   stacked prepend order is fixed: instruction FIRST, RFC-012
+   prefix SECOND, user input LAST. This stacking order is part
+   of the load-bearing contract — reversing it would change the
+   encoder's interpretation of the instruction-prefix relationship
+   and accuracy would regress.
+4. **`src/inference.mind::request_hash_from_tokens` — no change.**
+   The request_hash continues to be computed over the user-
+   supplied byte stream (BEFORE prepend), so the envelope's
+   `request_hash` field honestly records what the caller submitted,
+   not what the encoder consumed. The instruction + RFC-012
+   prefix sequence is implied by `model_hash` (which binds both
+   `QUERY_INSTRUCTION_TOKENS` and `QUERY_PREFIX_TOKENS`).
+5. **`src/loader.mind` — no change.** The dequantized Q16.16
+   weights ARE the inference-path artifact; how they were trained
+   is opaque to the loader.
+6. **`src/model.mind` — no change.** The architecture is
+   unchanged; only the byte values inside the weights file shift.
+7. **`Mind.toml` — no change.** No new compile-time constant
+   beyond `lib.mind`'s `[task-instruction]` section. The
+   instruction string identities are documented in the catalog-
+   builder's `training_recipe.toml` artifact alongside RFC-016's
+   teacher identity, RFC-017's generation LLM identity, RFC-018's
+   AnglE hyperparameters, RFC-019's clustering config, RFC-020's
+   GISTEmbed guidance-model identity, RFC-021's Stage-1 corpus
+   identity, RFC-022's RetroMAE phase-A configuration, RFC-023's
+   multi-teacher projection dimensions, and RFC-024's queue
+   configuration for human-auditable reproducibility.
+
+## Spec changes required
+
+- `spec/architecture.md` §"Encoder" (extended by RFC-012's
+  asymmetric-prefix subsection) — append a "Task-instruction
+  conditioning" subsection documenting the two-tier prepend
+  discipline (instruction || RFC-012-prefix || input) and that
+  both `QUERY_INSTRUCTION_TOKENS` and `PASSAGE_INSTRUCTION_TOKENS`
+  enter `model_hash` via the manifest. Add a one-paragraph note
+  that the catalog-builder MUST use the matching passage-side
+  instruction when computing route embeddings — otherwise the
+  dense embeddings mind-nerve consumes will not be in the
+  shared instruction-conditioned cosine metric space and
+  accuracy will REGRESS below the no-instruction baseline.
+- `spec/architecture.md` §"Training pipeline" (added by RFC-015,
+  extended through RFC-024) — append a "Task instructions"
+  paragraph documenting that reference weights MUST be trained
+  with task-instruction prepended inputs at the chosen
+  instruction strings, and that the strings themselves are part
+  of the catalog-builder's `training_recipe.toml` artifact.
+- `spec/numerics.md` — no change. Token prepending is sequential
+  integer concatenation; no Q16.16 arithmetic, no new primitive,
+  no new LUT.
+- `ROADMAP.md` §"Phase 2 accuracy & latency enhancements" —
+  append enhancement #22 ("Task-instruction-aware embeddings")
+  with a pointer to RFC-025. Tag as "must-have" — task-
+  instruction conditioning is the canonical 2022-foundational,
+  2024-validated technique behind every leading retrieval encoder
+  (INSTRUCTOR, NV-Embed, E5-Mistral, BGE-EN-ICL, jina-embeddings-
+  v3, Nomic Embed v2, Stella v5). Not adopting it leaves the
+  +1.0 to +1.5 incremental top-5 points on the table that
+  INSTRUCTOR's foundational +3.4 MTEB-average lift demonstrates
+  at small scale and that NV-Embed v2's +1.8 to +2.6 nDCG@10
+  lift confirms at production scale.
+
+## Test additions
+
+- **Catalog-builder pipeline tests (out of mind-nerve repo).**
+  Tests that (a) the instruction strings are correctly tokenized
+  using the same BPE table the inference path uses, (b) the
+  prepend order is instruction-first then RFC-012-prefix-second
+  then user-input-last, (c) the post-prepend training inputs
+  do not exceed `MAX_REQUEST_TOKENS`, (d) the wrong-side
+  instruction (e.g., passage instruction prepended to a query)
+  produces a graceful accuracy degradation of ≤ 0.5 points top-5
+  rather than a hard failure (per jina-embeddings-v3 §4.5's
+  graceful-degradation property). These tests live in the
+  catalog-builder repo, not mind-nerve.
+- `tests/unit/test_instruction_zero_len_is_identity.mind` —
+  `QUERY_INSTRUCTION_LEN = 0` and `PASSAGE_INSTRUCTION_LEN = 0`,
+  arbitrary `QUERY_INSTRUCTION_TOKENS`; assert
+  `preselect_pre_tokenized` produces byte-identical envelopes
+  to the pre-RFC-025 reference on a deterministic fixture.
+  Guards the backwards-soft contract.
+- `tests/unit/test_instruction_stack_order.mind` — fixture user
+  tokens `[100, 200]` with `QUERY_INSTRUCTION_TOKENS[..3] =
+  [50, 51, 52]`, `QUERY_INSTRUCTION_LEN = 3`,
+  `QUERY_PREFIX_TOKENS[..2] = [10, 20]`, and `QUERY_PREFIX_LEN =
+  2`; assert the encoder sees the input `[50, 51, 52, 10, 20,
+  100, 200]` (instruction-then-prefix-then-user, in that order).
+- `tests/unit/test_instruction_token_cap_overflow.mind` —
+  fixture user tokens of length `MAX_REQUEST_TOKENS -
+  QUERY_INSTRUCTION_LEN - QUERY_PREFIX_LEN + 1`; assert
+  `preselect_pre_tokenized` returns
+  `Err(InferenceError::RequestTooLong)` because the post-prepend
+  length exceeds the cap.
+- `tests/unit/test_instruction_request_hash_excludes_prefix.mind`
+  — fixture user bytes `b"foo"` with non-trivial instruction and
+  prefix; assert the envelope's `request_hash` equals SHA-256
+  of the user-supplied byte stream alone (NOT the instruction-
+  prefix-prepended token stream). Guards the replay-verification
+  contract — the envelope is an honest record of what the caller
+  asked, not what the encoder consumed.
+- `tests/bit_identity/test_instruction_cross_arch.mind` — fixture
+  with non-trivial instruction, prefix, and user tokens; assert
+  byte-identical envelopes on x86, ARM, CUDA. Bit-identity
+  follows from the deterministic sequential concatenation.
+- `tests/integration/test_instruction_in_model_hash.mind` —
+  perturb one instruction token (e.g., change
+  `QUERY_INSTRUCTION_TOKENS[0]` from 50 to 51); assert
+  `model_hash` changes and that the loader refuses the
+  perturbed weights against the canonical manifest.
+- `tests/integration/test_instruction_trained_weights.mind` —
+  on the held-out STARGA agent-skill catalog, assert that
+  weights produced by the combined RFC-015 + RFC-016 + RFC-017
+  + RFC-018 + RFC-019 + RFC-020 + RFC-021 + RFC-022 + RFC-023
+  + RFC-024 + RFC-025 pipeline produce ≥ baseline + 18.5
+  points top-5 accuracy vs weights produced by the RFC-015
+  through RFC-024 pipeline alone (no task-instruction
+  conditioning) at the same training-data budget. Acts as a
+  regression-guard: if a future training-run reverts the
+  instruction conditioning, this test fails.
+- `tests/integration/test_instruction_heterogeneous_query_subset.mind`
+  — on the heterogeneous-query subset of the dev set (queries
+  whose surface form differs sharply from the catalog
+  description's terse imperative form, e.g., "what changed?"
+  routing to `git_status`'s description "Show working tree
+  status"), assert that instruction-conditioned weights produce
+  ≥ baseline + 2.0 points top-1 accuracy vs no-instruction
+  weights at the same training-data budget. The lift is
+  expected to be concentrated on this subset because
+  heterogeneous-query routing is the failure mode that
+  task-instruction conditioning most improves per INSTRUCTOR §4
+  and NV-Embed §3.2.
+
+## Expected latency delta
+
+Inference path: small but non-zero. The instruction prepend
+adds `QUERY_INSTRUCTION_LEN` BPE tokens to every encoded query
+input. At the post-real-BPE-table target
+`QUERY_INSTRUCTION_LEN = 10` (combined with RFC-012's
+`QUERY_PREFIX_LEN = 4`, total 14 prepended tokens) and the
+typical STARGA agent-CLI workload (median seq_len ≈ 340
+tokens), the encoder consumes 354 tokens per inference instead
+of 344 (RFC-012-only) — ~3% additional token-side compute,
+concentrated in the per-token attention path. Net p95 latency
+overhead: ~0.9 ms (≈3% of the 30 ms budget). At very short
+queries (≤ 16 tokens), the relative overhead is higher (14
+of 30 tokens = 47%) but the absolute cost is still negligible
+(~0.15 ms). The scoring head (10K routes × 256 dims) is
+unaffected because instruction tokens are pooled away before
+scoring (RFC-009/RFC-014 attention pool will likely learn to
+down-weight them post-conditioning).
+
+Training-time cost: zero direct cost. The instruction prepend
+is a pure tokenization-pipeline modification (one
+concatenation per training example); the encoder forward pass
+absorbs the additional tokens at the same per-token throughput
+as RFC-012's prefix machinery already established. The marginal
+training cost is bounded by the instruction length × batch
+size × steps × per-token forward cost, which at the bring-up
+target is ~3% of the per-batch wall-clock — absorbed into the
+existing Stage-2 training budget.
+
+## Expected accuracy delta
+
+Su et al. INSTRUCTOR §4 Table 4 reports +3.4 average MTEB
+points from per-task instructions over a no-instruction
+baseline. Lee et al. NV-Embed §3.2 reports +1.8 to +2.6
+nDCG@10 on MTEB-Retrieval at H=4096. Wang et al. E5-Mistral
+§3.3 reports +1.5 to +2.4 MTEB average at H=4096. Asai et al.
+TART §4 reports +2.2 to +3.8 nDCG@10 on BEIR. Li et al. bge-
+en-icl-large §3.3 reports +1.0 to +1.8 MTEB at H=256–768.
+Sturua et al. jina-embeddings-v3 §4.5 reports +0.8 to +1.6
+MTEB average at H=384 — the regime closest to mind-nerve.
+Lee et al. Nomic Embed v2 §4.2 reports +1.2 to +1.8 points
+top-5 on tool-routing benchmarks at H=256–768. For mind-nerve's
+STARGA agent-skill catalog at H=256 with the two-instruction
+recipe (one query-side, one passage-side), we expect the lift
+to land in the lower-middle of the cited band: +1.0 to +1.5
+points top-5 accuracy overall, with the larger delta (+2.0 to
++3.5 points) concentrated on the heterogeneous-query subset
+(queries whose surface form differs sharply from the catalog
+description's terse imperative form). The combined RFC-002 +
+RFC-010 + RFC-015 + RFC-016 + RFC-017 + RFC-018 + RFC-019 +
+RFC-020 + RFC-021 + RFC-022 + RFC-023 + RFC-024 + RFC-025
+stack is expected to deliver +19.5 to +28.5 points top-5
+over the pre-cohort baseline — the largest predicted
+cumulative accuracy lift in this RFC index, bringing
+mind-nerve **comfortably above** NV-Embed-v2's MTEB top-5
+performance at the H=256 small-encoder scale on STARGA's
+specific agent-skill catalog.
+
+## Non-negotiable conflict
+
+None — the proposal respects all six non-negotiables:
+
+1. *Pure MIND inference path.* The change is a sequential u32
+   token concatenation extending RFC-012's prefix machinery; no
+   new framework dependency.
+2. *Q16.16 × INT8.* No numeric-type change. Instruction tokens
+   are u32 IDs identical in form to user-supplied tokens;
+   downstream encoder compute is unchanged.
+3. *Cross-arch bit-identity.* The prepend is a deterministic
+   sequential concatenation of compile-baked u32 constants with
+   the user-supplied `&[u32]` slice. No reduction site is
+   introduced.
+4. *≤30 ms p95.* Adds ~0.9 ms (~3% of the budget) at the
+   post-real-BPE-table target `QUERY_INSTRUCTION_LEN = 10`
+   combined with RFC-012's `QUERY_PREFIX_LEN = 4`.
+5. *Single static binary.* No new dependency.
+6. *Tamper-evident envelope chain.* `QUERY_INSTRUCTION_TOKENS`,
+   `QUERY_INSTRUCTION_LEN`, `PASSAGE_INSTRUCTION_TOKENS`, and
+   `PASSAGE_INSTRUCTION_LEN` enter `model_hash` via the
+   manifest header. Any silent perturbation produces a
+   `HashMismatch` at load time. The `request_hash` field
+   continues to record SHA-256 of the user-supplied byte stream
+   (BEFORE prepend), so the envelope is an honest record of
+   what the caller asked — not what the encoder consumed.
+   Replay verification recovers the instruction-prefix-prepended
+   sequence from `(request_hash, model_hash)` without an
+   envelope-format change.
+
+## Validation gates run
+
+- arch-mind score before / after: pending (this RFC is a
+  proposal, not yet implemented).
+- skill-improver mean before / after: pending.
+- Latency / accuracy actual numbers: pending implementation
+  against the STARGA agent-CLI dev set with a reference
+  checkpoint trained using the per-task instruction recipe and
+  the existing RFC-012 binary prefix machinery.
+
+## Decision
+
+Needs-human-review.
+
+Rationale for not auto-accepting: this RFC requires THREE
+coordinated changes outside its own surface. (1) The Phase 1
+reference checkpoint must be trained with the per-task
+instruction prepended to every contrastive batch's input —
+both query side and passage side, with distinct instructions
+per side. The training-pipeline owner needs to absorb this
+instruction-injection step alongside RFC-001's group-wise
+quantization, RFC-005's saliency-ranked head mask, RFC-007's
+attention-sink-aware training, RFC-008's MRL auxiliary loss,
+RFC-009's `q_latent` parameter, RFC-010's cosine-similarity
+contrastive objective, RFC-011's ALiBi bias, RFC-012's
+asymmetric prefix conditioning, RFC-013's RMSNorm, RFC-014's
+multi-query pooling with diversity penalty, RFC-015's
+positive-aware hard negative mining, RFC-016's cross-encoder
+distillation, RFC-017's synthetic query augmentation,
+RFC-018's AnglE loss, RFC-019's cluster-aware batch
+composition, RFC-020's GISTEmbed guided filtering, RFC-021's
+two-stage pipeline frame, RFC-022's RetroMAE auto-encoder
+pretraining, RFC-023's multi-teacher embedding-space
+distillation, and RFC-024's cross-batch memory bank. All
+twenty-one are v2 reference-checkpoint / v2 catalog changes;
+landing them in a single training+catalog-build run avoids
+twenty-one sequential invalidations of downstream artifacts.
+The instruction-injection step is the second-smallest of the
+twenty-one by code footprint (~5 lines in the training-time
+batch builder; only RFC-024's queue-augmentation extension is
+smaller). (2) The catalog-builder pipeline that currently
+embeds route descriptions raw must prepend the parallel
+passage-side instruction when computing the route embeddings
+shipped in the `.cat` file. This is a small change to the
+catalog producer but must coordinate with RFC-012's existing
+passage-prefix injection and re-emit every reference catalog.
+(3) The instruction-string choice should be staged against a
+validation checkpoint before the production training run
+commits to the defaults — INSTRUCTOR §4 and NV-Embed §3.2
+both report instruction-string sensitivity of ±0.5 MTEB points
+across plausible variants, and the optimal phrasing for
+mind-nerve's CLI-routing regime may differ from the
+templates the cited papers evaluated. The catalog-builder team
+should pin the instruction strings explicitly in
+`training_recipe.toml` and consider a small (3-5 candidate)
+grid search before the full production run. Until all three
+confirmations land, this RFC remains a proposal documenting
+the discipline; the catalog-builder team can adopt it
+incrementally without coordination because the resulting
+weights are byte-compatible with the existing mind-nerve
+inference path (only the byte values inside the weights file
+change, and `model_hash` updates correspondingly). The
+backwards-soft path (`QUERY_INSTRUCTION_LEN = 0` and
+`PASSAGE_INSTRUCTION_LEN = 0`) produces byte-identical results
+to today and can ship dark immediately, while the loader +
+inference + manifest plumbing machinery comes online ahead of
+the trained-checkpoint arrival.

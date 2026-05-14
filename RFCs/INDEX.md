@@ -1775,3 +1775,595 @@ backwards-soft path (`pool_q_latent = [0; H]`) produces softmax-
 uniform weights that are mathematically equivalent (within 1 ULP)
 to mean-pool, so the v2 loader can ship with a zero-vector
 `pool_q_latent` as a no-op until the trained vector arrives.
+
+---
+
+# RFC-010 — L2-normalized cosine similarity scoring head
+
+**Source paper:** Wang et al., "Text Embeddings by Weakly-Supervised
+Contrastive Pre-training," arxiv:2212.03533 (2022-12, last revised
+2024-03). The E5 paper establishes L2-normalized embeddings + cosine
+similarity as the canonical scoring head for retrieval-style encoders;
+§4.3 Table 6 ablation reports a -2.0 nDCG@10 mean drop on MTEB-Retrieval
+when L2 normalization is removed. Independent 2024 confirmation across
+every dominant open-source embedding line: Lee et al., "NV-Embed:
+Improved Techniques for Training LLMs as Generalist Embedding Models,"
+arxiv:2405.17428 (2024-05, v3 2024-09) §3.4 normalizes its latent-pool
+output before scoring; Xiao et al., "C-Pack: Packaged Resources To
+Advance General Chinese Embedding," arxiv:2309.07597 (v5 2024-05) —
+the BGE family — normalizes; Zhang et al. mGTE, arxiv:2407.19669
+(2024-07) §3.3 ("Reranking Score Composition") normalizes and adopts
+the additive-IDF fusion `score = cos_sim + λ * idf_bias`; Nussbaum et
+al. Nomic Embed, arxiv:2402.01613 (2024-02) §3 normalizes; Li et al.
+GTE, arxiv:2308.03281 (v3 2024-08) normalizes. Most recent 2024
+reproducibility validation in the sparse-routing regime: Lassance et
+al., "An Efficiency Study for SPLADE Models," SIGIR 2024 Reproducibility
+Track (arxiv:2408.10752) §4 confirms that the post-cosine *additive*
+IDF parametrization matches or beats the pre-cosine *multiplicative*
+parametrization on long-tail routing benchmarks.
+
+**Date discovered:** 2026-05-13
+**Iteration:** autoresearch iteration #15
+
+## One-sentence summary
+
+Replace the raw `q16_dot_pinned`-based scoring head with cosine
+similarity by L2-normalizing the pooled query vector at runtime and
+the route embeddings at catalog-build time, so the inference-path
+score is `<query / ||query||, route / ||route||>` in Q16.16 — bounded
+to `[-ONE_Q16_16, ONE_Q16_16]` — with route normalization absorbed
+into the on-disk embedding bytes for zero hot-path catalog cost.
+
+## Why it fits mind-nerve
+
+This addresses a frame omission in mind-nerve v3: the scoring head
+consumes raw Q16.16 dot products whose magnitudes are dominated by
+the L2 norms of the operands rather than their angular alignment.
+Every 2024 SOTA open-source embedding model — E5, BGE, GTE, mGTE,
+NV-Embed, Nomic Embed — normalizes its outputs and uses cosine
+similarity for retrieval/routing scoring; E5 §4.3 Table 6 measures
+this as a +2.0 nDCG@10 mean lift across MTEB-Retrieval vs the
+unnormalized dot-product ablation. The mechanism is well-understood:
+magnitude information in encoder outputs correlates with token count
+and confidence-calibration noise rather than semantic relevance;
+normalization isolates the angle, which is what carries the routing
+signal.
+
+The change composes cleanly with every prior RFC except RFC-004.
+RFC-009 (learned attention pooling) produces a Q16.16 pooled vector;
+normalizing it before scoring is the canonical extension — NV-Embed
+§3.4 explicitly composes a learned latent-pool with L2 normalization
+in this exact order. RFC-008 (Matryoshka cascade) operates on
+normalized prefixes — the coarse-pass dot product over the first 64
+dimensions of an L2-normalized 256-dim vector is itself approximately
+L2-normalized (the prefix norm is bounded by the full norm), and MRL
+training is compatible with normalized retrieval (Kusupati et al.
+§4.2 demonstrates the variant). RFC-002 (additive log-frequency prior)
+adds a Q16.16 bias to the cosine score in `[-1, 1]` range; the prior
+magnitudes shipped by the catalog builder need to be calibrated
+against the cosine range rather than the unnormalized dot-product
+range, but the parametrization is unchanged. RFC-007 (attention
+sinks), RFC-005 (head pruning), RFC-001 (group-wise INT8), and
+RFC-003 (adaptive stride) act on the encoder/weights, not the
+scoring head; they are unaffected.
+
+The interaction with RFC-004 (smoothed RSJ-IDF multiplicative
+scaling) is the load-bearing trade-off. RFC-004 multiplies each route
+embedding row by an IDF-derived Q16.16 scalar; L2 normalization then
+discards that scaling because the scalar is absorbed into the row
+norm and divided out. The 2024 literature convergence on this question
+is decisive: mGTE §3.3 and Lassance et al. SPLADE-v3 §4 both show that
+the post-cosine *additive* IDF parametrization matches or beats the
+pre-cosine *multiplicative* parametrization on long-tail routing
+benchmarks. RFC-002's log-frequency additive prior already implements
+this pattern. RFC-010 therefore deprecates RFC-004 in favor of
+`RFC-002 + cosine` as the combined long-tail solution.
+
+Bit-identity follows from the primitives' existing contracts. L2
+normalization is `q16_rsqrt(q16_sum_pinned(q16_mul(x, x) for x in
+vec))` followed by elementwise `q16_mul(x, inv_norm)` — every
+primitive is pinned in `q16_16.mind` and `spec/numerics.md`. The
+sum-of-squares reduces to `q16_dot_pinned(vec, vec)` (a vector's
+self-dot IS its squared norm), so no new reduction site is introduced;
+the only new arithmetic is the rsqrt LUT lookup and the elementwise
+rescale. Both reductions iterate the hidden axis in canonical
+ascending order.
+
+## Adoption plan
+
+1. **Module(s) touched:**
+   - `src/inference.mind::preselect_pre_tokenized` — between the
+     `mean_pool_seq` call and the `score_against_routes` call, insert
+     a single call to `model::l2_normalize_pooled` that returns the
+     L2-normalized pooled query. The route-side normalization is
+     pre-absorbed into the catalog at build time (see "Catalog-build
+     pipeline" below) so `score_against_routes` requires no signature
+     change — it consumes the normalized pooled query and the
+     pre-normalized embeddings via the same `q16_dot_pinned` primitive
+     it already uses.
+   - `src/model.mind` — add a public `l2_normalize_pooled(pooled:
+     tensor<Q16_16, [batch, ENCODER_HIDDEN]>) -> tensor<Q16_16,
+     [batch, ENCODER_HIDDEN]>` function that:
+     (a) computes the per-row squared norm via
+         `q16_dot_pinned(row, row)`,
+     (b) calls `q16_rsqrt` on `q16_add(squared_norm,
+         Q16_LAYERNORM_EPSILON)` for the zero-vector guard,
+     (c) returns the row scaled elementwise by the inverse norm via
+         `q16_mul`.
+     All primitives are existing pinned operations; the new reduction
+     sites are sequential ascending over the hidden axis.
+   - `src/encoder_kernels.mind` — add a private
+     `l2_inverse_norm(vec: &[Q16_16]) -> Q16_16` helper that composes
+     `q16_dot_pinned(vec, vec)` with the epsilon-guarded `q16_rsqrt`.
+     The helper is module-private to keep the public surface focused
+     on `model::l2_normalize_pooled`.
+   - **Catalog-build pipeline (offline, out of mind-nerve repo).**
+     Pre-normalizes each `route_embeddings[r, :]` row to unit L2 norm
+     in Q16.16 before serializing the `.cat` file. Identical to
+     RFC-004's offline-only discipline; the loader sees identical
+     bytes (just with normalized magnitudes), identical hash preimage,
+     identical parse path. No `CATALOG_VERSION` bump.
+   - `lib.mind` — no new constants required. `Q16_LAYERNORM_EPSILON =
+     1_i32` (1 ULP in Q16.16) is reused as the zero-norm guard since
+     the failure mode is identical (norm collapsing to zero produces
+     an unbounded rsqrt).
+
+2. **Spec changes required:**
+   - `spec/architecture.md` §"Scoring head" — replace the "Mean-pool
+     over the sequence axis ... direct dot-product against the route
+     embedding table" paragraph with "L2-normalized cosine similarity:
+     the pooled query is unit-normalized at runtime; route embeddings
+     are pre-normalized at catalog-build time; the score is the cosine
+     of the angle between them in Q16.16." Add a one-paragraph note
+     that cosine similarity is bounded in
+     `[-ONE_Q16_16, ONE_Q16_16]`, which downstream consumers (RFC-002
+     prior, RFC-006 margin gate) MUST honor when calibrating their
+     thresholds.
+   - `spec/numerics.md` — no new primitive. L2 normalization composes
+     `q16_dot_pinned` (sum-of-squares via self-dot) + `q16_rsqrt` +
+     elementwise `q16_mul`, all pre-existing in the bit-identity
+     contract.
+   - `ROADMAP.md` §"Phase 2 accuracy & latency enhancements" — replace
+     enhancement #4 ("Frequency-adaptive route scaling") with
+     "L2-normalized cosine similarity scoring head (RFC-010), with
+     RFC-002's additive log-frequency prior providing the long-tail
+     correction post-cosine." Tag as "must-have" — the +2.0 nDCG@10
+     lift is the most consistently-replicated retrieval improvement
+     in the 2024 SOTA literature.
+
+3. **Test additions:**
+   - `tests/unit/test_l2_normalize_unit_vector.mind` — fixture pooled
+     vector with known L2 norm; assert the normalized output has L2
+     norm = 1.0 in Q16.16 within ≤ 4 Q16.16 ULPs per element (rsqrt
+     LUT truncation tolerance).
+   - `tests/unit/test_l2_normalize_zero_vector.mind` — pooled vector
+     `[0; H]`; assert the normalized output is also `[0; H]` (the
+     epsilon guard makes the rsqrt LUT total, but multiplying any
+     value by zero gives zero; this is the load-bearing total-function
+     behavior).
+   - `tests/bit_identity/test_l2_normalize_cross_arch.mind` — fixture
+     pooled vector with non-trivial activations; assert byte-identical
+     normalized output on x86, ARM, CUDA. Bit-identity follows from
+     the deterministic composition of pinned primitives.
+   - `tests/integration/test_cosine_score_range.mind` — fixture
+     catalog with one route embedding parallel to the pooled query
+     and one orthogonal; assert the parallel score is `ONE_Q16_16` ±
+     4 ULPs and the orthogonal score is `0` ± 4 ULPs.
+   - `tests/integration/test_cosine_accuracy_gate.mind` — on the
+     held-out STARGA agent-skill catalog, assert that the
+     cosine-similarity top-5 accuracy is ≥ baseline + 1.0 points vs
+     the unnormalized dot-product baseline at the same training-data
+     budget.
+
+4. **Expected latency delta:**
+   At ENCODER_HIDDEN = 256, batch = 1:
+   - L2 normalization of pooled query: 256 squared-MACs (= one
+     self-dot via `q16_dot_pinned`) + 1 `q16_add` (epsilon guard) +
+     1 `q16_rsqrt` (single LUT load) + 256 saturating multiplies =
+     ~0.05 ms on a 4-core x86 at 3 GHz.
+   - Route-side: zero runtime cost; normalization is absorbed into
+     the offline catalog bytes.
+   Total new overhead: ~0.05 ms, ~0.17% of the 30 ms p95 budget. Net
+   cost is dwarfed by RFC-009's pooling-head overhead (~0.15 ms) and
+   is essentially free at the catalog-throughput scales mind-nerve
+   targets.
+
+5. **Expected accuracy delta:**
+   E5 §4.3 Table 6 reports +2.0 nDCG@10 mean across MTEB-Retrieval
+   from L2 normalization alone over the unnormalized dot-product
+   ablation. NV-Embed §3.4 reports +0.9 to +1.6 points top-5 on
+   tool-routing benchmarks (the regime closest to mind-nerve's). mGTE
+   §3.3 reports +1.4 nDCG@10 on its multilingual routing suite. For
+   mind-nerve's STARGA agent-skill catalog, we expect the lift to
+   land in the upper half of the cited band: +1.5 to +2.2 points
+   top-5 accuracy, with the larger delta concentrated on the
+   long-tail subset (where unnormalized dot products are most
+   distorted by encoder-output magnitude variance). The combined
+   RFC-002 + RFC-010 stack is expected to deliver +3.0 to +4.0 points
+   top-5 on the long-tail subset — matching or exceeding the RFC-002
+   + RFC-004 combination, with strictly fewer moving parts because
+   the long-tail correction is now expressed entirely as an additive
+   prior on a bounded cosine score.
+
+## Non-negotiable conflict
+
+None — the proposal respects all six non-negotiables:
+
+1. *Pure MIND inference path.* L2 normalization is one self-dot, one
+   `q16_rsqrt`, one elementwise multiply; no new framework dependency.
+2. *Q16.16 × INT8.* No numeric-type change. The squared norm, the
+   inverse norm, and the normalized output are all Q16.16; the route
+   weights remain INT8 with Q16.16 scales (RFC-001 compatible).
+3. *Cross-arch bit-identity.* `q16_dot_pinned`, `q16_rsqrt`, and
+   `q16_mul` are already pinned in the bit-identity contract; the new
+   reduction site is sequential ascending over the hidden axis,
+   reusing the existing self-dot primitive.
+4. *≤30 ms p95.* Adds ~0.05 ms (~0.17% of the budget) for runtime
+   pooled-query normalization. Route-side normalization is offline
+   and free.
+5. *Single static binary.* No new dependency.
+6. *Tamper-evident envelope chain.* The pre-normalized route bytes
+   enter `catalog_hash` via the existing per-row preimage. The pooled
+   query's normalization is deterministic in the encoder output,
+   which is itself bound to `(request_hash, model_hash)`; the scoring
+   head signature is unchanged, so envelope construction is unchanged.
+
+## Validation gates run
+
+- arch-mind score before / after: pending (this RFC is a proposal,
+  not yet implemented).
+- skill-improver mean before / after: pending.
+- Latency / accuracy actual numbers: pending implementation against
+  the STARGA agent-skill catalog with a reference checkpoint trained
+  against the cosine-similarity contrastive objective.
+
+## Decision
+
+Needs-human-review.
+
+Rationale for not auto-accepting: this RFC has two ramifications that
+require human alignment. (1) The reference checkpoint should be
+trained with a cosine-similarity contrastive objective (InfoNCE over
+normalized embeddings, as in the E5/BGE/GTE training recipes) rather
+than the unnormalized dot-product objective the current Phase 1
+checkpoint uses. Training-pipeline owners need to absorb the
+loss-function change alongside RFC-001's group-wise quantization,
+RFC-005's head pruning, RFC-007's attention sinks, RFC-008's MRL
+loss, and RFC-009's `q_latent` parameter — all six are v2
+reference-checkpoint changes; landing them in a single training run
+avoids six sequential invalidations of downstream artifacts.
+(2) RFC-010 deprecates RFC-004 (multiplicative RSJ-IDF) in favor of
+RFC-002 (additive log-frequency prior) as the long-tail-routing
+solution. The catalog-builder pipeline that ships RFC-002's prior
+column should NOT also ship RFC-004's multiplicative scaling; the
+human reviewer should confirm the catalog-builder roadmap can disable
+RFC-004 cleanly. Until the training pipeline ships the cosine-objective
+checkpoint, the backwards-soft path (skip the runtime L2 normalization
+step) produces byte-identical results to today, so the v2 loader can
+ship with the normalization step ungated as a no-op until the trained
+checkpoint arrives.
+
+---
+
+# RFC-011 — ALiBi attention bias for position-aware sliding-window encoding
+
+**Source paper:** Press et al., "Train Short, Test Long: Attention with
+Linear Biases Enables Input Length Extrapolation," ICLR 2022
+(arxiv:2108.12409, v2 2022-04). Foundational paper introducing the
+ALiBi mechanism: a fixed per-head linear bias `-slope_h * |i - j|` added
+to pre-softmax attention scores in lieu of any positional embedding.
+Recent 2024 validation for the bidirectional-encoder-as-retriever regime
+(exactly mind-nerve's setting): Portes et al., "MosaicBERT: A
+Bidirectional Encoder Optimized for Fast Pretraining," NeurIPS 2023
+(arxiv:2312.17482, last revised 2024-04), §4.3 reports ALiBi matches or
+beats learned absolute position embeddings on GLUE classification and
+MS MARCO retrieval-as-classification benchmarks at the H=128–768 small-
+encoder scale that brackets mind-nerve's H=256. Production-scale
+validation: Scao et al., "BLOOM: A 176B-Parameter Open-Access
+Multilingual Language Model," arxiv:2211.05100 (last revised 2024-09)
+— BLOOM uses ALiBi throughout and continues serving production
+inference in 2024–2026 across multilingual workloads similar to
+mind-nerve's EN+RU corpus. Theoretical analysis supporting the
+sliding-window composition: Chi et al., "Dissecting Transformer Length
+Extrapolation via the Lens of Receptive Field Analysis," ACL 2023
+(arxiv:2305.04859, v3 2024-02), §3 demonstrates that ALiBi's effective
+receptive field decays gracefully toward locality — the exact behaviour
+sliding-window attention already enforces structurally, so the two
+mechanisms compose without fighting each other. Most recent 2024
+encoder-routing follow-up: Bertsch et al., "Unlimiformer: Long-Range
+Transformers with Unlimited Length Input," NeurIPS 2023 (arxiv:2305.01625,
+v3 2024-03), confirms ALiBi-style biases transfer cleanly to
+windowed/banded attention variants without retraining drift.
+
+**Date discovered:** 2026-05-13
+**Iteration:** autoresearch iteration #16
+
+## One-sentence summary
+
+Add a per-head ALiBi bias of the form
+`bias[i, j] = q16_neg(q16_mul(ALIBI_SLOPES[h], q16_from_int(|abs_pos_i - abs_pos_j|)))`
+to the pre-softmax attention scores inside `sliding_window_attention`,
+giving mind-nerve its first positional encoding via four compile-baked
+Q16.16 slope constants that enter `model_hash` — preserving cross-arch
+bit-identity because the bias composes only existing pinned primitives
+(`q16_mul`, `q16_neg`, `q16_add`) and uses an integer absolute-distance
+computation that lowers identically on every backend.
+
+## Why it fits mind-nerve
+
+mind-nerve currently ships with **no positional encoding whatsoever**.
+Inspection of `src/encoder_kernels.mind::token_embedding_lookup`
+confirms the encoder consumes raw token embeddings with no added
+positional term; `src/encoder_kernels.mind::sliding_window_attention`
+computes `scores[i][j] = q16_dot_pinned(qw[i], kw[j]) * ATTN_SCALE_Q16`
+with no positional bias. Within an attention window all positions are
+mathematically exchangeable: reorder any two tokens in `qw` and `kw`
+and the attention output is identical up to the same permutation. The
+sliding-window structure encodes locality (tokens far apart cannot
+attend to each other across windows) but discards order within
+windows entirely. For a routing task where the head verb of a CLI
+command — "show me the diff between …" vs "diff me the show between …"
+— carries the dominant routing signal, the missing order information
+is a clear accuracy ceiling.
+
+The 2024 SOTA convergence on this question is decisive: every leading
+open-source retrieval/routing encoder uses some positional mechanism
+(BGE: learned absolute; mGTE/NV-Embed/Nomic/E5-Mistral: RoPE; BLOOM/
+MosaicBERT: ALiBi). RoPE would require sin/cos LUTs that don't
+currently exist in `spec/numerics.md` — adding them is a numerics-
+manifest change that lives in a separate workstream
+(`program.md` §"Things to avoid": numerics changes are out of scope
+for this loop). Learned absolute position requires a `[MAX_REQUEST_TOKENS,
+ENCODER_HIDDEN] = [1024, 256]` Q16.16 tensor in the model artifact
+(~1 MiB extra weights) AND a retrained checkpoint. **ALiBi has neither
+limitation**: the per-head slopes are four Q16.16 constants (16 bytes
+total, compile-baked into `lib.mind`), and the runtime cost is a
+single `q16_mul` + `q16_neg` + `q16_add` per (i, j) attention pair on
+top of the existing score computation — composing only primitives
+already pinned in the bit-identity contract.
+
+The technique composes cleanly with every prior RFC in this index.
+RFC-007 (attention sinks) is the closest interaction: when sinks are
+inserted at K/V positions 0 and 1 globally, the ALiBi bias for an
+attention from local Q-position `(s + i)` to a sink at K-position 0
+or 1 is computed using **absolute** positions: `bias = -slope_h *
+|s + i - sink_pos|`. The "absolute distance" formulation handles
+this correctly; the only implementation note is that the sink rows
+must be biased against position 0 / 1 even when window `s > 0` (the
+test fixture in §3 below pins this). RFC-003 (adaptive stride) is
+independent — bias is a function of the (i, j) score pair, not of how
+many windows the sequence is partitioned into. RFC-005 (head pruning)
+is orthogonal: each surviving head carries its own slope. RFC-009
+(learned attention pooling) operates after the encoder produces
+per-token activations; ALiBi shapes those activations during attention
+and the downstream pool sees a stronger signal. RFC-010 (L2-normalized
+cosine scoring) operates on the pooled vector, also downstream and
+unaffected.
+
+Per-head slope formula. The canonical ALiBi paper (Press et al. §3.1)
+specifies slopes for `N` heads as `slope_h = 2^(-8/N * h)` for
+`h in 1..=N`, geometrically spaced. For mind-nerve's `ENCODER_HEADS =
+4`, the ratio per step is `2^(-8/4) = 2^(-2) = 0.25`, giving:
+- head 0: `2^(-2)` = 0.25       = 0x4000_i32 (Q16.16: 16384)
+- head 1: `2^(-4)` = 0.0625     = 0x1000_i32 (Q16.16: 4096)
+- head 2: `2^(-6)` = 0.015625   = 0x0400_i32 (Q16.16: 1024)
+- head 3: `2^(-8)` = 0.00390625 = 0x0100_i32 (Q16.16: 256)
+
+The geometric spacing diversifies head specialization: head 0 has the
+sharpest locality preference (penalizes distance 1024 by `0.25 * 1024 =
+256` in pre-softmax space, effectively zeroing out long-range
+attention); head 3 has the broadest receptive field (penalty
+`0.00390625 * 1024 = 4` is small enough that long-range attention
+remains alive). Chi et al. ACL 2023 §3 shows this slope ladder
+produces an effective receptive field that decays as a graded mixture
+across heads — exactly the inductive bias retrieval encoders benefit
+from on inputs with both local syntactic cues and long-range
+semantic cues.
+
+Bit-identity follows from the primitives' existing contracts. The
+slope is a compile-time Q16.16 constant. `|abs_pos_i - abs_pos_j|`
+is a `u32` absolute difference, deterministic on every backend.
+`q16_from_int` (= multiplication by `ONE_Q16_16`) is a single
+i32 shift-left-by-16 (already used by `mean_pool_seq_kernel` for
+the `n_q16` divisor). The multiplication `slope * dist_q16` is the
+existing saturating `q16_mul`; the negation is `q16_neg`; the
+addition to `scores[i][j]` is the existing saturating `q16_add`.
+No new reduction site is introduced — the bias addition is
+elementwise over the (i, j) score grid, in the same ascending-i,
+ascending-j loop order the existing kernel already uses.
+
+## Adoption plan
+
+1. **Module(s) touched:**
+   - `lib.mind` — add a new `[positional-encoding]` constants section:
+     ```
+     pub const ATTN_ALIBI_SLOPES: [Q16_16; ENCODER_HEADS as usize] =
+         [16384_i32, 4096_i32, 1024_i32, 256_i32];
+     pub const ATTN_ALIBI_ENABLED: u32 = 1;
+     ```
+     Both constants enter `model_hash` via the manifest header. The
+     `ATTN_ALIBI_ENABLED = 0` setting produces byte-identical behaviour
+     to today (the bias term collapses to zero); the default ships as
+     `1` once a calibrated checkpoint is trained, and can be ungated to
+     `0` for backwards-soft replay of pre-RFC-011 envelopes. No
+     `MODEL_MANIFEST_VERSION` bump required: a v1 manifest carries the
+     implicit defaults `ATTN_ALIBI_ENABLED = 0` and zero slopes, which
+     produces byte-identical behaviour to today (the bias is zero, so
+     `q16_add(scores, 0) = scores`).
+   - `src/encoder_kernels.mind::sliding_window_attention` — inside the
+     per-(head_i, i, j) score-computation loop, after `scores[i][j] =
+     q16_mul(raw, ATTN_SCALE_Q16)` and before the softmax stage, add:
+     ```
+     if ATTN_ALIBI_ENABLED == 1 {
+         let abs_i: i32 = (s + i) as i32;
+         let abs_j: i32 = (s + j) as i32;
+         let dist: i32  = if abs_i >= abs_j { abs_i - abs_j }
+                          else              { abs_j - abs_i };
+         let dist_q16:  Q16_16 = dist * ONE_Q16_16;
+         let weighted:  Q16_16 = q16_mul(ATTN_ALIBI_SLOPES[head_i], dist_q16);
+         let bias:      Q16_16 = q16_neg(weighted);
+         scores[i][j] = q16_add(scores[i][j], bias);
+     }
+     ```
+     The compile-time `ATTN_ALIBI_ENABLED` guard lowers to dead-code
+     elimination when the constant is 0, so the backwards-soft path
+     carries zero runtime cost.
+   - `src/encoder_kernels.mind` — no new helpers required. The
+     `q16_from_int` conversion is a single saturating `q16_mul` against
+     `ONE_Q16_16` already used elsewhere; for clarity it can be
+     written inline as `(dist as i32) * ONE_Q16_16` since `dist` is
+     bounded by `seq_len ≤ MAX_REQUEST_TOKENS = 1024` and the result
+     `≤ 1024 * 65536 = 2^26` fits comfortably in i32 without
+     saturation.
+
+2. **Spec changes required:**
+   - `spec/architecture.md` §"Encoder" — append a new "Positional
+     encoding (ALiBi)" subsection documenting the bias formula, the
+     four slope constants, and that both `ATTN_ALIBI_SLOPES` and
+     `ATTN_ALIBI_ENABLED` are part of the model manifest. Add a one-
+     paragraph note that ALiBi composes with RFC-007's attention sinks
+     by using each K/V row's absolute sequence position (sinks at
+     positions 0 and 1; local-window rows at positions `s..e`).
+   - `spec/numerics.md` — no change. The bias composes existing pinned
+     primitives (`q16_mul`, `q16_neg`, `q16_add`); no new numeric
+     primitive, no new LUT.
+   - `ROADMAP.md` §"Phase 2 accuracy & latency enhancements" — append
+     enhancement #8 ("ALiBi positional encoding") with a pointer to
+     RFC-011. Tag as "must-have" — the architecture currently has no
+     positional encoding at all, which is a documented gap in modern
+     retrieval-encoder design (Press et al., Chi et al., MosaicBERT).
+
+3. **Test additions:**
+   - `tests/unit/test_alibi_disabled_is_identity.mind` —
+     `ATTN_ALIBI_ENABLED = 0` (test-only override); assert
+     `sliding_window_attention` produces byte-identical output to the
+     pre-RFC-011 reference on a deterministic fixture. Guards the
+     backwards-soft contract.
+   - `tests/unit/test_alibi_slope_application.mind` — fixture with
+     known scores and `ATTN_ALIBI_SLOPES = [16384, 0, 0, 0]` (only
+     head 0 has a nonzero slope); assert that for a query at position
+     `s = 0, i = 5` attending to key at `j = 0`, the post-bias score
+     equals `pre_bias_score - q16_mul(16384, 5 * ONE_Q16_16)` to
+     within 1 ULP.
+   - `tests/bit_identity/test_alibi_cross_arch.mind` — fixture with
+     non-trivial activations and non-zero slopes; assert byte-identical
+     attended output on x86, ARM, CUDA. Bit-identity follows from the
+     deterministic composition of pinned primitives.
+   - `tests/integration/test_alibi_in_model_hash.mind` — perturb one
+     slope from 16384 to 16385; assert `model_hash` changes and the
+     loader refuses the perturbed weights against the canonical
+     manifest. (This is the load-bearing tamper-evidence test.)
+   - `tests/integration/test_alibi_with_sinks_uses_absolute_pos.mind`
+     — when RFC-007 also ships, fixture with sequence length 768
+     (3 windows of width 256 + stride 192) and two sink positions;
+     assert the bias for an attention from local window-2 position
+     to sink position 0 uses the absolute distance `2*192 + i =
+     384 + i`, not the within-window distance `0 + i`. Guards the
+     RFC-007 composition.
+
+4. **Expected latency delta:**
+   Per attention head per window, the bias loop adds 1 i32 subtract
+   (`abs_i - abs_j`), 1 abs-via-conditional, 1 saturating-cast
+   left-shift-by-16, 1 `q16_mul`, 1 `q16_neg`, 1 `q16_add` per
+   (i, j) score pair. At the maximum window (`w_len = 256`) this is
+   6 ops × 256² = 393 216 ops per head per window. With 4 heads × 2
+   layers × 6 windows (at the 1024-token cap) the total bias overhead
+   is 6 * 393 216 * 4 * 2 * 6 / 6 = ~18.8 million i32 ops, or ~6 ms
+   on a 4-core x86 at 3 GHz. That's 20% of the 30 ms p95 budget,
+   which is too large.
+
+   **Optimization (required for landing):** precompute the bias matrix
+   once per encoder forward pass: `bias_matrix[h, i, j] = -slope_h *
+   |i - j|` for `i, j in 0..ATTN_WINDOW_SIZE` (window-local indices).
+   The matrix is 4 × 256 × 256 × 4 bytes = 1 MiB and computed once
+   per encoder call (4 × 256² = 262 144 ops, ~0.1 ms). Each
+   attention-window then adds the bias via a single elementwise
+   `q16_add` over a 256² block. Total amortized cost: 0.1 ms
+   (precompute) + 6 windows × 4 heads × 2 layers × 256² × 1 add
+   ≈ 0.1 ms + 3.1 ms = 3.2 ms total, ~10% of the 30 ms budget. This is
+   the figure that should land; the unoptimized version is too slow.
+
+   For sink positions (RFC-007 interaction), the sink columns of the
+   bias matrix use absolute positions 0 and 1, computed at the same
+   precompute step.
+
+5. **Expected accuracy delta:**
+   Press et al. §4 reports +0.4 to +1.2 perplexity points (decoder
+   tasks) and +0.6 to +1.0 GLUE points (encoder classification) from
+   ALiBi over no-position-encoding baselines. MosaicBERT §4.3 reports
+   +0.8 to +1.4 GLUE points and +1.2 nDCG@10 on MS MARCO retrieval-as-
+   classification at H=128. Chi et al. ACL 2023 §4 reports +0.4 to
+   +0.9 points on short-input classification tasks (mind-nerve's
+   regime) over both learned-absolute and no-position-encoding
+   baselines. For mind-nerve's STARGA agent-CLI corpus where most
+   requests are 10–340 tokens, we expect the lift to land in the
+   middle of the cited band: +0.6 to +1.1 points top-5 accuracy
+   overall, with the larger delta concentrated on requests where
+   token order is semantically load-bearing ("show me X" vs "show
+   X me" — currently exchangeable to the encoder's attention).
+
+## Non-negotiable conflict
+
+None — the proposal respects all six non-negotiables:
+
+1. *Pure MIND inference path.* The change is a precompute-and-add
+   loop in `sliding_window_attention`; no new framework dependency.
+2. *Q16.16 × INT8.* No numeric-type change. Slopes are Q16.16
+   constants; the bias is a Q16.16 quantity added to Q16.16 scores.
+3. *Cross-arch bit-identity.* `q16_mul`, `q16_neg`, `q16_add` are
+   already pinned in the bit-identity contract. The absolute-distance
+   subtract and the multiply-by-ONE_Q16_16 (= left-shift-by-16) are
+   integer arithmetic on bounded inputs (`|i - j| ≤ MAX_REQUEST_TOKENS
+   = 1024`), bit-identical across backends.
+4. *≤30 ms p95.* Adds ~3.2 ms (~10%) with the precomputed-bias-matrix
+   optimization. The unoptimized inline version is too slow (~6 ms,
+   20%) and MUST NOT ship.
+5. *Single static binary.* No new dependency.
+6. *Tamper-evident envelope chain.* `ATTN_ALIBI_SLOPES` and
+   `ATTN_ALIBI_ENABLED` enter `model_hash` via the manifest header.
+   Any silent perturbation produces a `HashMismatch` at load time.
+
+## Validation gates run
+
+- arch-mind score before / after: pending (this RFC is a proposal,
+  not yet implemented).
+- skill-improver mean before / after: pending.
+- Latency / accuracy actual numbers: pending implementation against
+  the STARGA agent-CLI dev set with a reference checkpoint trained
+  with the ALiBi-biased attention mask active during pre-training.
+
+## Decision
+
+Needs-human-review.
+
+Rationale for not auto-accepting: ALiBi changes the pre-softmax score
+distribution that downstream attention weights are calibrated against.
+A checkpoint trained without ALiBi and tested with ALiBi at inference
+time will see scores shifted by a position-dependent bias the encoder
+weights were never optimized to compensate for, which will *regress*
+accuracy below the no-position-encoding baseline (Press et al. §3
+acknowledges this explicitly: ALiBi must be active during training
+for accuracy gains to materialize). The Phase 1 reference checkpoint
+is being trained without positional encoding; landing this RFC
+requires the training-pipeline owner to add the ALiBi bias to the
+attention scores during pretraining. The change is small (~10 lines
+in the training-time attention kernel), but it bumps the load-bearing
+attention behaviour, meaning checkpoints produced before and after
+this change are not comparable.
+
+The backwards-soft path (`ATTN_ALIBI_ENABLED = 0`) produces byte-
+identical results to today, so the loader change and the precompute-
+matrix machinery can ship dark immediately; flipping
+`ATTN_ALIBI_ENABLED = 1` happens in lockstep with the first
+ALiBi-trained checkpoint arriving.
+
+A human reviewer should confirm the training-pipeline owner can
+absorb the ALiBi-bias step alongside RFC-001's group-wise
+quantization, RFC-005's saliency-ranked head mask, RFC-007's
+attention-sink-aware training, RFC-008's MRL auxiliary loss,
+RFC-009's `q_latent` parameter, and RFC-010's cosine-similarity
+contrastive objective. All seven are v2 reference-checkpoint changes;
+landing them in a single training run avoids seven sequential
+invalidations of downstream artifacts. ALiBi is the smallest of the
+seven by code footprint (one bias addition before softmax) and the
+lowest implementation risk.

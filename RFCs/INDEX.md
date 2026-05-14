@@ -1655,6 +1655,31 @@ roughly 10 lines in the training loop). Bundling these into a single
 v2 checkpoint avoids four sequential invalidations of downstream
 artifacts.
 
+**Status:** IMPLEMENTED at exp8 — added `pub const MATRYOSHKA_COARSE_DIM:
+u32 = 256` and `pub const K_COARSE_MULTIPLIER: u32 = 1` to `src/lib.mind`
+(backwards-soft sentinels equal to `ROUTE_EMBEDDING_DIM` and `1` so the
+cascade collapses to a no-op single-pass and the binary stays byte-
+identical to today). Added pinned ascending-`(b, r, d)` reductions
+`score_against_routes_prefix(query, embeddings, dim_cap)` (saturating
+`q16_mul` + `q16_add` inner dot, `dim_cap` clamped at
+`ROUTE_EMBEDDING_DIM`) and `score_against_routes_masked(query,
+embeddings, mask, fill_value)` (full-rank `q16_dot_pinned` gated by a
+`[u8]` shortlist) to `src/model.mind`, threading `q16_mul`/`q16_add`
+into the module imports. Added `pub fn extract_top_k_mask(logits,
+catalog, k)` to `src/top_k.mind` — same bounded-heap algorithm and
+ascending-`r` reduction order as `extract_top_k`, emitting a flat
+`[u8]` of length `num_routes` (1 = "in shortlist", 0 = "not"). Wired
+the cascade into `src/inference.mind::preselect_pre_tokenized` with a
+compile-time-resolvable guard `if MATRYOSHKA_COARSE_DIM <
+ROUTE_EMBEDDING_DIM { coarse_logits → extract_top_k_mask →
+score_against_routes_masked(MIN_Q16_16) } else {
+score_against_routes }`; with the default constants the predicate is
+statically false and mindc dead-code-eliminates the cascade branch
+entirely. The RFC-002 prior add runs unchanged on whichever logits
+tensor the cascade produces. Activating the cascade requires only
+flipping `MATRYOSHKA_COARSE_DIM = 64` and `K_COARSE_MULTIPLIER = 4`
+in the manifest once an MRL-trained reference checkpoint ships.
+
 ---
 
 # RFC-009 — Learned single-query attention pooling replacing mean-pool

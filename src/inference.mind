@@ -10,10 +10,13 @@
 
 use crate::mind_nerve::{
     Q16_16,
+    MIN_Q16_16,
     MAX_TOP_K,
     DEFAULT_TOP_K,
     MAX_REQUEST_TOKENS,
     ROUTE_EMBEDDING_DIM,
+    MATRYOSHKA_COARSE_DIM,
+    K_COARSE_MULTIPLIER,
     ATTESTATION_VERSION,
     ATTESTATION_BYTES,
     NUMERICS_WIRE_VERSION,
@@ -275,7 +278,46 @@ pub fn preselect_pre_tokenized(
     let token_ids: tensor<u32, [1, tokens.len()]> = [tokens.to_owned()];
     let enc_out      = model::encoder(token_ids, weights.encoder);
     let pooled_query = model::mean_pool_seq(enc_out);
-    let mut logits   = model::score_against_routes(pooled_query, catalog.embeddings);
+
+    // (4a) RFC-008: Matryoshka coarse-to-fine cascade. When the
+    //      backwards-soft default `MATRYOSHKA_COARSE_DIM ==
+    //      ROUTE_EMBEDDING_DIM` is in force, the const-resolvable guard
+    //      below is statically false and mindc dead-code-eliminates the
+    //      cascade branch entirely — the binary stays byte-identical to
+    //      today's single-pass `score_against_routes` path. With
+    //      calibrated constants bound into `model_hash` via the model
+    //      manifest (typical Phase 2 production values:
+    //      `MATRYOSHKA_COARSE_DIM = 64`, `K_COARSE_MULTIPLIER = 4`), the
+    //      cascade activates:
+    //        (i)   coarse pass scores every route over the first
+    //              MATRYOSHKA_COARSE_DIM dimensions (3.95× fewer MACs
+    //              than the full-rank dot at the Phase 1 catalog ceiling),
+    //        (ii)  `extract_top_k_mask` produces a flat `[u8]` shortlist
+    //              of length `num_routes` selecting the top-(K_COARSE_MULTIPLIER
+    //              * k) candidates under the same pinned bounded-heap
+    //              algorithm as the final top-K,
+    //        (iii) the fine pass rescores only the shortlisted routes over
+    //              the full ROUTE_EMBEDDING_DIM dimensions; non-shortlisted
+    //              routes saturate to MIN_Q16_16 so they cannot beat any
+    //              shortlisted route in the downstream `extract_top_k`.
+    //      RFC-002's per-route prior is added to the fine-pass logits
+    //      below regardless of which branch produced them, so the prior
+    //      composes cleanly with the cascade.
+    let mut logits = if MATRYOSHKA_COARSE_DIM < ROUTE_EMBEDDING_DIM {
+        let coarse_logits = model::score_against_routes_prefix(
+            pooled_query, catalog.embeddings, MATRYOSHKA_COARSE_DIM,
+        );
+        // Shortlist size: K_COARSE_MULTIPLIER * k, saturated at num_routes.
+        let k_coarse_raw: u32 = K_COARSE_MULTIPLIER * k;
+        let k_coarse: u32 =
+            if (k_coarse_raw as usize) > num_routes { num_routes as u32 } else { k_coarse_raw };
+        let mask: [u8] = top_k::extract_top_k_mask(coarse_logits, *catalog, k_coarse);
+        model::score_against_routes_masked(
+            pooled_query, catalog.embeddings, mask.as_slice(), MIN_Q16_16,
+        )
+    } else {
+        model::score_against_routes(pooled_query, catalog.embeddings)
+    };
 
     // (4b) RFC-002: add the per-route log-frequency catalog co-occurrence
     //      prior elementwise to the logits BEFORE top-K extraction. The

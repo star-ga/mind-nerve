@@ -451,6 +451,115 @@ pub fn extract_top_k(
 }
 
 // ---------------------------------------------------------------------------
+// RFC-008 — extract_top_k_mask
+// ---------------------------------------------------------------------------
+//
+// Materialises the boolean shortlist mask consumed by the Matryoshka
+// fine-pass rescore in `inference::preselect_pre_tokenized`. Walks the
+// same bounded-heap algorithm as `extract_top_k` over the supplied
+// coarse-pass logits and emits a `[u8]` of length `num_routes` where
+// `1` at index r means "route r is in the top-k of the coarse pass".
+//
+// Reduction order is pinned identically to `extract_top_k`: ascending
+// `r` ingest, strict-better eviction, ties on score broken by
+// ascending route_id (lex). Output bit-identity follows from the
+// per-primitive contract on `entry_better` plus the deterministic
+// drain order.
+//
+// Saturation:
+//   k == 0 or num_routes == 0   -> all-zero mask
+//   k >= num_routes             -> all-ones mask (every route survives)
+//
+// Recovery of original indices from the heap drain is by linear scan
+// over `catalog.ids`. The catalog is `UniqueRouteCatalog`-validated so
+// the SHA-256 comparison is unambiguous. Cost: O(k * num_routes) for
+// the recovery; at the Phase 1 ceiling (k ≤ 64 effective shortlist,
+// num_routes ≤ 10_000) this is well under 0.1 ms — and the cascade is
+// only ever active when MATRYOSHKA_COARSE_DIM < ROUTE_EMBEDDING_DIM,
+// at which point the scoring-head MAC reduction dominates the recovery
+// cost by ~3-4× at the same catalog size.
+@[determinism(BitIdentical)]
+pub fn extract_top_k_mask(
+    logits:  tensor<Q16_16, [batch, num_routes]>,
+    catalog: RouteCatalog,
+    k:       u32,
+) -> [u8]
+{
+    let num_routes = catalog.ids.len();
+
+    // Materialise an all-zero mask of length num_routes up front. Every
+    // path returns it after possibly flipping selected entries to 1.
+    let mut mask: [u8] = [];
+    let mut m: usize = 0;
+    while m < num_routes {
+        mask.push(0u8);
+        m = m + 1;
+    }
+
+    if k == 0 || num_routes == 0 {
+        return mask;
+    }
+
+    // Short-circuit: every route survives. No heap traversal needed.
+    if (k as usize) >= num_routes {
+        let mut i: usize = 0;
+        while i < num_routes {
+            mask[i] = 1u8;
+            i = i + 1;
+        }
+        return mask;
+    }
+
+    let effective_k: u32 = k;
+    let mut heap = heap_new(effective_k);
+
+    // Sequential ingest, left-to-right index order — same reduction
+    // discipline as `extract_top_k`.
+    for i in 0..num_routes {
+        let entry = HeapEntry {
+            score:    logits[0, i],
+            route_id: catalog.ids[i],
+        };
+        if heap_len(heap) < effective_k {
+            heap_push(&mut heap, entry);
+        } else if entry_better(entry, heap_peek_worst(heap)) {
+            heap_replace_worst(&mut heap, entry);
+        }
+    }
+
+    // Drain the heap into the mask. For each surviving entry, recover
+    // its original index by linear scan over catalog.ids and flip the
+    // matching position. UniqueRouteCatalog forbids duplicate sha,
+    // so the first match is unique.
+    let n_out = heap_len(heap);
+    let mut s: usize = 0;
+    while s < n_out as usize {
+        let popped = heap_pop_worst(&mut heap);
+        let mut j: usize = 0;
+        while j < num_routes {
+            if route_id_eq(popped.route_id, catalog.ids[j]) {
+                mask[j] = 1u8;
+                break;
+            }
+            j = j + 1;
+        }
+        s = s + 1;
+    }
+
+    return mask;
+}
+
+// Byte-equality on the 32-byte RouteId. Used by `extract_top_k_mask`
+// to recover the original route index after a heap drain.
+@[determinism(BitIdentical)]
+fn route_id_eq(a: [u8; 32], b: [u8; 32]) -> bool {
+    for i in 0..32 {
+        if a[i] != b[i] { return false; }
+    }
+    true
+}
+
+// ---------------------------------------------------------------------------
 // canonical_result_hash
 // ---------------------------------------------------------------------------
 //

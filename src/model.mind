@@ -17,7 +17,7 @@ use crate::mind_nerve::{
     ATTN_WINDOW_SIZE, ATTN_WINDOW_STRIDE,
     VOCAB_SIZE, MAX_REQUEST_TOKENS, ROUTE_EMBEDDING_DIM,
 };
-use crate::mind_nerve::q16_16::q16_dot_pinned;
+use crate::mind_nerve::q16_16::{q16_dot_pinned, q16_mul, q16_add};
 
 // Module-private helpers — sliding-window attention kernels, embedding lookup,
 // pre-norm, gated residual, mean-pool. Not part of the public stability
@@ -218,6 +218,105 @@ pub fn score_against_routes(
         while r < nr {
             let route_row: &[Q16_16] = &route_embeddings[r];
             out[b][r] = q16_dot_pinned(query_row, route_row);
+            r = r + 1;
+        }
+        b = b + 1;
+    }
+    return out;
+}
+
+// RFC-008 — Matryoshka coarse-pass scoring head.
+//
+// Identical reduction discipline to `score_against_routes` (ascending
+// (b, r) outer iteration, sequential left-to-right inner dot, every
+// multiply/accumulate funneled through the saturating `q16_mul` /
+// `q16_add` primitives) but contracts only the first `dim_cap`
+// dimensions of each (pooled_query[b], route_embeddings[r]) pair.
+//
+// `dim_cap` is clamped at ROUTE_EMBEDDING_DIM; values at or above
+// ROUTE_EMBEDDING_DIM degenerate this function to a full-rank dot
+// product that returns byte-identical output to `score_against_routes`
+// — guaranteeing the cascade is a no-op when the backwards-soft
+// default `MATRYOSHKA_COARSE_DIM = ROUTE_EMBEDDING_DIM` is in force.
+//
+// Bit-identity follows from the per-primitive contract: `q16_mul` is
+// the single saturating-MAC anchor (q16_16.mind §1), `q16_add` is
+// widen-then-saturate, and the outer (b, r, d) iteration is ascending.
+@[determinism(BitIdentical)]
+@[reduction_order(Pinned)]
+pub fn score_against_routes_prefix(
+    pooled_query:     tensor<Q16_16, [batch, ENCODER_HIDDEN]>,
+    route_embeddings: tensor<Q16_16, [num_routes, ROUTE_EMBEDDING_DIM]>,
+    dim_cap:          u32,
+) -> tensor<Q16_16, [batch, num_routes]>
+{
+    let bsz:  usize = pooled_query.len();
+    let nr:   usize = route_embeddings.len();
+    let full: usize = ROUTE_EMBEDDING_DIM as usize;
+    let cap:  usize = if (dim_cap as usize) > full { full } else { dim_cap as usize };
+
+    let mut out: tensor<Q16_16, [bsz, nr]> = [[0_i32; nr]; bsz];
+
+    let mut b: usize = 0;
+    while b < bsz {
+        let mut r: usize = 0;
+        while r < nr {
+            let mut acc: Q16_16 = 0_i32;
+            let mut d: usize = 0;
+            while d < cap {
+                let prod: Q16_16 = q16_mul(pooled_query[b][d], route_embeddings[r][d]);
+                acc = q16_add(acc, prod);
+                d = d + 1;
+            }
+            out[b][r] = acc;
+            r = r + 1;
+        }
+        b = b + 1;
+    }
+    return out;
+}
+
+// RFC-008 — Matryoshka fine-pass scoring head over a shortlist mask.
+//
+// Same `q16_dot_pinned` primitive as `score_against_routes` but gated
+// by a flat `[u8]` mask of length `num_routes` where `1` selects routes
+// for full-rank rescoring. Masked-out positions are filled with
+// `fill_value` (the caller passes MIN_Q16_16 so unselected routes can
+// never beat any shortlisted route in the downstream top-K extraction).
+//
+// Cross-arch bit-identity is preserved by the ascending (b, r)
+// iteration and the per-primitive contract on `q16_dot_pinned`. The
+// mask itself is materialised by the coarse pass via
+// `top_k::extract_top_k_mask`, whose bounded-heap reduction order is
+// already in the bit-identity contract (top_k.mind §"extract_top_k").
+@[determinism(BitIdentical)]
+@[reduction_order(Pinned)]
+pub fn score_against_routes_masked(
+    pooled_query:     tensor<Q16_16, [batch, ENCODER_HIDDEN]>,
+    route_embeddings: tensor<Q16_16, [num_routes, ROUTE_EMBEDDING_DIM]>,
+    mask:             &[u8],
+    fill_value:       Q16_16,
+) -> tensor<Q16_16, [batch, num_routes]>
+{
+    let bsz: usize = pooled_query.len();
+    let nr:  usize = route_embeddings.len();
+    let mlen: usize = mask.len();
+
+    let mut out: tensor<Q16_16, [bsz, nr]> = [[fill_value; nr]; bsz];
+
+    let mut b: usize = 0;
+    while b < bsz {
+        let query_row: &[Q16_16] = &pooled_query[b];
+        let mut r: usize = 0;
+        while r < nr {
+            // r >= mlen means the mask did not cover this row; treat it
+            // as "not selected" (fill_value already in place). This is
+            // a defensive guard — well-formed callers always pass a
+            // mask of length exactly `num_routes`.
+            if r < mlen && mask[r] == 1u8 {
+                let route_row: &[Q16_16] = &route_embeddings[r];
+                out[b][r] = q16_dot_pinned(query_row, route_row);
+            }
             r = r + 1;
         }
         b = b + 1;

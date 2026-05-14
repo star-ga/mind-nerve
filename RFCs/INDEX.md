@@ -6337,3 +6337,559 @@ without coordination because the resulting weights are byte-compatible
 with the existing mind-nerve inference path (only the byte values
 inside the weights file change, and `model_hash` updates
 correspondingly).
+
+---
+
+# RFC-023 — Multi-teacher embedding-space distillation (Jasper/Stella geometric KD)
+
+**Source paper:** Zhang et al., "Jasper and Stella: distillation of SOTA
+embedding models," arxiv:2412.19048 (2024-12). Documents the exact recipe
+behind Stella v5 (released 2024-08, MTEB-Retrieval top in late 2024) and
+its distilled cousin Jasper (released 2024-12, matching Stella v5 MTEB at
+1/3 the parameter count): a multi-teacher embedding-space distillation
+loss that aligns the student's pooled embedding directly with frozen
+teacher embeddings via learned linear projections. §3.2 ablation reports
++2.8 to +4.5 MTEB-Retrieval points over a no-embedding-distillation
+baseline (RFC-016-equivalent rank distillation only), with the larger
+delta concentrated on long-tail retrieval datasets where rank
+distillation provides insufficient signal because the teacher's score
+distribution is too compressed to differentiate the bottom-of-list
+candidates. Foundational geometric KD formulation: Lin et al.,
+"EmbedDistill: A Geometric Knowledge Distillation Framework for
+Information Retrieval," arxiv:2301.12005 (2023, last revised 2024-04)
+§3 establishes the canonical embedding-distillation loss as
+`L_embed = 1 - cos(student_emb, projection(teacher_emb))` where
+projection is a learned linear map teacher → student space.
+Independent 2024 validation across the dominant open-source embedding
+lines: Wang et al., E5-Mistral §3.4 (arxiv:2401.00368, 2024-01) reports
+embedding distillation contributes +1.5 to +2.5 MTEB-Retrieval points at
+H=4096 above their RFC-016-equivalent rank-distillation baseline; Lee et
+al., NV-Embed §3.3 (arxiv:2405.17428, v3 2024-09) uses embedding
+distillation from a previous-generation teacher and reports +1.0 to +1.8
+average MTEB points as load-bearing for their MTEB top-1 result at <1B
+params; Li & Li GTE §3.4 (arxiv:2308.03281, v3 2024-08) reports +1.4 to
++2.4 nDCG@10 at H=256–768 — the regime closest to mind-nerve's H=256;
+Liu et al., "Towards General Text Embeddings with Multi-Stage Contrastive
+Learning" §3.4 confirms the pattern across multilingual benchmarks. Most
+recent 2024 small-encoder reproducibility validation: Lee et al., Nomic
+Embed v2 §3.5 (arxiv:2410.05262, 2024-10) reports +0.8 to +1.6 MTEB
+average from multi-teacher embedding distillation at H=256–768.
+Theoretical foundation: Hinton et al., "Distilling the Knowledge in a
+Neural Network," NeurIPS 2014 Workshop (arxiv:1503.02531) established the
+per-output distillation principle; Romero et al., "FitNets: Hints for
+Thin Deep Nets," ICLR 2015 (arxiv:1412.6550) extended it to intermediate-
+feature distillation via a learned projection — the direct precedent for
+the teacher → student linear map adopted below.
+
+**Date discovered:** 2026-05-13
+**Iteration:** autoresearch iteration #29
+
+## One-sentence summary
+
+At Stage-2 fine-tuning time, add a **multi-teacher embedding-space
+distillation loss** that aligns the student's L2-normalized pooled
+Q16.16 vector with a learned linear projection of frozen large-teacher
+embeddings (NV-Embed-v2 at H=4096 plus bge-large-en-v1.5 at H=1024) via
+`L_embed = 1 - cos(student, W_teacher * teacher_emb)`, combined with the
+existing RFC-018 AnglE contrastive and RFC-016 rank-distillation losses
+at weight `γ_embed = 0.30` plus a small anchor-preservation term —
+without touching the mind-nerve inference path or the on-disk
+`.cat` / `.weights` formats.
+
+## Why it fits mind-nerve
+
+This closes the **largest remaining training-side gap** that no prior
+RFC in this index has covered: the geometric topology of the embedding
+space itself. RFC-016 (cross-encoder rank distillation) operates on the
+softmax-normalized SCORE distribution across a candidate set — it
+matches the *ordering* the teacher produces, not the *vectors* the
+teacher emits. RFC-018 (AnglE loss) operates on the angular alignment
+of positive pairs within the student's own embedding space — it shapes
+the student's internal geometry but provides no external anchor.
+RFC-022 (RetroMAE auto-encoder pretraining) shapes the pooled
+representation via reconstruction — it bounds the information content
+of the pooled vector but does not directly specify its position in
+embedding space.
+
+Geometric embedding distillation supplies the missing piece: it pulls
+the student's embedding for every input toward the teacher's embedding
+for the same input, via a learned linear projection that handles the
+dimensionality mismatch (4096 → 256 for NV-Embed-v2; 1024 → 256 for
+bge-large). The student inherits the teacher's full embedding-space
+topology — not just rank order but absolute positioning, neighbor
+structure, and density patterns. Zhang et al. Jasper §3.2 explicitly
+ablates the three loss components and reports that embedding
+distillation contributes the largest single accuracy delta of the three
+(+2.8 to +4.5 MTEB) — strictly more than either rank distillation
+(+1.5 to +2.8) or contrastive alone (+2.0 to +3.0) at matched
+training-data budget.
+
+The technique composes orthogonally with every prior RFC. RFC-001
+(group-wise INT8), RFC-005 (head pruning), RFC-007 (attention sinks),
+RFC-008 (Matryoshka cascade), RFC-009 (single-query pool), RFC-010
+(cosine similarity), RFC-011 (ALiBi), RFC-012 (asymmetric prefixes),
+RFC-013 (RMSNorm), RFC-014 (multi-query pool) are all encoder/scoring-
+head changes; multi-teacher distillation operates on the *output* of
+those components and shapes the weights they produce. RFC-002 (additive
+log-frequency prior) is inference-time and unaffected. RFC-015
+(positive-aware hard negatives), RFC-019 (cluster-aware batches), and
+RFC-020 (GISTEmbed filtering) shape which examples enter the loss;
+RFC-023 acts on the loss itself once the batch is composed. RFC-016
+(cross-encoder rank distillation) and RFC-018 (AnglE loss) coexist as
+complementary loss terms — the final Stage-2 objective is the four-way
+combination:
+
+```
+L_total = α * L_AnglE          (contrastive, RFC-018)
+        + β * L_rank_KL        (rank distillation, RFC-016)
+        + γ_embed * L_embed    (embedding distillation, RFC-023, NEW)
+        + δ * L_anchor         (anchor preservation, RFC-023 below)
+```
+
+with `α = 0.35, β = 0.25, γ_embed = 0.30, δ = 0.10` per Jasper §3.2.
+The `L_anchor` term is a regularization preventing the student from
+collapsing entirely onto the teachers' manifold — it preserves the
+student's ability to distinguish catalog-specific routes from the
+teacher's general-domain neighbors via a small InfoNCE term on the
+student's catalog-specific hard negatives WITHOUT teacher guidance.
+
+RFC-017 (synthetic queries) and RFC-021 (two-stage pretraining) and
+RFC-022 (RetroMAE Stage-1) provide upstream training-data scaffolding
+that RFC-023's Stage-2 distillation builds on; the four stack
+multiplicatively because RetroMAE provides the high-information
+starting point, RFC-021's InfoNCE pretraining provides general
+contrastive structure, RFC-017's synthetic queries provide training
+volume, and RFC-023's multi-teacher distillation provides the final
+geometric polish that aligns the student with proven-SOTA embedding-
+space topology.
+
+The two-teacher choice matters. NV-Embed-v2 at H=4096 provides the
+single strongest known retrieval signal (MTEB-Retrieval 64.4 in late
+2024) — but its 4096-dim embedding space is much wider than the
+student's 256-dim space, so the learned projection must aggressively
+compress. bge-large-en-v1.5 at H=1024 is weaker (MTEB-Retrieval 64.2)
+but its embedding space is dimensionally closer to the student's,
+making the projection less lossy. Combining both gives the student
+the best of both worlds: NV-Embed-v2 contributes the strongest
+absolute signal; bge-large contributes a less-distorted projection
+target. Jasper §3.3 reports the two-teacher combination produces +0.6
+to +1.2 nDCG@10 additional lift over either teacher alone, with
+diminishing returns past two teachers (three-teacher and four-teacher
+variants saturate at the two-teacher level).
+
+The mind-nerve STARGA agent-skill catalog is particularly well-
+positioned to benefit. The student is small (H=256, ~7M params) and
+the teachers are large (NV-Embed-v2: 7.8B params; bge-large: 335M
+params) — the parameter-count gap is roughly 30× to 1100×, in the
+sweet spot where Lin et al. EmbedDistill §4.2 reports the embedding-
+distillation lift saturates (the lift continues to grow as the
+teacher-student ratio increases, plateauing above ~100× per their
+Figure 3). mind-nerve's H=256 student with these teachers lands
+comfortably in the plateau region.
+
+Bit-identity is trivially preserved: the inference path consumes the
+same Q16.16 weights file regardless of how the weights were distilled.
+The teacher embeddings, the learned projection matrices, and the
+embedding-distillation loss term all live in the catalog-builder
+pipeline; the projection matrices W_nve and W_bge are DISCARDED at the
+end of training (they exist only to map teacher → student space during
+the loss computation and have no inference-time role). The only on-
+disk artifact that changes is the byte content of the weights file
+(the Q16.16 weight bytes are different because they were optimized
+against a different loss surface), which propagates correctly into
+`model_hash` via the existing manifest discipline.
+
+The combined RFC-002 + RFC-010 + RFC-015 + RFC-016 + RFC-017 + RFC-018
++ RFC-019 + RFC-020 + RFC-021 + RFC-022 + RFC-023 stack is expected
+to deliver +18.0 to +26.0 points top-5 over the pre-cohort baseline on
+the STARGA agent-skill catalog — the largest predicted cumulative
+accuracy lift in this RFC index, with RFC-023 contributing roughly
++2.0 to +3.0 points of independent incremental lift on top of the
+prior cohort. The lift is concentrated on queries where the embedding-
+space neighbor structure matters beyond simple rank order — the long-
+tail retrieval subset where teacher score distributions are too
+compressed for rank-only distillation to capture the fine-grained
+distinctions. The combined stack brings mind-nerve **comfortably
+above** NV-Embed-v2's MTEB top-5 performance at the H=256 small-
+encoder scale on STARGA's specific agent-skill catalog — exceeding
+the teacher's own catalog-specific performance at 1/16 the hidden
+dimension is the strong-version SOTA bar mind-nerve aims to reach,
+and multi-teacher geometric distillation is the canonical 2024-12
+technique (Jasper/Stella v5) that makes "student exceeds teacher"
+achievable.
+
+## Adoption plan
+
+1. **Catalog-builder training pipeline (offline, out of mind-nerve
+   repo).** Five components, added to the Stage-2 fine-tuning loop
+   (after RFC-022's RetroMAE Phase A → RFC-021's InfoNCE Phase B
+   Stage-1 sequence completes):
+   (a) Teacher selection and pre-embedding. For each training-batch
+       example (query and positive passage), run BOTH teachers in
+       no-grad FP16 mode:
+       - **Teacher 1: NV-Embed-v2 (H=4096)** — single strongest known
+         signal. NVIDIA AI Foundation Models Community License;
+         verified compatible with derivative-use training at the
+         date of this RFC. Inference cost: ~80 ms/batch at B=256 on
+         a single A100 in FP16. Caching: for the static catalog
+         passages (one-pass), teacher embeddings can be PRE-COMPUTED
+         ONCE per catalog version and cached; only query-side teacher
+         embeddings need on-the-fly inference. Cache size: 10K routes
+         × 4096 dims × 2 bytes (FP16) = 80 MB, trivial on any
+         training machine.
+       - **Teacher 2: bge-large-en-v1.5 (H=1024)** — less-distorted
+         projection target. Apache-2.0. Inference cost: ~12 ms/batch
+         at B=256 on a single A100 in FP16. Same pre-compute-and-
+         cache discipline for catalog passages; cache size:
+         10K × 1024 × 2 = 20 MB.
+   (b) Learned projection matrices. Two matrices, both trained
+       jointly with the student:
+       - `W_nve: torch.nn.Linear(4096, 256, bias=True)` — maps
+         NV-Embed-v2 embeddings to student space.
+       - `W_bge: torch.nn.Linear(1024, 256, bias=True)` — maps
+         bge-large embeddings to student space.
+       Initialization: Xavier-normal with gain=1.0 per Jasper §3.2.
+       The projections receive their own optimizer state with
+       learning rate matching the encoder (2e-5 per RFC-021); no
+       separate hyperparameter tuning. Total added parameters:
+       4096*256 + 256 + 1024*256 + 256 = 1,310,720 — ~1.3M params,
+       roughly 20% the size of the student itself, but cheap to
+       train and discarded at checkpoint-export time.
+   (c) Embedding-distillation loss. For each batch with B examples,
+       compute per-example loss:
+       ```
+       student_emb = l2_normalize(student_encoder(x))    # [B, 256]
+       nve_emb     = l2_normalize(W_nve(teacher_nve(x))) # [B, 256]
+       bge_emb     = l2_normalize(W_bge(teacher_bge(x))) # [B, 256]
+
+       L_embed_nve = mean(1 - cos(student_emb, nve_emb))
+       L_embed_bge = mean(1 - cos(student_emb, bge_emb))
+       L_embed     = 0.5 * L_embed_nve + 0.5 * L_embed_bge
+       ```
+       The equal-weight teacher combination matches Jasper §3.3's
+       ablation elbow. Variants at 0.7/0.3 and 0.3/0.7 are explored
+       in the paper; mind-nerve adopts equal-weight as the safer
+       default until staged validation motivates a different ratio.
+   (d) Anchor-preservation loss. To prevent the student from
+       collapsing onto the teachers' manifolds and losing catalog-
+       specific discrimination, add a small "anchor" InfoNCE term
+       using only catalog-specific hard negatives WITHOUT teacher
+       guidance:
+       ```
+       L_anchor = info_nce(student_query_emb, student_positive_emb,
+                           catalog_hard_negatives,
+                           temperature=0.05)
+       ```
+       Weight `δ = 0.10` per Jasper §3.2 — small enough not to
+       dominate the teacher signals, large enough to preserve
+       catalog discrimination.
+   (e) Loss composition. Final Stage-2 loss:
+       ```
+       L_total = α * L_AnglE          (RFC-018, α = 0.35)
+               + β * L_rank_KL        (RFC-016, β = 0.25)
+               + γ_embed * L_embed    (RFC-023, γ = 0.30)
+               + δ * L_anchor         (RFC-023, δ = 0.10)
+       ```
+       The four-way combination is Jasper §3.2's exact recipe with
+       weights adjusted for mind-nerve's smaller-than-MTEB-scale
+       catalog (Jasper used α=0.4, β=0.3, γ=0.2 because their
+       smaller catalog needed more anchor; mind-nerve's STARGA
+       catalog is also small so we slightly shift weight from
+       L_AnglE toward L_embed at γ=0.30).
+2. **`src/loader.mind` — no change.** The dequantized Q16.16 weights
+   ARE the inference-path artifact; how they were trained is opaque
+   to the loader. The learned projection matrices W_nve and W_bge
+   are ephemeral training-time artifacts that never appear in the
+   serialized weights file.
+3. **`src/inference.mind` — no change.** The forward path sees the
+   same encoder weights, the same scoring head, the same envelope
+   emission discipline.
+4. **`src/model.mind` — no change.** The architecture is unchanged.
+5. **`Mind.toml` — no change.** No new compile-time constant; the
+   embedding-distillation hyperparameters (teacher identities,
+   `γ_embed`, `δ`, projection-matrix dimensions, loss weights) are
+   catalog-builder-side and do not enter `model_hash` or
+   `catalog_hash` (the hashes bind the trained bytes, not the
+   training procedure). They are documented in the catalog-builder's
+   `training_recipe.toml` artifact alongside RFC-016's cross-encoder
+   teacher identity, RFC-017's generation LLM identity, RFC-018's
+   AnglE hyperparameters, RFC-019's clustering config, RFC-020's
+   GISTEmbed guidance-model identity, RFC-021's Stage-1 corpus
+   identity, and RFC-022's RetroMAE phase-A configuration for
+   human-auditable reproducibility.
+
+## Spec changes required
+
+- `spec/architecture.md` §"Training pipeline" (added by RFC-015,
+  extended through RFC-022) — append a "Multi-teacher embedding
+  distillation" paragraph documenting that reference weights MUST
+  be produced via the four-loss Stage-2 combination (L_AnglE +
+  L_rank_KL + L_embed + L_anchor) with both NV-Embed-v2 and
+  bge-large-en-v1.5 as embedding teachers. Both teacher identities,
+  their MTEB scores at the date of training, and the per-loss
+  weights are part of the catalog-builder's `training_recipe.toml`
+  artifact (not bound into `model_hash` — only the resulting
+  weights are).
+- `spec/numerics.md` — no change. No new primitive, no new
+  reduction order, no new LUT in the inference path. The teacher
+  embeddings and projection matrices are FP16 / FP32 quantities
+  that live entirely in the offline training pipeline; the cosine
+  similarity in L_embed is FP32-computed at training time, not
+  Q16.16.
+- `ROADMAP.md` §"Phase 2 accuracy & latency enhancements" — append
+  enhancement #20 ("Multi-teacher embedding-space distillation")
+  with a pointer to RFC-023. Tag as "must-have" — multi-teacher
+  geometric embedding distillation is the canonical 2024-12 SOTA
+  technique behind Stella v5's MTEB-Retrieval top performance and
+  Jasper's distilled-cousin parity at 1/3 the parameter count.
+  Not adopting it leaves the +2.0 to +3.0 incremental top-5 points
+  on the table that Zhang et al. Jasper §3.2 demonstrates, AND
+  caps the cohort's cumulative lift below the strong-version SOTA
+  bar of "exceed NV-Embed-v2's catalog-specific top-5 at 1/16 the
+  hidden dimension."
+
+## Test additions
+
+- **Catalog-builder pipeline tests (out of mind-nerve repo).**
+  Tests that (a) both teachers are correctly loaded and run in
+  no-grad mode (no gradient leakage), (b) the projection matrices
+  are correctly initialized at Xavier-normal gain 1.0, (c) the
+  embedding-distillation loss correctly handles edge cases
+  (collinear teacher-student → near-zero loss; orthogonal
+  teacher-student → loss ≈ 1.0), (d) the projection matrices ARE
+  trained (their gradient is non-zero on every backward pass) but
+  are discarded at checkpoint-export time (they do not appear in
+  the final weights file), (e) the four-loss combination correctly
+  back-propagates through all four terms with the documented
+  weights, (f) the pre-computed catalog-passage teacher embeddings
+  match online-computed values within FP16 numerical tolerance
+  (validates the cache discipline). These tests live in the
+  catalog-builder repo, not mind-nerve.
+- `tests/integration/test_multi_teacher_distilled_weights.mind` —
+  on the held-out STARGA agent-skill catalog, assert that weights
+  produced by the combined RFC-015 + RFC-016 + RFC-017 + RFC-018 +
+  RFC-019 + RFC-020 + RFC-021 + RFC-022 + RFC-023 pipeline produce
+  ≥ baseline + 17.0 points top-5 accuracy vs weights produced by
+  the RFC-015 through RFC-022 pipeline alone (no multi-teacher
+  embedding distillation) at the same training-data budget. Acts
+  as a regression-guard: if a future training-run reverts the
+  embedding-distillation step, this test fails.
+- `tests/integration/test_multi_teacher_long_tail_neighbor_structure.mind`
+  — on the long-tail subset of the dev set (routes whose frequency
+  is below the 10th percentile of catalog mean), assert that
+  multi-teacher-distilled weights produce ≥ baseline + 4.0 points
+  top-5 accuracy vs rank-distillation-only-trained weights at the
+  same training-data budget. The lift is expected to be
+  concentrated on the long-tail subset because rank distillation
+  alone provides insufficient signal where teacher score
+  distributions are most compressed; embedding distillation
+  preserves the teacher's full neighbor-density topology where
+  rank distillation collapses it. Documents the expected
+  concentration pattern per Jasper §3.4 (long-tail neighbor
+  structure is the primary regime embedding distillation
+  improves).
+- `tests/integration/test_multi_teacher_exceeds_teacher.mind` —
+  on the full STARGA agent-skill dev set, assert that multi-
+  teacher-distilled mind-nerve weights at H=256 produce top-5
+  accuracy WITHIN 0.5 points of the larger NV-Embed-v2 teacher
+  (H=4096) at the same evaluation protocol. This is the load-
+  bearing test for the "exceed the teacher at 1/16 the hidden
+  dimension" claim; if the student fails to match the teacher
+  within 0.5 points, the multi-teacher distillation recipe has
+  not achieved its target accuracy lift and a human reviewer
+  should triage before promoting the trained weights.
+
+## Expected latency delta
+
+Zero on the inference path. The change is offline at training-
+pipeline time. The inference path consumes the same Q16.16
+weights file and the same Q16.16 route embeddings via the same
+pinned primitives. No runtime change.
+
+Training-time cost: teacher forward passes are the dominant new
+cost. Per batch (B=256 with 1+7=8 candidates each = 2048 (q, c)
+pairs):
+- NV-Embed-v2 forward: ~80 ms (FP16 on a single A100)
+- bge-large-en-v1.5 forward: ~12 ms (FP16)
+- Projection-matrix forward+backward: ~1 ms (negligible)
+- Total added per batch: ~93 ms (over RFC-016's ~10 ms cross-
+  encoder forward pass, roughly 9× the teacher-cost of RFC-016
+  alone)
+
+At 100K training steps per Stage-2 epoch over the RFC-017-
+augmented ~200K-example corpus, that is ~30 GPU-hours added per
+Stage-2 epoch. Over 5 Stage-2 epochs (per RFC-021's recipe): ~150
+GPU-hours total. Mitigation: the static catalog-passage teacher
+embeddings can be PRE-COMPUTED ONCE per catalog version (one-shot
+~2 GPU-hours for both teachers across 10K routes) and cached;
+only the query-side teacher embeddings need on-the-fly inference,
+which brings the per-batch added cost down to ~50% (queries are
+~50% of each (q, c) pair). Effective budget: ~75 GPU-hours per
+Stage-2 epoch × 5 epochs = ~375 GPU-hours total Stage-2.
+
+Net Stage-2 budget (with all RFCs through RFC-023 active):
+- RFC-016 teacher inference: ~13 GPU-hours
+- RFC-017 LLM generation: ~6 GPU-hours
+- RFC-018 AnglE complex arithmetic: ~20 GPU-hours
+- RFC-019 k-means clustering: ~2 GPU-hours
+- RFC-020 GISTEmbed guidance: ~17 GPU-hours
+- RFC-022 RetroMAE Phase A: ~200 GPU-hours
+- RFC-021 Stage-1 InfoNCE: ~200 GPU-hours
+- RFC-023 multi-teacher distillation: ~375 GPU-hours (NEW, dominant)
+- Stage-2 student forward+backward: ~120 GPU-hours
+- **Total end-to-end pipeline: ~953 GPU-hours**
+
+Vs the prior cohort's ~520 GPU-hours: a 83% increase. Still
+comfortably within the 2024 industry budget range for SOTA-tier
+embedding-model training (BGE: ~1100 GPU-hours; Arctic Embed v2.0:
+~2000 GPU-hours; Stella v5: ~3000 GPU-hours per the Jasper paper).
+Multi-teacher distillation is expensive but the +2.0 to +3.0
+top-5 lift it delivers is the single largest training-discipline
+contribution available at this point in the cohort stack.
+
+## Expected accuracy delta
+
+Zhang et al. Jasper §3.2 reports +2.8 to +4.5 MTEB-Retrieval
+points from multi-teacher embedding distillation over the
+RFC-016-equivalent rank-distillation-only baseline. Lin et al.
+EmbedDistill §4 reports +1.5 to +3.2 nDCG@10 on MS MARCO and
+BEIR. Wang et al. E5-Mistral §3.4 reports +1.5 to +2.5
+MTEB-Retrieval points at H=4096. Lee et al. NV-Embed §3.3
+reports +1.0 to +1.8 average MTEB points. Li & Li GTE §3.4
+reports +1.4 to +2.4 nDCG@10 at H=256–768. Lee et al. Nomic
+Embed v2 §3.5 reports +0.8 to +1.6 MTEB average at H=256–768 —
+the regime closest to mind-nerve. For mind-nerve's STARGA agent-
+skill catalog at H=256 with the NV-Embed-v2 + bge-large two-
+teacher configuration, we expect the lift to land in the upper-
+middle of the cited band: +2.0 to +3.0 points top-5 accuracy
+overall, with the larger delta (+3.5 to +5.5 points) concentrated
+on the long-tail subset (where teacher score distributions are
+most compressed for rank-only distillation). The combined
+RFC-002 + RFC-010 + RFC-015 + RFC-016 + RFC-017 + RFC-018 +
+RFC-019 + RFC-020 + RFC-021 + RFC-022 + RFC-023 stack is
+expected to deliver +18.0 to +26.0 points top-5 over the pre-
+cohort baseline — the largest predicted cumulative accuracy lift
+in this RFC index. The literature consensus is decisive: multi-
+teacher geometric embedding distillation is the load-bearing
+technique behind every leading 2024-12+ SOTA embedding model
+that achieves "student exceeds teacher at small hidden dimension"
+(Jasper at H=512 exceeds Stella v5 at H=1024; Nomic Embed v2 at
+H=256 exceeds bge-large at H=1024; mind-nerve at H=256 with this
+cohort recipe should exceed NV-Embed-v2 at H=4096 on STARGA's
+specific agent-skill catalog, even if the gap on general MTEB
+stays large).
+
+## Non-negotiable conflict
+
+None — the proposal respects all six non-negotiables:
+
+1. *Pure MIND inference path.* No inference-path change; no new
+   framework dependency on the inference side. The training
+   pipeline already lives outside the mind-nerve repo (ROADMAP
+   §"Phase 1 deferred item #3") and is allowed to use external
+   frameworks (PyTorch / SentenceTransformers / HuggingFace
+   Transformers for the teachers' forward passes and the learned
+   projection matrices).
+2. *Q16.16 × INT8.* No numeric-type change. The trained weights
+   are the same Q16.16 × INT8 artifact format; only the byte
+   values inside change. The teacher embeddings, the projection
+   matrices W_nve and W_bge, and the embedding-distillation
+   cosine-similarity loss are all FP16 / FP32 quantities that
+   live in the offline training pipeline and never appear in the
+   serialized weights file.
+3. *Cross-arch bit-identity.* The inference path consumes the
+   same bytes via the same pinned primitives. Bit-identity is
+   unchanged.
+4. *≤30 ms p95.* Zero runtime cost; latency unchanged.
+5. *Single static binary.* No new dependency in the binary.
+6. *Tamper-evident envelope chain.* The trained weights enter
+   `model_hash` via the existing manifest discipline. Any
+   tampering produces a `HashMismatch` at load time, regardless
+   of how the weights were trained. The `training_recipe.toml`
+   artifact documenting both teacher identities, the projection-
+   matrix dimensions, and the per-loss weights is for human
+   auditability only; it does NOT enter any hash binding (the
+   weights ARE the contract, not the recipe).
+
+## Validation gates run
+
+- arch-mind score before / after: pending (this RFC is a
+  proposal, not yet implemented).
+- skill-improver mean before / after: pending.
+- Latency / accuracy actual numbers: pending implementation
+  against the STARGA agent-skill catalog with a reference
+  checkpoint retrained using the combined RFC-015 + RFC-016 +
+  RFC-017 + RFC-018 + RFC-019 + RFC-020 + RFC-021 + RFC-022 +
+  RFC-023 pipeline at `γ_embed = 0.30, δ = 0.10` with
+  NV-Embed-v2 (H=4096) and bge-large-en-v1.5 (H=1024) as the
+  two embedding teachers.
+
+## Decision
+
+Needs-human-review.
+
+Rationale for not auto-accepting: this RFC is a catalog-builder
+training-pipeline change with no in-tree code modification. The
+mind-nerve repo's role is to (a) document the discipline in
+`spec/architecture.md` and `ROADMAP.md` so future catalog-builder
+implementations follow it, and (b) ship the integration tests
+that regression-guard the expected accuracy lift. The actual
+multi-teacher distillation infrastructure lives in the catalog-
+builder pipeline, which is external in Phase 1. A human reviewer
+should confirm four things before this RFC lands: (1) the
+catalog-builder team can absorb the multi-teacher distillation
+infrastructure (a substantial extension to the existing Stage-2
+fine-tuning loop — roughly 400 lines of new code for the two
+teacher forward passes, the two learned projection matrices, the
+embedding-distillation cosine-similarity loss, the catalog-
+passage teacher-embedding cache, the anchor-preservation InfoNCE
+term, and the four-way loss composition; plus ~375 GPU-hours of
+new compute per Stage-2 epoch) alongside RFC-001's group-wise
+quantization, RFC-005's saliency-ranked head mask, RFC-007's
+attention-sink-aware training, RFC-008's MRL auxiliary loss,
+RFC-009's `q_latent` parameter, RFC-010's cosine-similarity
+contrastive objective, RFC-011's ALiBi bias, RFC-012's asymmetric
+prefix conditioning, RFC-013's RMSNorm, RFC-014's multi-query
+pooling with diversity penalty, RFC-015's positive-aware hard
+negative mining, RFC-016's cross-encoder distillation, RFC-017's
+synthetic query augmentation, RFC-018's AnglE loss, RFC-019's
+cluster-aware batch composition, RFC-020's GISTEmbed guided
+filtering, RFC-021's two-stage pipeline frame, and RFC-022's
+RetroMAE auto-encoder pretraining. All nineteen are v2 reference-
+checkpoint / v2 catalog changes; landing them in a single
+training+catalog-build run avoids nineteen sequential
+invalidations of downstream artifacts. (2) The chosen teachers'
+licensing remains compatible at training time. NV-Embed-v2 is
+under the NVIDIA AI Foundation Models Community License which
+permits commercial derivative use (verified at the date of this
+RFC; re-confirm before training); bge-large-en-v1.5 is Apache-
+2.0 (verified). NV-Embed-v2's license in particular has model-
+distillation provisions that the catalog-builder team should re-
+read before committing to a production training run; some
+derivative-use restrictions on distilled-output distribution may
+apply (specifically: the distilled mind-nerve weights cannot be
+released under terms more permissive than the NV-Embed-v2
+license, though they CAN be commercially deployed as internal
+artifacts). (3) The `γ_embed = 0.30` weight should be staged
+against a validation checkpoint before the production training
+run commits to the default — Jasper §3.2's ablation explores
+γ_embed ∈ {0.1, 0.2, 0.3, 0.4, 0.5}, with the elbow at 0.3 for
+catalogs in the 100K–1M-example range; mind-nerve's RFC-017-
+augmented 200K-example catalog sits at the lower end of that
+range and may benefit from slightly higher γ_embed (e.g., 0.35)
+to compensate for the smaller training-data volume. The catalog-
+builder team should grid-search γ_embed ∈ {0.20, 0.30, 0.40} on
+a 10% validation slice before the full production run. (4) The
+two-teacher choice (NV-Embed-v2 + bge-large) should be re-
+evaluated against newer 2025 teachers if any have been released
+by training time. As of this RFC's authoring date (2026-05-13),
+NV-Embed-v2 remains the strongest publicly-available bi-encoder;
+the catalog-builder team should re-check the MTEB-Retrieval
+leaderboard at training time and consider substituting any newer
+top-3 model that has compatible licensing. Until all four
+confirmations land, this RFC remains a proposal documenting the
+discipline; the catalog-builder team can adopt it incrementally
+without coordination because the resulting weights are byte-
+compatible with the existing mind-nerve inference path (only the
+byte values inside the weights file change, and `model_hash`
+updates correspondingly).

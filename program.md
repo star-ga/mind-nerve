@@ -122,15 +122,44 @@ quietly relaxes a constraint.
 composite = arch_mind_purity
           + skill_improver_mean * 100
           + rfcs_implemented   * 5000
+          + (rfcs_implemented + rfcs_skipped) * 100   # processed nudge
+          - consensus_penalty
 ```
 
 `rfcs_implemented` = `grep -c '^\*\*Status:\*\* IMPLEMENTED' RFCs/INDEX.md`.
+`rfcs_skipped` = same pattern for SKIPPED. The +100/processed nudge
+ensures SKIPPED iterations beat baseline by enough to be kept, so
+SKIPPED markers stick across the discard cycle. Big +5000 per
+IMPLEMENTED keeps shipping dominant.
+
+`consensus_penalty` = 6000 if a 3-LLM fleet review (grok, deepseek,
+mistral) rejects the iteration's diff, else 0. See "Consensus gate"
+below.
 
 Each shipped RFC is worth far more than any structural metric — that
 is the point. arch-mind + skill-improver act as guard rails (they
 gate against regressions) rather than as the main optimization
-target. The +5000 weight keeps the loop biased toward shipping while
-the structural metrics still get vetoed on regression.
+target.
+
+## Consensus gate (NEW)
+
+After every commit that adds a real `**Status:** IMPLEMENTED` line,
+`.autoresearch-consensus.py` broadcasts the diff + the RFC body to
+three fleet providers (grok, deepseek, mistral) for a structured
+review. Pass = ≥2 approves AND 0 rejects. A rejection subtracts
+6000 from the composite, pushing the iteration below baseline so
+`autorun.py` discards it (`git reset --hard <anchor>`).
+
+What the reviewers look for:
+- Real code change (not just a marker addition)
+- Compiles, no obvious dead branches
+- Doesn't break a load-bearing test
+- Respects every non-negotiable above
+- Backwards-soft default (binary stays byte-identical when disabled)
+
+If you mark SKIPPED with no code change, the consensus gate is
+inactive (no diff to vote on). The +100 processed nudge still locks
+the SKIP in.
 
 ## Termination
 

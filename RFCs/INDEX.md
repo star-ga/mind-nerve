@@ -135,6 +135,17 @@ requires aligning with whoever produces the next reference checkpoint.
 A human reviewer should confirm the version-bump timing before
 implementation lands.
 
+**Status:** IMPLEMENTED at exp1 — `src/loader.mind` now accepts both v1
+(per-output-channel scales, the byte-identical default) and v2 (RFC-001
+group-wise scales at `GROUP_SIZE = 32`). v1 weights files remain
+byte-compatible and dequantize identically to today; v2 files are
+parsed via the same `dequantize_matrix` with a `groupwise` flag that
+selects between `scales_off + oc*4` (v1) and
+`scales_off + (oc * H/GROUP_SIZE + ic/GROUP_SIZE)*4` (v2). The v2
+code path is dark until the offline training pipeline emits a v2
+reference checkpoint (Phase 1 deferred); flipping a producer to v2
+requires no further mind-nerve change.
+
 ---
 
 # RFC-002 — Log-frequency catalog-co-occurrence prior with empirical-Bayes shrinkage

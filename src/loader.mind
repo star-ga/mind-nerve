@@ -84,7 +84,11 @@
 //   offset    size                                       field
 //   0         4                                          magic = "MNW1"
 //                                                        (0x4D 0x4E 0x57 0x31)
-//   4         2                                          version u16 LE = 1
+//   4         2                                          version u16 LE ∈ {1, 2}
+//                                                        v1 = per-output-channel scales
+//                                                        v2 = RFC-001 group-wise scales
+//                                                             (GROUP_SIZE = 32; one Q16.16
+//                                                             scale per (oc, group) pair)
 //   6         2                                          reserved = 0
 //   8         32                                         model_hash [u8; 32]
 //                                                        (SHA-256 of manifest, opaque
@@ -96,20 +100,21 @@
 //   76        4                                          encoder_hidden u32 LE
 //                                                        (MUST equal ENCODER_HIDDEN)
 //
-//   (per-layer block, repeated encoder_layers times; size = 4*H^2 + 4*H*4 +
-//    3*H*4 bytes = 4*H^2 + 28*H bytes = 7168 + 0 = 0.27 MB at H=256):
+//   (per-layer block, repeated encoder_layers times; size depends on
+//    version. SCALES_BYTES_PER_MATRIX is H*4 in v1, H*(H/GROUP_SIZE)*4
+//    in v2):
 //
-//       H*H bytes      wq             (INT8, row-major, output channel × input)
-//       H*H bytes      wk             (INT8)
-//       H*H bytes      wv             (INT8)
-//       H*H bytes      wo             (INT8)
-//       H*4 bytes      wq_scales      (Q16.16 i32 LE, per output channel)
-//       H*4 bytes      wk_scales
-//       H*4 bytes      wv_scales
-//       H*4 bytes      wo_scales
-//       H*4 bytes      ln_gain        (Q16.16 i32 LE)
-//       H*4 bytes      ln_bias        (Q16.16 i32 LE)
-//       H*4 bytes      residual_gate  (Q16.16 i32 LE)
+//       H*H bytes               wq             (INT8, row-major, output channel × input)
+//       H*H bytes               wk             (INT8)
+//       H*H bytes               wv             (INT8)
+//       H*H bytes               wo             (INT8)
+//       SCALES_BYTES_PER_MATRIX wq_scales      (Q16.16 i32 LE)
+//       SCALES_BYTES_PER_MATRIX wk_scales
+//       SCALES_BYTES_PER_MATRIX wv_scales
+//       SCALES_BYTES_PER_MATRIX wo_scales
+//       H*4 bytes               ln_gain        (Q16.16 i32 LE)
+//       H*4 bytes               ln_bias        (Q16.16 i32 LE)
+//       H*4 bytes               residual_gate  (Q16.16 i32 LE)
 //
 //   (after all layers):
 //
@@ -251,7 +256,28 @@ const MNC1_MAGIC: [u8; 4] = [0x4Du8, 0x4Eu8, 0x43u8, 0x31u8]; // "MNC1"
 const MNW1_MAGIC: [u8; 4] = [0x4Du8, 0x4Eu8, 0x57u8, 0x31u8]; // "MNW1"
 
 const CATALOG_VERSION: u16 = 1;
-const WEIGHTS_VERSION: u16 = 1;
+
+// Weights file version range. v1 = per-output-channel INT8 scales (the
+// original 2026 layout); v2 = group-wise INT8 scales per RFC-001
+// (groups of GROUP_SIZE input channels share one Q16.16 scale). The
+// loader accepts both formats; v1 remains the default and produces
+// byte-identical dequantized output to today's reference checkpoint.
+// A v2 reference checkpoint requires the offline training pipeline to
+// emit `[H, H/GROUP_SIZE]` scale tensors instead of `[H]` — coordinated
+// separately (ROADMAP Phase 1 deferred item #3).
+const WEIGHTS_VERSION_V1: u16 = 1;
+const WEIGHTS_VERSION_V2: u16 = 2;
+
+// RFC-001 (AWQ-style group-wise INT8 quantization, MLSys 2024 /
+// arxiv:2306.00978): input channels are partitioned into contiguous
+// groups of GROUP_SIZE columns; each (output_channel, group) pair
+// carries its own Q16.16 scale. ENCODER_HIDDEN = 256 and
+// GROUP_SIZE = 32 yields 8 groups per output channel. The group index
+// for input channel `ic` is `ic / GROUP_SIZE` (a single right-shift
+// when GROUP_SIZE is a power of two — bit-identical on every backend).
+// Compile-time pinned here so cross-backend lowering sees the same
+// value without a Mind.toml round-trip.
+pub const GROUP_SIZE: usize = 32;
 
 const CATALOG_HEADER_BYTES: usize = 48;  // magic(4)+ver(2)+rsv(2)+nroutes(4)+edim(4)+hash(32)
 const WEIGHTS_HEADER_BYTES: usize = 80;  // magic(4)+ver(2)+rsv(2)+model_hash(32)
@@ -509,9 +535,14 @@ pub fn parse_weights(bytes: &[u8]) -> Result<ModelWeights, LoaderError> {
     }
 
     let version: u16 = read_u16_le(bytes, 4);
-    if version != WEIGHTS_VERSION {
+    if version != WEIGHTS_VERSION_V1 && version != WEIGHTS_VERSION_V2 {
         return Err(LoaderError::UnsupportedVersion);
     }
+    // RFC-001 group-wise scales when v2. v1 keeps the per-output-channel
+    // layout that today's reference checkpoint ships. Default is v1 so
+    // the binary stays byte-identical until a v2-trained checkpoint
+    // lands; the v2 path is dark code until that day.
+    let groupwise: bool = (version == WEIGHTS_VERSION_V2);
 
     let reserved: u16 = read_u16_le(bytes, 6);
     if reserved != 0u16 {
@@ -542,10 +573,21 @@ pub fn parse_weights(bytes: &[u8]) -> Result<ModelWeights, LoaderError> {
     let v_usz: usize = VOCAB_SIZE as usize;
 
     // (2) Per-layer blocks.
+    // v1: one Q16.16 scale per output channel  -> H * 4 bytes per matrix.
+    // v2: one Q16.16 scale per (output channel, group of GROUP_SIZE input
+    //     channels)                            -> H * (H/GROUP_SIZE) * 4
+    //                                            bytes per matrix.
+    // ENCODER_HIDDEN = 256, GROUP_SIZE = 32 => 8 groups per row, 8x the v1
+    // scales footprint. The INT8 weight bytes themselves do not change.
+    let scales_per_matrix_bytes: usize = if groupwise {
+        h_usz * (h_usz / GROUP_SIZE) * 4usize
+    } else {
+        h_usz * 4usize
+    };
     let per_layer_bytes: usize =
-          4usize * h_usz * h_usz          // wq/wk/wv/wo (INT8)
-        + 4usize * h_usz * 4usize          // wq/wk/wv/wo scales (Q16.16 i32)
-        + 3usize * h_usz * 4usize;         // ln_gain, ln_bias, residual_gate
+          4usize * h_usz * h_usz             // wq/wk/wv/wo (INT8)
+        + 4usize * scales_per_matrix_bytes   // wq/wk/wv/wo scales (Q16.16 i32)
+        + 3usize * h_usz * 4usize;           // ln_gain, ln_bias, residual_gate
 
     let layers_offset: usize = WEIGHTS_HEADER_BYTES;
     let layers_end:    usize = layers_offset + l_usz * per_layer_bytes;
@@ -576,23 +618,25 @@ pub fn parse_weights(bytes: &[u8]) -> Result<ModelWeights, LoaderError> {
         let wv_int8_off: usize = layer_off + 2usize         * h_usz * h_usz;
         let wo_int8_off: usize = layer_off + 3usize         * h_usz * h_usz;
 
-        // Scale offsets follow all four INT8 matrices.
+        // Scale offsets follow all four INT8 matrices. The scales block
+        // stride depends on the weights-file version: see
+        // `scales_per_matrix_bytes` above.
         let scales_base: usize = layer_off + 4usize * h_usz * h_usz;
-        let wq_scale_off: usize = scales_base + 0usize * h_usz * 4usize;
-        let wk_scale_off: usize = scales_base + 1usize * h_usz * 4usize;
-        let wv_scale_off: usize = scales_base + 2usize * h_usz * 4usize;
-        let wo_scale_off: usize = scales_base + 3usize * h_usz * 4usize;
+        let wq_scale_off: usize = scales_base + 0usize * scales_per_matrix_bytes;
+        let wk_scale_off: usize = scales_base + 1usize * scales_per_matrix_bytes;
+        let wv_scale_off: usize = scales_base + 2usize * scales_per_matrix_bytes;
+        let wo_scale_off: usize = scales_base + 3usize * scales_per_matrix_bytes;
 
         // Norm + gate vectors follow the scales.
-        let norm_base: usize = scales_base + 4usize * h_usz * 4usize;
+        let norm_base: usize = scales_base + 4usize * scales_per_matrix_bytes;
         let ln_gain_off:       usize = norm_base + 0usize * h_usz * 4usize;
         let ln_bias_off:       usize = norm_base + 1usize * h_usz * 4usize;
         let residual_gate_off: usize = norm_base + 2usize * h_usz * 4usize;
 
-        let wq = dequantize_matrix(bytes, wq_int8_off, wq_scale_off, h_usz);
-        let wk = dequantize_matrix(bytes, wk_int8_off, wk_scale_off, h_usz);
-        let wv = dequantize_matrix(bytes, wv_int8_off, wv_scale_off, h_usz);
-        let wo = dequantize_matrix(bytes, wo_int8_off, wo_scale_off, h_usz);
+        let wq = dequantize_matrix(bytes, wq_int8_off, wq_scale_off, h_usz, groupwise);
+        let wk = dequantize_matrix(bytes, wk_int8_off, wk_scale_off, h_usz, groupwise);
+        let wv = dequantize_matrix(bytes, wv_int8_off, wv_scale_off, h_usz, groupwise);
+        let wo = dequantize_matrix(bytes, wo_int8_off, wo_scale_off, h_usz, groupwise);
 
         let mut ln_gain:       tensor<Q16_16, [h_usz]> = [0_i32; h_usz];
         let mut ln_bias:       tensor<Q16_16, [h_usz]> = [0_i32; h_usz];
@@ -730,15 +774,29 @@ fn empty_layer_weights() -> EncoderLayerWeights {
     }
 }
 
-// Dequantize a single H×H INT8 matrix to Q16.16, given the per-output-channel
-// (per-row, output-major layout) Q16.16 scales.
+// Dequantize a single H×H INT8 matrix to Q16.16. The scales section
+// layout depends on `groupwise`:
+//
+//   groupwise == false (v1):
+//     One Q16.16 scale per output channel, packed as `H` i32 LE values.
+//     Address: `scales_off + oc * 4`.
+//
+//   groupwise == true (v2, RFC-001):
+//     One Q16.16 scale per (output channel, input-channel group), packed
+//     as `H * (H/GROUP_SIZE)` i32 LE values in row-major (oc outer,
+//     group inner) order. The group index for input channel `ic` is
+//     `ic / GROUP_SIZE`. Address:
+//       scales_off + (oc * (H/GROUP_SIZE) + (ic / GROUP_SIZE)) * 4
 //
 // Computation per element:
 //   product_i64 = (int8 as i64) * (scale_i32 as i64)        // up to 39 bits
 //   q16         = sat_i32((product_i64 + (1 << 15)) >> 16)  // round-half-to-even
 //
-// Reduction order is pinned by row-major (oc, ic) iteration. q16 fits in i32
-// because |int8| <= 127 and |scale_i32| <= 2^31-1; after the >>16 shift the
+// Reduction order is pinned by row-major (oc, ic) iteration. The
+// group-index integer division `ic / GROUP_SIZE` lowers to a single
+// right-shift on every backend (GROUP_SIZE is a power of two), which
+// is the bit-identity anchor for v2. q16 fits in i32 because
+// |int8| <= 127 and |scale_i32| <= 2^31-1; after the >>16 shift the
 // result is bounded by sat_i32 — saturating clamp on overflow.
 @[determinism(BitIdentical)]
 fn dequantize_matrix(
@@ -746,15 +804,29 @@ fn dequantize_matrix(
     int8_off:   usize,
     scales_off: usize,
     h:          usize,
+    groupwise:  bool,
 ) -> tensor<Q16_16, [h, h]> {
     let mut out: tensor<Q16_16, [h, h]> = [[0_i32; h]; h];
+    let groups_per_row: usize = h / GROUP_SIZE;
 
     let mut oc: usize = 0;
     while oc < h {
-        let scale: i32 = read_i32_le(bytes, scales_off + oc * 4usize);
-
         let mut ic: usize = 0;
         while ic < h {
+            // Resolve the scale address for this (oc, ic) pair. In v1 the
+            // address is invariant across `ic` and mindc hoists the load
+            // out of the inner loop; in v2 the address changes every
+            // GROUP_SIZE columns (8 distinct scales per row at H=256).
+            let scale: i32 = if groupwise {
+                let group: usize = ic / GROUP_SIZE;
+                read_i32_le(
+                    bytes,
+                    scales_off + (oc * groups_per_row + group) * 4usize,
+                )
+            } else {
+                read_i32_le(bytes, scales_off + oc * 4usize)
+            };
+
             // Read INT8 weight as signed byte.
             let raw: u8   = bytes[int8_off + oc * h + ic];
             let w_i8: i8  = raw as i8;

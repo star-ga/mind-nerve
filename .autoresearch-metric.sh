@@ -39,36 +39,33 @@ RFCS_IMPLEMENTED=$(grep -E '^\*\*Status:\*\*\s+IMPLEMENTED' RFCs/INDEX.md 2>/dev
 RFCS_SKIPPED=$(grep -E '^\*\*Status:\*\*\s+SKIPPED' RFCs/INDEX.md 2>/dev/null | wc -l)
 RFCS_QUEUED=$((RFCS_DRAFTED - RFCS_IMPLEMENTED - RFCS_SKIPPED))
 
-# --- Gate 4: multi-LLM consensus on the latest diff ---
-# Runs after every commit. If the iteration introduced a new
-# `**Status:** IMPLEMENTED` marker, 3 fleet providers (grok/deepseek/
-# mistral) review the diff against mind-nerve's six non-negotiables.
-# Pass = ≥2 approves AND 0 rejects. Failure subtracts CONSENSUS_PENALTY
-# from the composite — big enough to push the iteration below baseline
-# so autorun.py discards it (git_reset_hard the commit).
+# --- Gate 4: multi-LLM consensus (manual / opt-in) ---
+# The automatic consensus penalty has been REMOVED at user direction:
+# consensus is now an as-needed review tool, not an inline gate. The
+# loop trusts the agent + arch-mind + skill-improver per iteration;
+# a human (or chat-Claude watching the Monitor stream) can invoke
+#   `python3 .autoresearch-consensus.py`
+# on the most recent commit when something looks fishy, and revert
+# the commit manually if reviewers reject it.
 #
-# Output values mirror into run.log. If no IMPLEMENTED marker was
-# added this iteration, consensus_skipped=1 fires and no penalty.
-CONSENSUS_OUT=$(python3 .autoresearch-consensus.py 2>&1 || true)
-CONSENSUS_SKIPPED=$(printf "%s\n" "$CONSENSUS_OUT" | awk '/^consensus_skipped:/ {print $2; exit}')
-CONSENSUS_PASSED=$(printf "%s\n" "$CONSENSUS_OUT" | awk '/^consensus_passed:/ {print $2; exit}')
-CONSENSUS_SCORE=$(printf "%s\n" "$CONSENSUS_OUT" | awk '/^consensus_score:/ {print $2; exit}')
-[ -z "$CONSENSUS_SKIPPED" ] && CONSENSUS_SKIPPED=0
-[ -z "$CONSENSUS_PASSED" ] && CONSENSUS_PASSED=0
-[ -z "$CONSENSUS_SCORE" ] && CONSENSUS_SCORE=0
-
+# Set AUTORESEARCH_CONSENSUS=1 in the environment to re-enable the
+# automatic gate.
+CONSENSUS_SKIPPED=1
+CONSENSUS_PASSED=1
+CONSENSUS_SCORE=0
 CONSENSUS_PENALTY=0
-if [ "$CONSENSUS_SKIPPED" = "1" ]; then
-    # No vote was taken — no penalty. (Baseline iter, SKIPPED-only
-    # iter, or process change.)
-    :
-elif [ "$CONSENSUS_PASSED" = "1" ]; then
-    # Voted approve. No penalty.
-    :
-else
-    # Voted reject or unparseable. Push composite below baseline so
-    # autorun discards the iteration.
-    CONSENSUS_PENALTY=6000
+CONSENSUS_OUT=""
+if [ "${AUTORESEARCH_CONSENSUS:-0}" = "1" ]; then
+    CONSENSUS_OUT=$(python3 .autoresearch-consensus.py 2>&1 || true)
+    CONSENSUS_SKIPPED=$(printf "%s\n" "$CONSENSUS_OUT" | awk '/^consensus_skipped:/ {print $2; exit}')
+    CONSENSUS_PASSED=$(printf "%s\n" "$CONSENSUS_OUT" | awk '/^consensus_passed:/ {print $2; exit}')
+    CONSENSUS_SCORE=$(printf "%s\n" "$CONSENSUS_OUT" | awk '/^consensus_score:/ {print $2; exit}')
+    [ -z "$CONSENSUS_SKIPPED" ] && CONSENSUS_SKIPPED=0
+    [ -z "$CONSENSUS_PASSED" ] && CONSENSUS_PASSED=0
+    [ -z "$CONSENSUS_SCORE" ] && CONSENSUS_SCORE=0
+    if [ "$CONSENSUS_SKIPPED" != "1" ] && [ "$CONSENSUS_PASSED" != "1" ]; then
+        CONSENSUS_PENALTY=6000
+    fi
 fi
 
 # --- Composite ---

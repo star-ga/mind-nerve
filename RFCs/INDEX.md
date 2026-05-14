@@ -5812,6 +5812,8 @@ existing mind-nerve inference path (only the byte values inside
 the weights file change, and `model_hash` updates
 correspondingly).
 
+**Status:** SKIPPED — Training/catalog-builder-side only. The RFC's own "Adoption plan" §1 enumerates `src/loader.mind`, `src/inference.mind`, `src/model.mind`, and `Mind.toml` as "no change"; the entire mechanism (frozen `BAAI/bge-large-en-v1.5` guidance bi-encoder forward pass, `[B, B]` cosine similarity matrix, `cos_g(q, n) >= cos_g(q, p) - GIST_MARGIN` mask construction, and masked-InfoNCE softmax denominator) lives in the offline catalog-builder training loop outside the mind-nerve repo. The resulting bytes are absorbed into the trained Q16.16 × INT8 weight values via `model_hash` without touching the inference surface. Belongs in the catalog-builder repo.
+
 ---
 
 # RFC-021 — Two-stage contrastive pretraining (weakly-supervised → supervised fine-tuning)
@@ -6277,6 +6279,8 @@ with the existing mind-nerve inference path (only the byte
 values inside the weights file change, and `model_hash` updates
 correspondingly).
 
+**Status:** SKIPPED — Training/catalog-builder-side only. The RFC's own "Adoption plan" §2-§5 enumerates `src/loader.mind`, `src/inference.mind`, `src/model.mind`, and `Mind.toml` as "no change"; the entire two-stage pipeline (Stage-1 weakly-supervised contrastive pretraining on ~270M naturally-paired text pairs from Reddit/CommonCrawl/StackExchange/news/scientific abstracts, followed by Stage-2 supervised fine-tuning on MS MARCO + NLI + BEIR with hard-negative mining) lives entirely in the offline catalog-builder training loop outside the mind-nerve repo. The resulting representation quality is absorbed into the trained Q16.16 × INT8 weight values via `model_hash` without touching the inference surface. Belongs in the catalog-builder repo.
+
 ---
 
 # RFC-022 — RetroMAE auto-encoder pretraining as the dedicated Stage-1 objective
@@ -6711,6 +6715,8 @@ without coordination because the resulting weights are byte-compatible
 with the existing mind-nerve inference path (only the byte values
 inside the weights file change, and `model_hash` updates
 correspondingly).
+
+**Status:** SKIPPED — Training/catalog-builder-side only. The RFC's own "Adoption plan" §2-§5 enumerates `src/loader.mind`, `src/inference.mind`, `src/model.mind`, and `Mind.toml` as "no change"; the entire RetroMAE auto-encoder Stage-1 objective (encoder mask ~15%, two-token-projection decoder, 50% decoder mask, MLM-reconstruction loss with bottlenecked pooled-CLS conditioning) lives entirely in the offline catalog-builder pretraining loop outside the mind-nerve repo. The resulting representation quality is absorbed into the trained Q16.16 × INT8 weight values via `model_hash` without touching the inference surface; the Stage-1 decoder is discarded after pretraining and never enters the inference path. Belongs in the catalog-builder repo.
 
 ---
 

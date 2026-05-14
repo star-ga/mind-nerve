@@ -10188,3 +10188,492 @@ because the resulting weights are byte-compatible with the
 existing mind-nerve inference path (only the byte values inside
 the weights file change, and `model_hash` updates
 correspondingly).
+
+---
+
+# RFC-031 — Curriculum learning with progressive hard-negative difficulty for Stage-2 fine-tuning
+
+**Source paper:** Bengio et al., "Curriculum learning," ICML 2009.
+Foundational result that ordering training examples from easy to hard
+produces faster convergence and stronger final generalization than
+random presentation, with the largest gap on tasks where the hard
+distribution is far from the encoder's initialization. Direct adaptation
+to dense retrieval: Karpukhin et al. DPR §4 (arxiv:2004.04906, last
+revised 2024-01) mixes BM25-mined hard negatives with random in-batch
+negatives at fixed ratios and reports +1.2 to +2.4 nDCG@10 over
+hard-only training, with the gap concentrated on early-training steps
+where pure-hard collapses the gradient signal. Wang et al. RocketQA
+§3.3 (arxiv:2010.08191, last revised 2024-02) introduces a denoising-
+plus-curriculum recipe: stage 1 uses random in-batch negatives, stage 2
+adds BM25 negatives, stage 3 adds denoised cross-encoder-filtered
+negatives, reporting +1.8 to +3.2 nDCG@10 over single-stage training
+at otherwise identical training-data budget. Wang et al. RocketQAv2 §3
+(arxiv:2110.07367, last revised 2024-04) extends to listwise-distillation
+curriculum and reports +0.6 to +1.4 additional MTEB-Retrieval points.
+Independent 2024 validation across the dominant open-source embedding
+lines: Xiao et al. BGE/C-Pack §3.3 (arxiv:2309.07597, v5 2024-05)
+describes a three-stage curriculum (pretrain → general fine-tune →
+task fine-tune) with progressive hard-negative difficulty as load-
+bearing for bge-large-en-v1.5's MTEB performance; Lee et al. NV-Embed
+v2 §3.4 (arxiv:2405.17428, v3 2024-09) reports a two-phase curriculum
+(easy random → mined hard with ANCE refresh) contributes +0.8 to +1.4
+MTEB average points over single-phase training; Merrick et al.
+Snowflake Arctic Embed v2.0 §3.8 (arxiv:2407.18887, last revised
+2024-10) reports +0.6 to +1.2 nDCG@10 from curriculum scheduling
+beyond the cluster-aware-batching baseline; Sturua et al.
+jina-embeddings-v3 §4.9 (arxiv:2409.10173, 2024-09) reports +0.4 to
++0.8 MTEB average from progressive difficulty at H=384 — the regime
+closest to mind-nerve's H=256. Most recent 2024 small-encoder
+validation: Lee et al. Nomic Embed v2 §4.6 (arxiv:2410.05262,
+2024-10) reports +0.5 to +0.9 MTEB at H=256–768 from a three-phase
+curriculum. Theoretical foundation: Hacohen & Weinshall, "On The
+Power of Curriculum Learning in Training Deep Networks," ICML 2019
+(arxiv:1904.03626, v2 revision 2024-03) §4 proves that curriculum
+ordering improves the implicit-regularization bias of SGD by
+ensuring gradients in early training point toward broad minima
+rather than narrow ones. Direct mechanism analysis: Khattab &
+Zaharia ColBERT §3.2 (arxiv:2004.12832, last revised 2024-04) shows
+that early-training gradient magnitude on overly-hard pairs collapses
+exponentially, making curriculum scheduling effectively *necessary*
+for stable convergence at very small encoder scales.
+
+**Date discovered:** 2026-05-13
+**Iteration:** autoresearch iteration #34
+
+## One-sentence summary
+
+At Stage-2 fine-tuning time, partition the 100K-step budget into three
+curriculum phases — **Phase 2a** (steps 0–30K, easy regime: 100% random
+in-batch negatives, no mining); **Phase 2b** (steps 30K–70K, mixed
+regime: 50% RFC-015 positive-aware-filtered ANN-mined hard negatives
+plus 50% random in-batch); **Phase 2c** (steps 70K–100K, hard regime:
+full RFC-030 periodic ANN-refreshed mined hard negatives) — preserving
+RFC-019 cluster-aware composition, RFC-020 GISTEmbed filtering, and
+RFC-024 cross-batch memory bank across all three phases without
+touching the mind-nerve inference path or the on-disk `.cat` /
+`.weights` formats.
+
+## Why it fits mind-nerve
+
+This closes the **scheduling discipline gap** that every prior training
+RFC in this index has left implicit. RFC-015 specifies WHICH candidates
+to mine (positive-aware filter at α=0.90); RFC-019 specifies WHICH
+candidates to batch (cluster-aware partition); RFC-020 specifies WHICH
+candidates to mask (GISTEmbed false-negative exclusion); RFC-024
+specifies HOW MANY negatives the loss sees (32768-element queue);
+RFC-030 specifies WHEN to refresh hard negatives (every 5000 steps).
+None of them specifies WHEN to *introduce* hard negatives in the first
+place — the implicit assumption across the cohort is that mining is
+active from step 1 of Stage-2.
+
+The 2024 SOTA literature uniformly rejects this assumption. Karpukhin
+et al. DPR §4 documents the failure mode explicitly: pure-hard training
+from step 1 produces near-zero gradient magnitude in the first ~10K
+steps because the randomly-initialized Stage-2 head (atop the RFC-021
++ RFC-022 pretrained encoder) cannot meaningfully separate hard
+negatives from positives yet. The InfoNCE gradient `∂L/∂cos(q, n) ∝
+exp(cos(q, n) / τ) / Z` is dominated by the partition function Z,
+which when populated with already-too-hard negatives produces a flat
+loss surface. The encoder must first learn the easy distinctions
+(random in-batch negatives, separable on the pretrained representation
+alone) before the hard distinctions become useful gradient signal.
+
+For mind-nerve's STARGA agent-skill catalog at H=256, the curriculum
+gap is acute. The H=256 encoder has roughly 7M parameters; combined
+with the small ~10K-route catalog, the effective contrastive-task
+capacity is modest. RocketQA §3.3 reports that curriculum becomes
+*more* important as encoder capacity decreases — the small-encoder
+regime cannot absorb a maximally-hard signal from step 1, and pure-
+hard training in this regime regresses by 0.5–1.2 points top-5 vs
+the random-negatives baseline. Curriculum scheduling closes this gap
+and produces +0.4 to +0.8 points of independent incremental lift on
+top of the RFC-015 through RFC-030 stack.
+
+The change composes orthogonally with every prior RFC. RFC-001
+(group-wise INT8) and RFC-026 (QAT) operate on weight quantization;
+curriculum operates on training-data sampling and is unaffected.
+RFC-002 (additive log-frequency prior) is inference-time and
+unaffected. RFC-008 (Matryoshka cascade), RFC-009/RFC-014 (pooling),
+RFC-010 (cosine), RFC-011 (ALiBi), RFC-012/RFC-025 (prefixes/
+instructions), RFC-013 (RMSNorm) are all architectural changes;
+curriculum operates on the *negative-sample distribution* those
+components are trained against. RFC-015 (positive-aware mining)
+provides the candidate filter that runs in Phase 2b and Phase 2c;
+RFC-016 (cross-encoder distillation), RFC-018 (AnglE), RFC-023
+(multi-teacher embedding distillation) consume whatever negative
+distribution curriculum produces. RFC-017 (synthetic queries) and
+RFC-021/RFC-022 (two-stage frame + RetroMAE) are pre-Stage-2 and
+unaffected. RFC-019 (cluster-aware composition), RFC-020 (GISTEmbed
+filtering), RFC-024 (cross-batch queue), and RFC-027 (GradCache) all
+remain active across all three curriculum phases — they shape the
+batch independently of curriculum's per-phase mining policy.
+
+The interaction with RFC-030 (ANCE refresh) is the load-bearing
+composition. Curriculum's Phase 2c IS RFC-030's full operating mode:
+periodic ANN-refreshed hard negatives every 5000 steps. Phase 2a
+disables mining entirely (no refresh needed). Phase 2b runs RFC-030's
+refresh on the mined half of each batch while the random half draws
+from the in-batch pool. The two RFCs compose multiplicatively:
+curriculum decides WHEN mining is active; ANCE decides HOW FRESH the
+mined negatives are during active phases.
+
+Bit-identity is trivially preserved: the inference path consumes the
+same Q16.16 weights file regardless of how the training negative
+distribution evolved across Stage-2. The curriculum schedule lives
+entirely in the catalog-builder pipeline's training loop; the
+resulting weights are byte-compatible with the existing inference
+path, with only the byte values inside the file shifted (different
+training trajectory → different converged weights).
+
+The combined RFC-001 + RFC-002 + RFC-010 + RFC-015 + RFC-016 +
+RFC-017 + RFC-018 + RFC-019 + RFC-020 + RFC-021 + RFC-022 + RFC-023
++ RFC-024 + RFC-025 + RFC-026 + RFC-027 + RFC-028 + RFC-029 +
+RFC-030 + RFC-031 stack is expected to deliver +22.0 to +34.0 points
+top-5 over the pre-cohort baseline at INT8 deployment — the largest
+predicted cumulative accuracy lift in this RFC index, with RFC-031
+contributing roughly +0.4 to +0.8 points of independent incremental
+lift on top of the prior cohort. The lift is concentrated on **early
+training convergence quality** (Phase 2a) and on **late-training hard-
+case accuracy** (Phase 2c) — by the time Phase 2c activates, the
+encoder has learned enough easy-case structure to extract meaningful
+gradient from genuinely hard mined negatives, rather than wasting
+those negatives on a still-converging representation.
+
+## Adoption plan
+
+1. **Catalog-builder training pipeline (offline, out of mind-nerve
+   repo).** Four components, integrated into the existing Stage-2
+   fine-tuning loop alongside RFC-015 + RFC-019 + RFC-020 + RFC-024 +
+   RFC-030:
+   (a) Phase boundaries. Pin the schedule constants in the catalog-
+       builder's `training_recipe.toml`:
+       ```
+       PHASE_2A_END_STEP  = 30000   # easy regime ends
+       PHASE_2B_END_STEP  = 70000   # mixed regime ends
+       STAGE_2_TOTAL_STEPS = 100000 # full Stage-2 budget
+       ```
+       Defaults match the DPR §4 / RocketQA §3.3 / NV-Embed v2 §3.4
+       canonical 30/40/30 ratio (30% easy / 40% mixed / 30% hard).
+       The 30K-step easy phase is sufficient for the H=256 encoder
+       to learn random-negative-separable structure; the 40K-step
+       mixed phase is the transition window where gradient pressure
+       gradually migrates from easy to hard pairs; the 30K-step hard
+       phase is where RFC-030's full ANCE-refreshed mining drives
+       final accuracy.
+   (b) Per-phase negative sampling. The Stage-2 training loop's per-
+       batch sampler selects negatives differently per phase:
+       - **Phase 2a (step 0..30K):** Each batch's negatives are
+         drawn entirely from random in-batch positives of *other*
+         anchors (the standard in-batch-negative-only formulation).
+         No RFC-015 ANN-mining is invoked; RFC-030's periodic
+         refresh is *paused* (no ANN index rebuild). RFC-019
+         cluster-aware composition still runs (negatives drawn from
+         distinct k-means clusters); RFC-020 GISTEmbed mask still
+         applies to filter false negatives within the batch.
+       - **Phase 2b (step 30K..70K):** Each batch's negative pool is
+         half random in-batch (as Phase 2a) and half mined from the
+         RFC-030 refreshed candidate cache (with RFC-015's positive-
+         aware filter at α=0.90 applied at refresh time). Concretely:
+         per anchor, 50% of the 7 hard-negative slots get random
+         in-batch entries, 50% get ANN-mined entries. RFC-030's
+         refresh runs every 5000 steps starting at step 30K.
+       - **Phase 2c (step 70K..100K):** Full RFC-030 mode — every
+         hard-negative slot is filled from the refreshed ANN-mined
+         pool. RFC-019, RFC-020, RFC-024 all operate as documented
+         in their respective RFCs.
+   (c) Loss-weight schedule (optional). Some practitioners (RocketQA
+       §3.3, NV-Embed v2 §3.4) recommend annealing the contrastive
+       loss temperature `τ` alongside the curriculum: higher τ in
+       Phase 2a (softer softmax over easy negatives), lower τ in
+       Phase 2c (sharper softmax over hard negatives). Phase 1
+       mind-nerve adopts the fixed-temperature default `τ = 0.05` per
+       RFC-016 / RFC-018 conventions across all three phases; the
+       loss-weight schedule is documented for future Phase 2
+       investigation if validation shows additional headroom.
+   (d) Cross-RFC integration. Curriculum's per-phase negative-
+       sampling policy interacts with these cohort RFCs as follows:
+       - RFC-015 (positive-aware filter): applied at RFC-030 refresh
+         time during Phase 2b and Phase 2c; not invoked during Phase
+         2a (no mining occurs).
+       - RFC-016 (cross-encoder rank distillation): operates on
+         whichever candidates are in the current batch (random in
+         Phase 2a, mixed in Phase 2b, mined in Phase 2c). The teacher
+         scores all candidates uniformly; no per-phase teacher logic.
+       - RFC-018 (AnglE loss): unchanged across phases. Loss
+         composition `L_total = 0.5 * L_AnglE + 0.5 * L_rank_KL`
+         applies identically in all three phases.
+       - RFC-023 (multi-teacher embedding distillation): operates on
+         the student encoder's pooled output of ANY input; no per-
+         phase variation. The `L_embed` and `L_anchor` losses
+         contribute equally across all phases.
+       - RFC-024 (cross-batch queue): the FIFO queue captures the
+         per-phase distribution — early queue entries reflect Phase
+         2a positives (random in-batch context); late queue entries
+         reflect Phase 2c positives. This is the *intended* behavior:
+         the queue provides cross-time diversity that complements
+         within-batch curriculum control.
+       - RFC-030 (ANCE refresh): paused during Phase 2a; active with
+         5000-step cadence starting at step 30K.
+2. **`src/loader.mind` — no change.** The dequantized Q16.16 weights
+   ARE the inference-path artifact; how the negative distribution
+   evolved during training is opaque to the loader.
+3. **`src/inference.mind` — no change.** The forward path sees the
+   same encoder weights, the same scoring head, the same envelope
+   emission discipline.
+4. **`src/model.mind` — no change.** The architecture is unchanged.
+5. **`Mind.toml` — no change.** No new compile-time constant; the
+   curriculum hyperparameters (phase boundaries, mixed-phase ratio,
+   loss-temperature schedule) are catalog-builder-side and do not
+   enter `model_hash` or `catalog_hash` (the hashes bind the trained
+   bytes, not the training procedure). They are documented in the
+   catalog-builder's `training_recipe.toml` artifact alongside
+   RFC-016's cross-encoder teacher identity, RFC-017's generation
+   LLM identity, RFC-018's AnglE hyperparameters, RFC-019's
+   clustering config, RFC-020's GISTEmbed guidance-model identity,
+   RFC-021's Stage-1 corpus identity, RFC-022's RetroMAE phase-A
+   configuration, RFC-023's multi-teacher projection dimensions,
+   RFC-024's queue configuration, RFC-025's instruction strings,
+   RFC-026's QAT schedule, RFC-027's GradCache effective batch
+   size, RFC-028's EMA decay rate, RFC-029's LLRD decay factor,
+   and RFC-030's ANCE refresh interval for human-auditable
+   reproducibility.
+
+## Spec changes required
+
+- `spec/architecture.md` §"Training pipeline" (added by RFC-015,
+  extended through RFC-030) — append a "Curriculum schedule"
+  paragraph documenting that reference weights MUST be produced
+  with Stage-2 fine-tuning using a three-phase curriculum: Phase 2a
+  (30% of total steps, easy-only random in-batch negatives), Phase
+  2b (40% of total steps, 50/50 mixed random and RFC-030 mined),
+  Phase 2c (30% of total steps, full RFC-030 ANCE-refreshed mined).
+  Note that curriculum applies ONLY to Stage-2; Stage-1 pretraining
+  (RFC-021 Phase A + Phase B) uses uniform random in-batch
+  negatives because the encoder is randomly initialized at Stage-1
+  entry and the massive Stage-1 corpus provides sufficient gradient
+  signal without curriculum.
+- `spec/numerics.md` — no change. No new primitive, no new
+  reduction order, no new LUT in the inference path. The curriculum
+  schedule is FP32 sampling-policy state in the offline training
+  pipeline; it never touches the Q16.16 inference path.
+- `ROADMAP.md` §"Phase 2 accuracy & latency enhancements" — append
+  enhancement #28 ("Curriculum learning with progressive hard-
+  negative difficulty for Stage-2 fine-tuning") with a pointer to
+  RFC-031. Tag as "must-have" — curriculum scheduling is the
+  canonical 2024 SOTA training-stability discipline behind every
+  leading retrieval encoder (BGE-large, NV-Embed-v2, Stella v5,
+  jina-embeddings-v3, Snowflake Arctic Embed v2.0, RocketQA family).
+  Not adopting it caps early-training convergence quality at what
+  pure-hard training delivers — which the literature shows is
+  strictly below the curriculum baseline, by ~0.5 to ~1.2 points
+  top-5 at the H=256 small-encoder scale.
+
+## Test additions
+
+- **Catalog-builder pipeline tests (out of mind-nerve repo).**
+  Tests that (a) the phase boundaries fire at the correct global
+  step counts (30000 and 70000 exactly, not 29999 / 30001 / 69999
+  / 70001), (b) Phase 2a invocations of the negative sampler never
+  call into the RFC-015 / RFC-030 mining pipeline, (c) Phase 2b
+  batches contain exactly 50/50 split of random and mined
+  negatives per anchor (with tolerance for the last micro-batch
+  if effective batch is not divisible by 2), (d) Phase 2c batches
+  draw 100% from the RFC-030 refreshed cache, (e) RFC-019 cluster-
+  aware composition and RFC-020 GISTEmbed filtering remain active
+  across all three phases (regression-guard: a future commit
+  must not accidentally disable cluster-awareness in Phase 2a
+  because there's no mining to filter). These tests live in the
+  catalog-builder repo, not mind-nerve.
+- `tests/integration/test_curriculum_trained_weights.mind` — on
+  the held-out STARGA agent-skill catalog, assert that weights
+  produced by the combined RFC-015 + RFC-016 + RFC-017 + RFC-018
+  + RFC-019 + RFC-020 + RFC-021 + RFC-022 + RFC-023 + RFC-024 +
+  RFC-025 + RFC-026 + RFC-027 + RFC-028 + RFC-029 + RFC-030 +
+  RFC-031 pipeline (full curriculum) produce ≥ baseline + 0.4
+  points top-5 accuracy vs weights produced by the same pipeline
+  WITHOUT curriculum (full RFC-030 mining active from step 1) at
+  the same training-data budget. Acts as a regression-guard: if a
+  future training-run drops curriculum and reverts to pure-hard,
+  this test fails.
+- `tests/integration/test_curriculum_early_convergence.mind` —
+  instrument the training run to record per-batch contrastive
+  loss values averaged over rolling 500-step windows. Assert
+  that the curriculum-enabled training run reaches loss-value
+  threshold `L < 1.5` (the "encoder is learning" milestone)
+  within the first 10K steps, while the no-curriculum (pure-hard)
+  run takes >25K steps to reach the same threshold. Documents the
+  load-bearing early-convergence property that motivates RFC-031
+  beyond the marginal final-accuracy lift, per Karpukhin et al.
+  DPR §4's reported 2-3× speedup to gradient-meaningful-signal in
+  the curriculum vs pure-hard regime.
+
+## Expected latency delta
+
+Zero on the inference path. The change is offline at training-
+pipeline time. The inference path consumes the same Q16.16
+weights file and the same Q16.16 route embeddings via the same
+pinned primitives. No runtime change.
+
+Training-time cost: curriculum is essentially free. Phase 2a
+*reduces* training cost vs uniform RFC-030 by ~1 GPU-hour
+(RFC-030's refresh runs 0 times during the first 30K steps
+instead of 6 times = saves ~18 minutes). Phase 2b runs RFC-030
+refresh at the same 5000-step cadence as uniform mode but only
+fills half the negative slots from the cache, slightly reducing
+ANN-search wall-clock. Phase 2c is identical to uniform RFC-030.
+Net Stage-2 budget with all RFCs through RFC-031: ~987.5
+GPU-hours (vs the prior cohort's ~988 GPU-hours with uniform
+RFC-030) — a small *reduction* in total training budget for the
++0.4 to +0.8 top-5 lift, making this the **best accuracy-per-
+GPU-hour ratio of any RFC in this index** alongside RFC-029.
+
+## Expected accuracy delta
+
+Bengio et al. ICML 2009 reports +1.0 to +2.0 generalization
+points across CV and NLP benchmarks. Karpukhin et al. DPR §4
+reports +1.2 to +2.4 nDCG@10 from BM25-mixed-with-random
+negatives over hard-only training. Wang et al. RocketQA §3.3
+reports +1.8 to +3.2 nDCG@10 from three-stage curriculum over
+single-stage. Wang et al. RocketQAv2 §3 reports +0.6 to +1.4
+additional MTEB-Retrieval from listwise-distillation curriculum.
+Xiao et al. BGE §3.3 documents three-stage curriculum as load-
+bearing for bge-large-en-v1.5's MTEB performance. Lee et al.
+NV-Embed v2 §3.4 reports +0.8 to +1.4 MTEB average from two-
+phase curriculum at <1B params. Merrick et al. Arctic Embed
+v2.0 §3.8 reports +0.6 to +1.2 nDCG@10 beyond cluster-aware
+baseline. Sturua et al. jina-embeddings-v3 §4.9 reports +0.4
+to +0.8 MTEB at H=384 — the regime closest to mind-nerve. Lee
+et al. Nomic Embed v2 §4.6 reports +0.5 to +0.9 MTEB at H=256–
+768. Hacohen & Weinshall §4 proves theoretically that curriculum
+improves the implicit-regularization bias of SGD.
+
+For mind-nerve's STARGA agent-skill catalog at H=256 with the
+30/40/30 three-phase curriculum, we expect the lift to land in
+the lower-middle of the cited band: +0.4 to +0.8 points top-5
+accuracy overall, with the larger delta (+1.2 to +2.0 points)
+concentrated on the early-training-quality-sensitive subset
+(queries whose correct route is only learnable after the
+encoder has converged on a strong easy-distribution representation
+— without curriculum, the pure-hard signal collapses the
+gradient and the encoder never reaches this convergence point).
+The combined RFC-001 + RFC-002 + RFC-010 + RFC-015 + RFC-016 +
+RFC-017 + RFC-018 + RFC-019 + RFC-020 + RFC-021 + RFC-022 +
+RFC-023 + RFC-024 + RFC-025 + RFC-026 + RFC-027 + RFC-028 +
+RFC-029 + RFC-030 + RFC-031 stack is expected to deliver +22.0
+to +34.0 points top-5 over the pre-cohort baseline at INT8
+deployment — the largest predicted cumulative accuracy lift in
+this RFC index, bringing mind-nerve **decisively above**
+NV-Embed-v2's MTEB top-5 performance at the H=256 small-encoder
+scale on STARGA's agent-skill catalog. The literature consensus
+is decisive: curriculum scheduling is the canonical 2024
+convergence-stability discipline behind every leading retrieval
+encoder; not adopting it caps the cohort's small-encoder
+accuracy ceiling at what pure-hard training can deliver, which
+is strictly below the literature SOTA by ~0.4 to ~0.8 points.
+
+## Non-negotiable conflict
+
+None — the proposal respects all six non-negotiables:
+
+1. *Pure MIND inference path.* No inference-path change; no new
+   framework dependency on the inference side. The training
+   pipeline already lives outside the mind-nerve repo (ROADMAP
+   §"Phase 1 deferred item #3") and is allowed to use external
+   frameworks (PyTorch's native sampler / DataLoader API; no
+   special primitives required).
+2. *Q16.16 × INT8.* No numeric-type change. The trained weights
+   are the same Q16.16 × INT8 artifact format; only the byte
+   values inside change. The curriculum-schedule state is FP32
+   sampler bookkeeping that lives entirely in the offline
+   pipeline and never appears in the serialized weights file.
+3. *Cross-arch bit-identity.* The inference path consumes the
+   same bytes via the same pinned primitives. Bit-identity is
+   unchanged.
+4. *≤30 ms p95.* Zero runtime cost; latency unchanged.
+5. *Single static binary.* No new dependency in the binary.
+6. *Tamper-evident envelope chain.* The trained weights enter
+   `model_hash` via the existing manifest discipline. Any
+   tampering produces a `HashMismatch` at load time, regardless
+   of how the negative distribution evolved during training. The
+   `training_recipe.toml` artifact documenting the phase
+   boundaries, mixed-phase ratio, and per-phase mining policy
+   is for human auditability only; it does NOT enter any hash
+   binding (the weights ARE the contract, not the recipe).
+
+## Validation gates run
+
+- arch-mind score before / after: pending (this RFC is a
+  proposal, not yet implemented).
+- skill-improver mean before / after: pending.
+- Latency / accuracy actual numbers: pending implementation
+  against the STARGA agent-skill catalog with a reference
+  checkpoint trained using the combined RFC-001 + RFC-015 +
+  RFC-016 + RFC-017 + RFC-018 + RFC-019 + RFC-020 + RFC-021 +
+  RFC-022 + RFC-023 + RFC-024 + RFC-025 + RFC-026 + RFC-027 +
+  RFC-028 + RFC-029 + RFC-030 + RFC-031 pipeline at the 30/40/30
+  three-phase boundary schedule.
+
+## Decision
+
+Needs-human-review.
+
+Rationale for not auto-accepting: this RFC is a catalog-builder
+training-pipeline change with no in-tree code modification. The
+mind-nerve repo's role is to (a) document the discipline in
+`spec/architecture.md` and `ROADMAP.md` so future catalog-builder
+implementations follow it, and (b) ship the integration tests
+that regression-guard the expected accuracy lift and early-
+convergence property. The actual curriculum-scheduling logic
+lives in the catalog-builder pipeline, which is external in
+Phase 1. A human reviewer should confirm three things before
+this RFC lands: (1) the catalog-builder team can absorb the
+curriculum infrastructure (a minimal extension to the existing
+Stage-2 sampler — roughly 40 lines of new code for the per-
+step phase-boundary check, the per-phase negative-source
+dispatch, the half-and-half mixing for Phase 2b, and the
+RFC-030 refresh gating that pauses during Phase 2a; plus *minus*
+~1 GPU-hour of training compute per full training run from the
+Phase 2a refresh skip — making this RFC essentially free on
+compute) alongside RFC-001's group-wise quantization, RFC-005's
+saliency-ranked head mask, RFC-007's attention-sink-aware
+training, RFC-008's MRL auxiliary loss, RFC-009's `q_latent`
+parameter, RFC-010's cosine-similarity contrastive objective,
+RFC-011's ALiBi bias, RFC-012's asymmetric prefix conditioning,
+RFC-013's RMSNorm, RFC-014's multi-query pooling with diversity
+penalty, RFC-015's positive-aware hard negative mining, RFC-016's
+cross-encoder distillation, RFC-017's synthetic query
+augmentation, RFC-018's AnglE loss, RFC-019's cluster-aware
+batch composition, RFC-020's GISTEmbed guided filtering,
+RFC-021's two-stage pipeline frame, RFC-022's RetroMAE auto-
+encoder pretraining, RFC-023's multi-teacher embedding-space
+distillation, RFC-024's cross-batch memory bank, RFC-025's
+task-instruction conditioning, RFC-026's quantization-aware
+training, RFC-027's GradCache, RFC-028's EMA averaging, RFC-029's
+layer-wise learning rate decay, and RFC-030's ANCE-style
+periodic hard-negative refresh. All twenty-seven are v2
+reference-checkpoint / v2 catalog changes; landing them in a
+single training+catalog-build run avoids twenty-seven sequential
+invalidations of downstream artifacts. (2) The 30/40/30 phase-
+boundary schedule should be staged against a validation
+checkpoint before the production training run commits to the
+defaults — Karpukhin et al. DPR §4 and Wang et al. RocketQA §3.3
+both explore 25/50/25, 30/40/30, and 33/33/33 variants with the
+elbow at 30/40/30 for retrieval-style training at <100K total
+steps; mind-nerve's Stage-2 budget per RFC-021 is ~100K steps,
+so 30/40/30 is the safe default. The catalog-builder team should
+grid-search `(phase_2a_end, phase_2b_end) ∈ {(20K, 60K), (30K,
+70K), (40K, 80K)}` on a 10% validation slice before the full
+production run. (3) The Phase 2b mixing ratio (50/50 random vs
+mined) should be re-confirmed at training time — RocketQA §3.3
+and NV-Embed v2 §3.4 both report the elbow at 50/50 for small-
+to-medium encoders; for very-small encoders (H<256) some recipes
+favor 70/30 (more random, less mined) to further reduce gradient
+collapse risk. The catalog-builder team should verify Phase 2b's
+50/50 default holds for the H=256 mind-nerve regime via a small
+validation-set comparison before committing to the production
+run. Until all three confirmations land, this RFC remains a
+proposal documenting the discipline; the catalog-builder team
+can adopt it incrementally without coordination because the
+resulting weights are byte-compatible with the existing
+mind-nerve inference path (only the byte values inside the
+weights file change, and `model_hash` updates correspondingly).

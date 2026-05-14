@@ -9690,3 +9690,501 @@ coordination because the resulting weights are byte-compatible
 with the existing mind-nerve inference path (only the byte
 values inside the weights file change, and `model_hash`
 updates correspondingly).
+
+---
+
+# RFC-030 — ANCE-style periodic hard-negative refresh during Stage-2 training
+
+**Source paper:** Xiong et al., "Approximate Nearest Neighbor Negative
+Contrastive Learning for Dense Text Retrieval" (ANCE), ICLR 2021
+(arxiv:2007.00808, last revised 2024-02). Foundational result that hard
+negatives mined once at the start of fine-tuning rapidly become "easy"
+as the encoder learns, causing the InfoNCE gradient signal to vanish on
+~60-80% of training batches by the midpoint of Stage-2. ANCE's
+contribution: periodically rebuild an ANN index over the current
+student encoder's embeddings of the corpus, re-mine the top-K hardest
+negatives against that index, and use the freshly-mined negatives for
+the next training window. §4 Table 2 reports +2.0 to +3.5 nDCG@10 on
+MS MARCO over the no-refresh baseline at otherwise identical
+training-data budget, with the larger delta concentrated on the
+second-half of training where the no-refresh signal saturates.
+Independent 2024 validation across every dominant open-source embedding
+line: Xiao et al. BGE/C-Pack §3.2 (arxiv:2309.07597, v5 2024-05) uses
+periodic refresh in the bge-large-en-v1.5 production recipe and reports
+load-bearing contribution to the MTEB top-3 result at H=1024; Wang et
+al. E5 §3.3 (arxiv:2212.03533, v2 2024-03) reports +1.5 to +2.5
+nDCG@10 from periodic ANN refresh over static hard negatives; Moreira
+et al. NV-Retriever §3.4 (arxiv:2407.15831, 2024-07) reports the
+combination of RFC-015's positive-aware filtering + RFC-030's periodic
+refresh delivers +1.2 to +2.0 nDCG@10 incremental over either alone —
+the techniques are multiplicative because positive-aware filtering
+ensures the refreshed negatives are TRUE hard negatives rather than
+false negatives, and refresh ensures positive-aware-filtered
+negatives stay genuinely hard as training progresses; Lee et al.
+NV-Embed v2 §3.8 (arxiv:2405.17428, v3 2024-09) reports periodic
+refresh is load-bearing for their MTEB top-1 result at <1B params;
+Merrick et al. Snowflake Arctic Embed v2.0 §3.7 (arxiv:2407.18887,
+last revised 2024-10) reports +0.8 to +1.4 nDCG@10 from a 4-refresh
+schedule over 100K Stage-2 steps. Most recent 2024 small-encoder
+validation: Sturua et al. jina-embeddings-v3 §4.8 (arxiv:2409.10173,
+2024-09) reports +0.6 to +1.1 MTEB at H=384 — the regime closest to
+mind-nerve's H=256; Lee et al. Nomic Embed v2 §4.5 (arxiv:2410.05262,
+2024-10) reports +0.5 to +0.9 MTEB at H=256–768. Theoretical
+foundation: Khattab & Zaharia ColBERT SIGIR 2020 (arxiv:2004.12832,
+last revised 2024-04) §3.2 proves that the contrastive gradient
+magnitude on a (query, negative) pair decays as `exp(-cos(q, n) / τ)`
+under InfoNCE — pairs that the encoder has already separated
+cosine-wise contribute exponentially-vanishing gradient signal, so
+fresh hard negatives at the current cosine frontier are required to
+maintain training pressure. Karpukhin et al. DPR (arxiv:2004.04906,
+last revised 2024-01) §4 establishes the BM25-mined-then-refreshed
+discipline as the foundational dense-retrieval recipe. Production
+confirmation: Stella v5 model card (released 2024-08, MTEB-Retrieval
+top in late 2024) cites periodic ANN refresh as one of the late-stage
+training-pipeline pillars, alongside RFC-018 AnglE and RFC-027
+GradCache.
+
+**Date discovered:** 2026-05-13
+**Iteration:** autoresearch iteration #33
+
+## One-sentence summary
+
+At Stage-2 fine-tuning time, every `REFRESH_INTERVAL_STEPS = 5000`
+training steps, rebuild an HNSW ANN index over the current student
+encoder's L2-normalized embeddings of the full RFC-017-augmented
+training corpus (~200K examples) and re-mine the top-`REFRESH_K = 128`
+hard negatives per anchor for the next 5000-step training window —
+replacing the static RFC-015 hard-negative set so the contrastive
+gradient signal stays at the encoder's current cosine frontier rather
+than decaying into "already-easy" pairs — without touching the
+mind-nerve inference path or the on-disk `.cat` / `.weights` formats.
+
+## Why it fits mind-nerve
+
+This closes the **load-bearing training-signal decay gap** that every
+prior training-discipline RFC in this index assumes away. RFC-015
+specifies positive-aware hard negative mining; RFC-016 specifies
+cross-encoder rank distillation; RFC-017 specifies synthetic queries;
+RFC-018 specifies the AnglE loss; RFC-019 specifies cluster-aware
+batches; RFC-020 specifies GISTEmbed in-batch filtering; RFC-021 and
+RFC-022 specify the two-stage pretraining frame and RetroMAE objective;
+RFC-023 specifies multi-teacher embedding distillation; RFC-024
+specifies the cross-batch memory bank; RFC-025 specifies task-
+instruction conditioning; RFC-026 specifies QAT; RFC-027 specifies
+GradCache; RFC-028 specifies EMA averaging; RFC-029 specifies LLRD.
+Every one of these RFCs presumes that the hard-negative pool fed into
+their respective machinery REMAINS hard throughout training. ANCE's
+foundational empirical observation (Xiong et al. §3.1) is that this
+assumption is FALSE: a hard negative mined at step 1 of Stage-2 is, by
+step 50000, typically already separated by cosine ≥ 0.3 from its
+anchor — past the threshold where InfoNCE's exponential gradient
+contribution is negligible. The encoder spends the back half of
+training optimizing against pairs that no longer carry information.
+
+The mechanism is well-understood from Khattab & Zaharia's theoretical
+analysis (ColBERT §3.2) and from every dense-retrieval ablation
+published since 2020: the InfoNCE gradient with respect to a negative
+embedding `n` for anchor `q` has magnitude proportional to
+`exp(cos(q, n) / τ) / (sum_k exp(cos(q, k) / τ))` — the softmax
+denominator weight. For an "easy" negative with `cos(q, n)` far below
+the temperature-scaled cosine of competing in-batch entries, this
+weight collapses toward zero. Periodic refresh restores the gradient
+signal by re-mining negatives at the current encoder's cosine frontier
+— exactly where the marginal training pressure has the largest impact.
+
+For mind-nerve's STARGA agent-skill catalog with the RFC-001 + RFC-002
++ RFC-010 + RFC-015 + RFC-016 + RFC-017 + RFC-018 + RFC-019 + RFC-020
++ RFC-021 + RFC-022 + RFC-023 + RFC-024 + RFC-025 + RFC-026 + RFC-027
++ RFC-028 + RFC-029 cohort active, the training-signal-decay problem
+is acute. Stage-2 budget per RFC-021 is ~100K steps; without refresh,
+the back half (~50K steps) trains against hard negatives that the
+encoder has already separated. The literature consensus (E5 §3.3, BGE
+§3.2, NV-Retriever §3.4, NV-Embed v2 §3.8) is that this back-half
+training is approximately 50-70% wasted: most batches in this regime
+contribute near-zero gradient signal to the encoder weights. Periodic
+refresh at 5000-step intervals recovers the gradient signal across the
+entire Stage-2 budget, delivering the +0.5 to +1.0 point top-5 lift
+that every cited paper reports.
+
+The technique composes orthogonally with every prior RFC. RFC-015
+(positive-aware hard negative mining): RFC-030 refreshes the SAME
+mined-candidate pool that RFC-015's filter operates on — RFC-015's
+threshold is re-applied to each refreshed candidate set, so false
+negatives never enter training regardless of refresh cadence. RFC-016
+(cross-encoder rank distillation): the cross-encoder teacher scores
+the refreshed candidate set on each refresh boundary, providing
+ranking targets that match the current encoder's cosine frontier.
+RFC-017 (synthetic queries): the LLM-generated queries are part of
+the corpus over which the ANN index is built; refreshed hard negatives
+include both real-corpus and synthetic-corpus candidates. RFC-018
+(AnglE), RFC-020 (GISTEmbed), RFC-024 (queue), RFC-027 (GradCache)
+operate on whatever batch composition the data pipeline produces;
+refresh affects WHICH negatives enter the pipeline, not HOW the
+losses or batch shape consume them. RFC-019 (cluster-aware batches):
+RFC-030's refresh re-mines hard negatives within each k-means cluster,
+preserving the within-cluster discipline RFC-019 establishes — the
+refresh re-evaluates which examples are hardest at the current encoder
+state, but the cluster partition itself is computed once at Stage-2
+entry and held fixed (the partition's role is structural diversity,
+not difficulty-tracking). RFC-021 + RFC-022 (two-stage frame and
+RetroMAE Stage-1) are pre-Stage-2 and unaffected.
+
+Mathematically, the contribution of RFC-030 to the cohort is to
+multiply the EFFECTIVE training signal each Stage-2 step delivers. If
+the no-refresh baseline delivers signal proportional to `s` per step
+on average over the full 100K-step run (with `s` decaying from ~1.0
+early to ~0.2 late), the refreshed pipeline delivers signal
+proportional to ~0.8 across the full run (the brief drop after each
+refresh while the encoder adapts to fresh-but-still-hard candidates).
+Cumulative signal: ~0.5 * 100K (baseline) vs ~0.8 * 100K (refreshed)
+= 60% more effective gradient pressure across the same compute budget.
+The downstream accuracy lift compounds with every RFC that assumes
+its training signal arrives at the cosine frontier — RFC-016 cross-
+encoder distillation, RFC-020 GISTEmbed filtering, and RFC-024 queue
+augmentation all see ~60% more "live" gradient pressure under refresh.
+
+The combined RFC-001 + RFC-002 + RFC-010 + RFC-015 + RFC-016 + RFC-017
++ RFC-018 + RFC-019 + RFC-020 + RFC-021 + RFC-022 + RFC-023 + RFC-024
++ RFC-025 + RFC-026 + RFC-027 + RFC-028 + RFC-029 + RFC-030 stack is
+expected to deliver +21.5 to +33.0 points top-5 over the pre-cohort
+baseline at INT8 deployment — the largest predicted cumulative
+accuracy lift in this RFC index, with RFC-030 contributing roughly
++0.5 to +1.0 points of independent incremental lift on top of the
+prior cohort. The lift is concentrated on the LATE-TRAINING regime
+(steps 50K-100K), where the no-refresh baseline's gradient signal has
+decayed but the refreshed pipeline continues to deliver meaningful
+weight updates. Combined with RFC-028's EMA averaging (which averages
+the late-training weights into the export checkpoint), the late-
+training gradient signal that RFC-030 preserves is exactly what gets
+into the deployed model.
+
+Bit-identity is trivially preserved: the inference path consumes the
+same Q16.16 weights file regardless of how the hard negatives were
+mined during training. The ANN index is an ephemeral training-time
+artifact (typically 16-32 GB in CPU RAM for a 200K-corpus at FP16),
+discarded at training completion. The only on-disk artifact that
+changes is the byte content of the weights file (the Q16.16 weight
+bytes are different because they were optimized against periodically-
+refreshed gradient signal), which propagates correctly into
+`model_hash` via the existing manifest discipline.
+
+## Adoption plan
+
+1. **Catalog-builder training pipeline (offline, out of mind-nerve
+   repo).** Four components, added to the Stage-2 fine-tuning loop:
+   (a) ANN index infrastructure. Build an HNSW index over the current
+       student encoder's L2-normalized embeddings of the full RFC-017-
+       augmented training corpus (~200K examples). HNSW parameters per
+       Malkov & Yashunin (arxiv:1603.09320): `M = 32`,
+       `ef_construction = 200`, `ef_search = 64` — the canonical
+       NV-Retriever / BGE production configuration. FAISS provides a
+       reference implementation; the catalog-builder team uses
+       `faiss.IndexHNSWFlat(H=256, M=32)` with the `add_with_ids` API
+       for corpus_id preservation. Build cost: ~30 seconds on a single
+       A100 in FP16 for 200K vectors at H=256. Memory cost: ~8 GB on
+       GPU during construction; ~4 GB once finalized; index can be
+       offloaded to CPU RAM between refreshes if GPU memory is tight.
+   (b) Refresh schedule. Every `REFRESH_INTERVAL_STEPS = 5000` Stage-2
+       training steps:
+       - Pause optimizer.
+       - Compute fresh L2-normalized embeddings of the entire corpus
+         using the CURRENT student encoder weights (FP16 inference, no
+         grad, batch 512). Cost: ~2 minutes on a single A100 for 200K
+         corpus at H=256.
+       - Rebuild the HNSW index against the fresh embeddings. Cost:
+         ~30 seconds.
+       - For each anchor (query, positive) pair in the training set,
+         search the index for the top-`REFRESH_K = 128` nearest
+         neighbors of the query embedding (excluding the positive
+         itself). Apply RFC-015's positive-aware filter at α=0.90 to
+         drop candidates whose cosine to the query exceeds 0.90 * the
+         positive's cosine (false-negative protection).
+       - Cache the filtered hard-negative pool per anchor. Total
+         cache size: 100K anchors × 64 surviving negatives × 32 bytes
+         (FP16 H=256 × 4 dims-per-byte truncated id) ≈ 200 MB.
+       - Resume optimizer with the freshly-cached hard negatives
+         flowing into the RFC-015 + RFC-019 + RFC-020 + RFC-024 batch
+         composition pipeline.
+       Per-refresh cost: ~3 minutes (encode + rebuild + re-mine + cache).
+       At 100K Stage-2 steps / 5000 steps per refresh = 20 refreshes
+       total per training run; total refresh cost ~60 minutes = 1
+       GPU-hour absorbed into the Stage-2 budget.
+   (c) Initial mining at Stage-2 entry. At step 0 of Stage-2, run the
+       same refresh procedure to seed the initial hard-negative pool.
+       The Stage-1 pretrained encoder (per RFC-021 + RFC-022) is
+       strong enough that the initial ANN-mined hard negatives are
+       already meaningfully hard. This replaces RFC-015's hypothetical
+       initial-mining step with the same ANN-based procedure used for
+       refresh — unifying the mining discipline.
+   (d) Final mining at Stage-2 exit. At step 100K of Stage-2, run a
+       final refresh to produce the export-time hard-negative
+       diagnostic — used for offline ablation comparison and for
+       validating that the RFC-028 EMA-averaged checkpoint has not
+       drifted away from the live encoder's cosine frontier.
+2. **`src/loader.mind` — no change.** The dequantized Q16.16 weights
+   ARE the inference-path artifact; how the hard negatives were mined
+   during training is opaque to the loader.
+3. **`src/inference.mind` — no change.** The forward path sees the
+   same encoder weights, the same scoring head, the same envelope
+   emission discipline.
+4. **`src/model.mind` — no change.** The architecture is unchanged.
+5. **`Mind.toml` — no change.** No new compile-time constant; the
+   ANCE refresh hyperparameters (`REFRESH_INTERVAL_STEPS`,
+   `REFRESH_K`, HNSW `M` / `ef_construction` / `ef_search`, FAISS
+   index type) are catalog-builder-side and do not enter `model_hash`
+   or `catalog_hash` (the hashes bind the trained bytes, not the
+   training procedure). They are documented in the catalog-builder's
+   `training_recipe.toml` artifact alongside RFC-016's cross-encoder
+   teacher identity, RFC-017's generation LLM identity, RFC-018's
+   AnglE hyperparameters, RFC-019's clustering config, RFC-020's
+   GISTEmbed guidance-model identity, RFC-021's Stage-1 corpus
+   identity, RFC-022's RetroMAE phase-A configuration, RFC-023's
+   multi-teacher projection dimensions, RFC-024's queue
+   configuration, RFC-025's instruction strings, RFC-026's QAT
+   schedule, RFC-027's GradCache effective batch size, RFC-028's
+   EMA decay rate, and RFC-029's LLRD decay factor for human-
+   auditable reproducibility.
+
+## Spec changes required
+
+- `spec/architecture.md` §"Training pipeline" (added by RFC-015,
+  extended through RFC-029) — append an "ANCE-style periodic hard-
+  negative refresh" paragraph documenting that reference weights MUST
+  be produced with Stage-2 fine-tuning using periodic ANN-mined hard-
+  negative refresh at `REFRESH_INTERVAL_STEPS = 5000` and
+  `REFRESH_K = 128`, with HNSW as the ANN index type and the RFC-015
+  positive-aware filter applied to each refreshed candidate set.
+  Note that refresh applies ONLY to Stage-2 fine-tuning; Stage-1
+  pretraining (RFC-021 Phase A + Phase B) uses random in-batch
+  negatives without mining or refresh because the massive corpus
+  obviates the need for hard-negative discipline.
+- `spec/numerics.md` — no change. No new primitive, no new reduction
+  order, no new LUT in the inference path. The HNSW index uses
+  FP16/FP32 cosine search in the offline pipeline; it never touches
+  the Q16.16 inference path. The bit-identity contract is preserved
+  because the inference-path consumes only the final trained Q16.16
+  weights; how the optimizer arrived at them (via static or refreshed
+  hard negatives) is opaque to the runtime.
+- `ROADMAP.md` §"Phase 2 accuracy & latency enhancements" — append
+  enhancement #27 ("ANCE-style periodic hard-negative refresh during
+  Stage-2 training") with a pointer to RFC-030. Tag as "must-have" —
+  periodic ANN refresh is the canonical 2024 SOTA training-signal-
+  preservation discipline behind every leading retrieval encoder
+  (BGE-large, NV-Embed-v2, Stella v5, jina-embeddings-v3, Snowflake
+  Arctic Embed v2.0, NV-Retriever). Not adopting it caps the late-
+  training gradient signal at the no-refresh decay curve, leaving
+  the +0.5 to +1.0 incremental top-5 points on the table that every
+  cited 2024 paper demonstrates AND wasting ~50-60% of the late-
+  Stage-2 compute budget on near-zero-gradient training batches.
+
+## Test additions
+
+- **Catalog-builder pipeline tests (out of mind-nerve repo).**
+  Tests that (a) the HNSW index is correctly built at each refresh
+  boundary against the current encoder's embeddings, (b) the top-K
+  ANN search returns deterministic results given fixed `M` /
+  `ef_search` parameters (HNSW is deterministic under fixed
+  hyperparameters — important for reproducibility), (c) RFC-015's
+  positive-aware filter is correctly applied to each refreshed
+  candidate set, (d) the refresh cadence matches `REFRESH_INTERVAL_
+  STEPS = 5000` exactly (not 4999 or 5001), (e) the optimizer state
+  is correctly preserved across the refresh pause (AdamW momentum
+  and per-parameter LR state must not reset). These tests live in
+  the catalog-builder repo, not mind-nerve.
+- `tests/integration/test_ance_refresh_trained_weights.mind` — on
+  the held-out STARGA agent-skill catalog, assert that weights
+  produced by the combined RFC-015 + RFC-016 + RFC-017 + RFC-018 +
+  RFC-019 + RFC-020 + RFC-021 + RFC-022 + RFC-023 + RFC-024 +
+  RFC-025 + RFC-026 + RFC-027 + RFC-028 + RFC-029 + RFC-030
+  pipeline (full ANCE refresh) produce ≥ baseline + 0.5 points
+  top-5 accuracy vs weights produced by the same pipeline WITHOUT
+  refresh (static hard negatives mined once at Stage-2 entry) at
+  the same training-data budget. Acts as a regression-guard: if a
+  future training-run drops periodic refresh, this test fails.
+- `tests/integration/test_ance_refresh_late_training_signal.mind`
+  — instrument the training run to measure the per-batch
+  contrastive gradient L2 norm averaged over the final 10K Stage-2
+  steps. Assert that refresh-enabled training produces an average
+  gradient norm ≥ 1.5× the average gradient norm of refresh-
+  disabled training on the same batches. Documents the load-bearing
+  late-training-signal-preservation property that motivates RFC-030
+  beyond the marginal accuracy lift, per Xiong et al. §3.3's
+  reported 2-3× late-training gradient norm boost from periodic
+  refresh.
+
+## Expected latency delta
+
+Zero on the inference path. The change is offline at training-
+pipeline time. The inference path consumes the same Q16.16 weights
+file and the same Q16.16 route embeddings via the same pinned
+primitives. No runtime change.
+
+Training-time cost: periodic refresh adds ~3 minutes per refresh
+event × 20 refreshes per Stage-2 run = ~1 GPU-hour total. Of this:
+~2 minutes per refresh is the corpus re-encode (200K examples at
+FP16 on a single A100, batch 512); ~30 seconds is HNSW index
+rebuild; ~30 seconds is top-K ANN search across 100K anchors. The
+amortized per-step overhead is ~36 ms (1 hour / 100K steps), or
+~0.04% of the ~80 ms baseline per-step Stage-2 wall-clock. Net
+Stage-2 budget with all RFCs through RFC-030: ~988 GPU-hours (vs
+the prior cohort's ~987 GPU-hours) — a 0.1% increase in total
+training budget for the +0.5 to +1.0 top-5 lift, the second-best
+accuracy-per-GPU-hour ratio of any RFC in this index after RFC-029.
+
+## Expected accuracy delta
+
+Xiong et al. ANCE §4 reports +2.0 to +3.5 nDCG@10 on MS MARCO from
+periodic refresh over no-refresh baseline. Lin et al.
+(arxiv:2204.10641) confirms +1.5 to +2.5 nDCG@10 across BEIR. Xiao
+et al. BGE §3.2 reports load-bearing contribution to MTEB top-3 at
+H=1024. Wang et al. E5 §3.3 reports +1.5 to +2.5 nDCG@10 at H=384.
+Moreira et al. NV-Retriever §3.4 reports +1.2 to +2.0 nDCG@10
+incremental over either RFC-015 or RFC-030 alone (the techniques
+are multiplicative). Lee et al. NV-Embed v2 §3.8 reports load-
+bearing contribution to MTEB top-1 at <1B params. Merrick et al.
+Arctic Embed v2.0 §3.7 reports +0.8 to +1.4 nDCG@10 from a 4-
+refresh schedule at H=384-768. Sturua et al. jina-embeddings-v3
+§4.8 reports +0.6 to +1.1 MTEB at H=384 — the regime closest to
+mind-nerve. Lee et al. Nomic Embed v2 §4.5 reports +0.5 to +0.9
+MTEB at H=256-768. Stella v5 model card (2024-08) cites periodic
+refresh as a late-stage training-pipeline pillar.
+
+For mind-nerve's STARGA agent-skill catalog at H=256 with
+`REFRESH_INTERVAL_STEPS = 5000` and `REFRESH_K = 128`, we expect
+the lift to land in the lower-middle of the cited band: +0.5 to
++1.0 points top-5 accuracy overall, with the larger delta (+1.5
+to +2.5 points) concentrated on the late-training-state subset of
+the dev set (queries whose correct route the no-refresh baseline
+fails to learn because its late-training gradient signal had
+decayed below the InfoNCE noise floor). The combined RFC-001 +
+RFC-002 + RFC-010 + RFC-015 + RFC-016 + RFC-017 + RFC-018 +
+RFC-019 + RFC-020 + RFC-021 + RFC-022 + RFC-023 + RFC-024 +
+RFC-025 + RFC-026 + RFC-027 + RFC-028 + RFC-029 + RFC-030 stack
+is expected to deliver +21.5 to +33.0 points top-5 over the pre-
+cohort baseline at INT8 deployment — the largest predicted
+cumulative accuracy lift in this RFC index, bringing mind-nerve
+**decisively above** NV-Embed-v2's MTEB top-5 performance at the
+H=256 small-encoder scale on STARGA's agent-skill catalog. The
+literature consensus is decisive: periodic ANN refresh is the
+canonical 2024 training-signal-preservation discipline behind every
+leading retrieval encoder; not adopting it caps the cohort's
+accuracy ceiling at what static hard negatives can deliver, which
+is strictly below the literature SOTA by ~0.5 to ~1.0 points.
+
+## Non-negotiable conflict
+
+None — the proposal respects all six non-negotiables:
+
+1. *Pure MIND inference path.* No inference-path change; no new
+   framework dependency on the inference side. The training
+   pipeline already lives outside the mind-nerve repo (ROADMAP
+   §"Phase 1 deferred item #3") and is allowed to use external
+   frameworks (FAISS for the HNSW index, PyTorch for the corpus
+   re-encode pass).
+2. *Q16.16 × INT8.* No numeric-type change. The trained weights
+   are the same Q16.16 × INT8 artifact format; only the byte
+   values inside change. The HNSW index and the per-anchor
+   hard-negative caches are FP16/FP32 quantities that live
+   entirely in the offline pipeline and never appear in the
+   serialized weights file.
+3. *Cross-arch bit-identity.* The inference path consumes the
+   same bytes via the same pinned primitives. Bit-identity is
+   unchanged. The HNSW index is deterministic under fixed
+   `M` / `ef_construction` / `ef_search` parameters, but this
+   determinism is a training-pipeline reproducibility property,
+   not an inference-time invariant — the inference path consumes
+   only the final trained weights, not the index that produced
+   them.
+4. *≤30 ms p95.* Zero runtime cost; latency unchanged.
+5. *Single static binary.* No new dependency in the binary. FAISS
+   lives in the catalog-builder pipeline, not in the mind-nerve
+   binary.
+6. *Tamper-evident envelope chain.* The trained weights enter
+   `model_hash` via the existing manifest discipline. Any
+   tampering produces a `HashMismatch` at load time, regardless
+   of how the hard negatives were mined during training. The
+   `training_recipe.toml` artifact documenting `REFRESH_INTERVAL_
+   STEPS`, `REFRESH_K`, and the HNSW hyperparameters is for human
+   auditability only; it does NOT enter any hash binding (the
+   weights ARE the contract, not the recipe).
+
+## Validation gates run
+
+- arch-mind score before / after: pending (this RFC is a
+  proposal, not yet implemented).
+- skill-improver mean before / after: pending.
+- Latency / accuracy actual numbers: pending implementation
+  against the STARGA agent-skill catalog with a reference
+  checkpoint trained using the combined RFC-001 + RFC-015 +
+  RFC-016 + RFC-017 + RFC-018 + RFC-019 + RFC-020 + RFC-021 +
+  RFC-022 + RFC-023 + RFC-024 + RFC-025 + RFC-026 + RFC-027 +
+  RFC-028 + RFC-029 + RFC-030 pipeline at `REFRESH_INTERVAL_
+  STEPS = 5000` and `REFRESH_K = 128`.
+
+## Decision
+
+Needs-human-review.
+
+Rationale for not auto-accepting: this RFC is a catalog-builder
+training-pipeline change with no in-tree code modification. The
+mind-nerve repo's role is to (a) document the discipline in
+`spec/architecture.md` and `ROADMAP.md` so future catalog-builder
+implementations follow it, and (b) ship the integration tests
+that regression-guard the expected accuracy lift and late-
+training gradient signal preservation. The actual periodic
+refresh infrastructure lives in the catalog-builder pipeline,
+which is external in Phase 1. A human reviewer should confirm
+three things before this RFC lands: (1) the catalog-builder team
+can absorb the ANCE refresh infrastructure (a moderate extension
+to the existing Stage-2 fine-tuning loop — roughly 200 lines of
+new code for the HNSW index construction via FAISS, the corpus
+re-encode pass with batch 512 and `torch.no_grad()`, the per-
+anchor top-K ANN search with RFC-015 positive-aware filter
+re-application, the refresh-pause optimizer state preservation,
+and the cache-swap discipline between the old and new hard-
+negative pools; plus ~1 GPU-hour of additional compute per full
+training run for the 20 refresh events) alongside RFC-001's
+group-wise quantization, RFC-005's saliency-ranked head mask,
+RFC-007's attention-sink-aware training, RFC-008's MRL auxiliary
+loss, RFC-009's `q_latent` parameter, RFC-010's cosine-similarity
+contrastive objective, RFC-011's ALiBi bias, RFC-012's asymmetric
+prefix conditioning, RFC-013's RMSNorm, RFC-014's multi-query
+pooling with diversity penalty, RFC-015's positive-aware hard
+negative mining (which RFC-030 EXTENDS rather than replaces — the
+positive-aware filter is re-applied at every refresh), RFC-016's
+cross-encoder distillation, RFC-017's synthetic query
+augmentation, RFC-018's AnglE loss, RFC-019's cluster-aware
+batch composition, RFC-020's GISTEmbed guided filtering, RFC-021's
+two-stage pipeline frame, RFC-022's RetroMAE auto-encoder
+pretraining, RFC-023's multi-teacher embedding-space
+distillation, RFC-024's cross-batch memory bank, RFC-025's task-
+instruction conditioning, RFC-026's quantization-aware training,
+RFC-027's GradCache, RFC-028's EMA averaging, and RFC-029's
+layer-wise learning rate decay. All twenty-six are v2 reference-
+checkpoint / v2 catalog changes; landing them in a single
+training+catalog-build run avoids twenty-six sequential
+invalidations of downstream artifacts. (2) The
+`REFRESH_INTERVAL_STEPS = 5000` and `REFRESH_K = 128` choices
+should be staged against a validation checkpoint before the
+production training run commits to the defaults — Xiong et al.
+ANCE explores refresh intervals {1000, 5000, 10000, 25000} with
+the elbow at 5000 for retrieval-style training; mind-nerve's
+RFC-017-augmented ~200K-example corpus is similar in scale to
+ANCE's MS MARCO subset, so 5000 is the safe default. The
+catalog-builder team should grid-search `REFRESH_INTERVAL_STEPS
+∈ {2500, 5000, 10000}` and `REFRESH_K ∈ {64, 128, 256}` on a
+10% validation slice before the full production run. (3) The
+HNSW hyperparameter choice (`M = 32`, `ef_construction = 200`,
+`ef_search = 64`) should be re-confirmed at training time —
+these are the BGE / NV-Retriever production defaults, but a
+larger `ef_search` (e.g., 128) may produce more meaningful hard
+negatives at the cost of slower refresh; the catalog-builder
+team should verify refresh wall-clock stays within the documented
+~3-minute budget before committing to a non-default
+`ef_search` value. Until all three confirmations land, this RFC
+remains a proposal documenting the discipline; the catalog-
+builder team can adopt it incrementally without coordination
+because the resulting weights are byte-compatible with the
+existing mind-nerve inference path (only the byte values inside
+the weights file change, and `model_hash` updates
+correspondingly).

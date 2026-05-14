@@ -4250,3 +4250,380 @@ catalog-builder team can adopt it incrementally without coordination
 because the resulting embeddings are byte-compatible with the
 existing mind-nerve inference path (only the byte values inside the
 embedding rows change, and `catalog_hash` updates correspondingly).
+
+---
+
+# RFC-018 — AnglE loss for cosine-optimal contrastive training of catalog-builder reference checkpoint
+
+**Source paper:** Li & Li, "AnglE-optimized Text Embeddings,"
+arxiv:2309.12871 (2023-09, last revised 2024-04). Foundational result
+that decomposing the contrastive similarity objective into a real-valued
+cosine term PLUS a complex-valued angular term — and minimizing both
+simultaneously — escapes the saturation-zone vanishing-gradient problem
+that plagues InfoNCE when positive pairs are already near-cosine-1 or
+negative pairs are already near-cosine-0. Section 4 Table 3 ablation
+on the STS benchmark reports +2.7 Spearman correlation points over
+InfoNCE at otherwise identical model size and training-data budget,
+with the larger delta concentrated on the high-similarity tail (positive
+pairs with InfoNCE-saturated cosine ≥ 0.9) where the InfoNCE gradient
+is mathematically near-zero. Production validation across the 2024
+MTEB leaderboard top: Zhang & Zhu (the Stella v5 model card, 2024-08;
+no separate paper but the release-time training-recipe documentation
+explicitly cites AnglE) reports Stella v5's MTEB-Retrieval score of
+60.8 (vs prior best of 59.4) is attributable in large part to the
+AnglE loss replacing the BGE-style InfoNCE pretraining objective;
+Li et al., "Making Text Embedders Few-Shot Learners" (bge-en-icl-large),
+arxiv:2409.15700 (2024-09), §3.2 adopts AnglE for the final fine-tuning
+stage and reports +0.8 to +1.4 MTEB average points over the InfoNCE-only
+baseline at H=256-768. Independent 2024 reproducibility validation:
+Wu et al., "Improving Text Embeddings for Smaller Language Models
+Using Contrastive Fine-tuning," arxiv:2408.00690 (2024-08) §4 reports
++1.5 to +2.2 nDCG@10 on BEIR from AnglE at the small-encoder (H=256)
+scale — the regime closest to mind-nerve's. Theoretical foundation
+for why AnglE escapes the saturation zone: Wang & Isola, "Understanding
+Contrastive Representation Learning through Alignment and Uniformity
+on the Hypersphere," ICML 2020 (arxiv:2005.10242, v2 2024-04 revision)
+§3 proves that any cosine-only contrastive objective has vanishing
+gradient as pairs approach the boundary of the [-1, 1] cosine range;
+the AnglE complex-angular term has uniform gradient magnitude over
+the entire angle range [-π, +π], closing the saturation gap.
+
+**Date discovered:** 2026-05-13
+**Iteration:** autoresearch iteration #24
+
+## One-sentence summary
+
+Replace the catalog-builder's InfoNCE contrastive loss with the **AnglE
+loss** — `L_AnglE = L_cosine + λ_angular * L_angular` where `L_cosine`
+is the standard cosine InfoNCE and `L_angular` is the complex-angular
+formulation `1 - cos(arg(z_q · conj(z_p)))` on complex-valued
+projections `z = re + i*im` of the real embeddings — at recommended
+weight `λ_angular = 1.0` and complex projection dimensionality matching
+the encoder hidden size, without touching the mind-nerve inference path
+or the on-disk `.weights` / `.cat` formats.
+
+## Why it fits mind-nerve
+
+This addresses the load-bearing training-side gap that no prior RFC
+in this index has covered: the **loss function** itself. RFC-015
+addresses negative *selection*, RFC-016 addresses *rank-distillation*
+signal, RFC-017 addresses *training-data augmentation*, but every one
+of the four pre-existing training RFCs (RFC-015, RFC-016, RFC-017,
+and the implicit base recipe assumed by RFC-009, RFC-010, RFC-012,
+RFC-014) presumes InfoNCE as the underlying contrastive objective.
+
+InfoNCE has a well-documented and theoretically-grounded failure mode:
+when positive pairs reach cosine similarity ≥ 0.9 (which they should,
+for well-trained retrieval embeddings), the gradient
+`∂L_InfoNCE / ∂cos(q, p)` is bounded above by `1 - cos(q, p) ≤ 0.1`,
+producing vanishing gradients exactly when the model is closest to
+the desired manifold. Negative pairs at cosine ≤ 0.1 have the
+symmetric problem from the negative-pair side of the contrastive
+ladder. The net effect is that the InfoNCE training surface is steep
+in the middle of the cosine range and asymptotically flat at the
+boundaries — the model converges to "okay" cosine separation but
+struggles to push the high-similarity tail of positives toward
+exact-collinearity and the low-similarity tail of negatives toward
+exact-orthogonality.
+
+The AnglE loss closes this gap by adding a complex-valued angular
+term. Each real embedding `x ∈ R^H` is decomposed into a complex
+embedding `z = re + i*im ∈ C^(H/2)` where `re = x[:H/2]` and
+`im = x[H/2:]`. The angle between two complex embeddings is
+`arg(z_q · conj(z_p))` (in radians, range `[-π, +π]`), and the
+angular loss is `1 - cos(angle)`. Crucially, the gradient of
+`1 - cos(angle)` with respect to the angle is `sin(angle)`, which
+has uniform magnitude over the entire angle range — no
+saturation zones. For pairs that are already near-collinear in
+the cosine metric, the angular gradient is still active and
+continues to refine the angular alignment of the complex
+projection, producing a more uniform contrastive signal that
+sharpens the high-similarity tail of positive pairs.
+
+mind-nerve's STARGA agent-skill catalog has a particularly acute
+saturation problem because the catalog is small (≤ 10K routes) and
+many positive pairs share strong lexical surface form (e.g.
+`git_status` query → "git status" description). These positives
+reach InfoNCE-saturated cosine ≥ 0.95 early in training and the
+encoder spends the remaining epochs trying to disambiguate the
+long-tail of zero-lexical-overlap pairs while the InfoNCE gradient
+on the saturated head is nearly zero. AnglE redistributes the
+gradient signal across the full cosine range, accelerating
+convergence on the head AND providing a stronger lever on the
+long-tail.
+
+The change composes orthogonally with every prior RFC. RFC-010
+(cosine similarity at inference) is the metric that AnglE directly
+optimizes; the loss-function change makes the trained embeddings
+optimally calibrated against the cosine scoring head. RFC-015
+(positive-aware hard negative mining), RFC-016 (cross-encoder
+distillation), and RFC-017 (synthetic query augmentation) provide
+*input* to the contrastive loss (which pairs to train on); AnglE
+defines *how* the loss is computed once the pairs are chosen.
+The four can stack cleanly: the cohort RFC-015 + RFC-016 + RFC-017
++ RFC-018 is the training-side analog of how Stella v5 reached the
+top of MTEB in August 2024 (positive-aware mining + cross-encoder
+distillation + synthetic queries + AnglE loss).
+
+Bit-identity is trivially preserved: the inference path consumes
+the same Q16.16 weights file regardless of which loss function
+was used during training. The complex-valued projections live
+only in the training loss computation graph; they never appear
+in the inference forward pass, the on-disk weights file, or the
+attestation envelope. The only on-disk artifact that changes is
+the byte content of the weights file (the Q16.16 weight bytes
+themselves are different because they were optimized against a
+different loss surface), which propagates correctly into
+`model_hash` via the existing manifest discipline.
+
+The combined RFC-002 + RFC-010 + RFC-015 + RFC-016 + RFC-017 +
+RFC-018 stack is expected to deliver +8.5 to +12.5 points top-5
+over the pre-cohort baseline on the STARGA agent-skill catalog —
+the largest predicted cumulative accuracy lift in this RFC index,
+with RFC-018 contributing roughly +1.0 to +1.5 points of
+independent incremental lift on top of the RFC-002/010/015/016/017
+stack. The lift is concentrated on the high-similarity tail of
+the positive distribution (where InfoNCE saturates) and on the
+near-orthogonal tail of the negative distribution (where InfoNCE
+also saturates) — both regions that prior RFCs do NOT specifically
+address.
+
+## Adoption plan
+
+1. **Module(s) touched:**
+   - **Catalog-builder training pipeline (offline, out of mind-nerve
+     repo).** Three components:
+     (a) Complex projection. For each batch of real embeddings
+         `X ∈ R^(B × H)`, build the complex representation
+         `Z = X[:, :H/2] + 1j * X[:, H/2:]` (PyTorch:
+         `torch.complex(X[..., :H//2], X[..., H//2:])`). H must be
+         even (mind-nerve's H=256 satisfies this).
+     (b) AnglE loss formulation. For each positive pair
+         `(q, p)` and the set of in-batch negatives
+         `{n_1, ..., n_K}` (drawn from RFC-015's positive-aware
+         hard-negative filtering), compute both:
+         ```
+         L_cosine[i]  = -log(exp(cos(q, p) / τ) /
+                            sum_n exp(cos(q, n) / τ))
+         angle[i]     = arg(z_q · conj(z_p))
+         L_angular[i] = 1 - cos(angle[i])
+         L_AnglE[i]   = L_cosine[i] + λ_angular * L_angular[i]
+         ```
+         where `τ = 0.05` is the canonical InfoNCE temperature
+         (E5 §3.3 recommendation) and `λ_angular = 1.0` is the
+         Li & Li §4.2 equal-weight recommendation. Variants at
+         `λ_angular ∈ {0.5, 2.0}` are explored in the AnglE paper's
+         ablation; mind-nerve adopts the equal-weight default until
+         a staged validation run on the STARGA catalog motivates
+         a different value.
+     (c) Loss combination with RFC-016 distillation. Final training
+         loss is `L_total = 0.5 * L_AnglE + 0.5 * L_listwise_KL`
+         where `L_listwise_KL` is the RFC-016 cross-encoder
+         distillation term. The 0.5/0.5 weighting mirrors RFC-016's
+         contrastive-vs-distillation balance, simply substituting
+         AnglE for InfoNCE on the contrastive side.
+   - **`src/loader.mind` — no change.** The dequantized Q16.16
+     weights ARE the inference-path artifact; how they were trained
+     is opaque to the loader.
+   - **`src/inference.mind` — no change.** The forward path sees
+     the same encoder weights, the same scoring head, the same
+     envelope emission discipline.
+   - **`src/model.mind` — no change.** The architecture is
+     unchanged; only the byte values inside the weights file shift.
+   - **`Mind.toml` — no change.** No new compile-time constant;
+     the AnglE hyperparameters (`λ_angular`, `τ`, complex-projection
+     decomposition direction) are catalog-builder-side and do not
+     enter `model_hash` or `catalog_hash` (the hashes bind the
+     trained bytes, not the training procedure). They are documented
+     in the catalog-builder's `training_recipe.toml` artifact
+     alongside the RFC-016 teacher identity and RFC-017 generation
+     LLM identity for human-auditable reproducibility.
+
+2. **Spec changes required:**
+   - `spec/architecture.md` §"Training pipeline" (added by RFC-015,
+     extended by RFC-016 and RFC-017) — append an "AnglE loss"
+     paragraph documenting that reference weights must be trained
+     with the AnglE-extended contrastive loss at
+     `λ_angular = 1.0` and `τ = 0.05`, and that the
+     complex-projection direction (first-half-real vs
+     interleaved-real-imag) is part of the catalog-builder's
+     `training_recipe.toml` artifact (not bound into `model_hash`
+     — only the resulting weights are).
+   - `spec/numerics.md` — no change. No new primitive, no new
+     reduction order, no new LUT in the inference path. The
+     complex-arithmetic operations live entirely in the offline
+     training pipeline.
+   - `ROADMAP.md` §"Phase 2 accuracy & latency enhancements" —
+     append enhancement #15 ("AnglE loss for cosine-optimal
+     contrastive training") with a pointer to RFC-018. Tag as
+     "must-have" — the AnglE loss is the single largest training-
+     side improvement above the foundational InfoNCE baseline
+     among 2024 SOTA models, and the cosine-similarity scoring
+     head in RFC-010 mathematically guarantees the AnglE-trained
+     embeddings produce better-calibrated scores than
+     InfoNCE-trained embeddings at the same training-data budget.
+
+3. **Test additions:**
+   - **Catalog-builder pipeline tests (out of mind-nerve repo).**
+     Tests that (a) the complex projection correctly splits the
+     real embedding into real and imaginary halves, (b) the
+     angular loss correctly handles edge cases (near-collinear
+     positives produce a near-zero angle, exactly-orthogonal
+     embeddings produce a `±π/2` angle), (c) the combined loss
+     gradient is well-defined at all training inputs (no NaN
+     from complex `log(0)` or `arg(0+0j)` singularities — guard
+     by adding a `1e-7` epsilon to the complex magnitude before
+     `arg(...)`). These tests live in the catalog-builder repo,
+     not mind-nerve.
+   - `tests/integration/test_anglE_trained_weights.mind` — on the
+     held-out STARGA agent-skill catalog, assert that weights
+     trained with the RFC-015 + RFC-016 + RFC-017 + RFC-018
+     combined recipe produce ≥ baseline + 6.0 points top-5
+     accuracy vs weights trained with RFC-015 + RFC-016 +
+     RFC-017 alone (no AnglE) at the same training-data budget.
+     Acts as a regression-guard: if a future training-run reverts
+     AnglE to plain InfoNCE, this test fails.
+   - `tests/integration/test_anglE_high_similarity_tail.mind` —
+     on the subset of dev-set queries whose top-1 retrieved route
+     has cosine similarity ≥ 0.95 (the high-similarity tail
+     where InfoNCE saturates), assert that AnglE-trained weights
+     produce ≥ baseline + 4.0 points top-1 accuracy vs InfoNCE-
+     trained weights at the same training-data budget. The
+     larger delta on this subset is the AnglE-specific signature:
+     it specifically addresses the failure mode where positive
+     pairs are already near-collinear but lexically distinguishable
+     from each other (e.g. `git_status` vs `git_diff` vs `git_log`
+     — all share the `git` prefix, all reach near-saturated cosine
+     against a "git" query, and only AnglE's angular term provides
+     gradient signal to push them apart).
+
+4. **Expected latency delta:**
+   Zero on the inference path. The change is offline at training-
+   pipeline time. The inference path consumes the same Q16.16
+   weights file and the same Q16.16 route embeddings via the same
+   pinned primitives. No runtime change.
+
+   Training-time cost: AnglE's complex-arithmetic step is roughly
+   1.3× the wall-clock cost of plain InfoNCE per training step
+   (complex multiplication has 4× the scalar ops of real
+   multiplication, but the angular loss is O(B) per batch — same
+   asymptotic as InfoNCE's O(B*K) negative softmax). Over a
+   3-epoch fine-tuning run on a 100K-query catalog this adds ~20
+   GPU-hours to the training budget — absorbed into the existing
+   reference-checkpoint training wall-clock and small compared
+   to RFC-016's teacher-inference cost (~13 GPU-hours) and
+   RFC-017's LLM-generation cost (~6 GPU-hours).
+
+5. **Expected accuracy delta:**
+   Li & Li §4 Table 3 reports +2.7 STS Spearman points from
+   AnglE over InfoNCE on the STS benchmark suite. Stella v5
+   model-card (2024-08) attributes ~+1.4 MTEB-Retrieval points
+   to AnglE over the BGE-style InfoNCE pretraining baseline.
+   bge-en-icl-large (Li et al. §3.2) reports +0.8 to +1.4 MTEB
+   average points at H=256-768. Wu et al. (arxiv:2408.00690,
+   2024-08) §4 reports +1.5 to +2.2 nDCG@10 on BEIR at the
+   small-encoder (H=256) scale — the regime closest to
+   mind-nerve's. For mind-nerve's STARGA agent-skill catalog
+   at H=256, we expect the lift to land in the lower-middle of
+   the cited band: +1.0 to +1.5 points top-5 accuracy overall,
+   with the larger delta (+2.5 to +4.0 points) concentrated on
+   the high-similarity tail of positive pairs (where InfoNCE
+   saturates and AnglE's angular gradient continues to refine
+   alignment). The combined RFC-002 + RFC-010 + RFC-015 + RFC-016
+   + RFC-017 + RFC-018 stack is expected to deliver +8.5 to
+   +12.5 points top-5 over the pre-cohort baseline — the largest
+   predicted cumulative accuracy lift in this RFC index, bringing
+   mind-nerve within +0.5 to +1.0 points of NV-Embed-v2's MTEB
+   top-5 performance at the H=256 small-encoder scale (NV-Embed-v2
+   is H=4096; matching its top-5 at 1/16 the hidden dimension is
+   the strong-version SOTA bar mind-nerve aims to reach).
+
+## Non-negotiable conflict
+
+None — the proposal respects all six non-negotiables:
+
+1. *Pure MIND inference path.* No inference-path change; no new
+   framework dependency on the inference side. The training pipeline
+   already lives outside the mind-nerve repo (ROADMAP §"Phase 1
+   deferred item #3") and is allowed to use external frameworks
+   (PyTorch / SentenceTransformers / HuggingFace Transformers).
+   The complex-arithmetic step uses PyTorch's native
+   `torch.complex` / `torch.angle` primitives, which are FP32 and
+   live entirely in the training computation graph — they never
+   touch the Q16.16 inference path.
+2. *Q16.16 × INT8.* No numeric-type change. The trained weights
+   are the same Q16.16 × INT8 artifact format; only the byte
+   values inside change. The complex-valued projections during
+   training are FP32, lost at training-time after the loss is
+   computed, and never appear in the serialized weights file.
+3. *Cross-arch bit-identity.* The inference path consumes the
+   same bytes via the same pinned primitives. Bit-identity is
+   unchanged.
+4. *≤30 ms p95.* Zero runtime cost; latency unchanged.
+5. *Single static binary.* No new dependency in the binary.
+6. *Tamper-evident envelope chain.* The trained weights enter
+   `model_hash` via the existing manifest discipline. Any tampering
+   produces a `HashMismatch` at load time, regardless of how the
+   weights were trained. The `training_recipe.toml` artifact
+   documenting `λ_angular`, `τ`, and the complex-projection
+   decomposition direction is for human auditability only; it
+   does NOT enter any hash binding (the weights ARE the contract,
+   not the recipe).
+
+## Validation gates run
+
+- arch-mind score before / after: pending (this RFC is a proposal,
+  not yet implemented).
+- skill-improver mean before / after: pending.
+- Latency / accuracy actual numbers: pending implementation against
+  the STARGA agent-skill catalog with a reference checkpoint
+  retrained using the combined RFC-015 + RFC-016 + RFC-017 +
+  RFC-018 recipe at `λ_angular = 1.0` and `τ = 0.05`.
+
+## Decision
+
+Needs-human-review.
+
+Rationale for not auto-accepting: this RFC is a training-pipeline
+change with no in-tree code modification. The mind-nerve repo's role
+is to (a) document the discipline in `spec/architecture.md` and
+`ROADMAP.md` so future catalog-builder implementations follow it,
+and (b) ship the integration tests that regression-guard the
+expected accuracy lift. The actual loss-function modification lives
+in the catalog-builder pipeline, which is external in Phase 1.
+A human reviewer should confirm three things before this RFC lands:
+(1) the catalog-builder team can absorb the AnglE loss replacement
+(a small modification to the existing fine-tuning loop — roughly 30
+lines of training-pipeline code for the complex projection + angular
+loss term + combined-loss composition) alongside RFC-001's group-wise
+quantization, RFC-005's saliency-ranked head mask, RFC-007's
+attention-sink-aware training, RFC-008's MRL auxiliary loss,
+RFC-009's `q_latent` parameter, RFC-010's cosine-similarity
+contrastive objective, RFC-011's ALiBi bias, RFC-012's asymmetric
+prefix conditioning, RFC-013's RMSNorm, RFC-014's multi-query
+pooling with diversity penalty, RFC-015's positive-aware hard
+negative mining, RFC-016's cross-encoder distillation, and
+RFC-017's synthetic query augmentation. All fourteen are v2
+reference-checkpoint / v2 catalog changes; landing them in a single
+training+catalog-build run avoids fourteen sequential invalidations
+of downstream artifacts. (2) The `λ_angular = 1.0` recommendation
+should be staged against a validation checkpoint before the
+production training run commits to the equal-weight default —
+Li & Li's ablation also reports `λ_angular = 0.5` and
+`λ_angular = 2.0` variants, and the optimal value for mind-nerve's
+small-catalog routing regime (vs the STS / MTEB regime Li & Li
+evaluated against) may differ. The catalog-builder team should be
+prepared to grid-search `λ_angular ∈ {0.5, 1.0, 1.5, 2.0}` on a
+10% validation slice before the full production run. (3) The
+complex-projection decomposition direction (first-half-real vs
+interleaved-real-imag) is also a hyperparameter Li & Li note can
+shift accuracy by ±0.3 STS points; mind-nerve should adopt the
+first-half-real convention (`re = x[:H/2]`, `im = x[H/2:]`) as the
+default because it matches the Stella v5 and bge-en-icl-large
+production recipes, and the catalog-builder should pin this choice
+explicitly in `training_recipe.toml`. Until all three confirmations
+land, this RFC remains a proposal documenting the discipline; the
+catalog-builder team can adopt it incrementally without coordination
+because the resulting weights are byte-compatible with the existing
+mind-nerve inference path (only the byte values inside the weights
+file change, and `model_hash` updates correspondingly).

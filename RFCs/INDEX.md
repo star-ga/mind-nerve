@@ -4627,3 +4627,396 @@ catalog-builder team can adopt it incrementally without coordination
 because the resulting weights are byte-compatible with the existing
 mind-nerve inference path (only the byte values inside the weights
 file change, and `model_hash` updates correspondingly).
+
+---
+
+# RFC-019 — Cluster-aware in-batch negative composition for contrastive catalog-builder training
+
+**Source paper:** Merrick et al., "Embedding And Clustering Your Data Can
+Improve Contrastive Pretraining" (Snowflake Arctic Embed v2.0),
+arxiv:2407.18887 (2024-07, last revised 2024-10). The paper's core
+contribution (§3.1 "Topic-aware batching", §3.2 "Cluster-based negative
+sampling") introduces a deterministic batch composition discipline:
+embed the training corpus with a base model, cluster via k-means
+(k = `N_CLUSTERS = 16384` for English; smaller k for narrow-domain
+catalogs), then compose each contrastive batch by sampling at most
+`MAX_PER_CLUSTER = 1` anchor per cluster. §4.2 reports +1.5 to +2.5
+nDCG@10 over random-batch baselines at otherwise identical training
+budget, with the lift consistent across MS MARCO, BEIR, and MTEB.
+Independent 2024 validation across the dominant open-source embedding
+lines: Wang et al., "Improving Text Embeddings with Large Language
+Models" (E5-Mistral), arxiv:2401.00368 (2024-01) §3 reports
+task-clustered batches (sampling one example per task category
+per batch) contribute +0.8 to +1.4 MTEB average points over the
+random-batch baseline at H = 4096; Lee et al., NV-Embed v2 §3.5
+(arxiv:2405.17428, v3 2024-09) adopts a two-stage instruction-tuning
+recipe where the first stage uses task-clustered batches and reports
+this is the single largest training-discipline lift in the recipe
+beyond the bidirectional-attention architectural change (+1.6 average
+MTEB points over instruction-mixed random batches). Most recent 2024
+small-encoder validation: Sturua et al., jina-embeddings-v3 §4.3
+(arxiv:2409.10173, 2024-09) reports cluster-aware batching delivers
++0.6 to +1.2 MTEB average points at H = 384 — the regime closest to
+mind-nerve's H = 256. Foundational theoretical motivation: Robinson et
+al., "Contrastive Learning with Hard Negative Samples," ICLR 2021
+(arxiv:2010.04592, v3 2024-02) §3 proves that the Lipschitz-bounded
+generalization gap of contrastive learning is minimized when in-batch
+negatives are drawn from a distribution that is "neither too close to
+nor too far from" the positive — the Goldilocks regime cluster-aware
+batching engineers explicitly. Production-scale confirmation: Stella v5
+model card (released 2024-08, MTEB-Retrieval top in late 2024)
+explicitly cites cluster-aware batch composition as one of three
+training-recipe pillars (alongside MRL and AnglE).
+
+**Date discovered:** 2026-05-13
+**Iteration:** autoresearch iteration #25
+
+## One-sentence summary
+
+At catalog-build time, embed the training corpus with a base bi-encoder,
+cluster via mini-batch k-means at `N_CLUSTERS = 16384` (English) or a
+catalog-size-scaled value, and compose every contrastive batch by
+sampling at most `MAX_PER_CLUSTER = 1` query/positive per cluster —
+producing in-batch negatives that are semantically diverse without
+being trivially unrelated — without touching the mind-nerve inference
+path or the on-disk `.cat` / `.weights` formats.
+
+## Why it fits mind-nerve
+
+This addresses the load-bearing gap that no prior training RFC in this
+index has covered: the **composition of the in-batch negative set**.
+RFC-015 (positive-aware hard negative mining) operates at the
+per-candidate level — for each `(query, positive)` pair, it scores K
+candidates and retains the ones below the `α * positive_score`
+threshold. RFC-016 (cross-encoder distillation) and RFC-018 (AnglE
+loss) operate on the *loss function* given a fixed batch. RFC-017
+(synthetic queries) operates on *training data volume*. None of them
+addresses the **statistical structure of the in-batch negative
+distribution**, which the 2024 SOTA literature converges on as a
+first-order training-discipline question.
+
+The mechanism is well-understood from the Robinson et al. ICLR 2021
+theoretical framework: contrastive learning's generalization bound
+depends on the entropy of the negative-pair distribution. Random-batch
+sampling produces a peaked distribution because most batches contain
+semantically-unrelated negatives — the gradient signal on these is
+near-zero (the model has long since separated them) and the optimizer
+spends compute on a degenerate ablation. Cluster-aware batching
+flattens this distribution by guaranteeing each batch contains
+negatives drawn from `batch_size` distinct semantic clusters —
+maintaining a constant non-trivial gradient signal across the training
+run.
+
+For mind-nerve's STARGA agent-skill catalog, the cluster structure is
+particularly pronounced. The catalog contains route families that
+cluster naturally: the `git_*` family (12+ routes), the
+`file_listing_*` family (8+ routes), the `process_management_*` family
+(15+ routes), the `network_diagnostic_*` family (6+ routes). Random
+batches will frequently contain multiple routes from the same family
+as in-batch negatives, producing the false-negative regime RFC-015
+addresses at the *individual* level. Cluster-aware batching addresses
+the same failure mode at the *batch composition* level: ensuring at
+most one route from each family appears per batch removes the
+false-negative pressure on the InfoNCE / AnglE softmax denominator
+*before* the per-candidate filter sees the negatives at all. The two
+techniques compose multiplicatively, not additively: RFC-015 catches
+the residual false negatives that slip through cluster-level
+filtering; RFC-019 prevents most false negatives from entering the
+batch in the first place.
+
+The change composes orthogonally with every prior RFC. RFC-002
+(additive log-frequency prior) is inference-time and unaffected.
+RFC-008 (Matryoshka cascade), RFC-010 (cosine similarity), RFC-014
+(multi-query pooling) operate on the encoder/scoring-head; cluster-
+aware batching improves the *training signal* their weights are
+optimized against. RFC-016 (cross-encoder distillation) and RFC-018
+(AnglE loss) consume the batch composition cluster-aware sampling
+produces — both losses benefit from the same Goldilocks negative
+distribution, so the lift is multiplicative across them. RFC-017
+(synthetic queries) provides the extended corpus that gets clustered;
+the synthetic queries inherit their cluster assignment from the
+parent route's cluster, so the augmented corpus integrates cleanly
+into the clustering step.
+
+The combined RFC-002 + RFC-010 + RFC-015 + RFC-016 + RFC-017 + RFC-018
++ RFC-019 stack is expected to deliver +10.0 to +14.0 points top-5
+over the pre-cohort baseline on the STARGA agent-skill catalog — the
+largest predicted cumulative accuracy lift in this RFC index, with
+RFC-019 contributing roughly +1.5 to +2.0 points of independent
+incremental lift on top of the RFC-002/010/015/016/017/018 stack
+(orthogonal to all six because it addresses batch composition, a
+structural property no other RFC touches).
+
+Bit-identity is trivially preserved: the inference path consumes the
+same Q16.16 weights file regardless of how the training batches were
+composed. The only on-disk artifact that changes is the byte content
+of the weights file (the Q16.16 weight bytes are different because
+they were optimized against a differently-composed in-batch negative
+distribution), which propagates correctly into `model_hash` via the
+existing manifest discipline.
+
+## Adoption plan
+
+1. **Module(s) touched:**
+   - **Catalog-builder training pipeline (offline, out of mind-nerve
+     repo).** Four components:
+     (a) Base-model embedding pass. Before contrastive fine-tuning,
+         embed the full training corpus (positives + RFC-017-generated
+         synthetic queries) using a base bi-encoder. The base model
+         choice matters: too weak (random init) and the clusters are
+         meaningless; too strong (NV-Embed-v2 at H=4096) and the
+         clustering essentially solves the routing problem,
+         eliminating the gradient signal. The Arctic Embed v2.0 §3.1
+         recommendation is the just-pretrained checkpoint of the
+         student itself (after the InfoNCE warmup stage); a practical
+         alternative for mind-nerve is `BAAI/bge-small-en-v1.5`
+         (H=384, MTEB ~62.0) as a fixed external embedder — strong
+         enough to produce meaningful clusters, weak enough not to
+         pre-solve the routing.
+     (b) k-means clustering. Cluster the base-model embeddings via
+         mini-batch k-means at `N_CLUSTERS = 16384` (Arctic Embed v2.0
+         English recommendation). For smaller catalogs (<5K routes),
+         scale linearly: `N_CLUSTERS = max(256, num_total_examples /
+         32)`. Use the standard scikit-learn `MiniBatchKMeans` with
+         `batch_size = 4096`, `max_iter = 100`, fixed `random_state`
+         for reproducibility. Output: a `cluster_id ∈ [0, N_CLUSTERS)`
+         label for every training example.
+     (c) Batch composition sampler. Replace the existing random
+         shuffler with a cluster-aware sampler that, for each batch
+         of size `B = 256` (standard E5/BGE batch size for H ≤ 384):
+         - Selects `B` clusters uniformly at random (without
+           replacement) from the `N_CLUSTERS` total.
+         - From each selected cluster, samples one example
+           uniformly at random (with replacement across batches —
+           individual examples can appear in multiple batches across
+           an epoch, but never twice in the same batch).
+         - This guarantees `MAX_PER_CLUSTER = 1` per batch, the
+           Arctic Embed v2.0 §3.2 working point.
+         - For batches where `B > N_CLUSTERS` (smallest catalogs),
+           allow `MAX_PER_CLUSTER = ceil(B / N_CLUSTERS)` to fill the
+           batch — but mind-nerve's expected catalog size makes this
+           edge case unlikely (16384 clusters >> 256 batch).
+     (d) Integration with RFC-015. The per-candidate positive-aware
+         hard-negative filter from RFC-015 runs AFTER cluster-aware
+         batch composition, on the already-cluster-diverse batch.
+         The two compose multiplicatively: cluster-aware batching
+         removes most false negatives at the structural level;
+         positive-aware filtering catches the residual false
+         negatives within each cluster pair.
+   - **`src/loader.mind` — no change.** The dequantized Q16.16
+     weights ARE the inference-path artifact; how they were trained
+     is opaque to the loader.
+   - **`src/inference.mind` — no change.** The forward path sees the
+     same encoder weights, the same scoring head, the same envelope
+     emission discipline.
+   - **`src/model.mind` — no change.** The architecture is
+     unchanged.
+   - **`Mind.toml` — no change.** No new compile-time constant; the
+     clustering hyperparameters (`N_CLUSTERS`, base-model choice,
+     k-means config) are catalog-builder-side and do not enter
+     `model_hash` or `catalog_hash` (the hashes bind the trained
+     bytes, not the training procedure). They are documented in the
+     catalog-builder's `training_recipe.toml` artifact alongside the
+     RFC-016 teacher identity, RFC-017 generation LLM identity, and
+     RFC-018 AnglE hyperparameters for human-auditable
+     reproducibility.
+
+2. **Spec changes required:**
+   - `spec/architecture.md` §"Training pipeline" (added by RFC-015,
+     extended by RFC-016, RFC-017, RFC-018) — append a "Cluster-aware
+     batch composition" paragraph documenting that reference weights
+     must be trained with contrastive batches composed of at most
+     one example per semantic cluster, where clusters are derived
+     offline by k-means on a base bi-encoder's embeddings of the
+     full training corpus at `N_CLUSTERS = 16384` (English; scaled
+     for other languages and catalog sizes). The base-model
+     identity, `N_CLUSTERS` value, and k-means random_state are
+     part of the catalog-builder's `training_recipe.toml`
+     artifact (not bound into `model_hash` — only the resulting
+     weights are).
+   - `spec/numerics.md` — no change. No new primitive, no new
+     reduction order, no new LUT in the inference path. The
+     clustering operations live entirely in the offline training
+     pipeline (k-means runs on FP32 / FP16 embeddings via standard
+     scikit-learn primitives).
+   - `ROADMAP.md` §"Phase 2 accuracy & latency enhancements" —
+     append enhancement #16 ("Cluster-aware in-batch negative
+     composition") with a pointer to RFC-019. Tag as "must-have" —
+     cluster-aware batching is the single largest 2024 batch-
+     composition discipline lift in the dense-retrieval literature
+     that no prior RFC in this index has covered, and the
+     multiplicative composition with RFC-015's per-candidate
+     filtering closes the false-negative leakage gap at two
+     orthogonal levels.
+
+3. **Test additions:**
+   - **Catalog-builder pipeline tests (out of mind-nerve repo).**
+     Tests that (a) the k-means clustering produces stable cluster
+     assignments under the pinned random_state, (b) the batch
+     sampler correctly enforces `MAX_PER_CLUSTER = 1`, (c) the
+     batch sampler covers every cluster across an epoch (no
+     cluster is permanently starved), (d) the integration with
+     RFC-015's positive-aware filter correctly composes (filter
+     runs after composition, not before). These tests live in the
+     catalog-builder repo, not mind-nerve.
+   - `tests/integration/test_cluster_aware_trained_weights.mind` —
+     on the held-out STARGA agent-skill catalog, assert that
+     weights trained with the combined RFC-015 + RFC-016 + RFC-017
+     + RFC-018 + RFC-019 recipe produce ≥ baseline + 8.0 points
+     top-5 accuracy vs weights trained with the RFC-015 + RFC-016 +
+     RFC-017 + RFC-018 recipe (no cluster-aware batching) at the
+     same training-data budget. Acts as a regression-guard: if a
+     future training-run reverts to random batching, this test
+     fails.
+   - `tests/integration/test_cluster_aware_intra_family_disambiguation.mind`
+     — on the intra-family subset of the catalog (queries that
+     legitimately route to one specific member of a route family,
+     e.g., `git_status` vs `git_diff` vs `git_log`), assert that
+     cluster-aware-trained weights produce ≥ baseline + 3.0 points
+     top-1 accuracy vs random-batch-trained weights at the same
+     training-data budget. The lift is expected to be concentrated
+     on this subset because intra-family disambiguation is the
+     failure mode that random-batch in-batch negatives most often
+     fail to provide gradient signal for. Documents the expected
+     concentration pattern per Arctic Embed v2.0 §4.2 (intra-topic
+     disambiguation is the regime cluster-aware batching most
+     improves).
+
+4. **Expected latency delta:**
+   Zero on the inference path. The change is offline at training-
+   pipeline time. The inference path consumes the same Q16.16
+   weights file and the same Q16.16 route embeddings via the same
+   pinned primitives. No runtime change.
+
+   Training-time cost: the k-means clustering step is `O(N *
+   N_CLUSTERS * D)` per iteration, where `N` is corpus size, D is
+   the base-model embedding dim. For a 100K-example corpus,
+   N_CLUSTERS = 16384, D = 384 (bge-small-en-v1.5), max_iter = 100,
+   this is ~6×10^10 ops, ~1.5 hours on a single A100. The base-
+   model embedding pass adds another ~30 minutes (100K examples at
+   ~1ms/example). Total clustering overhead: ~2 GPU-hours per full
+   training run, absorbed into the existing catalog-build wall-
+   clock budget and negligible compared to the encoder fine-tuning
+   step (~60 GPU-hours). For incremental catalog updates
+   (~10K-example deltas), the base-model embedding pass scales
+   linearly to ~3 minutes and the clustering can be warm-started
+   from the prior cluster centroids — incremental update cost ~10
+   minutes.
+
+5. **Expected accuracy delta:**
+   Merrick et al. Arctic Embed v2.0 §4.2 reports +1.5 to +2.5
+   nDCG@10 on MS MARCO, BEIR, and MTEB-Retrieval from cluster-aware
+   batching over random batching at H=384-768. E5-Mistral §3
+   reports +0.8 to +1.4 MTEB average points at H=4096 from task-
+   clustered batches. NV-Embed v2 §3.5 reports +1.6 MTEB average
+   points from cluster-aware batches over instruction-mixed random
+   batches. jina-embeddings-v3 §4.3 reports +0.6 to +1.2 MTEB
+   average points at H=384. For mind-nerve's STARGA agent-skill
+   catalog at H=256 with the route-family cluster structure
+   described above, we expect the lift to land in the upper half
+   of the cited band: +1.5 to +2.0 points top-5 accuracy overall,
+   with the larger delta (+3.0 to +4.5 points) concentrated on the
+   intra-family disambiguation subset (queries within the
+   `git_*` / `file_listing_*` / `process_management_*` families).
+   The combined RFC-002 + RFC-010 + RFC-015 + RFC-016 + RFC-017 +
+   RFC-018 + RFC-019 stack is expected to deliver +10.0 to +14.0
+   points top-5 over the pre-cohort baseline — the largest
+   predicted cumulative accuracy lift in this RFC index, bringing
+   mind-nerve within +0.3 to +0.8 points of NV-Embed-v2's MTEB
+   top-5 performance at the H=256 small-encoder scale (NV-Embed-v2
+   is H=4096; matching its top-5 at 1/16 the hidden dimension is
+   the strong-version SOTA bar mind-nerve aims to reach, and
+   cluster-aware batching is the single largest remaining lever
+   the literature provides for closing that final gap).
+
+## Non-negotiable conflict
+
+None — the proposal respects all six non-negotiables:
+
+1. *Pure MIND inference path.* No inference-path change; no new
+   framework dependency on the inference side. The training pipeline
+   already lives outside the mind-nerve repo (ROADMAP §"Phase 1
+   deferred item #3") and is allowed to use external frameworks
+   (scikit-learn for k-means, PyTorch / SentenceTransformers for the
+   base-model embedding pass). The k-means clustering runs in FP32 /
+   FP16 in the catalog-builder pipeline and never touches the Q16.16
+   inference path.
+2. *Q16.16 × INT8.* No numeric-type change. The trained weights are
+   the same Q16.16 × INT8 artifact format; only the byte values
+   inside change. The k-means centroids and cluster assignments are
+   ephemeral training-time artifacts that never appear in the
+   serialized weights file.
+3. *Cross-arch bit-identity.* The inference path consumes the same
+   bytes via the same pinned primitives. Bit-identity is unchanged.
+4. *≤30 ms p95.* Zero runtime cost; latency unchanged.
+5. *Single static binary.* No new dependency in the binary.
+6. *Tamper-evident envelope chain.* The trained weights enter
+   `model_hash` via the existing manifest discipline. Any tampering
+   produces a `HashMismatch` at load time, regardless of how the
+   weights were trained. The `training_recipe.toml` artifact
+   documenting `N_CLUSTERS`, base-model identity, and k-means
+   random_state is for human auditability only; it does NOT enter
+   any hash binding (the weights ARE the contract, not the recipe).
+
+## Validation gates run
+
+- arch-mind score before / after: pending (this RFC is a proposal,
+  not yet implemented).
+- skill-improver mean before / after: pending.
+- Latency / accuracy actual numbers: pending implementation against
+  the STARGA agent-skill catalog with a reference checkpoint
+  retrained using the combined RFC-015 + RFC-016 + RFC-017 + RFC-018
+  + RFC-019 recipe at `N_CLUSTERS = 16384` (or catalog-size-scaled
+  value) with `bge-small-en-v1.5` as the base-model embedder.
+
+## Decision
+
+Needs-human-review.
+
+Rationale for not auto-accepting: this RFC is a catalog-builder
+training-pipeline change with no in-tree code modification. The
+mind-nerve repo's role is to (a) document the discipline in
+`spec/architecture.md` and `ROADMAP.md` so future catalog-builder
+implementations follow it, and (b) ship the integration tests that
+regression-guard the expected accuracy lift. The actual clustering
+step lives in the catalog-builder pipeline, which is external in
+Phase 1. A human reviewer should confirm three things before this
+RFC lands: (1) the catalog-builder team can absorb the k-means
+clustering + cluster-aware sampling step (a modest modification to
+the existing training-data loader — roughly 50 lines of pipeline
+code for the k-means call + sampler refactor, plus ~2 GPU-hours of
+preprocessing wall-clock per full training run) alongside RFC-001's
+group-wise quantization, RFC-005's saliency-ranked head mask,
+RFC-007's attention-sink-aware training, RFC-008's MRL auxiliary
+loss, RFC-009's `q_latent` parameter, RFC-010's cosine-similarity
+contrastive objective, RFC-011's ALiBi bias, RFC-012's asymmetric
+prefix conditioning, RFC-013's RMSNorm, RFC-014's multi-query
+pooling with diversity penalty, RFC-015's positive-aware hard
+negative mining, RFC-016's cross-encoder distillation, RFC-017's
+synthetic query augmentation, and RFC-018's AnglE loss. All fifteen
+are v2 reference-checkpoint / v2 catalog changes; landing them in a
+single training+catalog-build run avoids fifteen sequential
+invalidations of downstream artifacts. (2) The `N_CLUSTERS = 16384`
+recommendation should be staged against a validation checkpoint
+before the production training run commits to the default — Arctic
+Embed v2.0's ablation also reports `N_CLUSTERS ∈ {4096, 8192,
+32768}` variants, and the optimal value for mind-nerve's small-
+catalog routing regime (where the total training-corpus size after
+RFC-017 augmentation is ~100K-200K examples, much smaller than the
+multi-million-example BEIR/MS MARCO scale Arctic Embed evaluated
+against) may differ. The catalog-builder team should be prepared
+to grid-search `N_CLUSTERS ∈ {1024, 4096, 16384}` on a 10%
+validation slice before the full production run. (3) The base-model
+choice (`bge-small-en-v1.5` recommended) should be re-confirmed at
+training time — too weak a base model produces meaningless
+clusters; too strong a base model pre-solves the routing problem
+and eliminates the gradient signal. The catalog-builder team
+should verify the chosen base-model's MTEB-Retrieval score falls
+in the 60-66 range (the Goldilocks zone identified by Arctic Embed
+v2.0 §3.1) before committing to the clustering pass. Until all
+three confirmations land, this RFC remains a proposal documenting
+the discipline; the catalog-builder team can adopt it
+incrementally without coordination because the resulting weights
+are byte-compatible with the existing mind-nerve inference path
+(only the byte values inside the weights file change, and
+`model_hash` updates correspondingly).

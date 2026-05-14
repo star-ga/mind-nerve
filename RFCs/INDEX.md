@@ -8716,6 +8716,8 @@ are byte-compatible with the existing mind-nerve inference path
 (only the byte values inside the weights file change, and
 `model_hash` updates correspondingly).
 
+**Status:** SKIPPED — Training/catalog-builder-side only. The RFC's own "Adoption plan" §2-§5 enumerates `src/loader.mind`, `src/inference.mind`, `src/model.mind`, and `Mind.toml` as "no change"; the entire QAT discipline (per-step fake-quantization operator at RFC-001's `group_size = 32` with per-group `scale = max(|W|)/127`, quantize-then-dequantize round-trip via `W_use = W + (W_fq - W).detach()` STE idiom, always-on schedule from training step 1, applied to all 16 encoder Q/K/V/O matrices plus RFC-009/RFC-014 `pool_q_latent` and RFC-023 `W_teacher` projections, with the final-export fake-quantization producing the RFC-001 INT8 + Q16.16-scale bytes) lives entirely in the offline catalog-builder Stage-2 fine-tuning loop outside the mind-nerve repo. The resulting quantization-robust weight bytes are absorbed into the RFC-001 INT8 storage format via `model_hash` without touching the inference surface; the FP weights, STE gradient discipline, and the fake-quantization operator itself are discarded after Stage-2 export and never enter the mind-nerve binary. Belongs in the catalog-builder repo.
+
 ---
 
 # RFC-027 — GradCache for memory-efficient large-batch contrastive training
@@ -9186,6 +9188,8 @@ because the resulting weights are byte-compatible with the existing
 mind-nerve inference path (only the byte values inside the weights
 file change, and `model_hash` updates correspondingly).
 
+**Status:** SKIPPED — Training/catalog-builder-side only. The RFC's own "Adoption plan" §2-§5 enumerates `src/loader.mind`, `src/inference.mind`, `src/model.mind`, and `Mind.toml` as "no change"; the entire GradCache two-pass discipline (first-pass `torch.no_grad()` encoder forward over 8 micro-batches of 256 each → `[2048, H]` embedding tensor → `torch.autograd.grad(L_total, embeddings)` cached-gradient extraction → second-pass with-grad encoder forward+backward per micro-batch via `embeddings_microbatch.backward(gradient=cached_grad[start:end])`, with `EFFECTIVE_BATCH_SIZE = 2048` / `MICRO_BATCH_SIZE = 256`, RFC-020 GISTEmbed mask computed against the full effective batch, RFC-024 queue updated at effective-batch boundaries, and RFC-016 / RFC-023 teacher forward passes against the full effective batch in `torch.no_grad()`) lives entirely in the offline catalog-builder Stage-2 fine-tuning loop outside the mind-nerve repo. The resulting large-batch contrastive-trained weight bytes are absorbed into the Q16.16 × INT8 weight values via `model_hash` without touching the inference surface; the cached-gradient tensors, two-pass scheduling state, and the GradCache infrastructure itself are discarded after Stage-2 export and never enter the mind-nerve binary. Belongs in the catalog-builder repo.
+
 ---
 
 # RFC-028 — EMA / SWA weight averaging for robust final-checkpoint export
@@ -9613,6 +9617,8 @@ without coordination because the resulting weights are byte-
 compatible with the existing mind-nerve inference path (only the
 byte values inside the weights file change, and `model_hash`
 updates correspondingly).
+
+**Status:** SKIPPED — Training/catalog-builder-side only. The RFC's own "Adoption plan" §2-§5 enumerates `src/loader.mind`, `src/inference.mind`, `src/model.mind`, and `Mind.toml` as "no change"; the entire EMA / SWA discipline (per-step in-place blend `p_ema.data.mul_(EMA_DECAY).add_(p_live.data, alpha=1 - EMA_DECAY)` at `EMA_DECAY = 0.9999`, bias-correction via `1 / (1 - EMA_DECAY^t)` per Adam §2 for Stage-2 budgets shorter than 50 000 steps, FP32 `θ_ema` parameter copy maintained alongside `θ_live` under `torch.no_grad()`, and the final export-step swap from `θ_live` to `θ_ema` before RFC-026's fake-quantization operator runs) lives entirely in the offline catalog-builder Stage-2 fine-tuning loop outside the mind-nerve repo. The resulting Polyak-Ruppert-averaged weight bytes are absorbed into the Q16.16 × INT8 weight values via `model_hash` without touching the inference surface; the FP32 `θ_ema` parameter copy, the per-step blend infrastructure, and the bias-correction wrapper are discarded after Stage-2 export and never enter the mind-nerve binary. Belongs in the catalog-builder repo.
 
 ---
 

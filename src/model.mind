@@ -17,7 +17,9 @@ use crate::mind_nerve::{
     ATTN_WINDOW_SIZE, ATTN_WINDOW_STRIDE,
     VOCAB_SIZE, MAX_REQUEST_TOKENS, ROUTE_EMBEDDING_DIM,
 };
-use crate::mind_nerve::q16_16::{q16_dot_pinned, q16_mul, q16_add};
+use crate::mind_nerve::q16_16::{
+    q16_dot_pinned, q16_mul, q16_add, q16_rsqrt, Q16_LAYERNORM_EPSILON,
+};
 
 // Module-private helpers — sliding-window attention kernels, embedding lookup,
 // pre-norm, gated residual, mean-pool. Not part of the public stability
@@ -159,6 +161,81 @@ where
         let mut d: usize = 0;
         while d < h {
             out[b][d] = pooled[d];
+            d = d + 1;
+        }
+        b = b + 1;
+    }
+    return out;
+}
+
+// RFC-010 — L2-normalize the pooled query for the cosine-similarity
+// scoring head.
+//
+// For each batch row, computes:
+//   (1) sq_norm  = q16_dot_pinned(row, row)              — sum of squares
+//                                                          via pinned self-dot
+//                                                          over the hidden axis
+//   (2) guarded  = q16_add(sq_norm, Q16_LAYERNORM_EPSILON) — zero-vector
+//                                                            guard (1 ULP); the
+//                                                            rsqrt LUT clamps
+//                                                            non-positive
+//                                                            inputs to
+//                                                            MAX_Q16_16 which
+//                                                            would scale the
+//                                                            vector to its
+//                                                            saturation
+//                                                            boundary —
+//                                                            multiplying by the
+//                                                            zero row still
+//                                                            yields zero, so
+//                                                            the function stays
+//                                                            total
+//   (3) inv_norm = q16_rsqrt(guarded)                     — truncated LUT
+//   (4) out[b,d] = q16_mul(row[d], inv_norm)              — elementwise rescale
+//
+// The new reduction site is the self-dot, which is `q16_dot_pinned`
+// (already pinned ascending over the hidden axis in q16_16.mind). The
+// elementwise rescale carries no reduction. Cross-arch bit-identity
+// follows from the deterministic composition of pinned primitives;
+// `q16_dot_pinned`, `q16_add`, `q16_rsqrt`, and `q16_mul` are all in
+// the bit-identity contract.
+//
+// Output range: when the input row's squared norm sits in the
+// `q16_rsqrt` LUT domain (0, 32.0], the per-element output is bounded
+// in `[-ONE_Q16_16, ONE_Q16_16]` within the LUT's truncation tolerance.
+// For pooled queries emitted by the layer-normalized encoder (per-dim
+// magnitude ≈ 1/sqrt(seq_len), squared norm ≈ ENCODER_HIDDEN / seq_len
+// at the median STARGA agent-CLI workload ≈ 256/340 ≈ 0.75), the
+// squared norm lands well within the LUT domain. Routes that would
+// otherwise produce squared norms above 32.0 in Q16.16 saturate to the
+// LUT boundary entry; the cosine score remains deterministic but loses
+// magnitude precision, which is the documented trade-off the calibrated
+// reference checkpoint (trained with the InfoNCE cosine-similarity
+// contrastive objective) is responsible for preventing.
+//
+// Backwards-soft note: this function is only invoked when
+// COSINE_SCORING_ENABLED == 1 at compile time; under the default it is
+// dead code, mindc dead-code-eliminates the body, and the binary stays
+// byte-identical to today.
+@[determinism(BitIdentical)]
+@[reduction_order(Pinned)]
+pub fn l2_normalize_pooled(
+    pooled: tensor<Q16_16, [batch, ENCODER_HIDDEN]>,
+) -> tensor<Q16_16, [batch, ENCODER_HIDDEN]>
+{
+    let bsz: usize = pooled.len();
+    let h:   usize = ENCODER_HIDDEN as usize;
+    let mut out: tensor<Q16_16, [bsz, ENCODER_HIDDEN]> = [[0_i32; ENCODER_HIDDEN]; bsz];
+
+    let mut b: usize = 0;
+    while b < bsz {
+        let row: &[Q16_16] = &pooled[b];
+        let sq_norm:  Q16_16 = q16_dot_pinned(row, row);
+        let guarded:  Q16_16 = q16_add(sq_norm, Q16_LAYERNORM_EPSILON);
+        let inv_norm: Q16_16 = q16_rsqrt(guarded);
+        let mut d: usize = 0;
+        while d < h {
+            out[b][d] = q16_mul(row[d], inv_norm);
             d = d + 1;
         }
         b = b + 1;

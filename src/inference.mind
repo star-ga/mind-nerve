@@ -19,6 +19,7 @@ use crate::mind_nerve::{
     K_COARSE_MULTIPLIER,
     QUERY_PREFIX_TOKENS,
     QUERY_PREFIX_LEN,
+    COSINE_SCORING_ENABLED,
     ATTESTATION_VERSION,
     ATTESTATION_BYTES,
     NUMERICS_WIRE_VERSION,
@@ -332,8 +333,33 @@ pub fn preselect_pre_tokenized(
     //     so the model.mind signatures (which carry the batch axis on the
     //     public surface for Phase 2 compatibility) stay typed.
     let token_ids: tensor<u32, [1, effective_tokens.len()]> = [effective_tokens.clone()];
-    let enc_out      = model::encoder(token_ids, weights.encoder);
-    let pooled_query = model::mean_pool_seq(enc_out);
+    let enc_out             = model::encoder(token_ids, weights.encoder);
+    let pooled_query_raw    = model::mean_pool_seq(enc_out);
+
+    // (4a-pre) RFC-010: L2-normalize the pooled query for the cosine-
+    //          similarity scoring head. Route embeddings are pre-
+    //          normalized offline by the catalog-builder pipeline so
+    //          the route side carries zero hot-path cost. The resulting
+    //          score `<query / ||query||, route / ||route||>` is the
+    //          cosine of the angle between them, bounded in
+    //          `[-ONE_Q16_16, ONE_Q16_16]` within `q16_rsqrt` LUT
+    //          truncation tolerance. RFC-002's per-route log-frequency
+    //          prior (added below in step 4b) calibrates against this
+    //          bounded cosine range when the catalog-builder ships a
+    //          cosine-trained .cat file. With the backwards-soft
+    //          default `COSINE_SCORING_ENABLED = 0` the compile-time
+    //          predicate is statically false, the L2-normalize branch
+    //          is dead code, mindc constant-folds the dispatch to the
+    //          raw `mean_pool_seq` output, and the binary stays byte-
+    //          identical to today until a cosine-objective-trained
+    //          reference checkpoint (paired with a pre-normalized route
+    //          catalog) binds `COSINE_SCORING_ENABLED = 1` into
+    //          `model_hash`.
+    let pooled_query = if COSINE_SCORING_ENABLED == 1u32 {
+        model::l2_normalize_pooled(pooled_query_raw)
+    } else {
+        pooled_query_raw
+    };
 
     // (4a) RFC-008: Matryoshka coarse-to-fine cascade. When the
     //      backwards-soft default `MATRYOSHKA_COARSE_DIM ==

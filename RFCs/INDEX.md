@@ -2202,6 +2202,38 @@ step) produces byte-identical results to today, so the v2 loader can
 ship with the normalization step ungated as a no-op until the trained
 checkpoint arrives.
 
+**Status:** IMPLEMENTED at exp13 — `src/lib.mind` adds a backwards-soft
+compile-time constant `pub const COSINE_SCORING_ENABLED: u32 = 0` (bound
+into `model_hash` via the model manifest header). `src/model.mind` adds
+a public `l2_normalize_pooled(pooled: tensor<Q16_16, [batch,
+ENCODER_HIDDEN]>) -> tensor<Q16_16, [batch, ENCODER_HIDDEN]>` function
+that composes only existing pinned primitives — per-row `q16_dot_pinned(row,
+row)` self-dot for the squared norm, `q16_add` with `Q16_LAYERNORM_EPSILON`
+as the zero-vector guard, `q16_rsqrt` for the inverse norm, and an
+ascending-d `q16_mul(row[d], inv_norm)` elementwise rescale — with the
+batch axis iterated outer-to-inner and the hidden axis pinned by the
+inner sequential loop; the function carries `@[determinism(BitIdentical)]`
+and `@[reduction_order(Pinned)]`. The imports section of `src/model.mind`
+now pulls `q16_rsqrt` and `Q16_LAYERNORM_EPSILON` alongside the existing
+`q16_dot_pinned`/`q16_mul`/`q16_add` primitives. `src/inference.mind`
+imports `COSINE_SCORING_ENABLED` and threads a compile-time-resolvable
+predicate `if COSINE_SCORING_ENABLED == 1u32` between `mean_pool_seq` and
+the RFC-008 Matryoshka cascade: the truthy branch substitutes
+`model::l2_normalize_pooled(pooled_query_raw)` for the raw pooled query;
+the falsy branch falls through to the raw pooled query unchanged. With
+the backwards-soft default the predicate is statically false, mindc
+constant-folds the dispatch back to the pre-RFC-010 `mean_pool_seq`
+output, the L2-normalize branch is dead code, and the binary stays
+byte-identical to today until a cosine-objective-trained reference
+checkpoint (paired with a pre-normalized route catalog produced offline
+by the catalog-builder) binds `COSINE_SCORING_ENABLED = 1` into
+`model_hash`. RFC-002's per-route additive prior continues to compose
+cleanly with the cascade output regardless of which branch produced
+the logits; catalog-builder calibration of the prior column against
+the bounded cosine range `[-ONE_Q16_16, ONE_Q16_16]` is the load-bearing
+training-pipeline change that lands in lockstep with the
+COSINE_SCORING_ENABLED flip.
+
 ---
 
 # RFC-011 — ALiBi attention bias for position-aware sliding-window encoding
@@ -3768,6 +3800,24 @@ incrementally without coordination because the resulting weights
 are byte-compatible with the existing mind-nerve inference path
 (only the byte values inside the weights file change, and
 `model_hash` updates correspondingly).
+
+**Status:** SKIPPED — Training/catalog-builder-side only. The RFC's
+own one-sentence summary commits to "without touching the mind-nerve
+inference path or the on-disk `.cat` / `.weights` formats"; the
+discipline lives entirely inside the catalog-builder pipeline that
+selects which (query, route) pairs to contrast during InfoNCE
+training. Bit-identity of the inference path is preserved trivially:
+mind-nerve consumes the same Q16.16 weights file regardless of how
+the weights were trained, and `model_hash` updates correspondingly
+when the catalog-builder ships a positive-aware-trained reference
+checkpoint. Belongs in the catalog-builder repo alongside RFC-004
+(deprecated by RFC-010), RFC-017 (synthetic-query augmentation),
+RFC-018 (AnglE loss), RFC-019 (cluster-aware in-batch negatives),
+and the rest of the training-discipline cohort. The
+inference-pipeline surface this RFC implicitly relies on
+(unnormalized-dot-product or RFC-010 cosine scoring head, RFC-002
+additive prior, RFC-008 Matryoshka cascade) is already shipped or
+gated.
 
 ---
 

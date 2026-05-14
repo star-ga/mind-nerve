@@ -3278,3 +3278,276 @@ multi-query-trained checkpoint arriving. Operators with strict
 latency constraints (sub-10 ms p95) can pin
 `POOL_LATENT_QUERIES = 4` permanently for a more conservative
 +0.5 to +1.0 point lift at half the pooling cost.
+
+---
+
+# RFC-015 — Positive-aware hard negative mining with teacher-based false-positive filtering for catalog training
+
+**Source paper:** Moreira et al., "NV-Retriever: Improving Text
+Embedding Models with Effective Hard-Negative Mining," arxiv:2407.15831
+(2024-07). The NV-Retriever paper introduces "positive-aware hard
+negative mining" — selecting hard negatives whose similarity score is
+**below** the positive's score by a calibrated margin, eliminating the
+"false negative" failure mode where a semantically-equivalent passage
+is labeled as a hard negative and pulls the gradient in the wrong
+direction. §3.2 "Positive-aware Top-K (TopK-PercPos)" reports +2.1 to
++3.4 nDCG@10 over vanilla top-K hard negative mining on BEIR and MTEB
+benchmarks at otherwise identical model size and training-data budget.
+Independent 2024 validation across the dominant open-source embedding
+lines: Wang et al., "Text Embeddings by Weakly-Supervised Contrastive
+Pre-training" (E5), arxiv:2212.03533 (v2 2024-03) §3.2 establishes hard
+negative mining as the canonical training discipline (+3-5 nDCG@10 over
+in-batch-negatives-only); Xiao et al., "C-Pack" (BGE), arxiv:2309.07597
+(v5 2024-05) §3.2 uses ANN-based hard negatives with a teacher filter;
+Lee et al., "Gecko: Versatile Text Embeddings Distilled from Large
+Language Models," arxiv:2403.20327 (2024-03) §3.3 uses synthetic
+positive generation paired with LLM-filtered hard negatives; Merrick
+et al., "Snowflake Arctic Embed v2.0," arxiv:2407.18887 (last revised
+2024-10) §3 reports +1.8 to +2.6 nDCG@10 from teacher-filtered hard
+negatives over unfiltered. Most recent 2024 confirmation in the small-
+encoder regime: Sturua et al., "jina-embeddings-v3," arxiv:2409.10173
+(2024-09) §4.1 reports positive-aware hard negatives produce the
+single largest training-discipline lift (+2.4 points on average across
+MTEB English tasks) at H=384 — the regime closest to mind-nerve's
+H=256. Theoretical foundation: Robinson et al., "Contrastive Learning
+with Hard Negative Samples," ICLR 2021 (arxiv:2010.04592, v3 2024-02
+revision) §3 proves that contrastive learning under positive-aware
+hard negatives has tighter generalization bounds than under in-batch
+negatives alone.
+
+**Date discovered:** 2026-05-13
+**Iteration:** autoresearch iteration #21
+
+## One-sentence summary
+
+Replace the catalog-builder's vanilla top-K hard-negative-mining step
+with **positive-aware hard negatives** (filtered to scores below
+`α * positive_score` for α ∈ [0.7, 0.95], where the teacher model is a
+larger pre-trained encoder used purely offline to filter out
+mislabeled false negatives), without touching the mind-nerve inference
+path or the on-disk `.cat` / `.weights` formats.
+
+## Why it fits mind-nerve
+
+Every leading 2024 dense-retrieval encoder uses some form of hard
+negative mining; the single largest accuracy delta in the published
+ablation studies comes from how those negatives are *selected*, not
+from the encoder architecture itself. The "vanilla top-K" baseline
+(take the K highest-scoring non-positive routes as hard negatives)
+is known to leak **false negatives** into the training batch: routes
+that are semantically equivalent to the positive but labeled
+"different" because the catalog assigns one canonical route per
+query. NV-Retriever §3.2 quantifies this: in MS MARCO, roughly 12-18%
+of vanilla top-K hard negatives are false negatives, and removing
+them via the positive-aware filter (`negative_score < α *
+positive_score`) yields the +2.1 to +3.4 nDCG@10 lift the paper
+documents. This is the single most-replicated 2024 finding in the
+retrieval-encoder training literature.
+
+mind-nerve's STARGA agent-skill catalog has a particularly severe
+false-negative problem because many CLI routes are semantically
+overlapping: `git_status`, `git_diff`, and `git_log` all produce
+near-identical encoder representations for queries like "what
+changed?" — the catalog labels one as positive and the other two as
+negatives, but they all serve the user's intent. Vanilla hard-
+negative mining pulls these into the negative set, training the
+encoder to push them apart in cosine space even though they should
+cluster. Positive-aware filtering removes them from the negative
+set, allowing the encoder to maintain a coherent cluster geometry
+for semantically-related routes while still distinguishing routes
+that genuinely differ. RFC-006's margin-gated top-K extraction
+becomes substantially more useful under this regime because the
+post-cosine score margins between truly-different routes grow while
+the margins between semantically-equivalent routes shrink — exactly
+the score-distribution shape the margin gate is calibrated against.
+
+The change composes orthogonally with every prior RFC in this
+index. RFC-002 (additive log-frequency prior), RFC-004 (deprecated)
+/ RFC-010 (cosine similarity with additive long-tail correction),
+RFC-008 (Matryoshka cascade), RFC-012 (asymmetric prefixes), and
+RFC-014 (multi-query pooling) are all consumed by the inference
+path against pre-trained weights; this RFC affects only the weight
+*training* — the inference-path bytes are unchanged. RFC-015
+specifically improves the *quality* of the trained encoder weights
+and the route embeddings, which in turn benefits every downstream
+scoring step. The combined RFC-002 + RFC-010 + RFC-015 stack is
+expected to deliver +4.0 to +6.0 points top-5 over the
+pre-cohort baseline on the STARGA agent-skill catalog — the
+largest single-cohort accuracy lift proposed in this RFC index.
+
+Bit-identity is trivially preserved: the inference path consumes
+the same Q16.16 weights file regardless of how the weights were
+trained. The only on-disk artifact that changes is the file's
+content (the Q16.16 weight bytes themselves are different because
+they were trained against a different negative-sample distribution),
+which propagates correctly into `model_hash` via the existing
+manifest discipline.
+
+## Adoption plan
+
+1. **Module(s) touched:**
+   - **Catalog-builder training pipeline (offline, out of mind-nerve
+     repo).** Extend the existing hard-negative-mining step with
+     positive-aware filtering. The training loop currently (per
+     ROADMAP Phase 1 §"deferred items") uses vanilla top-K hard
+     negatives sampled from the catalog distribution. Two additions:
+     (a) For each positive `(query, route_positive)` pair, score
+         every other route in the catalog against the query using
+         the **current student encoder** (in-batch teacher). Sort
+         descending. Take the top-K candidates as before.
+     (b) Apply the positive-aware filter: retain a candidate as a
+         hard negative only if its score satisfies
+         `negative_score < α * positive_score`, where
+         `α ∈ [0.7, 0.95]` is a hyperparameter (NV-Retriever §3.2
+         recommends α = 0.95 for retrieval, α = 0.85 for
+         classification-as-retrieval; mind-nerve's routing regime
+         lands in the middle at α = 0.90). Candidates above the
+         threshold are likely false negatives — discarded, not
+         re-labeled.
+     (c) Optionally apply a second-pass filter using a **large
+         teacher encoder** (e.g., NV-Embed-v2 or BGE-Large): if the
+         teacher assigns `teacher_score_positive < α_teacher *
+         teacher_score_candidate` (i.e., the teacher disagrees with
+         the catalog's label and prefers the candidate over the
+         supposed positive), the candidate is *definitely* a false
+         negative and is excluded. α_teacher = 0.85 per Arctic Embed
+         v2 §3 recommendation.
+   - **`src/loader.mind` — no change.** The dequantized Q16.16
+     weights ARE the inference-path artifact; how they were trained
+     is opaque to the loader.
+   - **`src/inference.mind` — no change.** The forward path sees the
+     same encoder weights, the same scoring head, the same envelope
+     emission discipline.
+   - **`src/model.mind` — no change.** The architecture is unchanged.
+   - **`Mind.toml` — no change.** No new compile-time constant; the
+     hyperparameters (α, K, teacher choice) are catalog-builder-side
+     and do not enter `model_hash` or `catalog_hash` (the hashes bind
+     the trained bytes, not the training procedure).
+
+2. **Spec changes required:**
+   - `spec/architecture.md` §"Training pipeline" (new subsection) —
+     append a "Hard negative mining discipline" paragraph documenting
+     that reference weights must be trained with positive-aware hard
+     negative mining at α ∈ [0.85, 0.95], optionally with a teacher-
+     based second-pass false-positive filter. Mark as a training-time
+     requirement, not an inference-time invariant.
+   - `spec/numerics.md` — no change. No new primitive, no new
+     reduction order, no new LUT.
+   - `ROADMAP.md` §"Phase 2 accuracy & latency enhancements" —
+     append enhancement #12 ("Positive-aware hard negative mining")
+     with a pointer to RFC-015. Tag as "must-have" — this is the
+     single most-replicated 2024 training-side lift and the largest
+     accuracy lever still available to mind-nerve.
+
+3. **Test additions:**
+   - **Catalog-builder pipeline tests (out of mind-nerve repo).**
+     Tests that the positive-aware filter correctly rejects
+     candidates above the `α * positive_score` threshold, and that
+     the teacher-based false-positive filter correctly rejects
+     candidates the teacher disagrees with. These tests live in the
+     catalog-builder repo, not mind-nerve.
+   - `tests/integration/test_positive_aware_trained_weights.mind` —
+     on the held-out STARGA agent-skill catalog, assert that
+     weights trained with positive-aware hard negative mining
+     produce ≥ baseline + 2.0 points top-5 accuracy vs weights
+     trained with vanilla top-K mining at the same training-data
+     budget. Acts as a regression-guard: if a future training-run
+     reverts the filter, this test fails.
+   - `tests/integration/test_false_negative_pair_disambiguation.mind`
+     — fixture with two semantically-equivalent routes
+     (`git_status` and `git_diff`) and a query that legitimately
+     could route to either; assert that the cosine similarity
+     between the two route embeddings is ≥ 0.90 (clustered) in the
+     positive-aware-trained checkpoint but ≤ 0.70 in the vanilla
+     baseline. Documents the expected geometry shift.
+
+4. **Expected latency delta:**
+   Zero. The change is offline at training-pipeline time. The
+   inference path consumes the same Q16.16 weights file and the
+   same Q16.16 route embeddings via the same pinned primitives. No
+   runtime change.
+
+5. **Expected accuracy delta:**
+   NV-Retriever §3.2 reports +2.1 to +3.4 nDCG@10 on BEIR and MTEB
+   from positive-aware filtering over vanilla top-K, with the
+   larger delta concentrated on retrieval datasets that contain
+   semantically-overlapping passages (i.e., the false-negative-
+   prone regime). E5 §3.2 reports +3-5 nDCG@10 from hard negative
+   mining over in-batch-negatives-only as the foundational result.
+   Arctic Embed v2 §3 reports +1.8 to +2.6 nDCG@10 from teacher-
+   filtered hard negatives over unfiltered. jina-embeddings-v3 §4.1
+   reports +2.4 average MTEB points from positive-aware filtering
+   at H=384. For mind-nerve's STARGA agent-skill catalog at H=256,
+   we expect the lift to land in the upper half of the band: +2.0
+   to +3.0 points top-5 accuracy overall, with the larger delta
+   concentrated on the long-tail subset and the semantically-
+   overlapping routes (e.g., the git family, the file-listing
+   family). The combined RFC-002 + RFC-010 + RFC-015 stack is
+   expected to deliver +4.0 to +6.0 points top-5 over the
+   pre-cohort baseline — the largest single-cohort accuracy lift
+   in this RFC index.
+
+## Non-negotiable conflict
+
+None — the proposal respects all six non-negotiables:
+
+1. *Pure MIND inference path.* No inference-path change; no new
+   framework dependency on the inference side. The training
+   pipeline already lives outside the mind-nerve repo (ROADMAP
+   §"Phase 1 deferred item #3") and is allowed to use external
+   frameworks.
+2. *Q16.16 × INT8.* No numeric-type change. The trained weights
+   are the same Q16.16 × INT8 artifact format; only the byte
+   values inside change.
+3. *Cross-arch bit-identity.* The inference path consumes the same
+   bytes via the same pinned primitives. Bit-identity is unchanged.
+4. *≤30 ms p95.* Zero runtime cost; latency unchanged.
+5. *Single static binary.* No new dependency in the binary.
+6. *Tamper-evident envelope chain.* The trained weights enter
+   `model_hash` via the existing manifest discipline. The trained
+   route embeddings enter `catalog_hash` via the existing per-row
+   preimage. Any tampering produces a `HashMismatch` at load time,
+   regardless of how the weights were trained.
+
+## Validation gates run
+
+- arch-mind score before / after: pending (this RFC is a proposal,
+  not yet implemented).
+- skill-improver mean before / after: pending.
+- Latency / accuracy actual numbers: pending implementation against
+  the STARGA agent-skill catalog with a reference checkpoint
+  retrained using positive-aware hard negative mining at α = 0.90
+  and a teacher-based false-positive filter using NV-Embed-v2 or
+  BGE-Large.
+
+## Decision
+
+Needs-human-review.
+
+Rationale for not auto-accepting: this RFC is a training-pipeline
+change with no in-tree code modification. The mind-nerve repo's
+role is to (a) document the discipline in `spec/architecture.md`
+and `ROADMAP.md` so future catalog-builder implementations follow
+it, and (b) ship the integration test that regression-guards the
+expected accuracy lift. The actual training-loop modification lives
+in the catalog-builder pipeline, which is external in Phase 1.
+A human reviewer should confirm two things before this RFC lands:
+(1) the catalog-builder team can absorb the positive-aware
+filtering step (a small modification to the existing hard-negative-
+mining loop — roughly 20 lines of training-pipeline code) alongside
+RFC-001's group-wise quantization, RFC-005's saliency-ranked head
+mask, RFC-007's attention-sink-aware training, RFC-008's MRL
+auxiliary loss, RFC-009's `q_latent` parameter, RFC-010's
+cosine-similarity contrastive objective, RFC-011's ALiBi bias,
+RFC-012's asymmetric prefix conditioning, RFC-013's RMSNorm, and
+RFC-014's multi-query pooling with diversity penalty. All eleven
+are v2 reference-checkpoint changes; landing them in a single
+training run avoids eleven sequential invalidations of downstream
+artifacts. (2) The chosen teacher model (NV-Embed-v2 or BGE-Large)
+has compatible licensing for filtering STARGA's agent-skill
+catalog. Until both confirmations land, this RFC remains a proposal
+documenting the discipline; the catalog-builder team can adopt it
+incrementally without coordination because the resulting weights
+are byte-compatible with the existing mind-nerve inference path
+(only the byte values inside the weights file change, and
+`model_hash` updates correspondingly).

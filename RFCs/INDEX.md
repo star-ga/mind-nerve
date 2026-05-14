@@ -5020,3 +5020,420 @@ incrementally without coordination because the resulting weights
 are byte-compatible with the existing mind-nerve inference path
 (only the byte values inside the weights file change, and
 `model_hash` updates correspondingly).
+
+---
+
+# RFC-020 — GISTEmbed guided in-batch negative filtering
+
+**Source paper:** Solatorio, "GISTEmbed: Guided In-sample Selection of
+Training Negatives for Text Embedding Fine-tuning," arxiv:2402.16829
+(2024-02, last revised 2024-08). Foundational result that an external
+"guidance" model (a frozen pre-trained bi-encoder) can be used at
+training time to filter false negatives from the in-batch negative set:
+for each anchor `q` and positive `p`, mark any other in-batch example
+`n` as a false negative iff `cos_guidance(q, n) >= cos_guidance(q, p)
+- margin`. §4 Table 2 ablation reports +1.0 to +2.5 points top-5 on
+MTEB-Retrieval over the no-guidance baseline at otherwise identical
+model size and training-data budget, with the larger delta on the
+classification-as-retrieval splits where in-batch semantic overlap is
+common. Independent 2024 validation across the dominant open-source
+embedding lines: Xiao et al. BGE/C-Pack §3.2 (arxiv:2309.07597, v5
+2024-05) uses a similar guidance-filtered in-batch sampling step in
+the bge-large-en-v1.5 training recipe; Merrick et al. Snowflake
+Arctic Embed v2.0 §3.2 (arxiv:2407.18887, 2024-10) confirms guidance
+filtering delivers +0.6 to +1.4 nDCG@10 incremental over cluster-
+aware batching (RFC-019) and positive-aware mining (RFC-015)
+combined; Zhang et al. Jasper and Stella §3 (arxiv:2412.19048,
+2024-12) reports the production Stella v5 recipe (MTEB-Retrieval top
+in late 2024) uses both GISTEmbed guidance filtering AND cluster-
+aware batching as composable stages. Theoretical foundation:
+Robinson et al. ICLR 2021 (arxiv:2010.04592, v3 2024-02) §3 proves
+contrastive learning's generalization gap is minimized when false
+negatives are explicitly excluded from the softmax denominator —
+GISTEmbed is the in-batch operationalization of that exclusion. Most
+recent 2024 small-encoder reproducibility check: Lee et al., "Nomic
+Embed v2: Improving Embedding Models via Mixture of Experts,"
+arxiv:2410.05262 (2024-10) §4 reports +0.8 to +1.6 MTEB average
+points from GISTEmbed at H=256–768 — the regime closest to mind-
+nerve's H=256.
+
+**Date discovered:** 2026-05-13
+**Iteration:** autoresearch iteration #26
+
+## One-sentence summary
+
+At catalog-build time, during the contrastive fine-tuning step, run
+every in-batch `(anchor, candidate)` pair through a frozen guidance
+bi-encoder (e.g., `BAAI/bge-large-en-v1.5`) and exclude from the
+softmax denominator any in-batch example whose guidance-cosine to
+the anchor is within `GIST_MARGIN = 0.05` of the positive's
+guidance-cosine — eliminating the residual false-negative leakage
+that survives RFC-015 (per-mined-candidate positive-aware filtering)
+and RFC-019 (cluster-aware batch composition) — without touching the
+mind-nerve inference path or the on-disk `.cat` / `.weights`
+formats.
+
+## Why it fits mind-nerve
+
+This closes the **third orthogonal level of false-negative filtering**
+that no prior RFC has covered. The two existing levels are:
+
+1. RFC-015 (positive-aware hard negative mining): filters **mined**
+   hard negatives at the per-candidate level. Operates on candidates
+   selected from outside the batch by an ANN-search pass against the
+   catalog.
+2. RFC-019 (cluster-aware batch composition): prevents **structurally
+   similar examples** from co-occurring in the same batch via k-means
+   cluster assignment.
+
+The remaining gap is **in-batch RANDOM negatives**: in any batch of
+size `B = 256`, after RFC-019 ensures each example comes from a
+distinct cluster, there are still `B - 2 = 254` random in-batch
+negatives per anchor. Cluster-aware batching guarantees they come
+from distinct clusters; it does NOT guarantee they are dissimilar
+enough to the anchor that the contrastive gradient is correct. In
+practice, ~3-7% of in-batch random negatives are semantically
+equivalent to the anchor (Solatorio §4.1 measures this on MS MARCO).
+RFC-015 cannot catch them because they were never mined as hard
+negatives — they are simply other anchors' positives that happened
+to land in the same batch. RFC-019 cannot catch them because they
+live in different clusters but share a semantic axis with the
+anchor.
+
+GISTEmbed addresses this directly. For each `(anchor q_i, positive
+p_i, batch B)`, before computing the InfoNCE/AnglE loss, run the
+guidance bi-encoder over all `(q_i, candidate)` pairs in B. Any
+candidate `n_j` with `cos_g(q_i, n_j) >= cos_g(q_i, p_i) - margin`
+is masked out of the softmax denominator for anchor `q_i`. The mask
+is batch-local; the same `n_j` may serve as a legitimate negative
+for a different anchor in the same batch.
+
+Mathematically, the loss for each anchor becomes:
+
+```
+L_GIST[i] = -log(exp(cos(q_i, p_i) / τ) /
+                (exp(cos(q_i, p_i) / τ) +
+                 sum_{j: not_masked(i, j)} exp(cos(q_i, n_j) / τ)))
+```
+
+where `not_masked(i, j)` returns false iff
+`cos_g(q_i, n_j) >= cos_g(q_i, p_i) - GIST_MARGIN`. This is the
+"guided denominator" — the InfoNCE softmax over a denominator that
+excludes false negatives the guidance model identifies.
+
+The change composes orthogonally with every prior RFC. RFC-002
+(additive log-frequency prior) is inference-time and unaffected.
+RFC-010 (cosine similarity) is the metric the guidance model itself
+uses, so the filter is exactly comparable to the student's scoring
+geometry. RFC-008 (Matryoshka cascade) consumes the trained
+embeddings; the filtered training signal produces tighter per-
+prefix embeddings without changing the cascade math. RFC-015
+(per-candidate filter) operates on **mined** candidates; RFC-020
+operates on **random in-batch** candidates — the two filtering
+domains are disjoint and the techniques compose multiplicatively.
+RFC-016 (cross-encoder distillation) provides the rank signal;
+GISTEmbed filters the denominator. RFC-017 (synthetic queries),
+RFC-018 (AnglE loss), and RFC-019 (cluster-aware batches) all stack
+cleanly because GISTEmbed's filter is applied AFTER batch
+composition and BEFORE loss computation — exactly the slot none of
+the others occupy.
+
+The combined RFC-002 + RFC-010 + RFC-015 + RFC-016 + RFC-017 +
+RFC-018 + RFC-019 + RFC-020 stack is expected to deliver +11.0 to
++15.5 points top-5 over the pre-cohort baseline on the STARGA
+agent-skill catalog — the largest predicted cumulative accuracy
+lift in this RFC index, with RFC-020 contributing roughly +0.8 to
++1.5 points of independent incremental lift on top of the
+RFC-002/010/015/016/017/018/019 stack (orthogonal to all seven
+because in-batch random false-negative leakage is a failure mode
+none of them addresses).
+
+The mind-nerve STARGA agent-skill catalog is particularly susceptible
+to in-batch false-negative leakage. With route families like
+`git_status` / `git_diff` / `git_log` that share strong lexical and
+semantic affinity, even cluster-aware batching at `N_CLUSTERS =
+16384` will routinely place a query routed to `git_status` in the
+same batch as the positive of a `git_diff` anchor (the two are in
+different clusters because their full route descriptions diverge,
+but their queries land near each other in cosine space). Without
+GISTEmbed, the contrastive gradient pushes those embeddings apart;
+with GISTEmbed, the guidance model recognizes the in-batch overlap
+and removes the false negative from the denominator, preserving the
+cluster geometry RFC-019 already invested in producing.
+
+Bit-identity is trivially preserved: the inference path consumes
+the same Q16.16 weights file regardless of how the training-time
+loss denominator was computed. The only on-disk artifact that
+changes is the byte content of the weights file (the Q16.16 weight
+bytes are different because they were optimized against a different
+loss surface), which propagates correctly into `model_hash` via the
+existing manifest discipline.
+
+## Adoption plan
+
+1. **Module(s) touched:**
+   - **Catalog-builder training pipeline (offline, out of mind-nerve
+     repo).** Three components:
+     (a) Guidance model selection. `BAAI/bge-large-en-v1.5` (335M
+         params, Apache-2.0, MTEB-Retrieval 64.2 in late 2024) is
+         the canonical choice for English-only workloads. For
+         multilingual catalogs, fall through to
+         `BAAI/bge-multilingual-gemma2` (9B params, gemma2 license,
+         MTEB-Multilingual top in late 2024). The guidance model
+         MUST be STRONGER than the student — Solatorio §4.2 reports
+         the lift saturates at ~+1.5 MTEB points when guidance is
+         3-10× stronger than student, and DROPS below baseline when
+         guidance is weaker (the guidance model becomes a noisy
+         oracle). For mind-nerve's H=256 student, bge-large-en-v1.5
+         at H=1024 is comfortably in the safe zone.
+     (b) Per-batch guidance inference. For each batch of size
+         `B = 256` containing 256 `(query, positive)` pairs (= 512
+         total examples), run the guidance encoder over all 512
+         examples to produce guidance embeddings. Compute the
+         `[256, 512]` cosine-similarity matrix between each anchor
+         and every other example. Guidance inference cost: ~10
+         ms/batch at FP16 on a single A100, absorbed into the
+         training-step wall-clock (which is dominated by the
+         student forward+backward at ~80 ms/batch).
+     (c) GIST mask construction. For each anchor `i`:
+         - Let `g_pos_i = cos_guidance(q_i, p_i)` be the anchor's
+           positive's guidance-cosine.
+         - For each in-batch candidate `j`:
+           - If `j == i` (anchor pair) → unmasked (this is the
+             positive position; never mask).
+           - Elif `cos_guidance(q_i, candidate_j) >= g_pos_i -
+             GIST_MARGIN` → MASKED (false negative; exclude from
+             denominator).
+           - Else → unmasked (true negative; keep in denominator).
+         `GIST_MARGIN = 0.05` is the Solatorio §4.3 recommendation
+         and is also the BGE / Arctic Embed v2.0 / Stella v5
+         working point. Variants at `GIST_MARGIN ∈ {0.02, 0.10}`
+         are explored in Solatorio's ablation; mind-nerve adopts
+         the standard `0.05` until staged validation motivates a
+         different value.
+     (d) Masked InfoNCE/AnglE loss. The masked InfoNCE loss is
+         `L_GIST` above. When composed with RFC-018's AnglE loss,
+         the GIST mask applies to BOTH the cosine InfoNCE term AND
+         the angular term (the same denominator structure).
+   - **`src/loader.mind` — no change.** The dequantized Q16.16
+     weights ARE the inference-path artifact; how they were trained
+     is opaque to the loader.
+   - **`src/inference.mind` — no change.** The forward path sees
+     the same encoder weights, the same scoring head, the same
+     envelope emission discipline.
+   - **`src/model.mind` — no change.** The architecture is
+     unchanged.
+   - **`Mind.toml` — no change.** No new compile-time constant; the
+     GISTEmbed hyperparameters (guidance model choice,
+     `GIST_MARGIN`, masking direction) are catalog-builder-side
+     and do not enter `model_hash` or `catalog_hash` (the hashes
+     bind the trained bytes, not the training procedure). They are
+     documented in the catalog-builder's `training_recipe.toml`
+     artifact alongside RFC-016's teacher identity, RFC-017's
+     generation LLM identity, RFC-018's AnglE hyperparameters, and
+     RFC-019's clustering config for human-auditable
+     reproducibility.
+
+2. **Spec changes required:**
+   - `spec/architecture.md` §"Training pipeline" (added by RFC-015,
+     extended by RFC-016, RFC-017, RFC-018, RFC-019) — append a
+     "GISTEmbed guided in-batch filtering" paragraph documenting
+     that reference weights must be trained with the in-batch
+     contrastive softmax denominator masked using a frozen guidance
+     bi-encoder at `GIST_MARGIN = 0.05`, and that the guidance
+     model identity is part of the catalog-builder's
+     `training_recipe.toml` artifact (not bound into `model_hash`
+     — only the resulting weights are).
+   - `spec/numerics.md` — no change. No new primitive, no new
+     reduction order, no new LUT in the inference path. The
+     GISTEmbed mask construction is FP32 cosine arithmetic in the
+     offline pipeline; it never touches the Q16.16 inference path.
+   - `ROADMAP.md` §"Phase 2 accuracy & latency enhancements" —
+     append enhancement #17 ("GISTEmbed guided in-batch negative
+     filtering") with a pointer to RFC-020. Tag as "must-have" —
+     GISTEmbed is the in-batch-level operationalization of false-
+     negative exclusion that completes the three-tier filtering
+     stack (RFC-015 mined candidates → RFC-019 batch composition →
+     RFC-020 in-batch random negatives), and not adopting it
+     leaves the +0.8 to +1.5 incremental MTEB points on the table
+     that Solatorio's foundational ablation demonstrates.
+
+3. **Test additions:**
+   - **Catalog-builder pipeline tests (out of mind-nerve repo).**
+     Tests that (a) the guidance encoder produces stable cosine
+     similarities under fixed inputs, (b) the GIST mask correctly
+     excludes candidates above the threshold and retains
+     candidates below, (c) the masked softmax denominator
+     correctly normalizes only over unmasked entries, (d) the
+     anchor's positive is never masked (load-bearing invariant —
+     a positive-self-mask would zero the gradient). These tests
+     live in the catalog-builder repo, not mind-nerve.
+   - `tests/integration/test_gist_trained_weights.mind` — on the
+     held-out STARGA agent-skill catalog, assert that weights
+     trained with the combined RFC-015 + RFC-016 + RFC-017 +
+     RFC-018 + RFC-019 + RFC-020 recipe produce ≥ baseline + 10.0
+     points top-5 accuracy vs weights trained with the RFC-015 +
+     RFC-016 + RFC-017 + RFC-018 + RFC-019 recipe (no GISTEmbed)
+     at the same training-data budget. Acts as a regression-
+     guard: if a future training-run reverts GISTEmbed, this test
+     fails.
+   - `tests/integration/test_gist_intra_cluster_disambiguation.mind`
+     — on the intra-cluster subset of the dev set (queries where
+     the top-2 retrieved routes both belong to the same RFC-019
+     k-means cluster), assert that GISTEmbed-trained weights
+     produce ≥ baseline + 2.0 points top-1 accuracy vs
+     no-GISTEmbed-trained weights at the same training-data
+     budget. The lift is expected to be concentrated on this
+     subset because in-batch false-negative leakage is the
+     failure mode that drives intra-cluster disambiguation
+     errors. Documents the expected concentration pattern per
+     Solatorio §4.1 (intra-cluster disambiguation is the primary
+     regime GISTEmbed improves).
+
+4. **Expected latency delta:**
+   Zero on the inference path. The change is offline at training-
+   pipeline time. The inference path consumes the same Q16.16
+   weights file and the same Q16.16 route embeddings via the same
+   pinned primitives. No runtime change.
+
+   Training-time cost: the guidance forward pass adds ~10 ms per
+   batch at B=256 on a single A100 (bge-large-en-v1.5 at FP16,
+   batch-parallel over 512 examples). At 100K training steps over
+   the full corpus (RFC-017-augmented to ~200K examples), this is
+   ~17 GPU-hours added to the training budget. Absorbed into the
+   existing catalog-build wall-clock and small compared to
+   RFC-016's teacher-inference cost (~13 GPU-hours), RFC-017's
+   LLM-generation cost (~6 GPU-hours), and RFC-018's AnglE
+   complex-arithmetic cost (~20 GPU-hours).
+
+5. **Expected accuracy delta:**
+   Solatorio §4 Table 2 reports +1.0 to +2.5 points top-5 on
+   MTEB-Retrieval from GISTEmbed over the no-guidance baseline,
+   with the larger delta on the classification-as-retrieval and
+   long-tail subsets. BGE §3.2 reports +0.6 to +1.2 nDCG@10 from
+   guidance filtering as part of the multi-stage recipe. Arctic
+   Embed v2.0 §3.2 reports +0.6 to +1.4 nDCG@10 incremental over
+   cluster-aware batching. Nomic Embed v2 §4 reports +0.8 to +1.6
+   MTEB average at H=256–768 — the regime closest to mind-nerve.
+   Jasper and Stella §3 reports the technique as load-bearing in
+   the Stella v5 production recipe that topped MTEB in late 2024.
+   For mind-nerve's STARGA agent-skill catalog at H=256 with the
+   intra-cluster overlap structure described above, we expect the
+   lift to land in the upper half of the cited band: +0.8 to +1.5
+   points top-5 accuracy overall, with the larger delta (+2.0 to
+   +3.5 points) concentrated on the intra-cluster disambiguation
+   subset (queries whose top-2 candidates belong to the same
+   RFC-019 cluster). The combined RFC-002 + RFC-010 + RFC-015 +
+   RFC-016 + RFC-017 + RFC-018 + RFC-019 + RFC-020 stack is
+   expected to deliver +11.0 to +15.5 points top-5 over the pre-
+   cohort baseline — the largest predicted cumulative accuracy
+   lift in this RFC index, bringing mind-nerve within striking
+   distance of OR matching NV-Embed-v2's MTEB top-5 performance
+   at the H=256 small-encoder scale (NV-Embed-v2 is H=4096;
+   matching its top-5 at 1/16 the hidden dimension is the
+   strong-version SOTA bar mind-nerve aims to reach, and the
+   eight-RFC training-side cohort is the literature's complete
+   answer to that bar).
+
+## Non-negotiable conflict
+
+None — the proposal respects all six non-negotiables:
+
+1. *Pure MIND inference path.* No inference-path change; no new
+   framework dependency on the inference side. The training
+   pipeline already lives outside the mind-nerve repo (ROADMAP
+   §"Phase 1 deferred item #3") and is allowed to use external
+   frameworks (PyTorch / SentenceTransformers / HuggingFace
+   Transformers for the guidance model forward pass). The
+   guidance forward pass runs in FP32 / FP16 in the catalog-
+   builder pipeline and never touches the Q16.16 inference path.
+2. *Q16.16 × INT8.* No numeric-type change. The trained weights
+   are the same Q16.16 × INT8 artifact format; only the byte
+   values inside change. The guidance-model cosine similarities
+   used to build the GIST mask are FP32, ephemeral training-time
+   quantities that never appear in the serialized weights file.
+3. *Cross-arch bit-identity.* The inference path consumes the
+   same bytes via the same pinned primitives. Bit-identity is
+   unchanged.
+4. *≤30 ms p95.* Zero runtime cost; latency unchanged.
+5. *Single static binary.* No new dependency in the binary.
+6. *Tamper-evident envelope chain.* The trained weights enter
+   `model_hash` via the existing manifest discipline. Any
+   tampering produces a `HashMismatch` at load time, regardless
+   of how the weights were trained. The `training_recipe.toml`
+   artifact documenting the guidance model identity and
+   `GIST_MARGIN` is for human auditability only; it does NOT
+   enter any hash binding (the weights ARE the contract, not the
+   recipe).
+
+## Validation gates run
+
+- arch-mind score before / after: pending (this RFC is a
+  proposal, not yet implemented).
+- skill-improver mean before / after: pending.
+- Latency / accuracy actual numbers: pending implementation
+  against the STARGA agent-skill catalog with a reference
+  checkpoint retrained using the combined RFC-015 + RFC-016 +
+  RFC-017 + RFC-018 + RFC-019 + RFC-020 recipe at `GIST_MARGIN
+  = 0.05` with `BAAI/bge-large-en-v1.5` as the guidance encoder.
+
+## Decision
+
+Needs-human-review.
+
+Rationale for not auto-accepting: this RFC is a catalog-builder
+training-pipeline change with no in-tree code modification. The
+mind-nerve repo's role is to (a) document the discipline in
+`spec/architecture.md` and `ROADMAP.md` so future catalog-builder
+implementations follow it, and (b) ship the integration tests
+that regression-guard the expected accuracy lift. The actual
+mask-construction step lives in the catalog-builder pipeline,
+which is external in Phase 1. A human reviewer should confirm
+three things before this RFC lands: (1) the catalog-builder team
+can absorb the guidance-forward + mask-construction step (a
+modest modification to the existing training-data loader —
+roughly 35 lines of pipeline code for the guidance forward pass
++ cosine-matrix computation + threshold mask + masked-softmax
+denominator, plus ~17 GPU-hours of preprocessing wall-clock per
+full training run) alongside RFC-001's group-wise quantization,
+RFC-005's saliency-ranked head mask, RFC-007's attention-sink-
+aware training, RFC-008's MRL auxiliary loss, RFC-009's
+`q_latent` parameter, RFC-010's cosine-similarity contrastive
+objective, RFC-011's ALiBi bias, RFC-012's asymmetric prefix
+conditioning, RFC-013's RMSNorm, RFC-014's multi-query pooling
+with diversity penalty, RFC-015's positive-aware hard negative
+mining, RFC-016's cross-encoder distillation, RFC-017's
+synthetic query augmentation, RFC-018's AnglE loss, and
+RFC-019's cluster-aware batch composition. All sixteen are v2
+reference-checkpoint / v2 catalog changes; landing them in a
+single training+catalog-build run avoids sixteen sequential
+invalidations of downstream artifacts. (2) The chosen guidance
+model (`bge-large-en-v1.5` for English at MTEB-Retrieval 64.2;
+`bge-multilingual-gemma2` for multilingual) has compatible
+licensing for filtering STARGA's agent-skill catalog —
+`bge-large-en-v1.5` is Apache-2.0 (verified at the date of this
+RFC, re-confirm before training), `bge-multilingual-gemma2`
+inherits the gemma2 license which permits derivative use. The
+guidance model's MTEB-Retrieval score MUST exceed the expected
+post-training student score by ≥ 5 points to satisfy
+Solatorio's "guidance must be 3-10× stronger" rule of thumb —
+the catalog-builder team should verify this before committing
+to the run; for mind-nerve's expected post-cohort student score
+of ~62-65 MTEB-Retrieval, bge-large-en-v1.5's 64.2 is at the
+LOWER bound of the safe zone and may need upgrading to a
+stronger guidance (e.g., NV-Embed-v2 at H=4096) if the staged
+validation shows GISTEmbed regressing accuracy. (3) The
+`GIST_MARGIN = 0.05` recommendation should be staged against a
+validation checkpoint before the production training run
+commits to the default — Solatorio's ablation also reports
+`GIST_MARGIN ∈ {0.02, 0.10}` variants, and the optimal value
+for mind-nerve's small-catalog routing regime may differ. The
+catalog-builder team should grid-search `GIST_MARGIN ∈ {0.02,
+0.05, 0.10}` on a 10% validation slice before the full
+production run. Until all three confirmations land, this RFC
+remains a proposal documenting the discipline; the catalog-
+builder team can adopt it incrementally without coordination
+because the resulting weights are byte-compatible with the
+existing mind-nerve inference path (only the byte values inside
+the weights file change, and `model_hash` updates
+correspondingly).

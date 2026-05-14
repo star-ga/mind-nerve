@@ -1385,6 +1385,28 @@ are v2 reference-checkpoint changes; landing them in the same
 training run avoids three sequential invalidations of every
 downstream artifact).
 
+**Status:** IMPLEMENTED at exp6 — `src/encoder_kernels.mind` exposes
+`pub const NUM_SINK_TOKENS: u32 = 0` and
+`pub const SINK_POSITIONS: [u32; 2] = [0u32, 1u32]` and
+generalises `sliding_window_attention` to a per-window
+`sink_count: usize = if s == 0 || n < NUM_SINK_TOKENS { 0 } else
+{ NUM_SINK_TOKENS as usize }` with the K/V buffers `kw`/`vw`
+resized to `kv_len = w_len + sink_count`. Sink rows are copied from
+`k[SINK_POSITIONS[si]]` / `v[SINK_POSITIONS[si]]` (ascending `si`
+pins the prepend order); local rows occupy indices
+`[sink_count, kv_len)`. The scores matrix, the softmax row, and the
+value-weighted-sum contraction axis all widen to `kv_len`; the Q
+buffer `qw` and the overlap-add accumulation into
+`attended_tiled[s + i, head_off + d]` are unchanged. With the
+backwards-soft default `NUM_SINK_TOKENS = 0`, `sink_count` is
+uniformly zero across every window, `kv_len == w_len`, every buffer
+collapses to the pre-RFC-007 shape, and the attention output is
+byte-identical to today. Flipping `NUM_SINK_TOKENS` to 2 (the Xiao
+et al. / NSA elbow) inside a sink-aware reference checkpoint
+activates the sink mechanism with no further mind-nerve code
+change; the constants bind into `model_hash` via the model
+manifest.
+
 ---
 
 # RFC-008 — Matryoshka coarse-to-fine route scoring

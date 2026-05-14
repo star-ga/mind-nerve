@@ -219,6 +219,76 @@ pub fn is_head_alive(mask: &[u8], layer_idx: u32, head_i: u32) -> bool {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// RFC-007 — Compile-baked attention sinks for the sliding-window encoder.
+//
+// Every window after window 0 prepends the first `NUM_SINK_TOKENS` token
+// positions (per `SINK_POSITIONS`) from the post-projection K and V
+// tensors to its local K/V slice. The Q slice is unchanged — Q queries
+// from local positions `[s, e)` against keys at
+// `SINK_POSITIONS[0..NUM_SINK_TOKENS] ∪ [s, e)`. The scores row width
+// grows from `w_len` to `w_len + sink_count`, softmax runs over the
+// wider row, the value-weighted sum reads from `vw` of the wider depth,
+// and the overlap-add accumulation into `attended_tiled[s + i, :]` is
+// unchanged (the Q position `i` and the head offset both refer to the
+// output side, not the K/V side — the reduction order pinned by the
+// ascending window loop is preserved).
+//
+// Window-0 short-circuit: when `s == 0`, the sink positions are already
+// in `[s, e) = [0, w_len)`. Duplicating them would double-count their
+// K/V contribution inside the same window's softmax — we MUST NOT
+// prepend on window 0. Guard with `if s == 0 { sink_count = 0; }`. The
+// guard also covers the single-window case (seq_len <= ATTN_WINDOW_SIZE),
+// where the only window is window 0.
+//
+// Safety: if `n < NUM_SINK_TOKENS` the loop cannot prepend `n` sink
+// rows that exist. Guard `sink_count` with the same predicate; in
+// practice every window after window 0 sees `n > ATTN_WINDOW_SIZE = 256`
+// which is far above any realistic `NUM_SINK_TOKENS`, but the guard
+// keeps the kernel total on pathologically short sequences.
+//
+// Backwards-soft default: `NUM_SINK_TOKENS = 0` means `sink_count = 0`
+// for every window, `kv_len = w_len`, and every buffer + reduction
+// site degenerates to the pre-RFC-007 shape. The attention output is
+// byte-identical to today until a sink-aware reference checkpoint
+// flips `NUM_SINK_TOKENS` to 2 (the Xiao et al. / NSA elbow) through
+// the model manifest. The constants enter `model_hash` via the
+// manifest header so any silent perturbation surfaces as a
+// `HashMismatch` at load time.
+//
+// Determinism: the sink prepend is a deterministic byte-for-byte copy
+// of two fixed K/V rows from compile-time positions. The wider scores
+// row consumes the existing pinned `q16_softmax` 5-stage pipeline; the
+// wider value-weighted sum consumes the existing `q16_dot_pinned`.
+// No new reduction site is introduced — only the contraction axis of
+// existing pinned reductions grows by a compile-time constant.
+//
+// Latency: per window after window 0, attention compute grows from
+// `w_len * w_len * (1 + 2*hd)` to `w_len * (w_len + sink_count) *
+// (1 + 2*hd)`. With `sink_count = 2` and `w_len = 256`, that is a
+// 0.8 % per-window inflation. Across 5 sink-augmented windows × 4
+// heads × 2 layers at the 1024-token cap that is ~0.6 % of total
+// inference latency, well under 0.05 % of the 30 ms p95 budget.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Number of sink positions prepended to every window's K/V set after
+// window 0. Backwards-soft default = 0 (no sinks; byte-identical to
+// today). Calibrated reference checkpoints ship with `NUM_SINK_TOKENS
+// = 2` per Xiao et al. §5.1 and NSA §3.4. The constant must be ≤
+// SINK_POSITIONS.len() (= 2 in Phase 1); raising it past 2 is a model-
+// architecture change that requires growing SINK_POSITIONS.
+pub const NUM_SINK_TOKENS: u32 = 0;
+
+// Token positions used as attention sinks. Compile-time constants so
+// every backend prepends the same K/V rows; `model_hash` covers the
+// bytes via the model manifest. Phase 1 fixes the sinks at positions
+// 0 and 1 — the elbow of the Xiao et al. precision curve on short-
+// context (<=1024 token) sliding-window encoders. Future Phase 2
+// architectures with multi-token-class sinks (e.g. a learned `[SINK]`
+// special token) can grow this array; until then, position 0 and 1
+// are the canonical anchors.
+pub const SINK_POSITIONS: [u32; 2] = [0u32, 1u32];
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Window iteration math.
 //
 // Given seq_len, window=ATTN_WINDOW_SIZE, stride=ATTN_WINDOW_STRIDE, the
@@ -410,6 +480,16 @@ pub fn project_linear(
 // produces the same bytes as if the head had emitted all zeros. With
 // the backwards-soft default head_mask = [0xFFu8; HEAD_MASK_BYTES],
 // every head is alive and the kernel runs unchanged.
+// RFC-007: every window after window 0 prepends `sink_count` K/V rows
+// from `SINK_POSITIONS[0..sink_count]` to the local K/V buffers
+// `kw`/`vw`. `sink_count = if s == 0 || n < NUM_SINK_TOKENS { 0 } else
+// { NUM_SINK_TOKENS as usize }`. The Q buffer `qw` is unchanged; the
+// scores row width grows from `w_len` to `w_len + sink_count`, the
+// softmax runs over the wider row, and the value-weighted sum reads
+// from `vw` of the same wider depth. With the backwards-soft default
+// `NUM_SINK_TOKENS = 0`, `sink_count == 0` for every window and every
+// buffer + reduction site degenerates to the pre-RFC-007 shape — the
+// attention output is byte-identical to today.
 @[determinism(BitIdentical)]
 @[reduction_order(Pinned)]
 @[attention_kind(SlidingWindow(window = ATTN_WINDOW_SIZE, stride = ATTN_WINDOW_STRIDE))]
@@ -446,6 +526,22 @@ pub fn sliding_window_attention(
         let e: usize = if s + win > n { n } else { s + win };
         let w_len: usize = e - s;
 
+        // RFC-007: sink-count for this window. Window 0 already covers the
+        // sink positions inside its local K/V slice — prepending would
+        // double-count them inside the same softmax — so we zero-out the
+        // sink count there. The `n < NUM_SINK_TOKENS` guard keeps the
+        // kernel total on pathologically short sequences where the
+        // requested sink positions would index past the sequence; in
+        // practice every window after window 0 sees `n > ATTN_WINDOW_SIZE
+        // = 256`, so the guard is a defence-in-depth measure rather than
+        // a hot-path branch. With the backwards-soft default
+        // `NUM_SINK_TOKENS = 0` the count is uniformly zero and every
+        // K/V buffer below collapses to the pre-RFC-007 shape.
+        let sink_count: usize =
+            if s == 0 || n < (NUM_SINK_TOKENS as usize) { 0_usize }
+            else { NUM_SINK_TOKENS as usize };
+        let kv_len: usize = w_len + sink_count;
+
         // Per head, compute scores → softmax → attended, then add into the
         // head's slice of attended_tiled[s:e, head_offset:head_offset+hd].
         let mut head_i: usize = 0;
@@ -467,19 +563,58 @@ pub fn sliding_window_attention(
             }
             let head_off: usize = head_i * hd;
 
-            // Build qw, kw, vw views: [w_len, hd] slices of q, k, v over the
-            // hidden axis at the head offset. Materialising the slice keeps
-            // the dot-product input contiguous for `q16_dot_pinned`.
-            let mut qw: [[Q16_16; hd]; w_len] = [[0_i32; hd]; w_len];
-            let mut kw: [[Q16_16; hd]; w_len] = [[0_i32; hd]; w_len];
-            let mut vw: [[Q16_16; hd]; w_len] = [[0_i32; hd]; w_len];
+            // Build qw (Q queries, local-only — width w_len) and kw/vw
+            // (K/V keys + values — width kv_len = w_len + sink_count, with
+            // sink rows at indices [0, sink_count) and local rows at
+            // [sink_count, kv_len)). The sink prepend lets Q queries at
+            // local positions [s, e) attend over keys at SINK_POSITIONS ∪
+            // [s, e) per RFC-007. Materialising the slice keeps the
+            // dot-product input contiguous for `q16_dot_pinned`.
+            let mut qw: [[Q16_16; hd]; w_len]  = [[0_i32; hd]; w_len];
+            let mut kw: [[Q16_16; hd]; kv_len] = [[0_i32; hd]; kv_len];
+            let mut vw: [[Q16_16; hd]; kv_len] = [[0_i32; hd]; kv_len];
+
+            // Fill qw from local positions [s, e). Q is unchanged by
+            // RFC-007 — the sink mechanism only widens the K/V side.
             let mut t: usize = 0;
             while t < w_len {
                 let mut d: usize = 0;
                 while d < hd {
                     qw[t][d] = q[s + t][head_off + d];
-                    kw[t][d] = k[s + t][head_off + d];
-                    vw[t][d] = v[s + t][head_off + d];
+                    d = d + 1;
+                }
+                t = t + 1;
+            }
+
+            // RFC-007: prepend sink K/V rows. Ascending sink index pins the
+            // copy order; `SINK_POSITIONS` is a compile-time constant array
+            // so every backend reads the same source positions. With the
+            // backwards-soft default `NUM_SINK_TOKENS = 0` this loop runs
+            // zero iterations and the K/V buffers are filled exclusively
+            // from local positions below — byte-identical to the pre-
+            // RFC-007 K/V layout.
+            let mut si: usize = 0;
+            while si < sink_count {
+                let pos: usize = SINK_POSITIONS[si] as usize;
+                let mut d: usize = 0;
+                while d < hd {
+                    kw[si][d] = k[pos][head_off + d];
+                    vw[si][d] = v[pos][head_off + d];
+                    d = d + 1;
+                }
+                si = si + 1;
+            }
+
+            // Fill kw/vw local rows at indices [sink_count, kv_len) from
+            // positions [s, e). When sink_count == 0 (the backwards-soft
+            // default), kv_len == w_len and the local rows occupy indices
+            // [0, w_len) — identical to the pre-RFC-007 K/V layout.
+            t = 0;
+            while t < w_len {
+                let mut d: usize = 0;
+                while d < hd {
+                    kw[sink_count + t][d] = k[s + t][head_off + d];
+                    vw[sink_count + t][d] = v[s + t][head_off + d];
                     d = d + 1;
                 }
                 t = t + 1;
@@ -487,11 +622,13 @@ pub fn sliding_window_attention(
 
             // scores[i, j] = (qw[i] · kw[j]) * ATTN_SCALE_Q16.
             // ATTN_SCALE_Q16 = 1/sqrt(head_dim) = 1/8 in Q16.16 (= 8192).
-            let mut scores: [[Q16_16; w_len]; w_len] = [[0_i32; w_len]; w_len];
+            // Row width kv_len = w_len + sink_count; sink_count == 0 in
+            // the backwards-soft path so this is exactly w_len.
+            let mut scores: [[Q16_16; kv_len]; w_len] = [[0_i32; kv_len]; w_len];
             let mut i: usize = 0;
             while i < w_len {
                 let mut j: usize = 0;
-                while j < w_len {
+                while j < kv_len {
                     let raw: Q16_16 = q16_dot_pinned(&qw[i], &kw[j]);
                     scores[i][j] = q16_mul(raw, ATTN_SCALE_Q16);
                     j = j + 1;
@@ -500,13 +637,14 @@ pub fn sliding_window_attention(
             }
 
             // probs[i, :] = q16_softmax(scores[i, :]) — pinned 5-stage flow
-            // per spec §5. Bit-identical across backends.
-            let mut probs: [[Q16_16; w_len]; w_len] = [[0_i32; w_len]; w_len];
+            // per spec §5. Bit-identical across backends. Softmax row width
+            // is kv_len (degenerates to w_len in the backwards-soft path).
+            let mut probs: [[Q16_16; kv_len]; w_len] = [[0_i32; kv_len]; w_len];
             i = 0;
             while i < w_len {
                 let p: [Q16_16] = q16_softmax(&scores[i]);
                 let mut j: usize = 0;
-                while j < w_len {
+                while j < kv_len {
                     probs[i][j] = p[j];
                     j = j + 1;
                 }
@@ -516,15 +654,18 @@ pub fn sliding_window_attention(
             // attended[i, d] = sum_j probs[i, j] * vw[j, d]
             //                = q16_dot_pinned(probs[i, :], vw[:, d])
             // built column-by-column so the dot input stays contiguous.
+            // The contraction axis width is kv_len; in the backwards-soft
+            // path (sink_count == 0) this equals w_len and the value-
+            // weighted sum is byte-identical to the pre-RFC-007 reduction.
             i = 0;
             while i < w_len {
                 let mut d: usize = 0;
                 while d < hd {
                     // Materialise the d'th column of vw as a contiguous slice
                     // for the dot product.
-                    let mut v_col: [Q16_16; w_len] = [0_i32; w_len];
+                    let mut v_col: [Q16_16; kv_len] = [0_i32; kv_len];
                     let mut j: usize = 0;
-                    while j < w_len {
+                    while j < kv_len {
                         v_col[j] = vw[j][d];
                         j = j + 1;
                     }

@@ -39,8 +39,54 @@ use crate::mind_nerve::q16_16::{
     q16_sum_pinned,
     q16_softmax,
     q16_layernorm,
+    q16_rmsnorm,
     q16_sigmoid_lut,
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RFC-013 — Normalization kind dispatch for pre-norm and final-norm sites.
+//
+// The pre-norm step in each encoder layer and the final-norm step before
+// the scoring head share a single normalization primitive selected at
+// compile time by `NORMALIZATION_KIND`:
+//
+//   NORMALIZATION_KIND_LAYERNORM (= 0) — q16_layernorm (5-stage pinned pipeline:
+//     mean → centered sum-of-squares → variance → rsqrt → centered scale).
+//     This is the pre-RFC-013 default, byte-identical to today's behaviour
+//     when consumed against the current v1 reference checkpoints.
+//
+//   NORMALIZATION_KIND_RMSNORM   (= 1) — q16_rmsnorm (3-stage pinned pipeline:
+//     self-dot sum-of-squares → mean-squared rsqrt → elementwise scale).
+//     Drops the mean-centering step; ~50% fewer ops per normalization site,
+//     matching every leading 2024 open-source transformer (Llama 2/3, Qwen2,
+//     Mistral, Gemma 2, ModernBERT, Arctic Embed v2.0).
+//
+// Backwards-soft: `NORMALIZATION_KIND` defaults to `NORMALIZATION_KIND_LAYERNORM`
+// (= 0). With this default the compile-time-resolvable predicate
+// `NORMALIZATION_KIND == NORMALIZATION_KIND_RMSNORM` is statically false,
+// the RMSNorm branch in `prenorm_seq` is dead code, and mindc's
+// constant-folding pass collapses the dispatch to the same `q16_layernorm`
+// call the pre-RFC-013 binary emitted — so the bit-identity contract holds
+// across runs and across architectures.
+//
+// Model-hash binding: both `NORMALIZATION_KIND` and `Q16_RMSNORM_EPSILON`
+// (the latter declared in `q16_16.mind`) enter `model_hash` via the model
+// manifest header. A silent flip from 0 to 1 against a LayerNorm-trained
+// checkpoint produces a `HashMismatch` at load time — RMSNorm rescales the
+// activations the encoder gains were calibrated against, so swapping the
+// primitive without a matching checkpoint would regress accuracy below the
+// LayerNorm baseline. The hash binding makes that regression observable
+// rather than silent.
+//
+// Cross-arch bit-identity: both `q16_layernorm` and `q16_rmsnorm` carry
+// `@[determinism(BitIdentical)]` and pinned reduction order over the hidden
+// axis; the dispatch is a single u32 compare against a compile-time
+// constant.
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub const NORMALIZATION_KIND_LAYERNORM: u32 = 0u32;
+pub const NORMALIZATION_KIND_RMSNORM:   u32 = 1u32;
+pub const NORMALIZATION_KIND:           u32 = NORMALIZATION_KIND_LAYERNORM;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Attention score scaling.
@@ -369,10 +415,19 @@ pub fn apply_ln_affine(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Pre-norm: layer-norm + gain/bias affine, applied per token position.
+// Pre-norm: normalization + gain/bias affine, applied per token position.
 //
-// Sequential across positions; per-position uses the pinned 5-stage layer
-// norm pipeline in `q16_16::q16_layernorm`.
+// Sequential across positions; per-position dispatches between the pinned
+// 5-stage LayerNorm pipeline (`q16_layernorm`) and the pinned 3-stage
+// RMSNorm pipeline (`q16_rmsnorm`) based on the compile-time
+// `NORMALIZATION_KIND` constant. With the backwards-soft default
+// (`NORMALIZATION_KIND == NORMALIZATION_KIND_LAYERNORM`), the dispatch
+// resolves at compile time to the LayerNorm branch and the binary is
+// byte-identical to the pre-RFC-013 path. Flipping the constant to
+// `NORMALIZATION_KIND_RMSNORM` activates the cheaper magnitude-only
+// normalization in lockstep with an RMSNorm-trained reference checkpoint
+// (the constant binds into `model_hash` so a mismatched-pair load is
+// caught at the loader's hash check).
 // ─────────────────────────────────────────────────────────────────────────────
 @[determinism(BitIdentical)]
 @[reduction_order(Pinned)]
@@ -385,7 +440,18 @@ pub fn prenorm_seq(
     let mut out: tensor<Q16_16, [n, ENCODER_HIDDEN]> = [[0_i32; ENCODER_HIDDEN]; n];
     let mut i: usize = 0;
     while i < n {
-        let normed: [Q16_16] = q16_layernorm(&x[i]);
+        // Compile-time-resolvable dispatch. With the default
+        // `NORMALIZATION_KIND = NORMALIZATION_KIND_LAYERNORM` the RMSNorm
+        // branch is statically unreachable; mindc collapses the predicate
+        // and emits only the LayerNorm call, preserving the pre-RFC-013
+        // bit-pattern. With `NORMALIZATION_KIND = NORMALIZATION_KIND_RMSNORM`
+        // the LayerNorm branch is statically unreachable and the encoder
+        // runs the 3-stage RMSNorm pipeline.
+        let normed: [Q16_16] = if NORMALIZATION_KIND == NORMALIZATION_KIND_RMSNORM {
+            q16_rmsnorm(&x[i])
+        } else {
+            q16_layernorm(&x[i])
+        };
         let affined: [Q16_16] = apply_ln_affine(&normed, gain, bias);
         let mut d: usize = 0;
         while d < ENCODER_HIDDEN as usize {

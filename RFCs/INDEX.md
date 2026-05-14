@@ -3091,6 +3091,25 @@ with the first RMSNorm-trained checkpoint arriving. A human
 reviewer should confirm the training-pipeline owner can absorb the
 normalization swap as part of the v2 checkpoint cohort.
 
+**Status:** IMPLEMENTED at exp9 — `src/q16_16.mind` adds `pub const
+Q16_RMSNORM_EPSILON: Q16_16 = 1_i32` and a pinned 3-stage
+`q16_rmsnorm` primitive (self-`q16_dot_pinned` sum-of-squares →
+`q16_div_sat` mean-squared → `q16_rsqrt` of epsilon-guarded
+mean-squared → elementwise saturating `q16_mul` scale, with the
+same `x[i] == 0 → 0` short-circuit `q16_layernorm` uses to avoid the
+`q16_mul(0, MAX_Q16_16)` sentinel surprise on all-zero inputs);
+`src/encoder_kernels.mind` adds compile-time constants
+`NORMALIZATION_KIND_LAYERNORM = 0u32`,
+`NORMALIZATION_KIND_RMSNORM = 1u32`, and `NORMALIZATION_KIND =
+NORMALIZATION_KIND_LAYERNORM` alongside the new `q16_rmsnorm`
+import, then rewrites `prenorm_seq`'s per-token body to dispatch
+`if NORMALIZATION_KIND == NORMALIZATION_KIND_RMSNORM { q16_rmsnorm }
+else { q16_layernorm }`. With the backwards-soft default the RMSNorm
+branch is statically unreachable, mindc constant-folds the predicate
+to the existing `q16_layernorm` call, and the binary stays
+byte-identical to today until a calibrated RMSNorm-trained reference
+checkpoint binds `NORMALIZATION_KIND = 1` into `model_hash`.
+
 ---
 
 # RFC-014 — Multi-query latent attention pooling (r ≥ 2 latent queries)

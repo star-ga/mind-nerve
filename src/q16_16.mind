@@ -528,6 +528,83 @@ pub fn q16_layernorm(x: &[Q16_16]) -> [Q16_16] {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Section 6b: q16_rmsnorm — pinned 3-stage pipeline (RFC-013).
+//
+// Root-mean-square normalization. Replaces LayerNorm's mean-centering step
+// with a single self-magnitude rescale, matching the canonical 2024
+// open-source transformer convention (Llama 2/3, Qwen2, Mistral, Gemma 2,
+// ModernBERT, Arctic Embed v2.0). Composes only existing pinned primitives;
+// no new reduction site, no new LUT, no new numeric primitive.
+//
+// Stages:
+//   (1) sum_of_squares — self-`q16_dot_pinned` over the hidden axis,
+//                        sequential left-to-right (the dot's own pinned
+//                        reduction-order contract carries forward).
+//   (2) mean_squared   — q16_div_sat(sum_of_squares, N_q16)
+//   (3) inv_rms        — q16_rsqrt(mean_squared + Q16_RMSNORM_EPSILON)
+//   (4) normalize      — elementwise saturating q16_mul(x[i], inv_rms)
+//
+// Like q16_layernorm, the optional gain/bias affine is omitted here; the
+// call-site composes `apply_ln_affine` on the normalized vector to apply
+// gain × normed + bias. The semantic difference from LayerNorm — RMSNorm
+// preserves the sign of constant non-zero inputs while LayerNorm zeros
+// them — is the documented spec behaviour (Zhang & Sennrich NeurIPS 2019
+// §3); the v1 manifest default `NORMALIZATION_KIND = 0` in
+// `encoder_kernels.mind` selects LayerNorm for backwards-soft byte-identity
+// until a RMSNorm-trained reference checkpoint binds `NORMALIZATION_KIND = 1`
+// into `model_hash`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Epsilon for RMS stabilization. 1 ULP in Q16.16, mirroring
+// Q16_LAYERNORM_EPSILON; contributes to `model_hash` along with the LUT
+// tables and the NORMALIZATION_KIND constant.
+pub const Q16_RMSNORM_EPSILON: Q16_16 = 1_i32;
+
+@[determinism(BitIdentical)]
+@[reduction_order(Pinned)]
+pub fn q16_rmsnorm(x: &[Q16_16]) -> [Q16_16] {
+    let n: usize = x.len();
+    if n == 0 {
+        let empty: [Q16_16; 0] = [];
+        return empty;
+    }
+
+    // Stage 1: sum of squares via self-dot. q16_dot_pinned is sequential
+    // left-to-right over the hidden axis (annotated @[reduction_order(Pinned)]
+    // above), so the reduction order is pinned by the call itself.
+    let sum_sq: Q16_16 = q16_dot_pinned(x, x);
+
+    // Stage 2: mean_squared = sum_sq / N. q16_div_sat is the bit-identical
+    // saturating divide already used by q16_layernorm for the variance step.
+    let n_q16:   Q16_16 = (n as i32) * ONE_Q16_16;
+    let mean_sq: Q16_16 = q16_div_sat(sum_sq, n_q16);
+
+    // Stage 3: inv-rms = rsqrt(mean_sq + epsilon). Epsilon prevents the
+    // rsqrt LUT sentinel branch when mean_sq == 0 (all-zero input). For
+    // an all-zero input the numerator x[i] is exactly zero, so the
+    // multiply at stage 4 produces zero regardless of inv_rms.
+    let ms_eps:  Q16_16 = q16_add(mean_sq, Q16_RMSNORM_EPSILON);
+    let inv_rms: Q16_16 = q16_rsqrt(ms_eps);
+
+    // Stage 4: normalize (elementwise scale). Mirrors q16_layernorm stage 5:
+    // special-case the x[i] == 0 path so the (0 * MAX_Q16_16) sentinel
+    // result of an all-zero input is exactly 0 rather than relying on
+    // q16_mul rounding. Bit-identical to q16_mul(0, anything) on every
+    // backend.
+    let mut out: [Q16_16; n] = [0_i32; n];
+    let mut i: usize = 0;
+    while i < n {
+        if x[i] == 0_i32 {
+            out[i] = 0_i32;
+        } else {
+            out[i] = q16_mul(x[i], inv_rms);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Section 7: q16_sigmoid_lut — truncated lookup table (gated-residual gate).
 //
 // Domain: input x in Q16.16 covering [-8.0, +8.0]. Inputs ≤ -8.0 clamp to

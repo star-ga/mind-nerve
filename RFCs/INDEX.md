@@ -7274,6 +7274,8 @@ compatible with the existing mind-nerve inference path (only the
 byte values inside the weights file change, and `model_hash`
 updates correspondingly).
 
+**Status:** SKIPPED — Training/catalog-builder-side only. The RFC's own "Adoption plan" §1 enumerates `src/loader.mind`, `src/inference.mind`, `src/model.mind`, and `Mind.toml` as "no change"; the entire mechanism (frozen NV-Embed-v2 H=4096 + bge-large-en-v1.5 H=1024 teacher forward passes, learned linear teacher→student projections W_teacher : R^{H_t} → R^{ENCODER_HIDDEN=256}, and the multi-teacher embedding-distillation loss `L_embed = 1 - cos(student_emb, W_teacher * teacher_emb)` combined with RFC-018 AnglE + RFC-016 rank-distillation at γ_embed = 0.30 in the Stage-2 fine-tuning loop) lives entirely in the offline catalog-builder training pipeline outside the mind-nerve repo. The resulting Jasper/Stella geometric topology is absorbed into the trained Q16.16 × INT8 weight values via `model_hash` without touching the inference surface; the projection matrices W_teacher and the frozen teachers themselves are discarded after Stage-2 and never enter the mind-nerve binary. Belongs in the catalog-builder repo.
+
 ---
 
 # RFC-024 — Cross-batch memory bank for queue-augmented contrastive negatives
@@ -7721,6 +7723,8 @@ because the resulting weights are byte-compatible with the
 existing mind-nerve inference path (only the byte values inside
 the weights file change, and `model_hash` updates
 correspondingly).
+
+**Status:** SKIPPED — Training/catalog-builder-side only. The RFC's own "Adoption plan" §1 enumerates `src/loader.mind`, `src/inference.mind`, `src/model.mind`, and `Mind.toml` as "no change"; the entire mechanism (FP16 GPU-resident `Q: torch.Tensor` of shape `[QUEUE_SIZE=32768, H]` initialized to zeros, FIFO eviction with `B`-row overwrite per Stage-2 step, `positive_emb_batch.detach()` + L2-normalize-at-enqueue discipline, queue concatenation to in-batch negatives in the InfoNCE/AnglE softmax denominator with the optional GISTEmbed guidance-mask cache extended over queue entries, and the ~128-step warmup phase) lives entirely in the offline catalog-builder Stage-2 fine-tuning loop outside the mind-nerve repo. The resulting Wang & Liu §4 large-pool generalization gain is absorbed into the trained Q16.16 × INT8 weight values via `model_hash` without touching the inference surface; the queue tensor itself is discarded after Stage-2 and never enters the mind-nerve binary. Belongs in the catalog-builder repo.
 
 ---
 
@@ -8263,6 +8267,8 @@ backwards-soft path (`QUERY_INSTRUCTION_LEN = 0` and
 to today and can ship dark immediately, while the loader +
 inference + manifest plumbing machinery comes online ahead of
 the trained-checkpoint arrival.
+
+**Status:** SKIPPED — Training/catalog-builder-side only. The accuracy lift (+1.5 to +4.5 nDCG@10 across INSTRUCTOR / NV-Embed / E5-Mistral / TART / bge-en-icl-large / jina-embeddings-v3 / Nomic Embed v2 / Stella v5) is delivered by the offline Stage-2 fine-tuning step that conditions the encoder weights to interpret per-task instruction prefixes; the inference-path mechanism is functionally subsumed by RFC-012's already-implemented `QUERY_PREFIX_TOKENS` / `QUERY_PREFIX_LEN` machinery (the catalog-builder can encode any task-instruction string as a longer BPE prefix and bind `QUERY_PREFIX_LEN` to its actual length once the 8-token cap in `src/lib.mind` is widened to 24 in a future cohort iteration). Without the paired Stage-2 instruction-tuned reference checkpoint the inference-side prepend is a no-op against an instruction-naive encoder; with that checkpoint, the existing RFC-012 prepend machinery suffices for the binary "query: " case and the wider-cap version is a one-constant-bump in `src/lib.mind` (outside this iteration's target file set). The training-pipeline work — instruction-template definition in `training_recipe.toml`, Stage-2 prepend on every (query, passage) example, RFC-019 cluster-aware composition over (task, query) pairs, RFC-020 GISTEmbed mask construction over instruction-prefixed inputs — lives entirely in the offline catalog-builder repo. Belongs in the catalog-builder repo.
 
 ---
 

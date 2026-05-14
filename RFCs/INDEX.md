@@ -11577,6 +11577,8 @@ because the resulting weights are byte-compatible with the
 existing mind-nerve inference path (only the byte values inside
 the weights file change, and `model_hash` updates correspondingly).
 
+**Status:** SKIPPED — Training/catalog-builder-side only. The RFC's own "Adoption plan" §1 enumerates the entire mechanism (the cosine-annealed contrastive InfoNCE/AnglE temperature schedule from `TEMP_INIT = 0.08` to `TEMP_FINAL = 0.025` synchronized with the RFC-031 curriculum phase boundaries, covering both the RFC-016 cross-encoder rank-distillation contrastive softmax and the RFC-018 AnglE contrastive softmax under a single shared τ_t schedule, with the rank-KL distillation temperature `T_distill = 2.0` kept fixed and separate) as living entirely inside the offline catalog-builder Stage-2 fine-tuning loop outside the mind-nerve repo; every `src/loader.mind`, `src/inference.mind`, `src/model.mind`, and `Mind.toml` entry is listed as "no change". The resulting annealed-temperature-trained weight bytes are absorbed into the Q16.16 × INT8 weight values via `model_hash` without touching the inference surface; the per-step τ_t computation, the cosine-decay schedule infrastructure, and the (TEMP_INIT, TEMP_FINAL) grid-search machinery are FP32 training-pipeline state discarded after Stage-2 export and never enter the mind-nerve binary. Belongs in the catalog-builder repo.
+
 ---
 
 # RFC-033 — Sharpness-Aware Minimization (SAM) for Stage-2 fine-tuning generalization
@@ -12125,6 +12127,8 @@ with the existing mind-nerve inference path (only the byte values
 inside the weights file change, and `model_hash` updates
 correspondingly).
 
+**Status:** SKIPPED — Training/catalog-builder-side only. The RFC's own "Adoption plan" §1 enumerates the entire SAM discipline (per-step ascent `θ̃_t = θ_t + ρ · ĝ/‖ĝ‖` at `SAM_RHO = 0.05`, second forward+backward at `θ̃_t` to compute the descent-direction gradient `g̃`, restore `θ_t = θ̃_t - e_w`, then apply `g̃` via the normal AdamW update, with the two-pass nesting wrapping the RFC-027 GradCache effective-batch loop) as living entirely inside the offline catalog-builder Stage-2 fine-tuning loop outside the mind-nerve repo; every `src/loader.mind`, `src/inference.mind`, `src/model.mind`, and `Mind.toml` entry is listed as "no change". The resulting flat-minimum-trained weight bytes are absorbed into the Q16.16 × INT8 weight values via `model_hash` without touching the inference surface; the FP32 ascent perturbation tensor `e_w`, the per-step global gradient L2-norm `g_norm`, and the two-pass SAM scheduler are training-pipeline state discarded after Stage-2 export and never enter the mind-nerve binary. Belongs in the catalog-builder repo.
+
 ---
 
 # RFC-034 — R-Drop consistency regularization for Stage-2 fine-tuning
@@ -12646,6 +12650,8 @@ weights are byte-compatible with the existing mind-nerve
 inference path (only the byte values inside the weights
 file change, and `model_hash` updates correspondingly).
 
+**Status:** SKIPPED — Training/catalog-builder-side only. The RFC's own "Adoption plan" §1 enumerates the entire R-Drop discipline (per-step dual forward pass `(embeddings_A, logits_A)` and `(embeddings_B, logits_B)` over the same effective batch with two independent dropout masks `mask_A ≠ mask_B`, symmetric KL consistency penalty `L_rdrop = 0.5 * (KL(p_A || p_B) + KL(p_B || p_A))` over the softmaxed logits at `R_DROP_KL_TEMPERATURE = 1.0`, combined loss `loss_total = 0.5 * (loss_A + loss_B) + R_DROP_ALPHA * L_rdrop` at `R_DROP_ALPHA = 1.0` with warmup gate `R_DROP_ENABLED_FROM = 5000`, dropout-mask resampling discipline from PyTorch's `model.train()`) as living entirely inside the offline catalog-builder Stage-2 fine-tuning loop outside the mind-nerve repo; every `src/loader.mind`, `src/inference.mind`, `src/model.mind`, and `Mind.toml` entry is listed as "no change". The resulting Jensen-gap-minimized weight bytes are absorbed into the Q16.16 × INT8 weight values via `model_hash` without touching the inference surface; the dual-mask scheduling infrastructure, the symmetric-KL computation, and the warmup-gate state are FP32 training-pipeline state discarded after Stage-2 export and never enter the mind-nerve binary. Dropout itself is not present on the mind-nerve inference path (the encoder runs without dropout at inference time per the standard transformer-encoder convention), so even the dropout-mask infrastructure is fully offline. Belongs in the catalog-builder repo.
+
 ---
 
 # RFC-035 — FreeLB-style adversarial training with gradient-aligned input-embedding perturbation
@@ -13051,3 +13057,5 @@ three confirmations land, this RFC remains a proposal documenting the
 discipline; the catalog-builder team can adopt it incrementally without
 coordination because the resulting weights are byte-compatible with the
 existing mind-nerve inference path.
+
+**Status:** SKIPPED — Training/catalog-builder-side only. The RFC's own "Adoption plan" §1 enumerates the entire FreeLB discipline (per-step inner adversarial loop with `FREELB_K = 3` perturbation steps at `FREELB_EPSILON = 0.002` and `FREELB_STEP_SIZE = 0.000667` in the per-token L2-norm-constrained embedding-perturbation tensor `delta: [batch, seq_len, H]`, gradient-aligned ascent on `delta` with retain_graph=True, parameter-gradient accumulation `accumulated_grad += param_grads / FREELB_K` across the K inner steps, single AdamW step on `accumulated_grad` after all K inner steps complete, warmup gate `FREELB_ENABLED_FROM = 10000`, and nesting inside both RFC-033 (SAM) and RFC-034 (R-Drop) producing 12 forward + 12 backward passes per effective-batch step) as living entirely inside the offline catalog-builder Stage-2 fine-tuning loop outside the mind-nerve repo; every `src/loader.mind`, `src/inference.mind`, `src/model.mind`, and `Mind.toml` entry is listed as "no change". The resulting adversarially-robust-trained weight bytes are absorbed into the Q16.16 × INT8 weight values via `model_hash` without touching the inference surface; the FP32 input-embedding perturbation tensor `delta`, the K-step inner adversarial loop scheduler, the per-token L2-projection state, and the cross-step gradient accumulator are training-pipeline state discarded after Stage-2 export and never enter the mind-nerve binary. The mind-nerve inference path consumes the token-embedding lookup table directly (not perturbed); adversarial robustness is therefore a property of the trained weights, not a runtime mechanism. Belongs in the catalog-builder repo.

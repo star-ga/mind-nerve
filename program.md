@@ -36,12 +36,22 @@ hit the crash budget, and pause.
 
 ## What the agent does each iteration
 
-1. **Read `RFCs/INDEX.md` end-to-end** (it is in `target_files`).
-   Identify the first RFC whose section does NOT contain a
-   `**Status:** IMPLEMENTED` or `**Status:** SKIPPED` line. Call this
-   the *target RFC*.
+**Throughput rule (NEW): batch 2-3 RFCs per iteration when safe.**
+If the next 2-3 un-statused RFCs are independent (touch disjoint
+`src/` files OR are all SKIPPED-class training-side), implement /
+mark all of them in this single iteration. This triples the ship
+rate without weakening the consensus gate (the gate reviews the
+whole diff). Stay at 1 RFC if the next un-statused RFCs are tightly
+coupled (e.g. RFC-008 + RFC-014 both touch attention pooling) — let
+those land sequentially.
 
-2. **Classify the target RFC**:
+1. **Read `RFCs/INDEX.md`** (it is in `target_files`, capped — use
+   the Read tool to fetch sections beyond the cap). Identify the
+   first 1-3 RFCs whose section does NOT contain a `**Status:**
+   IMPLEMENTED` or `**Status:** SKIPPED` line. Call them the
+   *target batch*.
+
+2. **For each RFC in the target batch — classify**:
    - **Inference-side**: the change touches files in `src/*.mind`
      (model, kernels, scoring, attention, normalization, tokenizer,
      loader, evidence, etc.). These are implementable here.

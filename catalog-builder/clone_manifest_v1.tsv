@@ -1,0 +1,48 @@
+stars	size_kb	full_name	description
+134415	3703	anthropics/skills	Public repository for Agent Skills
+191575	2963	obra/superpowers	An agentic skills framework & software development methodology
+26590	10595	vercel-labs/agent-skills	Vercel's official collection of agent skills
+21741	330	VoltAgent/awesome-agent-skills	1000+ agent skills curated from teams + community
+18631	633	agentskills/agentskills	Specification and documentation for Agent Skills
+41692	316	addyosmani/agent-skills	Production-grade engineering skills for AI coding agents
+15652	3677	muratcankoylan/Agent-Skills-for-Context-Engineering	Comprehensive collection of Agent Skills for context engineering
+43765	20923	hesreallyhim/awesome-claude-code	Curated list of awesome skills, hooks, slash-commands, agents
+19822	985	VoltAgent/awesome-claude-code-subagents	100+ specialized Claude Code subagents
+14859	14163	alirezarezvani/claude-skills	263+ Claude Code skills & agent plugins (Claude/Codex/Gemini/Cursor)
+1668	1144	rohitg00/awesome-claude-code-toolkit	135 agents, 35 curated skills
+902	166	0xfurai/claude-code-subagents	100+ production-ready development subagents
+5189	1650	trailofbits/skills	Trail of Bits Claude Code skills for security research
+60369	2470	JuliusBrussee/caveman	Token-reduction Claude Code skill
+59881	4483	ComposioHQ/awesome-claude-skills	Curated list of awesome Claude Skills
+1657	1975	ComposioHQ/awesome-claude-plugins	Curated list of Claude Code plugins
+19402	3607	anthropics/claude-plugins-official	Official Anthropic-managed plugin directory
+88	689	anthropics/claude-plugins-community	Community plugin marketplace for Claude Code
+86900	23987	punkpeye/awesome-mcp-servers	Collection of MCP servers
+4253	466	vijaythecoder/awesome-claude-agents	Orchestrated sub agent dev team
+5089	1503	langgptai/awesome-claude-prompts	Claude prompt curation
+2186	23	VoltAgent/awesome-claude-design	68 ready-to-use design system inspirations
+87	1416	nicknisi/claude-plugins	Nick's own marketplace of Claude Plugins
+696	11286	quemsah/awesome-claude-plugins	Automated Claude Code plugin adoption metrics
+2340	17424	tech-leads-club/agent-skills	Secure validated skill registry for Antigravity
+725	361	coleam00/second-brain-skills	Second-brain Claude Skills
+2078	4312	mrgoonie/claudekit-skills	All powerful skills of ClaudeKit.cc
+9060	10906	Jeffallan/claude-skills	66 specialized skills for full-stack developers
+908	87	dgreenheck/webgpu-claude-skill	WebGPU + Three.js skill
+271	1167	PipedreamHQ/awesome-mcp-servers	Pipedream MCP server collection
+353	26	backant-io/backant-agents	BackAnt agents
+925	293	Aaronontheweb/dotnet-skills	.NET Developers skills + subagents
+1244	44	hesreallyhim/a-list-of-claude-code-agents	Community list of subagents
+785	445	ccplugins/awesome-claude-code-plugins	Slash commands, subagents, MCP servers
+871	2394	JohnRiceML/clawport-ui	OpenClaw-based AI agent command center
+4793	2407	heilcheng/awesome-agent-skills	Tutorials + Guides + Agent Skills Directories
+18882	63	blader/humanizer	Removes AI-generated writing signs
+511	560	Kamalnrf/claude-plugins	Lightweight plugin registry
+51	2012	rshah515/claude-code-subagents	133+ specialized AI subagents
+1450	4111	webfuse-com/awesome-claude	Anthropic Claude curated list
+21286	2885	OthmanAdi/planning-with-files	Manus-style persistent markdown planning skill
+4063	602	wong2/awesome-mcp-servers	Curated MCP servers
+5540	226	appcypher/awesome-mcp-servers	Curated MCP servers
+8885	180	LaurieWired/GhidraMCP	Ghidra MCP server
+32525	1989	microsoft/playwright-mcp	Playwright MCP server
+4332	1318	makenotion/notion-mcp-server	Official Notion MCP Server
+1413	5274	disler/claude-code-hooks-multi-agent-observability	Real-time monitoring for Claude Code agents via hooks

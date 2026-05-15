@@ -1,0 +1,39 @@
+stars	size_kb	full_name	description
+3796	38	OneRedOak/claude-code-workflows	Battle-tested workflows
+1810	781	softaworks/agent-toolkit	Curated skills for AI coding agents
+1843	14023	iamzhihuix/skills-manage	Cross-CLI skill manager (Claude/Cursor/Gemini)
+1356	238	CloudAI-X/claude-workflow-v2	Universal workflow plugin (agents/skills/hooks/commands)
+1351	260	peterkrueck/Claude-Code-Development-Kit	Beginner/intermediate workflow + tutorial
+678	59	runesleo/claude-code-workflow	Battle-tested workflow template
+405	22	zxdxjtu/claudecode-rule2hook	Natural-language rules → hooks
+374	26	yzddmr6/repo-analyzer	Deep architectural-analysis skill
+368	4220	crossoverJie/SkillDeck	Skill registry macOS app
+352	1024	shinpr/claude-code-workflows	Production workflows + AI agents
+335	3772	mxyhi/ok-skills	Codex/Claude/Cursor playbooks
+329	2623	aklofas/kicad-happy	KiCad electronics design skills
+271	148	Vishavjeet6/awesome-copilot-instructions	Awesome Copilot instructions
+241	23	iannuttall/task-magic	Cursor+Windsurf task management
+198	2974	SCStelz/security-investigator	Microsoft MCP + Copilot security investigation
+179	626	SebastienDegodez/copilot-instructions	Comprehensive coding rules
+137	33	pamelafox/awesome-copilot-instructions	Awesome Copilot custom instructions
+126	422	nnnggel/skills-management	CLI to manage/sync skills
+121	27	bit-of-a-shambles/rails_copilot_instructions	Canonical Rails Copilot instructions
+96	55	ithiria894/awesome-claude-code-workflows	Workflow recipes (hooks/MCP/skills/agents)
+70	1654	ursisterbtw/ccprompts	Practical Claude commands and subagents
+57	108	barkain/claude-code-workflow-orchestration	Multi-step workflow orchestration (small clone)
+55	33	he-yufeng/RuleForge	Auto-generate CLAUDE.md / .cursorrules / copilot-instructions
+55	456	dgalarza/claude-code-workflows	Personal workflow collection
+50	27	livekit/agent-skills	LiveKit voice AI skills
+41	2005	vaayne/agent-kit	Reusable components (skills/subagents/MCP)
+41	459	Robotti-io/copilot-security-instructions	Copilot security ruleset
+33	7	weekend-project-space/awesome-aigc-prompts	prompt-engineer / AIGC prompts
+23	211	emalorenzo/three-agent-skills	Three.js + React-Three-Fiber skills
+21	86	Yomudogly/awesome-ai-prompts	Awesome AI prompts
+16	265	blencorp/rules-gen	CLI to generate Cursor and Windsurf rules
+12	378	J-nowcow/awesome-korean-agent-skills	400+ Korean AI coding agent skills
+11	125	ximilsoft/awesome-ai-prompts	Custom AI prompts for ChatGPT/Gemini
+10	103	GulajavaMinistudio/awesome-copilot-id	Indonesian Copilot instructions + agents + prompts
+6	272	JokerRun/amp-skills	Amp AI coding agent skills
+6	60	0x2e-Tech/awesome-ai-prompts	500+ LLM prompts for ChatGPT/Claude/Gemini
+2	587	convertscout/awesome-ai-prompts	500+ Cursor rules + AI coding prompts
+6	19	slime21023/windsurf-rules-toolbox	Windsurf rules toolbox

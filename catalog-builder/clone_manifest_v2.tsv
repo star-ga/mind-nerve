@@ -1,0 +1,27 @@
+stars	size_kb	full_name	description
+506	43	EveryInc/claude_commands	Our favorite Claude Code commands
+502	48	badlogic/claude-commands	Global Claude Code commands and workflows
+301	1202	kiliczsh/claude-cmd	Claude Code Commands Manager
+276	3305	rsmdt/the-startup	Agentic Startup — commands + skills + agents
+132	1207	Comfy-Org/comfy-claude-prompt-library	Claude Code commands and memories
+70	1654	ursisterbtw/ccprompts	Practical Claude Code commands and subagents
+36	284	shakacode/claude-code-commands-skills-agents	ShakaCode team commands + agents + skills
+47	204	nimbalyst/product-manager-claude-code-commands	PM Claude Code commands
+27	144	rlajous/claude-code-commands	Production-ready slash commands + subagents + hooks
+84	1874	coleam00/ai-transformation-workshop	Principles of Agentic Engineering workshop
+3553	827	gemini-cli-extensions/conductor	Gemini CLI plan-and-implement extension
+316	7582	gemini-cli-extensions/ralph	Ralph loops Gemini CLI extension
+131	1561	AsyncFuncAI/ralph-wiggum-extension	Ralph Wiggum Gemini CLI extension
+55	51	Piebald-AI/awesome-gemini-cli-extensions	Curated list of Gemini CLI extensions
+147	25	philschmid/gemini-cli-extension	Helpful gemini CLI extensions and commands
+176	56	jduncan-rva/skill-porter	Convert Claude Code skills to Gemini CLI extensions and vice versa
+98	8	intellectronica/gemini-cli-skillz	Gemini CLI extension for Anthropic-style Agent Skills via skillz MCP
+402	77	harish-garg/gemini-cli-prompt-library	Curated library of dev prompts
+86	70	automateyournetwork/GeminiCLI_ComputerUse_Extension	Google Gemini CLI Computer Use extension
+62	12	gemini-cli-extensions/gcloud	gcloud Gemini CLI Extension
+3504	3404	sanjeed5/awesome-cursor-rules-mdc	Awesome Cursor Rules .mdc files
+14568	13098	jujumilk3/leaked-system-prompts	Collection of leaked system prompts
+26122	445	elder-plinius/CL4R1T4S	Leaked system prompts for ChatGPT/Claude/Gemini/Grok/Perplexity/Cursor/Lovable
+126	924	YeeKal/leaked-system-prompts	Leaked system prompts (multi-vendor)
+2	36	MukundaKatta/heimdall	Curated AI system prompts collection
+0	344	LifeJiggy/oss-system-prompts	Production-ready OSS-development system prompts

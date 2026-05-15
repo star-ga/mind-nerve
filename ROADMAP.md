@@ -23,6 +23,28 @@ shipped.
 6. **Compile speed never regresses.** mind-runtime frontend compile times
    stay within the published envelope; module-level gating only.
 
+## Hard prerequisites before any release (private or public)
+
+Three blockers must close before mind-nerve is shippable in any form
+(noted 2026-05-14, raised by Nikolai):
+
+1. **Catalog freeze.** Catalog mining is still in progress. The
+   release dataset is the catalog snapshot at freeze; Phase 1 cannot
+   exit while the catalog is still mutating.
+2. **Native MIND training pipeline.** The trained classifier weights
+   must come out of a native-MIND pipeline (custom BPE included) —
+   not an external framework one-shot. This is the same constraint
+   Phase 2 carries, pulled forward as a release blocker.
+3. **Wire MIND with protected libs.** The shipped binary must consume
+   STARGA's protection toolchain (the canonical separate protection
+   repo, the same one NikolaChess and mind-mem-protected use). The
+   open-source surface ships clean; the runtime is protected so the
+   release does not leak commercial MIND internals.
+
+No release tag — public or private — until 1, 2, and 3 close. The
+existing Phase 1 / Phase 2 exit criteria below are necessary but not
+sufficient.
+
 ## Phase 1 — Reference implementation (target: Q1 2027)
 
 **Architecture finalised (scaffold landed 2026-05-13):** encoder + direct
@@ -65,6 +87,19 @@ without measurable accuracy impact on agent-CLI request distributions.
 - Latency p95 ≤ 30 ms on ARM (Apple silicon, Snapdragon)
 
 ### Phase 2 accuracy & latency enhancements (SOTA-track)
+
+**Update 2026-05-14:** the autoresearch IMPLEMENT phase landed
+backwards-soft compile-time switches for items 1, 3, 4, and the
+group-wise INT8 / matryoshka / cosine / RMSNorm / ALiBi / sink-token
+/ multi-query-pooling / prefix-conditioning research vectors —
+together covering ~80% of the Phase 2 inference-surface roadmap.
+Each switch is **off by default** (binary byte-identical to today)
+and flips on once the offline catalog-builder pipeline emits a
+matching reference checkpoint. See
+`spec/architecture.md` § "Backwards-soft architecture switches"
+and `RFCs/INDEX.md` for the full set with source-paper citations.
+
+What's still ahead for Phase 2:
 
 The following improvements landed against fleet consensus on 2026-05-13 as
 the highest-leverage moves to differentiate mind-nerve from sentence-

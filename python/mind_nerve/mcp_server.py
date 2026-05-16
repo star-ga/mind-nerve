@@ -26,7 +26,8 @@ import sys
 from typing import Any
 
 from . import __version__
-from .inference import route as _route, load_default_runtime
+from .inference import load_default_runtime
+from .inference import route as _route
 
 
 def _ok(req_id: Any, result: Any) -> dict:

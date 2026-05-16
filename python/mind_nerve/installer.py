@@ -1,13 +1,14 @@
 """mind-nerve cross-CLI installer.
 
-Detects each of the 17 supported agent CLIs by config-path probe, then
-installs a per-CLI hook that calls `mind-nerve route`. Each CLI gets a
-small per-CLI shim because their hook protocols differ; the binary
-itself is unified.
+The universal install path is **MCP registration**. Most agent CLIs
+(Claude Code, Cursor, Codex, Claude Desktop) accept an MCP server in
+their config; mind-nerve ships an MCP server (`mind-nerve-mcp`)
+exposing a single `mind_nerve_route` tool. The installer's job is
+patching each CLI's MCP config to add the mind-nerve entry.
 
-v0.1.0 ships installer logic for 7 of the 17 — see PRIORITY_CLIS
-below. The remainder are stubs noted in NOT_YET_IMPLEMENTED. Each is
-a small addition: detect → write shim → patch settings file.
+For CLIs that don't speak MCP (aider, plain hook-only Claude Code
+setups), we fall back to per-CLI shim formats. These are noted in
+each install function.
 
 Usage:
     mind-nerve-install list
@@ -21,162 +22,228 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
 HOME = Path(os.path.expanduser("~"))
 
-PRIORITY_CLIS = {
-    "claude-code":   {"config_dir": HOME / ".claude",   "hook_kind": "hook"},
-    "codex":         {"config_dir": HOME / ".codex",    "hook_kind": "hook"},
-    "gemini":        {"config_dir": HOME / ".gemini",   "hook_kind": "extension"},
-    "cursor":        {"config_dir": HOME / ".cursor",   "hook_kind": "rule"},
-    "windsurf":      {"config_dir": HOME / ".windsurf", "hook_kind": "rule"},
-    "aider":         {"config_dir": HOME / ".aider",    "hook_kind": "config"},
-    "mcp":           {"config_dir": HOME / ".mcp",      "hook_kind": "server"},
-}
 
-NOT_YET_IMPLEMENTED = [
+# CLIs grouped by install mechanism.
+MCP_CAPABLE = {
+    "claude-code":    {"detect": HOME / ".claude" / "settings.json",
+                       "method": "claude_cli"},
+    "claude-desktop": {"detect": HOME / ".config" / "Claude" / "claude_desktop_config.json",
+                       "method": "json_mcp_servers"},
+    "cursor":         {"detect": HOME / ".cursor" / "mcp.json",
+                       "method": "json_mcp_servers"},
+    "codex":          {"detect": HOME / ".codex" / "config.toml",
+                       "method": "toml_mcp_servers"},
+}
+HOOK_BASED = {
+    "claude-code-hook": {"detect": HOME / ".claude" / "settings.json",
+                         "method": "claude_user_prompt_hook"},
+}
+STUB_CLIS = [
+    "gemini",       # extension format not verified yet
+    "windsurf",     # dir not standardly present
+    "aider",        # no MCP support; needs bespoke integration
     "vibe", "openclaw", "nanoclaw", "nemoclaw",
     "continue", "cline", "roo", "zed", "copilot", "cody",
 ]
 
-ALL_CLIS = list(PRIORITY_CLIS) + NOT_YET_IMPLEMENTED
+
+def _mcp_entry() -> dict:
+    """The mind-nerve MCP server registration entry, used by every CLI."""
+    return {
+        "command": "mind-nerve-mcp",
+        "args": [],
+        "env": {},
+    }
 
 
-def detect() -> dict[str, dict]:
-    out: dict[str, dict] = {}
-    for cli, info in PRIORITY_CLIS.items():
-        cfg = info["config_dir"]
-        out[cli] = {
-            "config_dir": str(cfg),
-            "present": cfg.exists(),
-            "status": "supported",
-        }
-    for cli in NOT_YET_IMPLEMENTED:
-        out[cli] = {"config_dir": None, "present": False, "status": "stub-only"}
-    return out
+# ---------------------------------------------------------------------------
+# Per-CLI installers
+# ---------------------------------------------------------------------------
 
 
-def install_claude_code(cfg_dir: Path) -> dict:
-    hooks_dir = cfg_dir / "hooks"
-    hooks_dir.mkdir(parents=True, exist_ok=True)
-    hook_path = hooks_dir / "mind-nerve-preselect.sh"
-    hook_path.write_text(
-        "#!/usr/bin/env bash\n"
-        "# mind-nerve UserPromptSubmit hook — installed by mind-nerve-install.\n"
-        "set -u\n"
-        'PROMPT="$(cat)"\n'
-        'echo "$PROMPT" | mind-nerve route --top-k 5 --ids-only 2>/dev/null || true\n'
-    )
-    hook_path.chmod(0o755)
-    return {"installed": True, "path": str(hook_path)}
+def install_claude_code(cfg: dict) -> dict:
+    """Use the `claude mcp add` CLI command (preferred, validated by claude itself)."""
+    if not shutil.which("claude"):
+        return _install_claude_code_manual()
+    try:
+        r = subprocess.run(
+            ["claude", "mcp", "add", "mind-nerve", "mind-nerve-mcp"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode == 0:
+            return {"installed": True, "method": "claude_mcp_add",
+                    "stdout": r.stdout.strip()}
+        # If it's already added, treat as ok.
+        if "already exists" in (r.stdout + r.stderr).lower():
+            return {"installed": True, "method": "claude_mcp_add",
+                    "note": "already exists"}
+        return _install_claude_code_manual()
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return {"installed": False, "error": str(exc)}
 
 
-def install_codex(cfg_dir: Path) -> dict:
-    hooks_dir = cfg_dir / "hooks"
-    hooks_dir.mkdir(parents=True, exist_ok=True)
-    hook_path = hooks_dir / "mind-nerve.sh"
-    hook_path.write_text(
-        "#!/usr/bin/env bash\n"
-        "# mind-nerve codex preselection hook — installed by mind-nerve-install.\n"
-        "set -u\n"
-        'REQUEST="${CODEX_USER_PROMPT:-}"\n'
-        '[ -z "$REQUEST" ] && exit 0\n'
-        'command -v mind-nerve >/dev/null 2>&1 || exit 0\n'
-        'echo "$REQUEST" | mind-nerve route --top-k 5 --ids-only 2>/dev/null || true\n'
-    )
-    hook_path.chmod(0o755)
-    return {"installed": True, "path": str(hook_path)}
+def _install_claude_code_manual() -> dict:
+    """Fall back: patch ~/.claude.json directly (Claude Code's project config).
 
-
-def install_gemini(cfg_dir: Path) -> dict:
-    ext_dir = cfg_dir / "extensions" / "mind-nerve"
-    ext_dir.mkdir(parents=True, exist_ok=True)
-    (ext_dir / "extension.json").write_text(json.dumps({
-        "name": "mind-nerve",
-        "version": "0.1.0",
-        "description": "mind-nerve preselector",
-        "command": "mind-nerve",
-        "args": ["route", "--top-k", "5"],
-    }, indent=2))
-    return {"installed": True, "path": str(ext_dir)}
-
-
-def install_cursor(cfg_dir: Path) -> dict:
-    rules_dir = cfg_dir / "rules"
-    rules_dir.mkdir(parents=True, exist_ok=True)
-    rule_path = rules_dir / "mind-nerve.mdc"
-    rule_path.write_text(
-        "---\n"
-        "description: mind-nerve preselector — invoke `mind-nerve route --top-k 5` "
-        "to filter the active skill set per turn.\n"
-        "---\n"
-        "Use `mind-nerve route` to retrieve top-K relevant skills before loading "
-        "the full skill catalog.\n"
-    )
-    return {"installed": True, "path": str(rule_path)}
-
-
-def install_windsurf(cfg_dir: Path) -> dict:
-    rules_dir = cfg_dir / "rules"
-    rules_dir.mkdir(parents=True, exist_ok=True)
-    rule_path = rules_dir / "mind-nerve.md"
-    rule_path.write_text(
-        "# mind-nerve preselector\n\n"
-        "Run `mind-nerve route --top-k 5` to filter the skill catalog per turn.\n"
-    )
-    return {"installed": True, "path": str(rule_path)}
-
-
-def install_aider(cfg_dir: Path) -> dict:
-    cfg_dir.mkdir(parents=True, exist_ok=True)
-    aider_cfg = cfg_dir / "aider.conf.yml"
-    aider_cfg.write_text(
-        "# mind-nerve preselector hook — installed by mind-nerve-install.\n"
-        "# Aider will call this command at the start of each turn to filter skills.\n"
-        "lint-cmd:\n"
-        "  - 'mind-nerve route --top-k 5'\n"
-    )
-    return {"installed": True, "path": str(aider_cfg)}
-
-
-def install_mcp(cfg_dir: Path) -> dict:
-    cfg_dir.mkdir(parents=True, exist_ok=True)
-    cfg_path = cfg_dir / "servers.json"
-    existing = {}
+    Claude Code stores MCP servers per-project in ~/.claude.json. Patching
+    the top-level `mcpServers` makes them visible across all projects.
+    """
+    cfg_path = HOME / ".claude.json"
+    existing: dict = {}
     if cfg_path.exists():
         try:
             existing = json.loads(cfg_path.read_text())
         except json.JSONDecodeError:
             existing = {}
     servers = existing.setdefault("mcpServers", {})
-    servers["mind-nerve"] = {
-        "command": "mind-nerve-mcp",
-        "args": [],
-        "env": {},
-    }
+    servers["mind-nerve"] = _mcp_entry()
     cfg_path.write_text(json.dumps(existing, indent=2) + "\n")
-    return {"installed": True, "path": str(cfg_path)}
+    return {"installed": True, "method": "manual_claude_json",
+            "path": str(cfg_path)}
+
+
+def install_claude_desktop(cfg: dict) -> dict:
+    """Patch ~/.config/Claude/claude_desktop_config.json (Linux) or macOS path."""
+    candidates = [
+        HOME / ".config" / "Claude" / "claude_desktop_config.json",
+        HOME / "Library" / "Application Support" / "Claude" / "claude_desktop_config.json",
+    ]
+    cfg_path = next((c for c in candidates if c.parent.exists()), candidates[0])
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    existing: dict = {}
+    if cfg_path.exists():
+        try:
+            existing = json.loads(cfg_path.read_text())
+        except json.JSONDecodeError:
+            existing = {}
+    servers = existing.setdefault("mcpServers", {})
+    servers["mind-nerve"] = _mcp_entry()
+    cfg_path.write_text(json.dumps(existing, indent=2) + "\n")
+    return {"installed": True, "method": "json_mcp_servers", "path": str(cfg_path)}
+
+
+def install_cursor(cfg: dict) -> dict:
+    """Patch ~/.cursor/mcp.json."""
+    cfg_path = HOME / ".cursor" / "mcp.json"
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    existing: dict = {}
+    if cfg_path.exists():
+        try:
+            existing = json.loads(cfg_path.read_text())
+        except json.JSONDecodeError:
+            existing = {}
+    servers = existing.setdefault("mcpServers", {})
+    servers["mind-nerve"] = _mcp_entry()
+    cfg_path.write_text(json.dumps(existing, indent=2) + "\n")
+    return {"installed": True, "method": "json_mcp_servers", "path": str(cfg_path)}
+
+
+def install_codex(cfg: dict) -> dict:
+    """Patch ~/.codex/config.toml — add `[mcp_servers.mind-nerve]` block.
+
+    Codex's config is TOML; we read-edit-write minimally to preserve
+    unrelated blocks. Idempotent: re-running replaces the section.
+    """
+    cfg_path = HOME / ".codex" / "config.toml"
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    block = (
+        "\n[mcp_servers.mind-nerve]\n"
+        'command = "mind-nerve-mcp"\n'
+        "args = []\n"
+        "env = {}\n"
+    )
+    existing = ""
+    if cfg_path.exists():
+        existing = cfg_path.read_text()
+
+    # If a [mcp_servers.mind-nerve] block already exists, replace it.
+    import re
+    pattern = re.compile(
+        r"\n?\[mcp_servers\.mind-nerve\][^\[]*?(?=\n\[|\Z)",
+        re.DOTALL,
+    )
+    if pattern.search(existing):
+        updated = pattern.sub(block, existing)
+    else:
+        updated = existing.rstrip() + block
+
+    cfg_path.write_text(updated)
+    return {"installed": True, "method": "toml_mcp_servers", "path": str(cfg_path)}
+
+
+def install_claude_code_hook(cfg: dict) -> dict:
+    """Alternative claude-code path: UserPromptSubmit hook instead of MCP.
+
+    Patches ~/.claude/settings.json `hooks.UserPromptSubmit` with a
+    `mind-nerve route` command. Use when you want the preselector
+    *inline* in the prompt path rather than as an explicit MCP tool.
+    """
+    cfg_path = HOME / ".claude" / "settings.json"
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    existing: dict = {}
+    if cfg_path.exists():
+        try:
+            existing = json.loads(cfg_path.read_text())
+        except json.JSONDecodeError:
+            existing = {}
+    hooks = existing.setdefault("hooks", {})
+    ups = hooks.setdefault("UserPromptSubmit", [])
+    # Idempotency: drop any existing mind-nerve entry first
+    ups = [e for e in ups if not any(
+        "mind-nerve" in (h.get("command", "") or "")
+        for h in (e.get("hooks") or [])
+    )]
+    ups.append({
+        "matcher": "",
+        "hooks": [{"type": "command", "command": "mind-nerve route --top-k 5 --ids-only"}],
+    })
+    hooks["UserPromptSubmit"] = ups
+    cfg_path.write_text(json.dumps(existing, indent=2) + "\n")
+    return {"installed": True, "method": "claude_user_prompt_hook",
+            "path": str(cfg_path)}
 
 
 INSTALLERS = {
-    "claude-code": install_claude_code,
-    "codex":       install_codex,
-    "gemini":      install_gemini,
-    "cursor":      install_cursor,
-    "windsurf":    install_windsurf,
-    "aider":       install_aider,
-    "mcp":         install_mcp,
+    "claude-code":      install_claude_code,
+    "claude-code-hook": install_claude_code_hook,
+    "claude-desktop":   install_claude_desktop,
+    "cursor":           install_cursor,
+    "codex":            install_codex,
 }
 
 
+# ---------------------------------------------------------------------------
+# Detect + list + main
+# ---------------------------------------------------------------------------
+
+
+def detect() -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    for cli, info in {**MCP_CAPABLE, **HOOK_BASED}.items():
+        present = info["detect"].exists()
+        out[cli] = {"config_probe": str(info["detect"]), "present": present,
+                    "method": info["method"], "status": "supported"}
+    for cli in STUB_CLIS:
+        out[cli] = {"present": False, "status": "stub_v0.1.1"}
+    return out
+
+
 def cmd_list(args) -> int:
-    print("Supported CLIs (priority — installer implemented):")
-    for cli in PRIORITY_CLIS:
+    print("MCP-capable CLIs (preferred path — single binary):")
+    for cli in MCP_CAPABLE:
         print(f"  - {cli}")
-    print("\nKnown but stub-only (v0.1.1+):")
-    for cli in NOT_YET_IMPLEMENTED:
+    print("\nHook-based fallback:")
+    for cli in HOOK_BASED:
+        print(f"  - {cli}")
+    print("\nStub CLIs (v0.1.1+, integration TBD):")
+    for cli in STUB_CLIS:
         print(f"  - {cli}")
     return 0
 
@@ -187,17 +254,22 @@ def cmd_detect(args) -> int:
 
 
 def cmd_install(args) -> int:
-    targets = list(PRIORITY_CLIS) if args.cli == "all" else [args.cli]
-    if args.cli not in (*PRIORITY_CLIS, "all"):
-        msg = f"unsupported CLI: {args.cli}\nrun `mind-nerve-install list` to see options"
-        print(msg, file=sys.stderr)
+    known = set(INSTALLERS) | {"all"}
+    if args.cli not in known:
+        print(f"unsupported CLI: {args.cli}\nrun `mind-nerve-install list` to see options",
+              file=sys.stderr)
         return 2
 
-    results = {}
+    targets = list(INSTALLERS) if args.cli == "all" else [args.cli]
+    # Don't install both claude-code and claude-code-hook in 'all' mode —
+    # they're alternative integrations of the same CLI; prefer MCP.
+    if args.cli == "all":
+        targets = [t for t in targets if t != "claude-code-hook"]
+
+    results: dict[str, dict] = {}
     for cli in targets:
-        info = PRIORITY_CLIS[cli]
         try:
-            results[cli] = INSTALLERS[cli](info["config_dir"])
+            results[cli] = INSTALLERS[cli](MCP_CAPABLE.get(cli) or HOOK_BASED.get(cli) or {})
         except Exception as exc:                       # noqa: BLE001
             results[cli] = {"installed": False, "error": str(exc)}
     print(json.dumps(results, indent=2))
@@ -216,7 +288,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p_ins = sub.add_parser("install", help="Install the mind-nerve hook for a CLI")
     p_ins.add_argument("--cli", required=True,
-                       help="One of: " + ", ".join(list(PRIORITY_CLIS) + ["all"]))
+                       help="One of: " + ", ".join(list(INSTALLERS) + ["all"]))
     p_ins.set_defaults(func=cmd_install)
 
     args = ap.parse_args(argv)

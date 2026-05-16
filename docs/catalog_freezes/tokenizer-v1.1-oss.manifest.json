@@ -1,0 +1,26 @@
+{
+  "actual_vocab_size": 16384,
+  "corpus_bytes": 11611131,
+  "corpus_sha256": "ee58567cc219594c222f790980256fbd5abdf94c53e6243a89f67d310cfa3461",
+  "model_kind": "BPE",
+  "schema_version": 1,
+  "signing": {
+    "algorithm": "HMAC-SHA256",
+    "key_id": "STARGA-ROOT-2026",
+    "status": "draft-unsigned"
+  },
+  "special_tokens": [
+    "[PAD]",
+    "[BOS]",
+    "[EOS]",
+    "[QUERY]",
+    "[POSITIVE]",
+    "[SINK]",
+    "[MASK]",
+    "[SEP]"
+  ],
+  "tokenizer_sha256": "cc2a5502d0fa683c98d59da77af1e4ef3a3812e7e2f345c1d8d7a90bed99d817",
+  "tokenizer_version": "v1.1-oss",
+  "trained_at_iso": "2026-05-16T03:58:31Z",
+  "vocab_size": 16384
+}

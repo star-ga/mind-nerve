@@ -52,3 +52,12 @@ version = { attr = "mind_nerve.__version__" }
 
 [tool.setuptools.package-data]
 mind_nerve = ["data/*.json", "data/*.bin"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B"]
+ignore = ["E501"]   # line-length handled by ruff format; help text + docstrings exceed
+

@@ -19,7 +19,9 @@ import json
 import sys
 
 from . import __version__
-from .inference import route, load_default_runtime, precompute_routes
+from .discovery import Watcher
+from .discovery import scan as discovery_scan
+from .inference import load_default_runtime, precompute_routes, route
 
 
 def cmd_route(args) -> int:
@@ -71,12 +73,43 @@ def cmd_precompute(args) -> int:
     return 0
 
 
+def cmd_learn(args) -> int:
+    out = discovery_scan(
+        args.dir,
+        source_repo=args.source or "local",
+        include_unknown=args.include_unknown,
+        runtime_dir=args.runtime_dir or "/data/datasets/mind-nerve-catalog/phase1/v1.1-oss",
+        dry_run=args.dry_run,
+    )
+    print(json.dumps(out, indent=2))
+    return 0
+
+
+def cmd_watch(args) -> int:
+    dirs = [(d, args.source or "local") for d in args.dirs]
+    w = Watcher(dirs, interval=args.interval, include_unknown=args.include_unknown,
+                runtime_dir=args.runtime_dir or "/data/datasets/mind-nerve-catalog/phase1/v1.0")
+    w.start()
+    print(f"[mind-nerve watch] watching {len(dirs)} dirs every {args.interval}s; ctrl-c to stop",
+          file=sys.stderr)
+    import time
+    try:
+        while True:
+            time.sleep(args.interval)
+            last = w.last
+            if last:
+                print(json.dumps(last, separators=(",", ":")), flush=True)
+    except KeyboardInterrupt:
+        w.stop()
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="mind-nerve")
     ap.add_argument("--version", action="version", version=f"mind-nerve {__version__}")
     ap.add_argument("--runtime-dir", default=None,
                     help="Override the runtime directory (default: $MIND_NERVE_RUNTIME_DIR or "
-                         "/data/datasets/mind-nerve-catalog/phase1/v1.0)")
+                         "/data/datasets/mind-nerve-catalog/phase1/v1.1-oss)")
 
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -95,6 +128,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_pre = sub.add_parser("precompute-routes",
                            help="(One-time) encode the catalog into route_table.npy")
     p_pre.set_defaults(func=cmd_precompute)
+
+    p_learn = sub.add_parser("learn",
+                             help="Scan a directory for new skills and add them to the route table")
+    p_learn.add_argument("dir", help="Directory to scan (e.g. ~/.agents/skills)")
+    p_learn.add_argument("--source", default=None, help="Source-repo label (default: 'local')")
+    p_learn.add_argument("--include-unknown", action="store_true",
+                         help="Include items with no declared license. OFF by default.")
+    p_learn.add_argument("--dry-run", action="store_true")
+    p_learn.set_defaults(func=cmd_learn)
+
+    p_watch = sub.add_parser("watch",
+                             help="Daemon: poll one or more dirs for new skills (no inotify dep)")
+    p_watch.add_argument("dirs", nargs="+", help="Directories to watch")
+    p_watch.add_argument("--source", default=None)
+    p_watch.add_argument("--interval", type=float, default=5.0, help="Poll interval (sec)")
+    p_watch.add_argument("--include-unknown", action="store_true")
+    p_watch.set_defaults(func=cmd_watch)
 
     return ap
 

@@ -1,6 +1,6 @@
 [package]
 name = "mind-nerve"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 authors = ["STARGA, Inc. <info@star.ga>"]
 description = "CPU-first intent-classification preselector for agent runtimes"
 license = "Apache-2.0"

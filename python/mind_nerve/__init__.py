@@ -12,8 +12,8 @@ Public API:
         print(r.score, r.name, r.kind)
 """
 
-from .types import Route, RouteResult
 from .inference import load_default_runtime, route
+from .types import Route, RouteResult
 
-__version__ = "0.1.0a1"
+__version__ = "0.1.0a2"
 __all__ = ["Route", "RouteResult", "route", "load_default_runtime", "__version__"]

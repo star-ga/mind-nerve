@@ -1,0 +1,27 @@
+{
+  "canonical_bytes": 3738859,
+  "catalog_version": "v1.1-oss",
+  "drop_reasons": {
+    "excluded_repo:YeeKal_leaked-system-prompts": 120,
+    "excluded_repo:elder-plinius_CL4R1T4S": 59,
+    "excluded_repo:jujumilk3_leaked-system-prompts": 121,
+    "excluded_repo:weekend-project-space_awesome-aigc-prompts": 7,
+    "local_skill_commercial_risk": 12,
+    "local_skill_missing": 5,
+    "local_skill_unknown": 222
+  },
+  "freeze_id": "1cd130fa98255241b93aaa2fe6a8086bcbf6fc0627c904008cf48ba9f233536d",
+  "frozen_at_iso": "2026-05-16T03:57:31Z",
+  "items_count": 11922,
+  "items_dropped": 546,
+  "policy": "v1.1-oss is the public-redistributable corpus. Filters out: (a) STARGA private claude-agents directory in full, (b) STARGA local-skills entries without declared OSS license, (c) ethically gray leaked-system-prompts collections, (d) any item matching commercial-content markers.",
+  "schema_version": 1,
+  "signing": {
+    "algorithm": "HMAC-SHA256",
+    "key_id": "STARGA-ROOT-2026",
+    "status": "draft-unsigned"
+  },
+  "source_freeze": "v1.0",
+  "source_freeze_id": "a63b55d728492fee9659d2568262c87aebe4d2fca615eb393cc24ce1fa59bb51",
+  "tokens_est_total": 934714
+}

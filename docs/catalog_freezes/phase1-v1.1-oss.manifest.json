@@ -1,0 +1,39 @@
+{
+  "base_model": "BAAI/bge-small-en-v1.5",
+  "baseline_metrics": {
+    "candidate_pool": 11922,
+    "top1": 0.7527,
+    "top10": 0.9489,
+    "top5": 0.9296
+  },
+  "batch": 32,
+  "catalog_version": "v1.1-oss",
+  "corpus_hash": "1cd130fa98255241b93aaa2fe6a8086bcbf6fc0627c904008cf48ba9f233536d",
+  "device": "cuda",
+  "epochs": 3,
+  "eval_pairs": 1193,
+  "final_metrics": {
+    "candidate_pool": 11922,
+    "top1": 0.8449,
+    "top10": 0.9707,
+    "top5": 0.9606
+  },
+  "improvement": {
+    "top1": 0.0922,
+    "top10": 0.0218,
+    "top5": 0.031
+  },
+  "lr": 2e-05,
+  "max_len": 256,
+  "model_hash": "83d4d390469bc1bc6a6cac3b9ab8448dcfcd9ac2ba1ab9fce9348c64012681a6",
+  "phase": 1,
+  "phase1_version": "v1.1-oss",
+  "policy": "v1.1-oss public-clean \u2014 no STARGA-private content in training corpus",
+  "schema_version": 1,
+  "seed": 1337,
+  "tokenizer_hash": "cc2a5502d0fa683c98d59da77af1e4ef3a3812e7e2f345c1d8d7a90bed99d817",
+  "torch_version": "2.6.0+cu124",
+  "train_pairs": 10729,
+  "train_seconds": 119.5,
+  "trained_at_iso": "2026-05-16T04:00:53Z"
+}

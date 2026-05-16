@@ -21,7 +21,7 @@ from .types import Route, RouteResult
 
 _DEFAULT_RUNTIME_DIR = os.environ.get(
     "MIND_NERVE_RUNTIME_DIR",
-    "/data/datasets/mind-nerve-catalog/phase1/v1.0",
+    "/data/datasets/mind-nerve-catalog/phase1/v1.1-oss",
 )
 
 
@@ -45,7 +45,7 @@ class _Runtime:
                 f"Run mind_nerve.installer.precompute_routes() first."
             )
         self.embeddings: "np.ndarray" = np.load(emb_path)
-        self.routes: list[dict] = [json.loads(l) for l in meta_path.open("r")]
+        self.routes: list[dict] = [json.loads(ln) for ln in meta_path.open("r")]
         if self.embeddings.shape[0] != len(self.routes):
             raise RuntimeError("Route table embeddings/meta length mismatch")
 

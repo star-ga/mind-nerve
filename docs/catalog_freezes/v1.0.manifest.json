@@ -1,0 +1,33 @@
+{
+  "canonical_bytes": 3890265,
+  "catalog_version": "v1.0",
+  "dedup_drops": 574,
+  "encoder": "utf-8",
+  "fnv1a_32": "8168cd03",
+  "freeze_id": "a63b55d728492fee9659d2568262c87aebe4d2fca615eb393cc24ce1fa59bb51",
+  "frozen_at": 1778898241,
+  "frozen_at_iso": "2026-05-16T02:24:01Z",
+  "items_count": 12468,
+  "json_form": "compact, sort_keys=true, ensure_ascii=true",
+  "line_endings": "LF",
+  "raw_lines_seen": 13042,
+  "schema_version": 1,
+  "signing": {
+    "algorithm": "HMAC-SHA256",
+    "key_id": "STARGA-ROOT-2026",
+    "note": "Signature lives in manifest.sig and is applied out-of-band with the STARGA root key.",
+    "status": "draft-unsigned"
+  },
+  "sort": "lex(sha256) ascending",
+  "tokens_est_total": 972566,
+  "upstream_manifests": {
+    "clone_log_v1.tsv": "65595593a830cf71bf4f84c4fb9740735977d9c6b388c7adbca2cde9ec8d6b85",
+    "clone_log_v2.tsv": "b8acfaa36f320880bf35fdca23b98dd7b4174fbea0898d85c5ef4bd16c026ad7",
+    "clone_log_v3.tsv": "858e119e1d2d79b019ef40197db3f7195947b83b39352cc2215149f20bdff47c",
+    "clone_log_v4.tsv": "a48e59b29b52975265671611f099e529b65f9e0ffb9c1649618c1fe23392d3c0",
+    "clone_manifest_v1.tsv": "eb556b0c071f278d82432ed1da730c3bad5ed6102d37d4f664efccd6b38da2c2",
+    "clone_manifest_v2.tsv": "364d36fc8505e5296c34537ea3bb6bab087aa28d4bb7d65b511088aebd9a07e0",
+    "clone_manifest_v3.tsv": "1e6127396335011e57cd3a868f5d75095dcf0b88ea29e852aef3ac3de3239885",
+    "clone_manifest_v4.tsv": "bb4049bd45487494cdb94c2c3b2d3a75a2d1026ad1262ab3b5a3bfe1dd94bc1c"
+  }
+}

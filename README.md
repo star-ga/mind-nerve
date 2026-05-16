@@ -45,14 +45,10 @@ for r in result.routes:
     print(r.score, r.name, r.kind)
 ```
 
-Pre-download the runtime once and point `MIND_NERVE_RUNTIME_DIR` at it:
-
-```bash
-huggingface-cli download star-ga/mind-nerve-phase1 --local-dir ~/.mind-nerve/phase1
-export MIND_NERVE_RUNTIME_DIR=~/.mind-nerve/phase1
-```
-
-Auto-download on first `route()` call is on the 0.1.0a4 backlog.
+The first call auto-downloads the Phase-1 weights (~150 MB) from
+[`star-ga/mind-nerve-phase1`](https://huggingface.co/star-ga/mind-nerve-phase1)
+into `~/.local/share/mind-nerve/runtime/`. To pre-seed or use a custom
+location, set `MIND_NERVE_RUNTIME_DIR=/path/to/your/runtime/`.
 
 ## Why this exists
 

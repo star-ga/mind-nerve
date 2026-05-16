@@ -6,6 +6,16 @@ precomputed catalog embeddings, encodes one query, returns top-K.
 The Phase 1 inference path is intentionally simple. Phase 2 swaps the
 PyTorch encoder for the native MIND inference binary; the public
 API in `__init__.py` stays unchanged.
+
+Runtime directory resolution
+----------------------------
+The runtime dir holds `manifest.json`, `checkpoint/`, `route_table.npy`,
+and `route_table.jsonl`. Resolution order, first hit wins:
+
+  1. Explicit ``runtime_dir`` argument to ``route()`` / ``load_default_runtime()``
+  2. ``MIND_NERVE_RUNTIME_DIR`` env var
+  3. ``~/.local/share/mind-nerve/runtime/`` (auto-seeded from
+     ``star-ga/mind-nerve-phase1`` on Hugging Face on first use)
 """
 
 from __future__ import annotations
@@ -13,16 +23,86 @@ from __future__ import annotations
 import functools
 import json
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Any
 
 from .types import Route, RouteResult
 
-_DEFAULT_RUNTIME_DIR = os.environ.get(
-    "MIND_NERVE_RUNTIME_DIR",
-    "/data/datasets/mind-nerve-catalog/phase1/v1.1-oss",
-)
+_HF_REPO_ID = "star-ga/mind-nerve-phase1"
+_USER_RUNTIME_DIR = Path.home() / ".local" / "share" / "mind-nerve" / "runtime"
+
+
+def _seed_from_hf(target: Path) -> None:
+    """Snapshot-download the Phase-1 weights from Hugging Face into *target*.
+
+    Idempotent: skips files that already exist. Prints a one-line progress
+    notice to stderr on first download (sub-second on cache-hot machines,
+    ~150 MB cold).
+    """
+    from huggingface_hub import snapshot_download
+
+    print(
+        f"mind-nerve: downloading Phase-1 weights ({_HF_REPO_ID}, ~150 MB) "
+        f"to {target}", file=sys.stderr,
+    )
+    cached = Path(snapshot_download(repo_id=_HF_REPO_ID, repo_type="model"))
+    target.mkdir(parents=True, exist_ok=True)
+    import shutil
+    for item in cached.iterdir():
+        if item.name.startswith("."):
+            continue
+        dst = target / item.name
+        if dst.exists():
+            continue
+        if item.is_dir():
+            shutil.copytree(item, dst, symlinks=False)
+        else:
+            shutil.copy2(item, dst)
+
+
+def _resolve_runtime_dir(runtime_dir: str | None = None) -> Path:
+    """Return a Path to a valid mind-nerve runtime directory.
+
+    Auto-seeds ``~/.local/share/mind-nerve/runtime/`` from Hugging Face when
+    no explicit runtime is provided.
+    """
+    if runtime_dir:
+        p = Path(runtime_dir).expanduser()
+        if not p.is_dir():
+            raise FileNotFoundError(f"runtime dir {p} does not exist")
+        return p
+    env_dir = os.environ.get("MIND_NERVE_RUNTIME_DIR")
+    if env_dir:
+        p = Path(env_dir).expanduser()
+        if not p.is_dir():
+            raise FileNotFoundError(
+                f"MIND_NERVE_RUNTIME_DIR={env_dir} does not exist"
+            )
+        return p
+    if not (_USER_RUNTIME_DIR / "manifest.json").exists():
+        _seed_from_hf(_USER_RUNTIME_DIR)
+    return _USER_RUNTIME_DIR
+
+
+# Compatibility shim: discovery.py and the CLI used to import this constant.
+# It now lazy-evaluates on first attribute access so the HF download isn't
+# triggered at import time.
+class _DefaultRuntimeDirProxy(str):  # type: ignore[misc]
+    """str-compatible proxy that resolves to the runtime dir on str-cast."""
+
+    def __new__(cls):
+        return super().__new__(cls, "<lazy:mind-nerve-runtime>")
+
+    def __str__(self) -> str:
+        return str(_resolve_runtime_dir())
+
+    def __fspath__(self) -> str:
+        return str(_resolve_runtime_dir())
+
+
+_DEFAULT_RUNTIME_DIR = _DefaultRuntimeDirProxy()
 
 
 class _Runtime:
@@ -67,12 +147,18 @@ class _Runtime:
 
 
 @functools.lru_cache(maxsize=4)
-def load_default_runtime(runtime_dir: str = _DEFAULT_RUNTIME_DIR) -> _Runtime:
-    """Cached runtime loader — call once per process."""
-    p = Path(runtime_dir)
-    if not p.is_dir():
-        raise FileNotFoundError(f"runtime dir {p} does not exist")
-    return _Runtime(p)
+def _load_cached(runtime_dir_str: str) -> _Runtime:
+    return _Runtime(Path(runtime_dir_str))
+
+
+def load_default_runtime(runtime_dir: str | None = None) -> _Runtime:
+    """Cached runtime loader — call once per process.
+
+    Auto-downloads the Phase-1 weights from Hugging Face the first time
+    it's called without an explicit ``runtime_dir`` or ``MIND_NERVE_RUNTIME_DIR``.
+    """
+    p = _resolve_runtime_dir(runtime_dir)
+    return _load_cached(str(p))
 
 
 def route(query: str, top_k: int = 5, *, runtime_dir: str | None = None) -> RouteResult:
@@ -82,7 +168,7 @@ def route(query: str, top_k: int = 5, *, runtime_dir: str | None = None) -> Rout
     """
     import numpy as np
 
-    rt = load_default_runtime(runtime_dir or _DEFAULT_RUNTIME_DIR)
+    rt = load_default_runtime(runtime_dir)
 
     t0 = time.perf_counter()
     qv = rt.model.encode([query], convert_to_numpy=True, show_progress_bar=False,
@@ -120,8 +206,8 @@ def route(query: str, top_k: int = 5, *, runtime_dir: str | None = None) -> Rout
     )
 
 
-def precompute_routes(runtime_dir: str = _DEFAULT_RUNTIME_DIR,
-                      catalog_path: str = "/data/datasets/mind-nerve-catalog/freeze/v1.0/items.jsonl",
+def precompute_routes(runtime_dir: str | None = None,
+                      catalog_path: str | None = None,
                       ) -> dict[str, Any]:
     """Encode every catalog item and write route_table.npy + .jsonl.
 
@@ -131,9 +217,15 @@ def precompute_routes(runtime_dir: str = _DEFAULT_RUNTIME_DIR,
     import numpy as np
     from sentence_transformers import SentenceTransformer
 
-    rdir = Path(runtime_dir)
+    rdir = _resolve_runtime_dir(runtime_dir)
     if not (rdir / "checkpoint").is_dir():
         raise FileNotFoundError(f"no trained checkpoint at {rdir/'checkpoint'}")
+    if catalog_path is None:
+        catalog_path = str(rdir / "items.jsonl")
+        if not Path(catalog_path).exists():
+            raise FileNotFoundError(
+                f"no catalog_path provided and no items.jsonl found at {catalog_path}"
+            )
 
     model = SentenceTransformer(str(rdir / "checkpoint"))
     items: list[dict] = []

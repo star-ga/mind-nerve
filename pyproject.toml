@@ -26,6 +26,7 @@ dependencies = [
     "numpy>=1.24",
     "sentence-transformers>=3.0",
     "torch>=2.0",
+    "huggingface_hub>=0.20",
 ]
 
 [project.optional-dependencies]

@@ -2,6 +2,34 @@
 
 All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.0-alpha.6] — 2026-05-16
+
+### Added
+- **`pip install mind-nerve` works out of the box.** First `route()` call
+  auto-downloads the Phase-1 weights (~150 MB) from
+  [`star-ga/mind-nerve-phase1`](https://huggingface.co/star-ga/mind-nerve-phase1)
+  into `~/.local/share/mind-nerve/runtime/`. No more manual
+  `huggingface-cli download` + `MIND_NERVE_RUNTIME_DIR` setup.
+- GitHub Actions CI: ruff lint + wheel build + `libmindnerve.so`-in-wheel
+  check + multi-Python smoke (3.10 / 3.11 / 3.12) + pytest gate.
+- Regression tests for the 0.1.0a4 fixes in `tests/python/test_runtime_dir_env.py`:
+  atomic save no longer leaks `.tmp.npy`; CLI learn/watch honor
+  `MIND_NERVE_RUNTIME_DIR`.
+
+### Changed
+- `huggingface_hub>=0.20` is now a direct dependency (was indirect via
+  `sentence-transformers`).
+- `inference._DEFAULT_RUNTIME_DIR` is a lazy proxy now; the runtime path
+  resolves on first use rather than at import time, so the HF download
+  isn't triggered just by `import mind_nerve`.
+- `precompute_routes` default `runtime_dir` and `catalog_path` are
+  `None`; resolution mirrors the new auto-seed flow.
+
+### Removed
+- Hardcoded `/data/datasets/mind-nerve-catalog/...` default. Replaced by
+  the user-local + HF-auto-seeded path. STARGA-internal use sets
+  `MIND_NERVE_RUNTIME_DIR` explicitly.
+
 ## [0.1.0-alpha.5] — 2026-05-16
 
 ### Fixed
@@ -51,6 +79,7 @@ First private alpha tag. Phase 1 (Python-side inference) is complete; Phase 2 (n
 - Latency p95 ≤ 30 ms target on a 4-core CPU — Phase 2 only; currently measured Python-side.
 - `mindc` 0.2.5 parses `Mind.toml [protection]` / `[exports]` but does not yet act on them. Protection is delivered by the C bridge + build-pipeline post-processing.
 
+[0.1.0-alpha.6]: https://github.com/star-ga/mind-nerve/releases/tag/v0.1.0-alpha.6
 [0.1.0-alpha.5]: https://github.com/star-ga/mind-nerve/releases/tag/v0.1.0-alpha.5
 [0.1.0-alpha.4]: https://github.com/star-ga/mind-nerve/releases/tag/v0.1.0-alpha.4
 [0.1.0-alpha.3]: https://github.com/star-ga/mind-nerve/releases/tag/v0.1.0-alpha.3

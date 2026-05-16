@@ -13,9 +13,17 @@ per turn.
 
 ## Status
 
-Phase 0 — specification and scaffold. No trained weights. No runnable inference
-yet. The repository declares the architecture, integration surface, and
-quality targets. Implementation lands in Phase 1.
+**Phase 1 — private alpha (`v0.1.0-alpha.2`, 2026-05-16).** Python wheel ships;
+the FORTRESS-protected `libmindnerve.so` is bundled inside it. The router runs
+end-to-end on PyTorch via `BAAI/bge-small-en-v1.5` fine-tuned with
+MultipleNegativesRankingLoss; top-5 accuracy is 96.06 % against the full
+v1.1-oss catalog of 11,922 routing candidates.
+
+Phase 2 (Q3 2027 target) replaces the PyTorch path with a native MIND Q16.16
+inference loop and adds the cross-architecture bit-identity gate + 4-core CPU
+p95 ≤ 30 ms latency budget. Until Phase 2 closes, the inference path uses
+external ML tooling — explicitly permitted by the
+[ROADMAP](./ROADMAP.md) Phase 1 exception.
 
 ## Why this exists
 

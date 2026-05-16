@@ -23,29 +23,31 @@ shipped.
 6. **Compile speed never regresses.** mind-runtime frontend compile times
    stay within the published envelope; module-level gating only.
 
-## Hard prerequisites before any release (private or public)
+## Hard prerequisites — status (revised 2026-05-16)
 
-Three blockers must close before mind-nerve is shippable in any form
-(noted 2026-05-14, raised by Nikolai):
+Three blockers were raised 2026-05-14. Status after the Phase 1 alpha sprint:
 
-1. **Catalog freeze.** Catalog mining is still in progress. The
-   release dataset is the catalog snapshot at freeze; Phase 1 cannot
-   exit while the catalog is still mutating.
-2. **Native MIND training pipeline.** The trained classifier weights
-   must come out of a native-MIND pipeline (custom BPE included) —
-   not an external framework one-shot. This is the same constraint
-   Phase 2 carries, pulled forward as a release blocker.
-3. **Wire MIND with protected libs.** The shipped binary must consume
-   STARGA's protection toolchain (the canonical separate protection
-   repo, the same one NikolaChess and mind-mem-protected use). The
-   open-source surface ships clean; the runtime is protected so the
-   release does not leak commercial MIND internals.
+1. **Catalog freeze — DONE.** `catalog-v1.0` (12,468 items, draft-unsigned
+   `freeze_id a63b55d7…`) shipped 2026-05-14, refined to `v1.1-oss` (11,922
+   items, `freeze_id 1cd130fa…`) 2026-05-15 after license-gate filtering.
+2. **Native MIND training pipeline — DEFERRED TO PHASE 2.** The Phase 1
+   alpha trains with PyTorch + `sentence-transformers` per the *Pure MIND*
+   guideline above ("Reference training pipeline may use external tooling
+   in Phase 1, must port to native MIND by Phase 2"). The shipped
+   *inference* path is what must move to native MIND; the *training* path
+   is allowed to remain external until Phase 2's native-MIND trainer
+   (`mind-train`) is built.
+3. **Wire MIND with protected libs — DONE.** `libmindnerve.so` ships
+   bundled inside the wheel at 51,280 bytes with 8 FORTRESS C-side
+   primitives. The build pipeline + 846-line `protection.mind` + 1199-line
+   `protection.c` live in the private `star-ga/mind-nerve-protected`
+   sibling repo. Public surface passes a 7-check leak verifier.
 
-No release tag — public or private — until 1, 2, and 3 close. The
-existing Phase 1 / Phase 2 exit criteria below are necessary but not
-sufficient.
+**Private alpha (`v0.1.0-alpha.2`) gates closed 2026-05-16.** The public
+release gate stays closed until Phase 2 ships native MIND inference,
+cross-arch bit-identity, and the p95 ≤ 30 ms latency floor.
 
-## Phase 1 — Reference implementation (target: Q1 2027)
+## Phase 1 — Reference implementation (private alpha shipped 2026-05-16)
 
 **Architecture finalised (scaffold landed 2026-05-13):** encoder + direct
 scoring head, no decoder. Sliding-window self-attention (window=256,

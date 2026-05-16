@@ -51,7 +51,7 @@ where = ["python"]
 version = { attr = "mind_nerve.__version__" }
 
 [tool.setuptools.package-data]
-mind_nerve = ["data/*.json", "data/*.bin"]
+mind_nerve = ["data/*.json", "data/*.bin", "lib/*.so", "lib/*.dylib", "lib/*.dll"]
 
 [tool.ruff]
 line-length = 100

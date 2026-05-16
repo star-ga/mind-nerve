@@ -1,9 +1,15 @@
 // Model: encoder + scoring head. No decoder.
 //
-// Phase 0 — typed signatures with bit-identity annotations. Bodies are
-// `unimplemented!()` pending Phase 1 implementation. The signatures are the
-// contract; implementations that change shapes here are architecture changes,
-// not bug fixes.
+// Phase 1 (`v0.1.0-alpha.2`, 2026-05-16) — bodies fully implemented against
+// `encoder_kernels.mind` + `q16_16.mind`. The function signatures here are
+// the stability contract; the @[determinism(BitIdentical)] and
+// @[reduction_order(Pinned)] attributes constrain implementations such that
+// changing shape, dtype, or summation order constitutes an architecture
+// change, not a bug fix.
+//
+// Phase 2 work on this file is weight-format consumption: pulling Q16.16
+// imported weights through `loader.mind` and asserting cross-arch bit
+// identity against tasks #57 / #59. The kernels here do not change.
 //
 // Architectural decision (see spec/architecture.md):
 // A decoder cross-attending to a fixed route table has identical expressive

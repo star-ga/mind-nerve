@@ -47,3 +47,8 @@ node_modules/
 /autoresearch_results.tsv
 /.autoresearch-*.log
 /.autoresearch-state/
+
+# Protected-build artefacts — never committed
+protected-build/target/
+protected-build/dist/
+dist/

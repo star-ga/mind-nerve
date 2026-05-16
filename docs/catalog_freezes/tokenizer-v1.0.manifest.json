@@ -1,0 +1,33 @@
+{
+  "actual_vocab_size": 16384,
+  "byte_fallback": true,
+  "corpus_bytes": 12704103,
+  "corpus_path": "/data/datasets/mind-nerve-catalog/tokenizer/corpus.txt",
+  "corpus_sha256": "4283384566f4af64156e0ac0feac02cf824eee716d7355da0464cfa52996fd36",
+  "min_frequency": 2,
+  "model_kind": "BPE",
+  "pre_tokenizer": "ByteLevel",
+  "schema_version": 1,
+  "signing": {
+    "algorithm": "HMAC-SHA256",
+    "key_id": "STARGA-ROOT-2026",
+    "status": "draft-unsigned"
+  },
+  "special_tokens": [
+    "[PAD]",
+    "[BOS]",
+    "[EOS]",
+    "[QUERY]",
+    "[POSITIVE]",
+    "[SINK]",
+    "[MASK]",
+    "[SEP]"
+  ],
+  "tokenizer_bytes": 1132037,
+  "tokenizer_sha256": "1b9ebc24b712e10fdc71e44dafe9882a18c255dd7e46793be35439d72fad71f3",
+  "tokenizer_version": "v1.0",
+  "trained_at": 1778898487,
+  "trained_at_iso": "2026-05-16T02:28:07Z",
+  "training_seconds": 1.68,
+  "vocab_size": 16384
+}

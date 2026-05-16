@@ -13,17 +13,42 @@ per turn.
 
 ## Status
 
-**Phase 1 — private alpha (`v0.1.0-alpha.2`, 2026-05-16).** Python wheel ships;
-the FORTRESS-protected `libmindnerve.so` is bundled inside it. The router runs
-end-to-end on PyTorch via `BAAI/bge-small-en-v1.5` fine-tuned with
-MultipleNegativesRankingLoss; top-5 accuracy is 96.06 % against the full
-v1.1-oss catalog of 11,922 routing candidates.
+**Phase 1 — public alpha (`v0.1.0-alpha.3`, 2026-05-16).** Python wheel on PyPI;
+weights on Hugging Face. The router runs end-to-end on PyTorch via
+`BAAI/bge-small-en-v1.5` fine-tuned with MultipleNegativesRankingLoss; top-5
+accuracy is 96.06 % against the v1.1-oss catalog of 11,922 routing candidates.
 
-Phase 2 (Q3 2027 target) replaces the PyTorch path with a native MIND Q16.16
-inference loop and adds the cross-architecture bit-identity gate + 4-core CPU
-p95 ≤ 30 ms latency budget. Until Phase 2 closes, the inference path uses
-external ML tooling — explicitly permitted by the
+- PyPI: <https://pypi.org/project/mind-nerve/>
+- Weights: <https://huggingface.co/star-ga/mind-nerve-phase1>
+
+Phase 2 replaces the PyTorch path with a native MIND Q16.16 inference loop
+and adds the cross-architecture bit-identity gate + 4-core CPU p95 ≤ 30 ms
+latency budget. Phase 2 is gated on `mindc` 0.2.6 (`pub fn` → C symbol
+export) and 0.3.0 (cdylib emit). Until Phase 2 closes, the inference path
+uses external ML tooling — explicitly permitted by the
 [ROADMAP](./ROADMAP.md) Phase 1 exception.
+
+## Quickstart
+
+```bash
+pip install mind-nerve==0.1.0a3
+```
+
+```python
+from mind_nerve import route
+result = route("git status", top_k=5)
+for r in result.routes:
+    print(r.score, r.name, r.kind)
+```
+
+Pre-download the runtime once and point `MIND_NERVE_RUNTIME_DIR` at it:
+
+```bash
+huggingface-cli download star-ga/mind-nerve-phase1 --local-dir ~/.mind-nerve/phase1
+export MIND_NERVE_RUNTIME_DIR=~/.mind-nerve/phase1
+```
+
+Auto-download on first `route()` call is on the 0.1.0a4 backlog.
 
 ## Why this exists
 
@@ -104,16 +129,24 @@ mind-nerve/
 
 ## License
 
-The architecture, integration shims, and reference inference loop are
-Apache-2.0. Trained weights are not distributed under this license; weight
-distribution is handled separately under STARGA terms.
+mind-nerve ships under **Apache-2.0** — repository, Python wheel, and the
+Phase-1 trained weights on Hugging Face all carry the same license. The
+wheel additionally bundles `libmindnerve.so`, a FORTRESS-protected runtime
+component whose source remains private under STARGA Commercial terms. The
+protected binary is the future Phase-2 native inference layer; the Phase-1
+PyTorch path does not depend on it.
 
-See [`LICENSE.md`](LICENSE.md) for the full split.
+For commercial deployments needing per-customer FORTRESS-locked builds of
+the runtime layer, contact `license@star.ga`. See [`LICENSE.md`](LICENSE.md)
+for the full split.
 
 ## Dependencies
 
-- `mind-runtime` — provides the 18-backend lowering matrix
+- `numpy`, `sentence-transformers`, `torch` — Phase-1 inference path
+- `mind-runtime` — Phase-2 native inference (gated on `mindc` 0.3.0)
 - `mind-mem` (optional) — consumes mind-nerve preselection for tool routing
 
-No third-party machine learning framework dependency. No PyTorch, no ONNX,
-no TensorFlow in the inference path. Pure MIND end-to-end.
+The "no third-party ML framework" goal applies to **Phase 2**. Phase 1
+(this release) deliberately uses sentence-transformers + PyTorch to ship
+the API, evaluation harness, and integration surface before the native
+runtime lands.

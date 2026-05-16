@@ -43,9 +43,11 @@ Three blockers were raised 2026-05-14. Status after the Phase 1 alpha sprint:
    `protection.c` live in the private `star-ga/mind-nerve-protected`
    sibling repo. Public surface passes a 7-check leak verifier.
 
-**Private alpha (`v0.1.0-alpha.2`) gates closed 2026-05-16.** The public
-release gate stays closed until Phase 2 ships native MIND inference,
-cross-arch bit-identity, and the p95 ≤ 30 ms latency floor.
+**Public alpha (`v0.1.0-alpha.3`) shipped 2026-05-16.** Python wheel on PyPI,
+weights on Hugging Face under Apache-2.0 (`star-ga/mind-nerve-phase1`). The
+PyTorch-based Phase-1 inference path is the trial surface that drives
+adoption; Phase-2 native MIND inference + cross-arch bit-identity + p95 ≤ 30 ms
+remain on the deferred list below.
 
 ## Phase 1 — Reference implementation (private alpha shipped 2026-05-16)
 
@@ -75,6 +77,21 @@ without measurable accuracy impact on agent-CLI request distributions.
   reads weights into MIND inference)
 - Per-CLI hook-surface stabilisation for runtimes whose hook protocol is
   still in flux upstream
+
+**Deferred to Phase 2 — gated on `mindc` toolchain**:
+
+These exit criteria from the original Phase-1 list are now sequenced behind
+the `mindc` 0.2.6 / 0.3.0 milestones in the STARGA ecosystem roadmap. The
+Phase-1 alpha ships without them by design; PyTorch covers the inference
+path until the native cdylib path lands.
+
+| Task | Blocker | mindc milestone |
+|---|---|---|
+| Cross-arch bit-identity (x86-CPU vs CUDA) | `pub fn` → C symbol export so the native MIND inference kernel is callable as a `cdylib` | **0.2.6** — `pub fn`-to-C, `[exports]`, `--profile` flag |
+| p95 ≤ 30 ms on 4-core CPU | Native `cdylib` emit so the PyTorch encode-cost (~270 ms today) can be replaced by a Q16.16 native kernel | **0.3.0** — `--lib` cdylib, AOT codegen, MIC profile-locked headers |
+
+Both tasks remain tracked (#57 and #59 in the work queue) and re-open the
+moment the matching `mindc` release ships.
 
 ## Phase 2 — Production path (target: Q2 2027)
 

@@ -18,6 +18,10 @@ weights on Hugging Face. The router runs end-to-end on PyTorch via
 `BAAI/bge-small-en-v1.5` fine-tuned with MultipleNegativesRankingLoss; top-5
 accuracy is 96.06 % against the v1.1-oss catalog of 11,922 routing candidates.
 
+MIND Language Profile target: `default` (full tensor stdlib + Q16.16 + heap)
+— see [`mind` Phase 10.6](https://github.com/star-ga/mind/blob/main/docs/roadmap.md#phase-106--library-output--c-abi-mindc-026--030)
+for the `--profile` flag landing in `mindc` 0.2.6. <!-- mind-profile: default -->
+
 - PyPI: <https://pypi.org/project/mind-nerve/>
 - Weights: <https://huggingface.co/star-ga/mind-nerve-phase1>
 

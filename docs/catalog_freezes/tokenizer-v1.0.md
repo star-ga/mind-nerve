@@ -71,7 +71,7 @@ sha256 doesn't match the model's bound hash.
 ## Reproducibility
 
 ```bash
-# from /home/n/mind-nerve/catalog-builder/
+# from ./catalog-builder/
 python3 build_corpus.py          # rebuild corpus.txt from frozen catalog
 python3 train_bpe.py --version v1.0 --vocab-size 16384
 ```

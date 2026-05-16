@@ -2,13 +2,13 @@
 """Filter the catalog down to OSS-redistributable items only.
 
 Inputs:
-  /data/datasets/mind-nerve-catalog/freeze/v1.0/items.jsonl
-  /home/n/.agents/skills/<name>/SKILL.md      (license lookup for STARGA/local-skills)
-  /home/n/.claude/agents/<name>.md            (license lookup for STARGA/claude-agents)
+  $MIND_NERVE_CATALOG_FREEZE/v1.0/items.jsonl   (default: ./catalog-builder/freeze/v1.0)
+  $MIND_NERVE_LOCAL_SKILLS/<name>/SKILL.md      (license lookup for STARGA/local-skills)
+  $MIND_NERVE_CLAUDE_AGENTS/<name>.md           (license lookup for STARGA/claude-agents)
 
 Output (new freeze):
-  /data/datasets/mind-nerve-catalog/freeze/v1.1-oss/items.jsonl
-  /data/datasets/mind-nerve-catalog/freeze/v1.1-oss/manifest.json
+  $MIND_NERVE_CATALOG_FREEZE/v1.1-oss/items.jsonl
+  $MIND_NERVE_CATALOG_FREEZE/v1.1-oss/manifest.json
   exclusion_log.jsonl  (every dropped item + reason)
 
 Exclusion rules (any one excludes):
@@ -26,15 +26,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sys
 import time
 from pathlib import Path
 
-V1 = Path("/data/datasets/mind-nerve-catalog/freeze/v1.0/items.jsonl")
-OUT_DIR = Path("/data/datasets/mind-nerve-catalog/freeze/v1.1-oss")
+_FREEZE_BASE = Path(os.environ.get("MIND_NERVE_CATALOG_FREEZE", "./catalog-builder/freeze"))
+V1 = _FREEZE_BASE / "v1.0" / "items.jsonl"
+OUT_DIR = _FREEZE_BASE / "v1.1-oss"
 
-LOCAL_SKILLS = Path("/home/n/.agents/skills")
+LOCAL_SKILLS = Path(os.environ.get("MIND_NERVE_LOCAL_SKILLS", str(Path.home() / ".agents" / "skills")))
 
 PUBLIC_LICENSES = {
     "apache-2.0", "apache 2.0", "apache2", "mit", "bsd-3-clause",

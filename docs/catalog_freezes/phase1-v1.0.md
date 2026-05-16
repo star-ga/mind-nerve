@@ -84,7 +84,7 @@ the right answer and the next-best are healthy (typical 0.1+).
 ## Reproducibility
 
 ```bash
-cd /home/n/mind-nerve/catalog-builder
+cd ./catalog-builder
 python3 train_phase1.py --epochs 3 --batch 32 --lr 2e-5 --out-version v1.0
 # To precompute the route table the Python wheel needs:
 PYTHONPATH=../python python3 -m mind_nerve.cli precompute-routes

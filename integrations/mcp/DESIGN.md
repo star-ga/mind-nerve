@@ -364,9 +364,9 @@ simultaneously, one façade process per `[mcp.<name>]` entry.
 upstream_command = "python"
 upstream_args = ["-m", "mind_mem.mcp_server"]
 upstream_env = { LOG_LEVEL = "INFO" }
-upstream_cwd = "/home/n/mind-mem"
+upstream_cwd = "~/mind-mem"
 
-mind_nerve_bin = "/home/n/.local/bin/mind-nerve"
+mind_nerve_bin = "~/.local/bin/mind-nerve"
 top_k = 7
 fallback_turn_ttl_ms = 5000
 catalog_refresh_ttl_ms = 60000

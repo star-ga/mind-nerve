@@ -15,7 +15,7 @@ Lives next to `ROADMAP.md` as the operational plan for the Phase 1 build.
 | **Quantization** | INT8 weights, Q16.16 activations, cross-arch bit-identity gate | Non-negotiable Phase 1 exit criterion. |
 | **Integration approach** | Wrapper-process daemon + filesystem overlay + MCP gateway hybrid | Multi-LLM consensus (grok-4.3 + deepseek-v4-pro + internal). Covers 17 CLIs without per-CLI plugin matrix. |
 | **Distribution** | One core artifact (`nerve` Python package on PyPI), thin wrappers for brew / npm / Claude Code marketplace / VS Code marketplace | Same artifact pulled by every channel. |
-| **Protection** | Open Python orchestrator + wrappers; closed `nerve-runtime.so` built via STARGA protection toolchain (NOT NikolaChess's) | Mirrors mind-mem's public/protected split. |
+| **Protection** | Open Python orchestrator + wrappers; closed `nerve-runtime.so` built via STARGA protection toolchain | Mirrors mind-mem's public/protected split. |
 | **Brand** | `nerve.md` domain (available, registry NIC.MD) | Drops the `mind-` prefix on purpose — free/open product with its own identity. |
 
 ## Phase 0 — Catalog mining (no GPU, fully autonomous)

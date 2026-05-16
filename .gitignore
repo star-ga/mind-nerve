@@ -60,10 +60,12 @@ dist/
 *.dylib
 *.dll
 
-# arch-mind transient state (Tranche 5)
+# arch-mind transient state (Tranche 5). Including last_summary.json keeps
+# the local absolute repo path out of the public tree.
 .arch-mind/store/
 .arch-mind/_log_*
 .arch-mind/scan_before.json
+.arch-mind/last_summary.json
 
 # Python build artifacts
 *.egg-info/

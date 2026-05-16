@@ -32,25 +32,34 @@ HOME = Path(os.path.expanduser("~"))
 
 # CLIs grouped by install mechanism.
 MCP_CAPABLE = {
-    "claude-code":    {"detect": HOME / ".claude" / "settings.json",
-                       "method": "claude_cli"},
-    "claude-desktop": {"detect": HOME / ".config" / "Claude" / "claude_desktop_config.json",
-                       "method": "json_mcp_servers"},
-    "cursor":         {"detect": HOME / ".cursor" / "mcp.json",
-                       "method": "json_mcp_servers"},
-    "codex":          {"detect": HOME / ".codex" / "config.toml",
-                       "method": "toml_mcp_servers"},
+    "claude-code": {"detect": HOME / ".claude" / "settings.json", "method": "claude_cli"},
+    "claude-desktop": {
+        "detect": HOME / ".config" / "Claude" / "claude_desktop_config.json",
+        "method": "json_mcp_servers",
+    },
+    "cursor": {"detect": HOME / ".cursor" / "mcp.json", "method": "json_mcp_servers"},
+    "codex": {"detect": HOME / ".codex" / "config.toml", "method": "toml_mcp_servers"},
 }
 HOOK_BASED = {
-    "claude-code-hook": {"detect": HOME / ".claude" / "settings.json",
-                         "method": "claude_user_prompt_hook"},
+    "claude-code-hook": {
+        "detect": HOME / ".claude" / "settings.json",
+        "method": "claude_user_prompt_hook",
+    },
 }
 STUB_CLIS = [
-    "gemini",       # extension format not verified yet
-    "windsurf",     # dir not standardly present
-    "aider",        # no MCP support; needs bespoke integration
-    "vibe", "openclaw", "nanoclaw", "nemoclaw",
-    "continue", "cline", "roo", "zed", "copilot", "cody",
+    "gemini",  # extension format not verified yet
+    "windsurf",  # dir not standardly present
+    "aider",  # no MCP support; needs bespoke integration
+    "vibe",
+    "openclaw",
+    "nanoclaw",
+    "nemoclaw",
+    "continue",
+    "cline",
+    "roo",
+    "zed",
+    "copilot",
+    "cody",
 ]
 
 
@@ -75,15 +84,15 @@ def install_claude_code(cfg: dict) -> dict:
     try:
         r = subprocess.run(
             ["claude", "mcp", "add", "mind-nerve", "mind-nerve-mcp"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         if r.returncode == 0:
-            return {"installed": True, "method": "claude_mcp_add",
-                    "stdout": r.stdout.strip()}
+            return {"installed": True, "method": "claude_mcp_add", "stdout": r.stdout.strip()}
         # If it's already added, treat as ok.
         if "already exists" in (r.stdout + r.stderr).lower():
-            return {"installed": True, "method": "claude_mcp_add",
-                    "note": "already exists"}
+            return {"installed": True, "method": "claude_mcp_add", "note": "already exists"}
         return _install_claude_code_manual()
     except (subprocess.TimeoutExpired, OSError) as exc:
         return {"installed": False, "error": str(exc)}
@@ -105,8 +114,7 @@ def _install_claude_code_manual() -> dict:
     servers = existing.setdefault("mcpServers", {})
     servers["mind-nerve"] = _mcp_entry()
     cfg_path.write_text(json.dumps(existing, indent=2) + "\n")
-    return {"installed": True, "method": "manual_claude_json",
-            "path": str(cfg_path)}
+    return {"installed": True, "method": "manual_claude_json", "path": str(cfg_path)}
 
 
 def install_claude_desktop(cfg: dict) -> dict:
@@ -153,18 +161,14 @@ def install_codex(cfg: dict) -> dict:
     """
     cfg_path = HOME / ".codex" / "config.toml"
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
-    block = (
-        "\n[mcp_servers.mind-nerve]\n"
-        'command = "mind-nerve-mcp"\n'
-        "args = []\n"
-        "env = {}\n"
-    )
+    block = '\n[mcp_servers.mind-nerve]\ncommand = "mind-nerve-mcp"\nargs = []\nenv = {}\n'
     existing = ""
     if cfg_path.exists():
         existing = cfg_path.read_text()
 
     # If a [mcp_servers.mind-nerve] block already exists, replace it.
     import re
+
     pattern = re.compile(
         r"\n?\[mcp_servers\.mind-nerve\][^\[]*?(?=\n\[|\Z)",
         re.DOTALL,
@@ -196,26 +200,28 @@ def install_claude_code_hook(cfg: dict) -> dict:
     hooks = existing.setdefault("hooks", {})
     ups = hooks.setdefault("UserPromptSubmit", [])
     # Idempotency: drop any existing mind-nerve entry first
-    ups = [e for e in ups if not any(
-        "mind-nerve" in (h.get("command", "") or "")
-        for h in (e.get("hooks") or [])
-    )]
-    ups.append({
-        "matcher": "",
-        "hooks": [{"type": "command", "command": "mind-nerve route --top-k 5 --ids-only"}],
-    })
+    ups = [
+        e
+        for e in ups
+        if not any("mind-nerve" in (h.get("command", "") or "") for h in (e.get("hooks") or []))
+    ]
+    ups.append(
+        {
+            "matcher": "",
+            "hooks": [{"type": "command", "command": "mind-nerve route --top-k 5 --ids-only"}],
+        }
+    )
     hooks["UserPromptSubmit"] = ups
     cfg_path.write_text(json.dumps(existing, indent=2) + "\n")
-    return {"installed": True, "method": "claude_user_prompt_hook",
-            "path": str(cfg_path)}
+    return {"installed": True, "method": "claude_user_prompt_hook", "path": str(cfg_path)}
 
 
 INSTALLERS = {
-    "claude-code":      install_claude_code,
+    "claude-code": install_claude_code,
     "claude-code-hook": install_claude_code_hook,
-    "claude-desktop":   install_claude_desktop,
-    "cursor":           install_cursor,
-    "codex":            install_codex,
+    "claude-desktop": install_claude_desktop,
+    "cursor": install_cursor,
+    "codex": install_codex,
 }
 
 
@@ -228,8 +234,12 @@ def detect() -> dict[str, dict]:
     out: dict[str, dict] = {}
     for cli, info in {**MCP_CAPABLE, **HOOK_BASED}.items():
         present = info["detect"].exists()
-        out[cli] = {"config_probe": str(info["detect"]), "present": present,
-                    "method": info["method"], "status": "supported"}
+        out[cli] = {
+            "config_probe": str(info["detect"]),
+            "present": present,
+            "method": info["method"],
+            "status": "supported",
+        }
     for cli in STUB_CLIS:
         out[cli] = {"present": False, "status": "stub_v0.1.1"}
     return out
@@ -256,8 +266,10 @@ def cmd_detect(args) -> int:
 def cmd_install(args) -> int:
     known = set(INSTALLERS) | {"all"}
     if args.cli not in known:
-        print(f"unsupported CLI: {args.cli}\nrun `mind-nerve-install list` to see options",
-              file=sys.stderr)
+        print(
+            f"unsupported CLI: {args.cli}\nrun `mind-nerve-install list` to see options",
+            file=sys.stderr,
+        )
         return 2
 
     targets = list(INSTALLERS) if args.cli == "all" else [args.cli]
@@ -270,7 +282,7 @@ def cmd_install(args) -> int:
     for cli in targets:
         try:
             results[cli] = INSTALLERS[cli](MCP_CAPABLE.get(cli) or HOOK_BASED.get(cli) or {})
-        except Exception as exc:                       # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             results[cli] = {"installed": False, "error": str(exc)}
     print(json.dumps(results, indent=2))
     return 0
@@ -287,8 +299,9 @@ def main(argv: list[str] | None = None) -> int:
     p_det.set_defaults(func=cmd_detect)
 
     p_ins = sub.add_parser("install", help="Install the mind-nerve hook for a CLI")
-    p_ins.add_argument("--cli", required=True,
-                       help="One of: " + ", ".join(list(INSTALLERS) + ["all"]))
+    p_ins.add_argument(
+        "--cli", required=True, help="One of: " + ", ".join(list(INSTALLERS) + ["all"])
+    )
     p_ins.set_defaults(func=cmd_install)
 
     args = ap.parse_args(argv)

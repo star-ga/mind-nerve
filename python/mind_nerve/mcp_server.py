@@ -45,29 +45,47 @@ def handle(msg: dict) -> dict | None:
     params = msg.get("params") or {}
 
     if method == "initialize":
-        return _ok(req_id, {
-            "protocolVersion": "2024-11-05",
-            "serverInfo": {"name": "mind-nerve-mcp", "version": __version__},
-            "capabilities": {"tools": {"listChanged": False}},
-        })
+        return _ok(
+            req_id,
+            {
+                "protocolVersion": "2024-11-05",
+                "serverInfo": {"name": "mind-nerve-mcp", "version": __version__},
+                "capabilities": {"tools": {"listChanged": False}},
+            },
+        )
 
     if method == "notifications/initialized":
-        return None      # notifications are not replied to
+        return None  # notifications are not replied to
 
     if method == "tools/list":
-        return _ok(req_id, {"tools": [{
-            "name": "mind_nerve_route",
-            "description": "Return the top-K most relevant skill/tool/agent routes for a query, "
-                           "from a catalog of ~12k entries (catalog v1.0).",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "query":  {"type": "string", "description": "The user request / intent."},
-                    "top_k":  {"type": "integer", "default": 5, "minimum": 1, "maximum": 50},
-                },
-                "required": ["query"],
+        return _ok(
+            req_id,
+            {
+                "tools": [
+                    {
+                        "name": "mind_nerve_route",
+                        "description": "Return the top-K most relevant skill/tool/agent routes for a query, "
+                        "from a catalog of ~12k entries (catalog v1.0).",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "query": {
+                                    "type": "string",
+                                    "description": "The user request / intent.",
+                                },
+                                "top_k": {
+                                    "type": "integer",
+                                    "default": 5,
+                                    "minimum": 1,
+                                    "maximum": 50,
+                                },
+                            },
+                            "required": ["query"],
+                        },
+                    }
+                ]
             },
-        }]})
+        )
 
     if method == "tools/call":
         name = params.get("name")
@@ -89,7 +107,7 @@ def main(argv: list[str] | None = None) -> int:
     # Eagerly warm the model so the first `tools/call` isn't slow.
     try:
         load_default_runtime()
-    except Exception as exc:                       # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         sys.stderr.write(f"[mind-nerve-mcp] warmup failed: {exc}\n")
 
     for line in sys.stdin:

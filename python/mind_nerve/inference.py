@@ -44,12 +44,13 @@ def _seed_from_hf(target: Path) -> None:
     from huggingface_hub import snapshot_download
 
     print(
-        f"mind-nerve: downloading Phase-1 weights ({_HF_REPO_ID}, ~150 MB) "
-        f"to {target}", file=sys.stderr,
+        f"mind-nerve: downloading Phase-1 weights ({_HF_REPO_ID}, ~150 MB) to {target}",
+        file=sys.stderr,
     )
     cached = Path(snapshot_download(repo_id=_HF_REPO_ID, repo_type="model"))
     target.mkdir(parents=True, exist_ok=True)
     import shutil
+
     for item in cached.iterdir():
         if item.name.startswith("."):
             continue
@@ -77,9 +78,7 @@ def _resolve_runtime_dir(runtime_dir: str | None = None) -> Path:
     if env_dir:
         p = Path(env_dir).expanduser()
         if not p.is_dir():
-            raise FileNotFoundError(
-                f"MIND_NERVE_RUNTIME_DIR={env_dir} does not exist"
-            )
+            raise FileNotFoundError(f"MIND_NERVE_RUNTIME_DIR={env_dir} does not exist")
         return p
     if not (_USER_RUNTIME_DIR / "manifest.json").exists():
         _seed_from_hf(_USER_RUNTIME_DIR)
@@ -171,28 +170,31 @@ def route(query: str, top_k: int = 5, *, runtime_dir: str | None = None) -> Rout
     rt = load_default_runtime(runtime_dir)
 
     t0 = time.perf_counter()
-    qv = rt.model.encode([query], convert_to_numpy=True, show_progress_bar=False,
-                         normalize_embeddings=True).astype(np.float32)[0]
+    qv = rt.model.encode(
+        [query], convert_to_numpy=True, show_progress_bar=False, normalize_embeddings=True
+    ).astype(np.float32)[0]
     t_encode = (time.perf_counter() - t0) * 1000.0
 
     t0 = time.perf_counter()
-    scores = rt.embeddings @ qv                           # (N,)
+    scores = rt.embeddings @ qv  # (N,)
     k = min(top_k, scores.shape[0])
     top = np.argpartition(-scores, k - 1)[:k]
-    top = top[np.argsort(-scores[top])]                   # exact sort over the k
+    top = top[np.argsort(-scores[top])]  # exact sort over the k
     t_rank = (time.perf_counter() - t0) * 1000.0
 
     out: list[Route] = []
     for i in top:
         meta = rt.routes[int(i)]
-        out.append(Route(
-            id=str(meta.get("id", "")),
-            name=str(meta.get("name", "")),
-            kind=str(meta.get("kind", "")),
-            score=float(scores[int(i)]),
-            source_repo=str(meta.get("source_repo", "")),
-            url=meta.get("url"),
-        ))
+        out.append(
+            Route(
+                id=str(meta.get("id", "")),
+                name=str(meta.get("name", "")),
+                kind=str(meta.get("kind", "")),
+                score=float(scores[int(i)]),
+                source_repo=str(meta.get("source_repo", "")),
+                url=meta.get("url"),
+            )
+        )
 
     return RouteResult(
         query=query,
@@ -206,9 +208,10 @@ def route(query: str, top_k: int = 5, *, runtime_dir: str | None = None) -> Rout
     )
 
 
-def precompute_routes(runtime_dir: str | None = None,
-                      catalog_path: str | None = None,
-                      ) -> dict[str, Any]:
+def precompute_routes(
+    runtime_dir: str | None = None,
+    catalog_path: str | None = None,
+) -> dict[str, Any]:
     """Encode every catalog item and write route_table.npy + .jsonl.
 
     Run once after training. The result lives inside runtime_dir so the
@@ -219,7 +222,7 @@ def precompute_routes(runtime_dir: str | None = None,
 
     rdir = _resolve_runtime_dir(runtime_dir)
     if not (rdir / "checkpoint").is_dir():
-        raise FileNotFoundError(f"no trained checkpoint at {rdir/'checkpoint'}")
+        raise FileNotFoundError(f"no trained checkpoint at {rdir / 'checkpoint'}")
     if catalog_path is None:
         catalog_path = str(rdir / "items.jsonl")
         if not Path(catalog_path).exists():
@@ -240,8 +243,13 @@ def precompute_routes(runtime_dir: str | None = None,
             items.append(obj)
             texts.append(text)
 
-    emb = model.encode(texts, batch_size=128, convert_to_numpy=True,
-                       show_progress_bar=True, normalize_embeddings=False)
+    emb = model.encode(
+        texts,
+        batch_size=128,
+        convert_to_numpy=True,
+        show_progress_bar=True,
+        normalize_embeddings=False,
+    )
     emb = np.asarray(emb, dtype=np.float32)
 
     np.save(rdir / "route_table.npy", emb)

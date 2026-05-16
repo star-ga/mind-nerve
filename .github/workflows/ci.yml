@@ -39,22 +39,13 @@ jobs:
         run: python -m build
       - name: twine check
         run: twine check dist/*
-      - name: Verify protected lib in wheel
+      - name: Note about protected .so
         run: |
-          python -c "
-          import zipfile, sys
-          with zipfile.ZipFile([f for f in __import__('os').listdir('dist') if f.endswith('.whl')][0].replace('/', '')) as z:
-              names = z.namelist()
-          assert any('lib/libmindnerve.so' in n for n in names), f'protected .so missing from wheel: {names}'
-          print('OK: libmindnerve.so present in wheel')
-          " || (cd dist && python -c "
-          import zipfile, glob
-          whl = glob.glob('*.whl')[0]
-          with zipfile.ZipFile(whl) as z:
-              names = z.namelist()
-          assert any('lib/libmindnerve.so' in n for n in names), f'protected .so missing from wheel: {names}'
-          print('OK: libmindnerve.so present in wheel')
-          ")
+          # The FORTRESS-protected libmindnerve.so is NOT in the public repo —
+          # it's bundled into the wheel only at STARGA release time. CI here
+          # validates the OSS surface (Python code, tests, lint, build); the
+          # production wheel published to PyPI is built locally and re-uploaded.
+          echo "CI builds an OSS-surface wheel (no .so). Release wheels are built locally with the protected runtime bundled."
       - uses: actions/upload-artifact@v4
         with:
           name: dist

@@ -87,12 +87,19 @@ def cmd_learn(args) -> int:
 
 def cmd_watch(args) -> int:
     dirs = [(d, args.source or "local") for d in args.dirs]
-    w = Watcher(dirs, interval=args.interval, include_unknown=args.include_unknown,
-                runtime_dir=args.runtime_dir or _DEFAULT_RUNTIME_DIR)
+    w = Watcher(
+        dirs,
+        interval=args.interval,
+        include_unknown=args.include_unknown,
+        runtime_dir=args.runtime_dir or _DEFAULT_RUNTIME_DIR,
+    )
     w.start()
-    print(f"[mind-nerve watch] watching {len(dirs)} dirs every {args.interval}s; ctrl-c to stop",
-          file=sys.stderr)
+    print(
+        f"[mind-nerve watch] watching {len(dirs)} dirs every {args.interval}s; ctrl-c to stop",
+        file=sys.stderr,
+    )
     import time
+
     try:
         while True:
             time.sleep(args.interval)
@@ -107,39 +114,48 @@ def cmd_watch(args) -> int:
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="mind-nerve")
     ap.add_argument("--version", action="version", version=f"mind-nerve {__version__}")
-    ap.add_argument("--runtime-dir", default=None,
-                    help="Override the runtime directory (default: $MIND_NERVE_RUNTIME_DIR or "
-                         "/data/datasets/mind-nerve-catalog/phase1/v1.1-oss)")
+    ap.add_argument(
+        "--runtime-dir",
+        default=None,
+        help="Override the runtime directory (default: $MIND_NERVE_RUNTIME_DIR or "
+        "/data/datasets/mind-nerve-catalog/phase1/v1.1-oss)",
+    )
 
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p_route = sub.add_parser("route", help="Return top-K routes for a query")
     p_route.add_argument("query", nargs="?", help="Query text (or read from stdin if omitted)")
     p_route.add_argument("--top-k", type=int, default=5)
-    p_route.add_argument("--json", action="store_true", default=True,
-                         help="Emit JSON (default).")
-    p_route.add_argument("--ids-only", action="store_true",
-                         help="One route id per line (overrides --json)")
+    p_route.add_argument("--json", action="store_true", default=True, help="Emit JSON (default).")
+    p_route.add_argument(
+        "--ids-only", action="store_true", help="One route id per line (overrides --json)"
+    )
     p_route.set_defaults(func=cmd_route)
 
     p_info = sub.add_parser("info", help="Print runtime info as JSON")
     p_info.set_defaults(func=cmd_info)
 
-    p_pre = sub.add_parser("precompute-routes",
-                           help="(One-time) encode the catalog into route_table.npy")
+    p_pre = sub.add_parser(
+        "precompute-routes", help="(One-time) encode the catalog into route_table.npy"
+    )
     p_pre.set_defaults(func=cmd_precompute)
 
-    p_learn = sub.add_parser("learn",
-                             help="Scan a directory for new skills and add them to the route table")
+    p_learn = sub.add_parser(
+        "learn", help="Scan a directory for new skills and add them to the route table"
+    )
     p_learn.add_argument("dir", help="Directory to scan (e.g. ~/.agents/skills)")
     p_learn.add_argument("--source", default=None, help="Source-repo label (default: 'local')")
-    p_learn.add_argument("--include-unknown", action="store_true",
-                         help="Include items with no declared license. OFF by default.")
+    p_learn.add_argument(
+        "--include-unknown",
+        action="store_true",
+        help="Include items with no declared license. OFF by default.",
+    )
     p_learn.add_argument("--dry-run", action="store_true")
     p_learn.set_defaults(func=cmd_learn)
 
-    p_watch = sub.add_parser("watch",
-                             help="Daemon: poll one or more dirs for new skills (no inotify dep)")
+    p_watch = sub.add_parser(
+        "watch", help="Daemon: poll one or more dirs for new skills (no inotify dep)"
+    )
     p_watch.add_argument("dirs", nargs="+", help="Directories to watch")
     p_watch.add_argument("--source", default=None)
     p_watch.add_argument("--interval", type=float, default=5.0, help="Poll interval (sec)")

@@ -9,6 +9,7 @@ from typing import Any
 @dataclass(frozen=True)
 class Route:
     """A single routing candidate returned by `route()`."""
+
     id: str
     name: str
     kind: str
@@ -17,8 +18,13 @@ class Route:
     url: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
-        d = {"id": self.id, "name": self.name, "kind": self.kind,
-             "score": round(self.score, 6), "source_repo": self.source_repo}
+        d = {
+            "id": self.id,
+            "name": self.name,
+            "kind": self.kind,
+            "score": round(self.score, 6),
+            "source_repo": self.source_repo,
+        }
         if self.url:
             d["url"] = self.url
         return d
@@ -27,6 +33,7 @@ class Route:
 @dataclass(frozen=True)
 class RouteResult:
     """Result of one routing call."""
+
     query: str
     top_k: int
     routes: list[Route]

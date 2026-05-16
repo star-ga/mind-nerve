@@ -40,8 +40,17 @@ from typing import Any, Iterable
 from .inference import _DEFAULT_RUNTIME_DIR, load_default_runtime
 
 PUBLIC_LICENSES = {
-    "apache-2.0", "apache 2.0", "apache2", "mit", "bsd-3-clause",
-    "bsd-2-clause", "isc", "cc0", "cc0-1.0", "unlicense", "cc-by-4.0",
+    "apache-2.0",
+    "apache 2.0",
+    "apache2",
+    "mit",
+    "bsd-3-clause",
+    "bsd-2-clause",
+    "isc",
+    "cc0",
+    "cc0-1.0",
+    "unlicense",
+    "cc-by-4.0",
 }
 
 COMMERCIAL_MARKERS = re.compile(
@@ -52,14 +61,14 @@ COMMERCIAL_MARKERS = re.compile(
 )
 
 SKILL_PATTERNS = [
-    (re.compile(r"(^|/)SKILL\.md$",                       re.I), "skill"),
-    (re.compile(r"(^|/)skills?/[^/]+\.md$",               re.I), "skill"),
+    (re.compile(r"(^|/)SKILL\.md$", re.I), "skill"),
+    (re.compile(r"(^|/)skills?/[^/]+\.md$", re.I), "skill"),
     (re.compile(r"(\.claude|^claude)/(skills|commands|agents)/.*\.md$", re.I), "skill"),
-    (re.compile(r"(^|/)commands?/[^/]+\.md$",             re.I), "command"),
-    (re.compile(r"(^|/)agents?/[^/]+\.md$",               re.I), "agent"),
-    (re.compile(r"(^|/)subagents?/[^/]+\.md$",            re.I), "agent"),
-    (re.compile(r"\.cursorrules$",                        re.I), "rule"),
-    (re.compile(r"\.mdc$",                                re.I), "rule"),
+    (re.compile(r"(^|/)commands?/[^/]+\.md$", re.I), "command"),
+    (re.compile(r"(^|/)agents?/[^/]+\.md$", re.I), "agent"),
+    (re.compile(r"(^|/)subagents?/[^/]+\.md$", re.I), "agent"),
+    (re.compile(r"\.cursorrules$", re.I), "rule"),
+    (re.compile(r"\.mdc$", re.I), "rule"),
 ]
 SKIP_DIRS = {".git", "node_modules", "dist", "build", "target", "__pycache__"}
 
@@ -117,6 +126,7 @@ def _detect_kind(rel: str) -> str | None:
 
 def _load_table(runtime_dir: Path) -> tuple[Any, list[dict]]:
     import numpy as np
+
     emb = np.load(runtime_dir / "route_table.npy")
     meta = [json.loads(line) for line in (runtime_dir / "route_table.jsonl").open()]
     return emb, meta
@@ -124,6 +134,7 @@ def _load_table(runtime_dir: Path) -> tuple[Any, list[dict]]:
 
 def _save_table_atomic(runtime_dir: Path, emb, meta: list[dict]) -> None:
     import numpy as np
+
     tmp_npy = runtime_dir / "route_table.tmp.npy"
     tmp_jsonl = runtime_dir / "route_table.jsonl.tmp"
     with tmp_npy.open("wb") as f:
@@ -158,7 +169,7 @@ def _item_from_file(path: Path, source_repo: str, kind: str) -> dict | None:
     fm = _parse_frontmatter(text)
     bucket, reasons = _classify(text, fm)
     name = fm.get("name") or _first_h1(text) or path.stem
-    body = text[text.find("\n---", 3) + 4:] if text.startswith("---") else text
+    body = text[text.find("\n---", 3) + 4 :] if text.startswith("---") else text
     sha = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
     return {
         "id": sha[:16],
@@ -198,10 +209,13 @@ def _walk_dir(root: Path, source_repo: str) -> Iterable[dict]:
 # ---------------------------------------------------------------------------
 
 
-def scan(directory: str | Path, source_repo: str = "local",
-         include_unknown: bool = False,
-         runtime_dir: str = _DEFAULT_RUNTIME_DIR,
-         dry_run: bool = False) -> dict:
+def scan(
+    directory: str | Path,
+    source_repo: str = "local",
+    include_unknown: bool = False,
+    runtime_dir: str = _DEFAULT_RUNTIME_DIR,
+    dry_run: bool = False,
+) -> dict:
     """One-shot scan: discover new skills under `directory`, embed, persist.
 
     Returns a summary dict.
@@ -213,8 +227,7 @@ def scan(directory: str | Path, source_repo: str = "local",
     seen_ids = {m["sha256"] for m in rt.routes}
 
     new_items: list[dict] = []
-    skipped: dict[str, int] = {"already_indexed": 0, "license_excluded": 0,
-                                "unknown_excluded": 0}
+    skipped: dict[str, int] = {"already_indexed": 0, "license_excluded": 0, "unknown_excluded": 0}
 
     for item in _walk_dir(Path(directory), source_repo):
         if item["sha256"] in seen_ids:
@@ -230,8 +243,7 @@ def scan(directory: str | Path, source_repo: str = "local",
         new_items.append(item)
 
     if not new_items:
-        return {"added": 0, "skipped": skipped,
-                "total_routes_after": len(rt.routes)}
+        return {"added": 0, "skipped": skipped, "total_routes_after": len(rt.routes)}
 
     if dry_run:
         return {
@@ -243,16 +255,20 @@ def scan(directory: str | Path, source_repo: str = "local",
 
     # Embed the new items using the same model the route table was built with
     texts = [i["_embedded_text"] for i in new_items]
-    new_emb = rt.model.encode(texts, batch_size=64, convert_to_numpy=True,
-                              show_progress_bar=False,
-                              normalize_embeddings=False).astype(np.float32)
+    new_emb = rt.model.encode(
+        texts,
+        batch_size=64,
+        convert_to_numpy=True,
+        show_progress_bar=False,
+        normalize_embeddings=False,
+    ).astype(np.float32)
 
     # Load raw table (rt.embeddings is the *normalised* in-memory copy)
     raw_emb, meta = _load_table(rdir)
     combined_emb = np.concatenate([raw_emb, new_emb], axis=0)
-    combined_meta = list(meta) + [{k: v for k, v in i.items()
-                                    if not k.startswith("_")}
-                                   for i in new_items]
+    combined_meta = list(meta) + [
+        {k: v for k, v in i.items() if not k.startswith("_")} for i in new_items
+    ]
     _save_table_atomic(rdir, combined_emb, combined_meta)
 
     # Invalidate the in-memory cache so the next route() call reloads
@@ -266,8 +282,9 @@ def scan(directory: str | Path, source_repo: str = "local",
     }
 
 
-def add_route(item: dict, runtime_dir: str = _DEFAULT_RUNTIME_DIR,
-              include_unknown: bool = False) -> dict:
+def add_route(
+    item: dict, runtime_dir: str = _DEFAULT_RUNTIME_DIR, include_unknown: bool = False
+) -> dict:
     """Programmatic single-route registration.
 
     `item` must contain at minimum {name, description, kind} and may
@@ -290,8 +307,9 @@ def add_route(item: dict, runtime_dir: str = _DEFAULT_RUNTIME_DIR,
     if bucket == "commercial_risk":
         raise PermissionError(f"refusing commercial-risk item: {reasons}")
     if bucket == "unknown" and not include_unknown:
-        raise PermissionError(f"refusing unknown-license item: {reasons}; "
-                              "pass include_unknown=True to override")
+        raise PermissionError(
+            f"refusing unknown-license item: {reasons}; pass include_unknown=True to override"
+        )
 
     sha = hashlib.sha256(text.encode()).hexdigest()
     rt = load_default_runtime(runtime_dir)
@@ -300,9 +318,12 @@ def add_route(item: dict, runtime_dir: str = _DEFAULT_RUNTIME_DIR,
     if any(m["sha256"] == sha for m in rt.routes):
         return {"added": 0, "reason": "already indexed", "sha256": sha}
 
-    emb = rt.model.encode([f"{name}\n\n{desc}"], convert_to_numpy=True,
-                          show_progress_bar=False,
-                          normalize_embeddings=False).astype(np.float32)
+    emb = rt.model.encode(
+        [f"{name}\n\n{desc}"],
+        convert_to_numpy=True,
+        show_progress_bar=False,
+        normalize_embeddings=False,
+    ).astype(np.float32)
     raw_emb, meta = _load_table(rdir)
     combined_emb = np.concatenate([raw_emb, emb], axis=0)
     new_meta = {
@@ -337,9 +358,14 @@ class Watcher:
     already in `seen_ids`.
     """
 
-    def __init__(self, directories: list[tuple[str | Path, str]], *,
-                 interval: float = 5.0, include_unknown: bool = False,
-                 runtime_dir: str = _DEFAULT_RUNTIME_DIR):
+    def __init__(
+        self,
+        directories: list[tuple[str | Path, str]],
+        *,
+        interval: float = 5.0,
+        include_unknown: bool = False,
+        runtime_dir: str = _DEFAULT_RUNTIME_DIR,
+    ):
         self.dirs = [(Path(d), src) for d, src in directories]
         self.interval = interval
         self.include_unknown = include_unknown
@@ -353,20 +379,21 @@ class Watcher:
             try:
                 for d, src in self.dirs:
                     if d.is_dir():
-                        out = scan(d, source_repo=src,
-                                   include_unknown=self.include_unknown,
-                                   runtime_dir=self.runtime_dir)
-                        self._last_summary = {"dir": str(d), "summary": out,
-                                              "ts": time.time()}
-            except Exception as exc:                 # noqa: BLE001
+                        out = scan(
+                            d,
+                            source_repo=src,
+                            include_unknown=self.include_unknown,
+                            runtime_dir=self.runtime_dir,
+                        )
+                        self._last_summary = {"dir": str(d), "summary": out, "ts": time.time()}
+            except Exception as exc:  # noqa: BLE001
                 self._last_summary = {"error": str(exc), "ts": time.time()}
             self._stop.wait(self.interval)
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return
-        self._thread = threading.Thread(target=self._loop, daemon=True,
-                                         name="mind-nerve-watcher")
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="mind-nerve-watcher")
         self._thread.start()
 
     def stop(self, timeout: float = 5.0) -> None:

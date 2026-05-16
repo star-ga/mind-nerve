@@ -50,6 +50,65 @@ The first call auto-downloads the Phase-1 weights (~150 MB) from
 into `~/.local/share/mind-nerve/runtime/`. To pre-seed or use a custom
 location, set `MIND_NERVE_RUNTIME_DIR=/path/to/your/runtime/`.
 
+### Daemon mode (recommended for hooks)
+
+For hot-path callers (CLI hooks, the MCP server, any tool that hits
+`route()` many times per minute) run the daemon and connect over the
+UNIX socket — it loads the runtime once and serves sub-30 ms
+round-trips after warmup.
+
+```bash
+mind-nerve-routed &       # listens on $XDG_RUNTIME_DIR/mind-nerve.sock
+```
+
+```python
+import json, socket, os
+def route(prompt: str, top_k: int = 5) -> dict:
+    sock = f"{os.environ.get('XDG_RUNTIME_DIR', f'/run/user/{os.getuid()}')}/mind-nerve.sock"
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.connect(sock)
+        s.sendall(json.dumps({"prompt": prompt, "top_k": top_k}).encode() + b"\n")
+        return json.loads(s.makefile("r").readline())
+```
+
+### Skill preselection for Claude Code
+
+If you use [Claude Code](https://docs.anthropic.com/claude/claude-code) with
+a large `~/.claude/skills/` directory, mind-nerve can rewrite that directory
+on every prompt to only the top-K most relevant skills:
+
+```bash
+pip install mind-nerve
+mind-nerve-install install --cli claude-code --with-preselect
+```
+
+That wires two hooks into `~/.claude/settings.json`:
+
+- **SessionStart**: spawns the `mind-nerve-routed` daemon if not already
+  running (~7 s warmup; sub-30 ms responses afterwards).
+- **UserPromptSubmit**: asks the daemon for the top-K matching skills and
+  atomically rewrites `~/.claude/skills/` as a directory of symlinks
+  pointing into your real catalog.
+
+The installer auto-detects two install layouts:
+
+- **Regular**: your existing `~/.claude/skills/` directory is renamed once
+  to `~/.claude/skills.full/`. After that the daemon projects a top-K
+  subset back into `~/.claude/skills/` per turn.
+- **Shared catalog** (e.g. STARGA's `~/.agents/skills/` linked across
+  multiple CLIs): the shared catalog stays put. mind-nerve projects from
+  there into `~/.claude/skills/` per turn.
+
+If you also use [mind-mem](https://pypi.org/project/mind-mem/) for durable
+memory, add the companion MCP:
+
+```bash
+mind-nerve-install install --cli claude-code --with-preselect --with-mind-mem
+```
+
+mind-nerve handles intent routing; mind-mem provides search-backed memory.
+Together they bracket the prompt path.
+
 ## Why this exists
 
 Agent runtimes today load entire skill/tool/MCP libraries into the LLM's system

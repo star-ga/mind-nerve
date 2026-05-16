@@ -10,10 +10,24 @@ For CLIs that don't speak MCP (aider, plain hook-only Claude Code
 setups), we fall back to per-CLI shim formats. These are noted in
 each install function.
 
+Optional add-ons (only Claude Code right now):
+
+* ``--with-preselect`` — wire the SessionStart + UserPromptSubmit
+  hooks that project the top-K skills into ``~/.claude/skills``.
+  Works for both the STARGA shared-catalog layout (``~/.agents/skills``)
+  and a plain default layout (renames the user's existing
+  ``~/.claude/skills`` to ``~/.claude/skills.full`` and projects in
+  its place).
+* ``--with-mind-mem`` — also register the ``mind-mem-mcp`` server,
+  if installed on PATH. mind-nerve does intent routing; mind-mem
+  provides durable memory. Together they bracket the prompt path.
+
 Usage:
     mind-nerve-install list
     mind-nerve-install detect
     mind-nerve-install install --cli claude-code
+    mind-nerve-install install --cli claude-code --with-preselect
+    mind-nerve-install install --cli claude-code --with-preselect --with-mind-mem
     mind-nerve-install install --cli all
 """
 
@@ -63,12 +77,12 @@ STUB_CLIS = [
 ]
 
 
-def _mcp_entry() -> dict:
-    """The mind-nerve MCP server registration entry, used by every CLI."""
+def _mcp_entry(command: str = "mind-nerve-mcp", env: dict | None = None) -> dict:
+    """Generic MCP server registration entry, used by every CLI."""
     return {
-        "command": "mind-nerve-mcp",
+        "command": command,
         "args": [],
-        "env": {},
+        "env": env or {},
     }
 
 
@@ -226,6 +240,307 @@ INSTALLERS = {
 
 
 # ---------------------------------------------------------------------------
+# --with-preselect: SessionStart + UserPromptSubmit hooks for Claude Code
+# ---------------------------------------------------------------------------
+
+
+def _looks_like_projection_dir(p: Path) -> bool:
+    """Return True if ``p`` is a real directory whose children are mostly symlinks.
+
+    That's the fingerprint of an in-place projection from a previous run:
+    we must not rename it into ``.full``. Heuristic: at least one child and
+    more than half are symlinks.
+    """
+    if not p.is_dir() or p.is_symlink():
+        return False
+    children = list(p.iterdir())
+    if not children:
+        return False
+    link_count = sum(1 for c in children if c.is_symlink())
+    return link_count > len(children) // 2
+
+
+def _detect_skill_layout() -> dict:
+    """Decide the source/projection layout for the preselect hook.
+
+    Four patterns supported (probed in this order):
+
+    1. ``~/.claude/skills.full/`` already exists → preselect was installed
+       previously. Use it as source, project into ``~/.claude/skills``.
+    2. ``~/.claude/skills`` is a symlink → STARGA layout (or any custom
+       shared layout). Source = the symlink's target, project in place.
+    3. ``~/.agents/skills/`` exists with at least one ``SKILL.md`` → STARGA
+       canonical layout, even if ``~/.claude/skills`` is now a real
+       projection dir of symlinks. Source = ``~/.agents/skills``.
+    4. ``~/.claude/skills`` is a real directory of *real* skills → regular
+       user. Rename it to ``~/.claude/skills.full`` so we can project in
+       place.
+    5. Empty / absent → create ``.full`` so the hook has somewhere to grow
+       into; meanwhile it fails-open until the first skill arrives.
+    """
+    sk = HOME / ".claude" / "skills"
+    full = HOME / ".claude" / "skills.full"
+    agents = HOME / ".agents" / "skills"
+
+    if full.is_dir():
+        return {
+            "layout": "preselect_already_installed",
+            "source_dir": str(full),
+            "projected_dir": str(sk),
+            "action": "none",
+        }
+    if sk.is_symlink():
+        return {
+            "layout": "starga_symlink",
+            "source_dir": str(sk.resolve()),
+            "projected_dir": str(sk),
+            "action": "none",
+        }
+    if agents.is_dir() and any(agents.glob("*/SKILL.md")):
+        return {
+            "layout": "starga_shared_catalog",
+            "source_dir": str(agents),
+            "projected_dir": str(sk),
+            "action": "none",
+        }
+    if _looks_like_projection_dir(sk):
+        # Real dir of symlinks but no detected source — leave it alone and
+        # let the user set MIND_NERVE_SOURCE_DIR manually.
+        return {
+            "layout": "projection_without_known_source",
+            "source_dir": str(full),
+            "projected_dir": str(sk),
+            "action": "none",
+            "note": "set MIND_NERVE_SOURCE_DIR to your real skill catalog",
+        }
+    if sk.is_dir() and any(sk.glob("*/SKILL.md")):
+        return {
+            "layout": "regular_populated",
+            "source_dir": str(full),
+            "projected_dir": str(sk),
+            "action": "rename_to_full",
+        }
+    return {
+        "layout": "empty_or_absent",
+        "source_dir": str(full),
+        "projected_dir": str(sk),
+        "action": "create_full",
+    }
+
+
+def _install_preselect_hook(layout: dict) -> dict:
+    """Patch ~/.claude/settings.json with the SessionStart + UserPromptSubmit hooks.
+
+    SessionStart spawns the daemon idempotently (no-op if already running).
+    UserPromptSubmit projects the top-K skills into ``MIND_NERVE_PROJECTED_DIR``.
+    """
+    cfg_path = HOME / ".claude" / "settings.json"
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    existing: dict = {}
+    if cfg_path.exists():
+        try:
+            existing = json.loads(cfg_path.read_text())
+        except json.JSONDecodeError:
+            existing = {}
+
+    source_dir = layout["source_dir"]
+    projected_dir = layout["projected_dir"]
+    env_export = f'MIND_NERVE_SOURCE_DIR="{source_dir}" MIND_NERVE_PROJECTED_DIR="{projected_dir}"'
+
+    hooks = existing.setdefault("hooks", {})
+
+    ss = hooks.setdefault("SessionStart", [])
+    ss = [
+        e
+        for e in ss
+        if not any(
+            "mind-nerve-routed-ensure" in (h.get("command", "") or "")
+            for h in (e.get("hooks") or [])
+        )
+    ]
+    ss.append(
+        {
+            "matcher": "",
+            "hooks": [{"type": "command", "command": "mind-nerve-routed-ensure"}],
+        }
+    )
+    hooks["SessionStart"] = ss
+
+    ups = hooks.setdefault("UserPromptSubmit", [])
+    ups = [
+        e
+        for e in ups
+        if not any(
+            "mind-nerve-preselect" in (h.get("command", "") or "")
+            or "mind-nerve route" in (h.get("command", "") or "")
+            for h in (e.get("hooks") or [])
+        )
+    ]
+    ups.append(
+        {
+            "matcher": "",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": f"{env_export} mind-nerve-preselect",
+                }
+            ],
+        }
+    )
+    hooks["UserPromptSubmit"] = ups
+
+    cfg_path.write_text(json.dumps(existing, indent=2) + "\n")
+    return {"installed": True, "method": "session_and_prompt_hooks", "path": str(cfg_path)}
+
+
+def install_claude_code_preselect() -> dict:
+    """Wire SessionStart + UserPromptSubmit hooks for skill preselection.
+
+    Migrates a regular user's existing ``~/.claude/skills`` directory to
+    ``~/.claude/skills.full`` so the hook can rewrite the original path
+    as a top-K projection on every turn. Idempotent.
+    """
+    layout = _detect_skill_layout()
+    actions: list[str] = []
+
+    if layout["action"] == "rename_to_full":
+        src = HOME / ".claude" / "skills"
+        dst = HOME / ".claude" / "skills.full"
+        try:
+            os.rename(src, dst)
+            actions.append(f"renamed {src} -> {dst}")
+        except OSError as exc:
+            return {"installed": False, "error": f"rename failed: {exc}", "layout": layout}
+    elif layout["action"] == "create_full":
+        full = HOME / ".claude" / "skills.full"
+        try:
+            full.mkdir(parents=True, exist_ok=True)
+            actions.append(f"created empty {full}")
+            # Remove an empty real `skills` dir so the projection can take its place.
+            sk = HOME / ".claude" / "skills"
+            if sk.is_dir() and not sk.is_symlink() and not any(sk.iterdir()):
+                sk.rmdir()
+                actions.append(f"removed empty {sk}")
+        except OSError as exc:
+            return {
+                "installed": False,
+                "error": f"create skills.full failed: {exc}",
+                "layout": layout,
+            }
+
+    hook_result = _install_preselect_hook(layout)
+    hook_result["layout"] = layout["layout"]
+    hook_result["source_dir"] = layout["source_dir"]
+    hook_result["projected_dir"] = layout["projected_dir"]
+    hook_result["actions"] = actions
+    if not shutil.which("mind-nerve-preselect") or not shutil.which("mind-nerve-routed-ensure"):
+        hook_result["warning"] = (
+            "mind-nerve-preselect / mind-nerve-routed-ensure not found on PATH; "
+            "make sure the mind-nerve venv's bin/ is on PATH for the shell that "
+            "launches Claude Code."
+        )
+    return hook_result
+
+
+# ---------------------------------------------------------------------------
+# --with-mind-mem: register mind-mem-mcp alongside mind-nerve
+# ---------------------------------------------------------------------------
+
+
+def _register_mind_mem_in(cfg_path: Path, fmt: str) -> dict:
+    """Idempotent mind-mem MCP entry write into a JSON or TOML CLI config."""
+    if fmt == "json":
+        existing: dict = {}
+        if cfg_path.exists():
+            try:
+                existing = json.loads(cfg_path.read_text())
+            except json.JSONDecodeError:
+                existing = {}
+        servers = existing.setdefault("mcpServers", {})
+        servers["mind-mem"] = _mcp_entry("mind-mem-mcp")
+        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        cfg_path.write_text(json.dumps(existing, indent=2) + "\n")
+        return {"installed": True, "path": str(cfg_path), "fmt": fmt}
+
+    if fmt == "toml":
+        import re
+
+        block = '\n[mcp_servers.mind-mem]\ncommand = "mind-mem-mcp"\nargs = []\nenv = {}\n'
+        existing_text = cfg_path.read_text() if cfg_path.exists() else ""
+        pattern = re.compile(
+            r"\n?\[mcp_servers\.mind-mem\][^\[]*?(?=\n\[|\Z)",
+            re.DOTALL,
+        )
+        updated = (
+            pattern.sub(block, existing_text)
+            if pattern.search(existing_text)
+            else (existing_text.rstrip() + block)
+        )
+        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        cfg_path.write_text(updated)
+        return {"installed": True, "path": str(cfg_path), "fmt": fmt}
+
+    return {"installed": False, "error": f"unknown fmt: {fmt}"}
+
+
+def install_mind_mem_companion(targets: list[str]) -> dict:
+    """Register the ``mind-mem-mcp`` MCP server next to ``mind-nerve``.
+
+    Only writes to CLI configs the user is already installing mind-nerve
+    into. If ``mind-mem-mcp`` is not on PATH we still write the config
+    entry (idempotent) but flag a warning.
+    """
+    if not shutil.which("mind-mem-mcp"):
+        warning = (
+            "mind-mem-mcp not found on PATH; install mind-mem first (`pip install mind-mem[mcp]`)"
+        )
+    else:
+        warning = None
+
+    results: dict[str, dict] = {}
+    for cli in targets:
+        try:
+            if cli == "claude-code":
+                if shutil.which("claude"):
+                    r = subprocess.run(
+                        ["claude", "mcp", "add", "mind-mem", "mind-mem-mcp"],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    if r.returncode == 0 or "already exists" in (r.stdout + r.stderr).lower():
+                        results[cli] = {"installed": True, "method": "claude_mcp_add"}
+                    else:
+                        results[cli] = _register_mind_mem_in(HOME / ".claude.json", "json")
+                else:
+                    results[cli] = _register_mind_mem_in(HOME / ".claude.json", "json")
+            elif cli == "claude-desktop":
+                candidates = [
+                    HOME / ".config" / "Claude" / "claude_desktop_config.json",
+                    HOME
+                    / "Library"
+                    / "Application Support"
+                    / "Claude"
+                    / "claude_desktop_config.json",
+                ]
+                cfg_path = next((c for c in candidates if c.parent.exists()), candidates[0])
+                results[cli] = _register_mind_mem_in(cfg_path, "json")
+            elif cli == "cursor":
+                results[cli] = _register_mind_mem_in(HOME / ".cursor" / "mcp.json", "json")
+            elif cli == "codex":
+                results[cli] = _register_mind_mem_in(HOME / ".codex" / "config.toml", "toml")
+            else:
+                results[cli] = {"installed": False, "error": f"not supported for {cli}"}
+        except Exception as exc:  # noqa: BLE001
+            results[cli] = {"installed": False, "error": str(exc)}
+
+    out = {"results": results}
+    if warning:
+        out["warning"] = warning
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Detect + list + main
 # ---------------------------------------------------------------------------
 
@@ -242,6 +557,10 @@ def detect() -> dict[str, dict]:
         }
     for cli in STUB_CLIS:
         out[cli] = {"present": False, "status": "stub_v0.1.1"}
+    out["__addons__"] = {
+        "mind-mem-mcp": {"present": bool(shutil.which("mind-mem-mcp"))},
+        "skill_layout": _detect_skill_layout(),
+    }
     return out
 
 
@@ -255,6 +574,9 @@ def cmd_list(args) -> int:
     print("\nStub CLIs (v0.1.1+, integration TBD):")
     for cli in STUB_CLIS:
         print(f"  - {cli}")
+    print("\nOptional add-ons (claude-code only):")
+    print("  --with-preselect  SessionStart + UserPromptSubmit hooks for top-K skill projection")
+    print("  --with-mind-mem   also register mind-mem-mcp (requires `pip install mind-mem[mcp]`)")
     return 0
 
 
@@ -284,6 +606,21 @@ def cmd_install(args) -> int:
             results[cli] = INSTALLERS[cli](MCP_CAPABLE.get(cli) or HOOK_BASED.get(cli) or {})
         except Exception as exc:  # noqa: BLE001
             results[cli] = {"installed": False, "error": str(exc)}
+
+    if args.with_preselect:
+        if "claude-code" in targets:
+            results["__preselect__"] = install_claude_code_preselect()
+        else:
+            results["__preselect__"] = {
+                "installed": False,
+                "reason": "--with-preselect only applies to claude-code right now",
+            }
+
+    if args.with_mind_mem:
+        results["__mind_mem__"] = install_mind_mem_companion(
+            [t for t in targets if t in {"claude-code", "claude-desktop", "cursor", "codex"}]
+        )
+
     print(json.dumps(results, indent=2))
     return 0
 
@@ -301,6 +638,16 @@ def main(argv: list[str] | None = None) -> int:
     p_ins = sub.add_parser("install", help="Install the mind-nerve hook for a CLI")
     p_ins.add_argument(
         "--cli", required=True, help="One of: " + ", ".join(list(INSTALLERS) + ["all"])
+    )
+    p_ins.add_argument(
+        "--with-preselect",
+        action="store_true",
+        help="Also wire SessionStart + UserPromptSubmit hooks for top-K skill projection (claude-code only)",
+    )
+    p_ins.add_argument(
+        "--with-mind-mem",
+        action="store_true",
+        help="Also register the mind-mem-mcp server next to mind-nerve (requires mind-mem installed)",
     )
     p_ins.set_defaults(func=cmd_install)
 

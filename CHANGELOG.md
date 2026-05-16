@@ -2,6 +2,42 @@
 
 All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.0-alpha.7] — 2026-05-16
+
+### Added
+- **`mind-nerve-routed` daemon** — long-lived route server over a UNIX
+  socket. Loads the runtime once at startup, answers single-line JSON
+  requests forever. Round-trip after warmup is sub-30 ms (typical 23 ms
+  on RTX 3080-class hardware), 12× faster than the cold subprocess path
+  and inside the Phase 2 p95 ≤ 30 ms target even on Phase 1 PyTorch.
+  Socket defaults to `$XDG_RUNTIME_DIR/mind-nerve.sock` with a `/tmp`
+  fallback. Console script: `mind-nerve-routed`. Module: `mind_nerve.daemon`.
+- **`mind-nerve-routed-ensure`** — idempotent daemon starter, designed
+  to be wired into a Claude Code `SessionStart` hook. Probes the socket;
+  spawns the daemon detached if not responsive; always exits 0.
+- **`mind-nerve-preselect`** — Claude Code `UserPromptSubmit` hook that
+  reads the prompt, asks the daemon for the top-K matching skills, and
+  atomically rewrites the projected skills directory. Auto-detects three
+  install layouts (regular `~/.claude/skills.full/`, STARGA shared
+  `~/.agents/skills/`, or symlink) and falls open on every error.
+- **`mind-nerve-install install --with-preselect`** — wires the
+  SessionStart + UserPromptSubmit hooks above into `~/.claude/settings.json`
+  for the user's actual layout. For regular users this renames their
+  existing `~/.claude/skills/` to `~/.claude/skills.full/` once.
+- **`mind-nerve-install install --with-mind-mem`** — optional companion
+  that registers the `mind-mem-mcp` MCP server alongside `mind-nerve-mcp`
+  in the same CLI configs (claude-code / claude-desktop / cursor / codex).
+  mind-nerve routes intent; mind-mem provides search-backed memory.
+- PyPI metadata: `keywords = [agent, llm, mcp, preselector, ...]` +
+  `Topic :: Scientific/Engineering :: Artificial Intelligence` classifier
+  for better discoverability.
+
+### Fixed
+- CI: ruff format applied across `python/mind_nerve/`; smoke step no
+  longer asserts the proprietary `libmindnerve.so` is in the wheel
+  (CI builds an OSS-surface wheel by design; production wheels are
+  built locally with the protected runtime before PyPI upload).
+
 ## [0.1.0-alpha.6] — 2026-05-16
 
 ### Added
@@ -79,6 +115,7 @@ First private alpha tag. Phase 1 (Python-side inference) is complete; Phase 2 (n
 - Latency p95 ≤ 30 ms target on a 4-core CPU — Phase 2 only; currently measured Python-side.
 - `mindc` 0.2.5 parses `Mind.toml [protection]` / `[exports]` but does not yet act on them. Protection is delivered by the C bridge + build-pipeline post-processing.
 
+[0.1.0-alpha.7]: https://github.com/star-ga/mind-nerve/releases/tag/v0.1.0-alpha.7
 [0.1.0-alpha.6]: https://github.com/star-ga/mind-nerve/releases/tag/v0.1.0-alpha.6
 [0.1.0-alpha.5]: https://github.com/star-ga/mind-nerve/releases/tag/v0.1.0-alpha.5
 [0.1.0-alpha.4]: https://github.com/star-ga/mind-nerve/releases/tag/v0.1.0-alpha.4

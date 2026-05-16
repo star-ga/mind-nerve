@@ -40,9 +40,12 @@ mcp = ["mcp>=0.9"]
 dev = ["pytest>=7", "ruff>=0.5", "build>=1.0"]
 
 [project.scripts]
-mind-nerve            = "mind_nerve.cli:main"
-mind-nerve-mcp        = "mind_nerve.mcp_server:main"
-mind-nerve-install    = "mind_nerve.installer:main"
+mind-nerve              = "mind_nerve.cli:main"
+mind-nerve-mcp          = "mind_nerve.mcp_server:main"
+mind-nerve-install      = "mind_nerve.installer:main"
+mind-nerve-routed       = "mind_nerve.daemon:main"
+mind-nerve-routed-ensure = "mind_nerve.ensure:main"
+mind-nerve-preselect    = "mind_nerve.preselect_hook:main"
 
 [project.urls]
 Homepage = "https://github.com/star-ga/mind-nerve"

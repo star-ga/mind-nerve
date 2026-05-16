@@ -52,7 +52,7 @@ for r in result.routes:
 | | |
 | :--- | :--- |
 | **96.06% top-5 accuracy** | against 11,922 routing candidates (v1.1-oss catalog) |
-| **23 ms p95 latency** | UNIX-socket daemon, warm pool, GPU — Phase 1 PyTorch (CPU cold-start is ~90 ms; native MIND target is ≤30 ms on 4-core CPU) |
+| **23 ms p95 latency** | UNIX-socket daemon, warm, on GPU — Phase 1 PyTorch (warm daemon on 4-core CPU is ~90 ms; native MIND target is ≤30 ms on 4-core CPU) |
 | **~95% token reduction** | on a 440-skill Claude Code catalog per turn |
 | **One-line install** | `mind-nerve-install install --cli claude-code --with-preselect` |
 | **Six target CLIs today** | Claude Code, Claude Desktop, Cursor, Codex, Claude Code hooks, MCP — 13 more on the roadmap |
@@ -99,7 +99,8 @@ for r in result.routes:
 For CLI hooks, the MCP server, or anything that hits `route()` many times
 per minute, run the daemon and connect over a UNIX socket. It loads the
 runtime once. After warmup the round trip is ~23 ms on GPU and ~90 ms on
-4-core CPU — the cost of the model load (~250 ms) only happens once.
+4-core CPU. The model load (~250 ms) only happens once at daemon start,
+so subsequent prompts never pay for it.
 
 ```bash
 mind-nerve-routed &       # listens on $XDG_RUNTIME_DIR/mind-nerve.sock
@@ -207,9 +208,9 @@ the same ranking. Full spec in [`spec/architecture.md`](spec/architecture.md).
 ## Design constraints
 
 - **Latency p95 ≤ 30 ms** on 4-core CPU — non-negotiable end target. Phase 1
-  hits 23 ms via the GPU+daemon path and ~90 ms on CPU cold-start; the
-  full ≤30 ms-on-CPU budget closes with the Phase 2 native MIND Q16.16
-  inference loop (gated on `mindc` 0.3.0).
+  hits 23 ms via the GPU+daemon path and ~90 ms with a warm daemon on
+  4-core CPU; the full ≤30 ms-on-CPU budget closes with the Phase 2 native
+  MIND Q16.16 inference loop (gated on `mindc` 0.3.0).
 - **Cross-architecture bit-identity** — same request on x86, ARM, CUDA, and
   WebGPU returns the same top-K. Q16.16 fixed-point throughout, no IEEE-754
   fallback in the inference path. (Phase 2 gate; landing with `mindc` 0.3.0.)
@@ -276,7 +277,7 @@ If mind-nerve helps your work, a citation is appreciated:
   title   = {mind-nerve: Intent-classification preselector for agent runtimes},
   year    = {2026},
   url     = {https://github.com/star-ga/mind-nerve},
-  version = {0.1.0-alpha.11}
+  version = {0.1.0-alpha.12}
 }
 ```
 

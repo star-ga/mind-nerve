@@ -2,6 +2,19 @@
 
 All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.0-alpha.12] — 2026-05-16
+
+### Changed
+- README precision fix: the "~90 ms" CPU number is the **warm-daemon** path
+  (encoder reused, model already loaded) not a cold-start. The actual cold
+  subprocess number is ~270–340 ms because of the one-time model load.
+  Now that the daemon is in-package the warm path is what users hit
+  every turn after `SessionStart`, so the README states that explicitly.
+- Rebuilt and reverified the FORTRESS-protected `libmindnerve.so` —
+  same 51,280-byte full build (8 exports; 7/7 leak-verifier checks pass;
+  39 KB of TEXT, real anti-debug surface — not a stub).
+- Supersedes the 0.1.0-alpha.11 tag, which was never uploaded to PyPI.
+
 ## [0.1.0-alpha.11] — 2026-05-16
 
 ### Changed
@@ -157,6 +170,7 @@ First private alpha tag. Phase 1 (Python-side inference) is complete; Phase 2 (n
 - Latency p95 ≤ 30 ms target on a 4-core CPU — Phase 2 only; currently measured Python-side.
 - `mindc` 0.2.5 parses `Mind.toml [protection]` / `[exports]` but does not yet act on them. Protection is delivered by the C bridge + build-pipeline post-processing.
 
+[0.1.0-alpha.12]: https://github.com/star-ga/mind-nerve/releases/tag/v0.1.0-alpha.12
 [0.1.0-alpha.11]: https://github.com/star-ga/mind-nerve/releases/tag/v0.1.0-alpha.11
 [0.1.0-alpha.10]: https://github.com/star-ga/mind-nerve/releases/tag/v0.1.0-alpha.10
 [0.1.0-alpha.9]: https://github.com/star-ga/mind-nerve/releases/tag/v0.1.0-alpha.9

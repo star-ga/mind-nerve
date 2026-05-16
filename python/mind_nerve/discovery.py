@@ -124,9 +124,10 @@ def _load_table(runtime_dir: Path) -> tuple[Any, list[dict]]:
 
 def _save_table_atomic(runtime_dir: Path, emb, meta: list[dict]) -> None:
     import numpy as np
-    tmp_npy = runtime_dir / "route_table.npy.tmp"
+    tmp_npy = runtime_dir / "route_table.tmp.npy"
     tmp_jsonl = runtime_dir / "route_table.jsonl.tmp"
-    np.save(tmp_npy, emb)
+    with tmp_npy.open("wb") as f:
+        np.save(f, emb)
     with tmp_jsonl.open("w", encoding="utf-8") as f:
         for m in meta:
             f.write(json.dumps(m, separators=(",", ":")) + "\n")

@@ -21,7 +21,7 @@ import sys
 from . import __version__
 from .discovery import Watcher
 from .discovery import scan as discovery_scan
-from .inference import load_default_runtime, precompute_routes, route
+from .inference import _DEFAULT_RUNTIME_DIR, load_default_runtime, precompute_routes, route
 
 
 def cmd_route(args) -> int:
@@ -78,7 +78,7 @@ def cmd_learn(args) -> int:
         args.dir,
         source_repo=args.source or "local",
         include_unknown=args.include_unknown,
-        runtime_dir=args.runtime_dir or "/data/datasets/mind-nerve-catalog/phase1/v1.1-oss",
+        runtime_dir=args.runtime_dir or _DEFAULT_RUNTIME_DIR,
         dry_run=args.dry_run,
     )
     print(json.dumps(out, indent=2))
@@ -88,7 +88,7 @@ def cmd_learn(args) -> int:
 def cmd_watch(args) -> int:
     dirs = [(d, args.source or "local") for d in args.dirs]
     w = Watcher(dirs, interval=args.interval, include_unknown=args.include_unknown,
-                runtime_dir=args.runtime_dir or "/data/datasets/mind-nerve-catalog/phase1/v1.0")
+                runtime_dir=args.runtime_dir or _DEFAULT_RUNTIME_DIR)
     w.start()
     print(f"[mind-nerve watch] watching {len(dirs)} dirs every {args.interval}s; ctrl-c to stop",
           file=sys.stderr)

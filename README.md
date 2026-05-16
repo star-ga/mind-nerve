@@ -90,14 +90,15 @@ That wires two hooks into `~/.claude/settings.json`:
   atomically rewrites `~/.claude/skills/` as a directory of symlinks
   pointing into your real catalog.
 
-The installer auto-detects two install layouts:
+The installer auto-detects your layout:
 
-- **Regular**: your existing `~/.claude/skills/` directory is renamed once
-  to `~/.claude/skills.full/`. After that the daemon projects a top-K
-  subset back into `~/.claude/skills/` per turn.
-- **Shared catalog** (e.g. STARGA's `~/.agents/skills/` linked across
-  multiple CLIs): the shared catalog stays put. mind-nerve projects from
-  there into `~/.claude/skills/` per turn.
+- **Default Claude Code install** (most users): your existing
+  `~/.claude/skills/` directory is renamed once to `~/.claude/skills.full/`.
+  After that the daemon projects a top-K subset back into
+  `~/.claude/skills/` per turn.
+- **Shared catalog** (multiple agent CLIs pointed at one directory,
+  e.g. `~/.agents/skills/`): the shared catalog stays put.
+  mind-nerve projects from there into `~/.claude/skills/` per turn.
 
 If you also use [mind-mem](https://pypi.org/project/mind-mem/) for durable
 memory, add the companion MCP:

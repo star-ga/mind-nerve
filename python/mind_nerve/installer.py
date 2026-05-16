@@ -12,12 +12,12 @@ each install function.
 
 Optional add-ons (only Claude Code right now):
 
-* ``--with-preselect`` — wire the SessionStart + UserPromptSubmit
-  hooks that project the top-K skills into ``~/.claude/skills``.
-  Works for both the STARGA shared-catalog layout (``~/.agents/skills``)
-  and a plain default layout (renames the user's existing
-  ``~/.claude/skills`` to ``~/.claude/skills.full`` and projects in
-  its place).
+* ``--with-preselect`` — wire the SessionStart + UserPromptSubmit hooks
+  that project the top-K skills into ``~/.claude/skills``. For most users
+  this renames the existing ``~/.claude/skills`` to
+  ``~/.claude/skills.full`` once, then projects from ``.full`` back into
+  the original path on every prompt. A cross-CLI shared catalog at
+  ``~/.agents/skills`` is detected automatically if present.
 * ``--with-mind-mem`` — also register the ``mind-mem-mcp`` server,
   if installed on PATH. mind-nerve does intent routing; mind-mem
   provides durable memory. Together they bracket the prompt path.
@@ -263,20 +263,21 @@ def _looks_like_projection_dir(p: Path) -> bool:
 def _detect_skill_layout() -> dict:
     """Decide the source/projection layout for the preselect hook.
 
-    Four patterns supported (probed in this order):
+    Probed in this order — most users hit case 4 (regular) or 5 (empty):
 
-    1. ``~/.claude/skills.full/`` already exists → preselect was installed
-       previously. Use it as source, project into ``~/.claude/skills``.
-    2. ``~/.claude/skills`` is a symlink → STARGA layout (or any custom
-       shared layout). Source = the symlink's target, project in place.
-    3. ``~/.agents/skills/`` exists with at least one ``SKILL.md`` → STARGA
-       canonical layout, even if ``~/.claude/skills`` is now a real
-       projection dir of symlinks. Source = ``~/.agents/skills``.
-    4. ``~/.claude/skills`` is a real directory of *real* skills → regular
-       user. Rename it to ``~/.claude/skills.full`` so we can project in
-       place.
-    5. Empty / absent → create ``.full`` so the hook has somewhere to grow
-       into; meanwhile it fails-open until the first skill arrives.
+    1. ``~/.claude/skills.full/`` exists → preselect was already installed
+       on a previous run. Use ``.full`` as source, project into
+       ``~/.claude/skills``.
+    2. ``~/.claude/skills`` is a symlink → some other tool already moved
+       the catalog elsewhere. Leave it in place; source = symlink target.
+    3. ``~/.agents/skills/`` exists with at least one ``SKILL.md`` →
+       cross-CLI shared catalog (Codex/Gemini/Vibe/Claude pointed at the
+       same directory). Project from there.
+    4. ``~/.claude/skills`` is a real directory of real skills (each
+       subdir has its own ``SKILL.md``) → typical Claude Code user.
+       Rename to ``~/.claude/skills.full`` so we can project in place.
+    5. Empty / absent → create ``.full`` so the hook has somewhere to
+       grow into; meanwhile it fails-open until the first skill arrives.
     """
     sk = HOME / ".claude" / "skills"
     full = HOME / ".claude" / "skills.full"
@@ -291,14 +292,14 @@ def _detect_skill_layout() -> dict:
         }
     if sk.is_symlink():
         return {
-            "layout": "starga_symlink",
+            "layout": "symlinked_catalog",
             "source_dir": str(sk.resolve()),
             "projected_dir": str(sk),
             "action": "none",
         }
     if agents.is_dir() and any(agents.glob("*/SKILL.md")):
         return {
-            "layout": "starga_shared_catalog",
+            "layout": "shared_catalog_dir",
             "source_dir": str(agents),
             "projected_dir": str(sk),
             "action": "none",

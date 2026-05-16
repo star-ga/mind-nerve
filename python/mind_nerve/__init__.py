@@ -15,5 +15,5 @@ Public API:
 from .inference import load_default_runtime, route
 from .types import Route, RouteResult
 
-__version__ = "0.1.0a7"
+__version__ = "0.1.0a8"
 __all__ = ["Route", "RouteResult", "route", "load_default_runtime", "__version__"]

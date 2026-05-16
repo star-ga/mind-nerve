@@ -20,9 +20,8 @@ Without any env vars set, the hook detects two install patterns:
   - **Regular**: real skill catalog at `~/.claude/skills.full/`
     (installer renamed the user's original `~/.claude/skills/`
     to `.full/` and started projecting into `~/.claude/skills/`).
-  - **STARGA**: shared catalog at `~/.agents/skills/` (the
-    canonical STARGA layout used across `claude`, `codex`,
-    `gemini`, `vibe`).
+  - **Shared catalog**: catalog at `~/.agents/skills/`, used by
+    setups that point multiple agent CLIs at one skill directory.
 
 If neither exists the hook short-circuits to pass-through and
 leaves the current state alone.
@@ -69,12 +68,10 @@ def _default_source_dir() -> Path:
     """Auto-detect the real skill catalog.
 
     Priority:
-      1. `~/.claude/skills.full/` — created by `mind-nerve-install` when
-         the user already had a real `~/.claude/skills/` directory; the
-         installer renames it to `.full/` and projects into the original
-         path.
-      2. `~/.agents/skills/` — STARGA's canonical shared catalog.
-      3. Fallback to `~/.agents/skills/` even if absent; the hook will
+      1. ``~/.claude/skills.full/`` — created by ``mind-nerve-install``
+         after renaming the user's original ``~/.claude/skills/``.
+      2. ``~/.agents/skills/`` — optional cross-CLI shared catalog.
+      3. Fallback to ``~/.agents/skills/`` even if absent; the hook will
          simply find no skills and exit pass-through.
     """
     full = Path.home() / ".claude" / "skills.full"

@@ -2,6 +2,15 @@
 
 All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.0-alpha.9] — 2026-05-16
+
+### Changed
+- README rewritten for the public alpha: centered hero, status badges
+  (PyPI / Python / License / CI / Downloads / HF / Stars), table-driven
+  comparison against the standard responses to library-size growth,
+  four-step Quickstart, integration matrix, console-script reference,
+  full env-var table, citation block. No code changes.
+
 ## [0.1.0-alpha.8] — 2026-05-16
 
 ### Changed
@@ -127,6 +136,7 @@ First private alpha tag. Phase 1 (Python-side inference) is complete; Phase 2 (n
 - Latency p95 ≤ 30 ms target on a 4-core CPU — Phase 2 only; currently measured Python-side.
 - `mindc` 0.2.5 parses `Mind.toml [protection]` / `[exports]` but does not yet act on them. Protection is delivered by the C bridge + build-pipeline post-processing.
 
+[0.1.0-alpha.9]: https://github.com/star-ga/mind-nerve/releases/tag/v0.1.0-alpha.9
 [0.1.0-alpha.8]: https://github.com/star-ga/mind-nerve/releases/tag/v0.1.0-alpha.8
 [0.1.0-alpha.7]: https://github.com/star-ga/mind-nerve/releases/tag/v0.1.0-alpha.7
 [0.1.0-alpha.6]: https://github.com/star-ga/mind-nerve/releases/tag/v0.1.0-alpha.6

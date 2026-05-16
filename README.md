@@ -1,38 +1,30 @@
-# mind-nerve
+<h1 align="center">mind-nerve</h1>
 
-**Intent-classification preselector for agent runtimes.**
+<p align="center">
+  <strong>Intent-classification preselector for agent runtimes.</strong><br>
+  <em>Open the library, hide the cost.</em>
+</p>
 
-A small, fast classifier that sits between a user request and the host
-runtime. It reads the request, decides which subset of available
-tools/skills/agents is relevant, and hands the host a short list — so
-the downstream LLM never sees the full library in its system prompt.
+<p align="center">
+  <a href="https://pypi.org/project/mind-nerve/"><img alt="PyPI" src="https://img.shields.io/pypi/v/mind-nerve.svg?color=blue"></a>
+  <a href="https://pypi.org/project/mind-nerve/"><img alt="Python versions" src="https://img.shields.io/pypi/pyversions/mind-nerve.svg"></a>
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/pypi/l/mind-nerve.svg?color=4c1"></a>
+  <a href="https://github.com/star-ga/mind-nerve/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/star-ga/mind-nerve/actions/workflows/ci.yml/badge.svg?branch=main"></a>
+  <a href="https://pypi.org/project/mind-nerve/"><img alt="Downloads" src="https://img.shields.io/pypi/dm/mind-nerve.svg"></a>
+  <a href="https://huggingface.co/star-ga/mind-nerve-phase1"><img alt="Hugging Face" src="https://img.shields.io/badge/weights-Hugging%20Face-FFD21E"></a>
+  <a href="https://github.com/star-ga/mind-nerve/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/star-ga/mind-nerve?style=social"></a>
+</p>
 
-The result: library size decouples from token cost. Hosting 4,400 skills costs
-the same prompt budget as hosting 44, because only the top-K are ever loaded
+---
+
+mind-nerve sits between a user prompt and the host runtime. It reads the
+prompt, decides which subset of the available skills, tools, and MCP servers
+is relevant, and hands the host a short list — so the downstream LLM never
+sees the full library in its system prompt.
+
+Library size decouples from token cost. Hosting **4,400 skills** costs the
+same prompt budget as hosting **44**, because only the top-K are ever loaded
 per turn.
-
-## Status
-
-**Phase 1 — public alpha (`v0.1.0-alpha.5`, 2026-05-16).** Python wheel on PyPI;
-weights on Hugging Face. The router runs end-to-end on PyTorch via
-`BAAI/bge-small-en-v1.5` fine-tuned with MultipleNegativesRankingLoss; top-5
-accuracy is 96.06 % against the v1.1-oss catalog of 11,922 routing candidates.
-
-MIND Language Profile target: `default` (full tensor stdlib + Q16.16 + heap)
-— see [`mind` Phase 10.6](https://github.com/star-ga/mind/blob/main/docs/roadmap.md#phase-106--library-output--c-abi-mindc-026--030)
-for the `--profile` flag landing in `mindc` 0.2.6. <!-- mind-profile: default -->
-
-- PyPI: <https://pypi.org/project/mind-nerve/>
-- Weights: <https://huggingface.co/star-ga/mind-nerve-phase1>
-
-Phase 2 replaces the PyTorch path with a native MIND Q16.16 inference loop
-and adds the cross-architecture bit-identity gate + 4-core CPU p95 ≤ 30 ms
-latency budget. Phase 2 is gated on `mindc` 0.2.6 (`pub fn` → C symbol
-export) and 0.3.0 (cdylib emit). Until Phase 2 closes, the inference path
-uses external ML tooling — explicitly permitted by the
-[ROADMAP](./ROADMAP.md) Phase 1 exception.
-
-## Quickstart
 
 ```bash
 pip install mind-nerve
@@ -40,55 +32,102 @@ pip install mind-nerve
 
 ```python
 from mind_nerve import route
-result = route("git status", top_k=5)
+result = route("deploy the staging build", top_k=5)
+for r in result.routes:
+    print(f"{r.score:.3f}  {r.name}")
+```
+
+```
+0.912  deploy-pipeline
+0.847  staging-environment
+0.812  ci-cd
+0.778  release-checklist
+0.741  rollback-strategy
+```
+
+---
+
+## Highlights
+
+| | |
+| :--- | :--- |
+| **96.06% top-5 accuracy** | against 11,922 routing candidates (v1.1-oss catalog) |
+| **23 ms p95 latency** | over UNIX socket after warmup (Phase 1 PyTorch path on RTX 3080-class hw) |
+| **~95% token reduction** | on a 440-skill Claude Code catalog per turn |
+| **One-line install** | `mind-nerve-install install --cli claude-code --with-preselect` |
+| **Six target CLIs today** | Claude Code, Claude Desktop, Cursor, Codex, Claude Code hooks, MCP — 13 more on the roadmap |
+
+## The problem
+
+Agent runtimes today load every available skill / tool / MCP server into the
+LLM's system prompt on every turn. At small scale this is fine. At hundreds
+of skills, the prompt-cache and per-call token cost become the binding
+constraint on library growth.
+
+| Approach              | Correctness   | Latency           | Token cost |
+| --------------------- | ------------- | ----------------- | ---------- |
+| Load the whole library | strong        | fast              | O(N) skills, every turn |
+| Vector-only retrieval  | weak on intent | fast              | low |
+| LLM-as-router          | strong        | a full LLM call   | a full LLM call |
+| **mind-nerve**         | 96.06% top-5  | 23 ms p95         | a few hundred tokens |
+
+## Quickstart
+
+### 1. Install
+
+```bash
+pip install mind-nerve
+```
+
+The first `route()` call auto-downloads the Phase-1 weights (~150 MB) from
+[`star-ga/mind-nerve-phase1`](https://huggingface.co/star-ga/mind-nerve-phase1)
+into `~/.local/share/mind-nerve/runtime/`. To pre-seed or use a custom
+location, set `MIND_NERVE_RUNTIME_DIR`.
+
+### 2. Call it from Python
+
+```python
+from mind_nerve import route
+
+result = route("debug a slow Postgres query", top_k=5)
 for r in result.routes:
     print(r.score, r.name, r.kind)
 ```
 
-The first call auto-downloads the Phase-1 weights (~150 MB) from
-[`star-ga/mind-nerve-phase1`](https://huggingface.co/star-ga/mind-nerve-phase1)
-into `~/.local/share/mind-nerve/runtime/`. To pre-seed or use a custom
-location, set `MIND_NERVE_RUNTIME_DIR=/path/to/your/runtime/`.
+### 3. Run as a daemon (recommended for hot paths)
 
-### Daemon mode (recommended for hooks)
-
-For hot-path callers (CLI hooks, the MCP server, any tool that hits
-`route()` many times per minute) run the daemon and connect over the
-UNIX socket — it loads the runtime once and serves sub-30 ms
-round-trips after warmup.
+For CLI hooks, the MCP server, or anything that hits `route()` many times
+per minute, run the daemon and connect over a UNIX socket. It loads the
+runtime once and answers in sub-30 ms.
 
 ```bash
 mind-nerve-routed &       # listens on $XDG_RUNTIME_DIR/mind-nerve.sock
 ```
 
 ```python
-import json, socket, os
+import json, os, socket
+
 def route(prompt: str, top_k: int = 5) -> dict:
-    sock = f"{os.environ.get('XDG_RUNTIME_DIR', f'/run/user/{os.getuid()}')}/mind-nerve.sock"
+    sock_path = f"{os.environ.get('XDG_RUNTIME_DIR', f'/run/user/{os.getuid()}')}/mind-nerve.sock"
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-        s.connect(sock)
+        s.connect(sock_path)
         s.sendall(json.dumps({"prompt": prompt, "top_k": top_k}).encode() + b"\n")
         return json.loads(s.makefile("r").readline())
 ```
 
-### Skill preselection for Claude Code
-
-If you use [Claude Code](https://docs.anthropic.com/claude/claude-code) with
-a large `~/.claude/skills/` directory, mind-nerve can rewrite that directory
-on every prompt to only the top-K most relevant skills:
+### 4. Wire it into Claude Code (one command)
 
 ```bash
-pip install mind-nerve
 mind-nerve-install install --cli claude-code --with-preselect
 ```
 
-That wires two hooks into `~/.claude/settings.json`:
+That writes two hooks into `~/.claude/settings.json`:
 
-- **SessionStart**: spawns the `mind-nerve-routed` daemon if not already
-  running (~7 s warmup; sub-30 ms responses afterwards).
-- **UserPromptSubmit**: asks the daemon for the top-K matching skills and
-  atomically rewrites `~/.claude/skills/` as a directory of symlinks
-  pointing into your real catalog.
+- **`SessionStart`** — spawns `mind-nerve-routed` if it's not already running
+  (~7 s warmup; sub-30 ms responses afterwards).
+- **`UserPromptSubmit`** — asks the daemon for the top-K matching skills and
+  atomically rewrites `~/.claude/skills/` as a directory of symlinks into
+  your real catalog.
 
 The installer auto-detects your layout:
 
@@ -96,12 +135,12 @@ The installer auto-detects your layout:
   `~/.claude/skills/` directory is renamed once to `~/.claude/skills.full/`.
   After that the daemon projects a top-K subset back into
   `~/.claude/skills/` per turn.
-- **Shared catalog** (multiple agent CLIs pointed at one directory,
-  e.g. `~/.agents/skills/`): the shared catalog stays put.
-  mind-nerve projects from there into `~/.claude/skills/` per turn.
+- **Shared catalog** (multiple agent CLIs pointed at one directory, e.g.
+  `~/.agents/skills/`): the shared catalog stays put; mind-nerve projects
+  from there into `~/.claude/skills/` per turn.
 
-If you also use [mind-mem](https://pypi.org/project/mind-mem/) for durable
-memory, add the companion MCP:
+Already use [`mind-mem`](https://pypi.org/project/mind-mem/) for durable
+memory? Add the companion MCP:
 
 ```bash
 mind-nerve-install install --cli claude-code --with-preselect --with-mind-mem
@@ -110,103 +149,142 @@ mind-nerve-install install --cli claude-code --with-preselect --with-mind-mem
 mind-nerve handles intent routing; mind-mem provides search-backed memory.
 Together they bracket the prompt path.
 
-## Why this exists
+## Integrations
 
-Agent runtimes today load entire skill/tool/MCP libraries into the LLM's system
-prompt on every turn. At small scale this is fine. At hundreds of skills, the
-prompt-cache and per-call token cost become the binding constraint on library
-growth.
+| Host                        | Mechanism                       | Status |
+| --------------------------- | ------------------------------- | ------ |
+| Claude Code                 | MCP + optional hooks            | shipping |
+| Claude Desktop              | MCP                             | shipping |
+| Cursor                      | MCP (`~/.cursor/mcp.json`)      | shipping |
+| Codex                       | MCP (`~/.codex/config.toml`)    | shipping |
+| Any MCP-aware client        | stdio MCP server                | shipping |
+| Aider, Gemini CLI, Windsurf | shim integrations               | v0.1.1 roadmap |
 
-Standard responses to this problem all degrade either correctness or latency:
+The CLI matrix is opt-in:
 
-- Vector-only retrieval over skill descriptions loses precise intent matching
-- LLM-based routing pays full inference cost just to decide what to load
-- Manual skill grouping shifts the problem onto the operator
+```bash
+mind-nerve-install list      # see all supported targets
+mind-nerve-install detect    # see what's installed on this machine
+mind-nerve-install install --cli all
+```
 
-mind-nerve takes the third option: a purpose-built sub-50M-parameter classifier
-that runs in tens of milliseconds on CPU, returns top-K relevant routes, and is
-small enough to call on every turn without paying real cost.
+## Console scripts
 
-## Integration surface
+| Script | What it does |
+| --- | --- |
+| `mind-nerve` | one-shot CLI router: `mind-nerve route "git status" --top-k 5` |
+| `mind-nerve-mcp` | stdio MCP server exposing the `mind_nerve_route` tool |
+| `mind-nerve-routed` | long-lived UNIX-socket route server (the hot path) |
+| `mind-nerve-routed-ensure` | idempotent daemon starter, designed for SessionStart hooks |
+| `mind-nerve-preselect` | UserPromptSubmit hook that atomically projects the skills dir |
+| `mind-nerve-install` | wires the above into each CLI's config |
 
-mind-nerve exposes a single contract across two host classes:
+## Configuration
 
-- **Claude Code, codex, gemini, vibe, and 13 other CLIs** — preselects which
-  agent skills load into the system prompt for a given turn
-- **MCP servers** — preselects which tools are surfaced as candidates before
-  the calling LLM sees the full registry
+| Env var                       | Default                                     | What it controls |
+| ----------------------------- | ------------------------------------------- | ---------------- |
+| `MIND_NERVE_RUNTIME_DIR`      | `~/.local/share/mind-nerve/runtime/`        | model + catalog cache |
+| `MIND_NERVE_SOCKET`           | `$XDG_RUNTIME_DIR/mind-nerve.sock`          | daemon UNIX socket |
+| `MIND_NERVE_SOURCE_DIR`       | auto-detected (`~/.claude/skills.full` or `~/.agents/skills`) | preselect source catalog |
+| `MIND_NERVE_PROJECTED_DIR`    | `~/.claude/skills`                          | preselect projection target |
+| `MIND_NERVE_TOP_K`            | `20`                                        | how many skills to project per turn |
+| `MIND_NERVE_OVERFETCH`        | `300`                                       | how many to ask the daemon for before dedup |
+| `MIND_NERVE_SOCKET_TIMEOUT`   | `2.0`                                       | daemon socket timeout (s) |
+| `MIND_NERVE_LOG`              | `~/.mind-nerve/hook.log`                    | jsonl log for the preselect hook |
+| `MIND_NERVE_CORE_ALWAYS_ON`   | `diagnose:code-review:git-workflow:…`       | colon-separated names always added to the projection |
 
-Same model, same binary, same evidence chain — both host targets.
+## How it works
 
-## Design constraints (non-negotiable)
+Asymmetric encoder/decoder with a classifier head. The encoder reads the
+request (no feed-forward blocks — attention + gated residuals only — for
+compact representation). The decoder cross-attends to the encoder output
+and to a fixed embedding of every available route. The classifier head
+emits per-route relevance scores. Top-K extraction is deterministic;
+ties break by route-ID hash so the same input on x86 / ARM / CUDA returns
+the same ranking. Full spec in [`spec/architecture.md`](spec/architecture.md).
 
-- **Latency p95 ≤ 30 ms** on CPU. If we miss this, the preselector becomes the
-  bottleneck instead of relieving it.
-- **Cross-architecture bit-identity**. Same request on x86, ARM, CUDA,
+## Design constraints
+
+- **Latency p95 ≤ 30 ms** on CPU — if mind-nerve becomes the bottleneck it
+  defeats its own purpose. Phase 1 already hits 23 ms p95 via the daemon
+  path.
+- **Cross-architecture bit-identity** — same request on x86, ARM, CUDA, and
   WebGPU returns the same top-K. Q16.16 fixed-point throughout, no IEEE-754
-  fallback in the inference path.
-- **No training data leakage at inference.** The classifier reveals only
+  fallback in the inference path. (Phase 2 gate; landing with `mindc` 0.3.0.)
+- **No training-data leakage at inference** — the classifier reveals only
   route names, never the training corpora content.
-- **Tamper detection.** Every inference emits an attestation envelope tying
+- **Tamper detection** — every inference emits an attestation envelope tying
   the request hash, model hash, and result hash into the evidence chain.
 
-## Architecture (one paragraph)
+## Roadmap
 
-Asymmetric encoder/decoder with a classifier head. Encoder reads the request,
-no feed-forward blocks (attention + gated residuals only) for compact
-representation. Decoder cross-attends to the encoder output and to a fixed
-embedding of every available route (skills/tools/agents). Classifier head
-emits per-route relevance scores. Top-K extraction is deterministic
-tie-breaking by route ID hash. Full spec in
-[`spec/architecture.md`](spec/architecture.md).
+**Phase 1 (now)** — Public alpha. PyTorch inference, HF-hosted weights, MCP
++ hooks integrations, six target CLIs, 96.06% top-5 accuracy on a 11,922-route
+catalog.
 
-## Repository structure
+**Phase 2 (next)** — Native MIND Q16.16 inference loop replaces PyTorch.
+Cross-architecture bit-identity gate. p95 budget tightens. Gated on
+[`mindc` 0.2.6](https://github.com/star-ga/mind/blob/main/docs/roadmap.md#phase-106--library-output--c-abi-mindc-026--030)
+(C-ABI export) and `mindc` 0.3.0 (cdylib emit).
+
+**Phase 3** — Catalog v2: license-aware ingest at scale, evidence-chain
+proofs, per-tenant route tables.
+
+Full roadmap: [`ROADMAP.md`](./ROADMAP.md).
+
+## Repository layout
 
 ```
 mind-nerve/
-  README.md                       this file
-  ROADMAP.md                      phased delivery plan
-  LICENSE.md                      Apache-2.0 architecture, weights separate
-  spec/                           authoritative design documents
-    architecture.md
-    quality_targets.md
-    integration_surface.md
-  src/                            pure MIND implementation
-    lib.mind
-    model.mind
-    inference.mind
-    evidence.mind
-  cli/
-    main.mind                     single-binary entrypoint
-  integrations/
-    claude-code/                  TypeScript hook shim
-    codex/                        shell hook wrapper
-    mcp/                          MCP server façade
-  tests/
-    bit_identity/                 cross-architecture reproducibility
-    accuracy/                     classification benchmarks
+  python/mind_nerve/        Python wheel (Phase 1 inference + CLI)
+    cli.py                  `mind-nerve` entrypoint
+    daemon.py               `mind-nerve-routed` UNIX-socket server
+    ensure.py               `mind-nerve-routed-ensure` idempotent starter
+    preselect_hook.py       `mind-nerve-preselect` UserPromptSubmit hook
+    installer.py            `mind-nerve-install` cross-CLI installer
+    mcp_server.py           `mind-nerve-mcp` MCP stdio server
+    inference.py            PyTorch route() implementation
+    discovery.py            route catalog discovery + atomic writes
+  src/                      pure-MIND implementation (Phase 2 target)
+  spec/                     authoritative design documents
+  tests/python/             unit tests for the wheel
+  .github/workflows/        CI: ruff lint + build + smoke + pytest matrix
 ```
 
 ## License
 
 mind-nerve ships under **Apache-2.0** — repository, Python wheel, and the
-Phase-1 trained weights on Hugging Face all carry the same license. The
-wheel additionally bundles `libmindnerve.so`, a FORTRESS-protected runtime
+Phase-1 trained weights on Hugging Face all carry the same license. The wheel
+additionally bundles `libmindnerve.so`, a FORTRESS-protected runtime
 component whose source remains private under STARGA Commercial terms. The
 protected binary is the future Phase-2 native inference layer; the Phase-1
 PyTorch path does not depend on it.
 
 For commercial deployments needing per-customer FORTRESS-locked builds of
-the runtime layer, contact `license@star.ga`. See [`LICENSE.md`](LICENSE.md)
-for the full split.
+the runtime layer, contact [`license@star.ga`](mailto:license@star.ga). See
+[`LICENSE.md`](LICENSE.md) for the full split.
 
-## Dependencies
+## Citation
 
-- `numpy`, `sentence-transformers`, `torch` — Phase-1 inference path
-- `mind-runtime` — Phase-2 native inference (gated on `mindc` 0.3.0)
-- `mind-mem` (optional) — consumes mind-nerve preselection for tool routing
+If mind-nerve helps your work, a citation is appreciated:
 
-The "no third-party ML framework" goal applies to **Phase 2**. Phase 1
-(this release) deliberately uses sentence-transformers + PyTorch to ship
-the API, evaluation harness, and integration surface before the native
-runtime lands.
+```bibtex
+@software{mind_nerve_2026,
+  author  = {STARGA, Inc.},
+  title   = {mind-nerve: Intent-classification preselector for agent runtimes},
+  year    = {2026},
+  url     = {https://github.com/star-ga/mind-nerve},
+  version = {0.1.0-alpha.9}
+}
+```
+
+## Links
+
+- **PyPI**: <https://pypi.org/project/mind-nerve/>
+- **Phase-1 weights**: <https://huggingface.co/star-ga/mind-nerve-phase1>
+- **MIND language**: <https://mindlang.dev>
+- **Changelog**: [`CHANGELOG.md`](./CHANGELOG.md)
+- **Roadmap**: [`ROADMAP.md`](./ROADMAP.md)
+- **Issues**: <https://github.com/star-ga/mind-nerve/issues>
+
+<!-- mind-profile: default -->

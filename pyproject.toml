@@ -10,6 +10,11 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
 authors = [{ name = "STARGA, Inc.", email = "info@star.ga" }]
+keywords = [
+    "agent", "agents", "llm", "mcp", "preselector",
+    "intent-classification", "routing", "sentence-transformers",
+    "mind-language", "ai-tools",
+]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -21,6 +26,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Topic :: Software Development :: Libraries",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
     "numpy>=1.24",

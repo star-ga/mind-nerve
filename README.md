@@ -13,7 +13,7 @@ per turn.
 
 ## Status
 
-**Phase 1 — public alpha (`v0.1.0-alpha.3`, 2026-05-16).** Python wheel on PyPI;
+**Phase 1 — public alpha (`v0.1.0-alpha.5`, 2026-05-16).** Python wheel on PyPI;
 weights on Hugging Face. The router runs end-to-end on PyTorch via
 `BAAI/bge-small-en-v1.5` fine-tuned with MultipleNegativesRankingLoss; top-5
 accuracy is 96.06 % against the v1.1-oss catalog of 11,922 routing candidates.
@@ -35,7 +35,7 @@ uses external ML tooling — explicitly permitted by the
 ## Quickstart
 
 ```bash
-pip install mind-nerve==0.1.0a3
+pip install mind-nerve
 ```
 
 ```python

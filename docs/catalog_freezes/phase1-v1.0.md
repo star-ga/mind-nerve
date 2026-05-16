@@ -18,7 +18,7 @@
 | Batch | 32 |
 | Epochs | 3 |
 | Seed | 1337 |
-| Device | RTX 3080 (CUDA), AMP enabled |
+| Device | RTX (CUDA), AMP enabled |
 | Train wall-time | 126.5 s |
 
 ## Quality (12,468-pool candidate set)

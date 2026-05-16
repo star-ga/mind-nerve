@@ -78,7 +78,7 @@ Single target: **≥92% top-5 accuracy** on held-out test set, **p95 ≤30ms** o
 ```
 1. Tokenize merged catalog + query corpus  →  custom 32k BPE
 2. Build catalog embedding index            →  lex-sorted Vec<(id, vec)>
-3. Train encoder (PyTorch, RTX 3080):
+3. Train encoder (PyTorch, RTX):
    - Loss: contrastive InfoNCE (query ↔ chosen-tool)
    - Optimizer: AdamW, cosine LR, warmup 1k steps
    - Hard negative mining every 5k steps

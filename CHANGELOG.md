@@ -2,7 +2,7 @@
 
 All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [0.1.0-alpha.9] — 2026-05-16
+## [0.1.0-alpha.10] — 2026-05-16
 
 ### Changed
 - README rewritten for the public alpha: centered hero, status badges
@@ -10,6 +10,16 @@ All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](htt
   comparison against the standard responses to library-size growth,
   four-step Quickstart, integration matrix, console-script reference,
   full env-var table, citation block. No code changes.
+- Hardware references in the README, CHANGELOG, and historical training
+  docs are now generic (`RTX`, `RTX-class hw`) instead of naming a
+  specific consumer card. Supersedes the 0.1.0-alpha.9 README, which was
+  never uploaded to PyPI.
+
+## [0.1.0-alpha.9] — 2026-05-16
+
+### Changed
+- README rewritten for the public alpha (superseded by 0.1.0-alpha.10
+  before PyPI upload).
 
 ## [0.1.0-alpha.8] — 2026-05-16
 
@@ -29,7 +39,7 @@ All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](htt
 - **`mind-nerve-routed` daemon** — long-lived route server over a UNIX
   socket. Loads the runtime once at startup, answers single-line JSON
   requests forever. Round-trip after warmup is sub-30 ms (typical 23 ms
-  on RTX 3080-class hardware), 12× faster than the cold subprocess path
+  on RTX-class hardware), 12× faster than the cold subprocess path
   and inside the Phase 2 p95 ≤ 30 ms target even on Phase 1 PyTorch.
   Socket defaults to `$XDG_RUNTIME_DIR/mind-nerve.sock` with a `/tmp`
   fallback. Console script: `mind-nerve-routed`. Module: `mind_nerve.daemon`.
@@ -136,6 +146,7 @@ First private alpha tag. Phase 1 (Python-side inference) is complete; Phase 2 (n
 - Latency p95 ≤ 30 ms target on a 4-core CPU — Phase 2 only; currently measured Python-side.
 - `mindc` 0.2.5 parses `Mind.toml [protection]` / `[exports]` but does not yet act on them. Protection is delivered by the C bridge + build-pipeline post-processing.
 
+[0.1.0-alpha.10]: https://github.com/star-ga/mind-nerve/releases/tag/v0.1.0-alpha.10
 [0.1.0-alpha.9]: https://github.com/star-ga/mind-nerve/releases/tag/v0.1.0-alpha.9
 [0.1.0-alpha.8]: https://github.com/star-ga/mind-nerve/releases/tag/v0.1.0-alpha.8
 [0.1.0-alpha.7]: https://github.com/star-ga/mind-nerve/releases/tag/v0.1.0-alpha.7

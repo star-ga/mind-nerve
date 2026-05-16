@@ -52,7 +52,7 @@ for r in result.routes:
 | | |
 | :--- | :--- |
 | **96.06% top-5 accuracy** | against 11,922 routing candidates (v1.1-oss catalog) |
-| **23 ms p95 latency** | over UNIX socket after warmup (Phase 1 PyTorch path on RTX 3080-class hw) |
+| **23 ms p95 latency** | over UNIX socket after warmup (Phase 1 PyTorch path on RTX-class hw) |
 | **~95% token reduction** | on a 440-skill Claude Code catalog per turn |
 | **One-line install** | `mind-nerve-install install --cli claude-code --with-preselect` |
 | **Six target CLIs today** | Claude Code, Claude Desktop, Cursor, Codex, Claude Code hooks, MCP — 13 more on the roadmap |
@@ -274,7 +274,7 @@ If mind-nerve helps your work, a citation is appreciated:
   title   = {mind-nerve: Intent-classification preselector for agent runtimes},
   year    = {2026},
   url     = {https://github.com/star-ga/mind-nerve},
-  version = {0.1.0-alpha.9}
+  version = {0.1.0-alpha.10}
 }
 ```
 

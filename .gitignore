@@ -48,7 +48,14 @@ node_modules/
 /.autoresearch-*.log
 /.autoresearch-state/
 
-# Protected-build artefacts — never committed
-protected-build/target/
-protected-build/dist/
+# Proprietary protection toolchain lives in star-ga/mind-nerve-protected (private).
+# This open-source repo MUST NOT contain protection sources or build artefacts.
+# History was scrubbed via `git filter-repo --path protected-build --invert-paths`
+# on 2026-05-16; this guard prevents the contents from being re-introduced.
+protected-build/
+protected-build/**
+mind-nerve-protected/
 dist/
+*.so
+*.dylib
+*.dll

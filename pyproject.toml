@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mind-nerve"
+dynamic = ["version"]
+description = "Intent-classification preselector for agent runtimes — open the library, hide the cost"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "STARGA, Inc.", email = "info@star.ga" }]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = [
+    "numpy>=1.24",
+    "sentence-transformers>=3.0",
+    "torch>=2.0",
+]
+
+[project.optional-dependencies]
+mcp = ["mcp>=0.9"]
+dev = ["pytest>=7", "ruff>=0.5", "build>=1.0"]
+
+[project.scripts]
+mind-nerve            = "mind_nerve.cli:main"
+mind-nerve-mcp        = "mind_nerve.mcp_server:main"
+mind-nerve-install    = "mind_nerve.installer:main"
+
+[project.urls]
+Homepage = "https://github.com/star-ga/mind-nerve"
+Issues   = "https://github.com/star-ga/mind-nerve/issues"
+
+[tool.setuptools]
+package-dir = { "" = "python" }
+
+[tool.setuptools.packages.find]
+where = ["python"]
+
+[tool.setuptools.dynamic]
+version = { attr = "mind_nerve.__version__" }
+
+[tool.setuptools.package-data]
+mind_nerve = ["data/*.json", "data/*.bin"]

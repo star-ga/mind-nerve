@@ -1,0 +1,40 @@
+{
+  "base_model": "BAAI/bge-small-en-v1.5",
+  "baseline_metrics": {
+    "candidate_pool": 12468,
+    "top1": 0.7538,
+    "top10": 0.9407,
+    "top5": 0.915
+  },
+  "batch": 32,
+  "catalog_version": "v1.0",
+  "corpus_hash": "a63b55d728492fee9659d2568262c87aebe4d2fca615eb393cc24ce1fa59bb51",
+  "device": "cuda",
+  "epochs": 3,
+  "eval_pairs": 1247,
+  "final_metrics": {
+    "candidate_pool": 12468,
+    "top1": 0.8549,
+    "top10": 0.9727,
+    "top5": 0.9655
+  },
+  "improvement": {
+    "candidate_pool": 0,
+    "top1": 0.1011,
+    "top10": 0.032,
+    "top5": 0.0505
+  },
+  "lr": 2e-05,
+  "max_len": 256,
+  "model_hash": "860cf77ad80c2681267421e3674fc499bbdf701916e58b67e5f527fcf54dcec9",
+  "note": "Phase 1 = PyTorch internal training per docs/catalog_and_training_plan.md. Phase 2 retrains under native MIND via mind-train v0.1.",
+  "phase": 1,
+  "phase1_version": "v1.0",
+  "schema_version": 1,
+  "seed": 1337,
+  "tokenizer_hash": "1b9ebc24b712e10fdc71e44dafe9882a18c255dd7e46793be35439d72fad71f3",
+  "torch_version": "2.6.0+cu124",
+  "train_pairs": 11221,
+  "train_seconds": 127.8,
+  "trained_at_iso": "2026-05-16T03:36:29Z"
+}

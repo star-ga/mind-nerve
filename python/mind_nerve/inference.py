@@ -113,7 +113,34 @@ class _Runtime:
 
         self.dir = runtime_dir
         self.manifest = json.loads((runtime_dir / "manifest.json").read_text())
-        self.model = SentenceTransformer(str(runtime_dir / "checkpoint"))
+
+        # Device selection. `MIND_NERVE_DEVICE=cpu` forces CPU even if a GPU
+        # is visible — useful when sharing the GPU with another resident
+        # model (e.g. a local LLM). Otherwise we attempt the default
+        # sentence-transformers selection (CUDA → MPS → CPU) and fall back
+        # to CPU on OOM rather than crashing the user's first prompt.
+        forced = os.environ.get("MIND_NERVE_DEVICE")
+        if forced:
+            self.model = SentenceTransformer(str(runtime_dir / "checkpoint"), device=forced)
+        else:
+            try:
+                self.model = SentenceTransformer(str(runtime_dir / "checkpoint"))
+            except Exception as exc:  # noqa: BLE001  fall through to CPU on GPU failure
+                msg = str(exc).lower()
+                if (
+                    "out of memory" in msg
+                    or "cuda" in msg
+                    or "cudaerror" in msg
+                    or "no cuda" in msg
+                ):
+                    print(
+                        f"mind-nerve: GPU init failed ({exc.__class__.__name__}), "
+                        f"falling back to CPU",
+                        file=sys.stderr,
+                    )
+                    self.model = SentenceTransformer(str(runtime_dir / "checkpoint"), device="cpu")
+                else:
+                    raise
         self.model.eval()
 
         emb_path = runtime_dir / "route_table.npy"

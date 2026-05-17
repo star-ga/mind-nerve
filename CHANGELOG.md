@@ -2,6 +2,17 @@
 
 All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.0-alpha.13] — 2026-05-16
+
+### Fixed
+- **CUDA OOM no longer crashes `route()`.** Hit while installing 0.1.0a12
+  alongside another GPU-resident model (e.g. a local LLM in Ollama): the
+  default sentence-transformers device pick (CUDA) raised
+  `torch.AcceleratorError: CUDA error: out of memory` on first inference
+  and the whole call failed. `_Runtime.__init__` now catches GPU-init
+  failures and falls back to CPU with a one-line stderr notice. Users
+  who want to force CPU unconditionally can set `MIND_NERVE_DEVICE=cpu`.
+
 ## [0.1.0-alpha.12] — 2026-05-16
 
 ### Changed
@@ -170,6 +181,7 @@ First private alpha tag. Phase 1 (Python-side inference) is complete; Phase 2 (n
 - Latency p95 ≤ 30 ms target on a 4-core CPU — Phase 2 only; currently measured Python-side.
 - `mindc` 0.2.5 parses `Mind.toml [protection]` / `[exports]` but does not yet act on them. Protection is delivered by the C bridge + build-pipeline post-processing.
 
+[0.1.0-alpha.13]: https://github.com/star-ga/mind-nerve/releases/tag/v0.1.0-alpha.13
 [0.1.0-alpha.12]: https://github.com/star-ga/mind-nerve/releases/tag/v0.1.0-alpha.12
 [0.1.0-alpha.11]: https://github.com/star-ga/mind-nerve/releases/tag/v0.1.0-alpha.11
 [0.1.0-alpha.10]: https://github.com/star-ga/mind-nerve/releases/tag/v0.1.0-alpha.10

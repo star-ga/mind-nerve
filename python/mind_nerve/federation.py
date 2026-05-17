@@ -33,7 +33,7 @@ class Peer:
 
     host: str
     port: int
-    pubkey: bytes   # 32-byte ed25519 public key
+    pubkey: bytes  # 32-byte ed25519 public key
     chain_tip: bytes  # 32-byte SHA-256 of the peer's latest envelope
 
 

@@ -630,10 +630,14 @@ def install_mind_mem_companion(targets: list[str]) -> dict:
                 # Gemini uses extension.json, not a flat mcp.json; inject into
                 # the existing extension manifest produced by install_gemini().
                 ext_manifest = HOME / ".gemini" / "extensions" / "mind-nerve" / "extension.json"
-                results[cli] = _register_mind_mem_in(ext_manifest, "json") if ext_manifest.exists() else {
-                    "installed": False,
-                    "error": "install mind-nerve for gemini first (mind-nerve install --cli gemini)",
-                }
+                results[cli] = (
+                    _register_mind_mem_in(ext_manifest, "json")
+                    if ext_manifest.exists()
+                    else {
+                        "installed": False,
+                        "error": "install mind-nerve for gemini first (mind-nerve install --cli gemini)",
+                    }
+                )
             else:
                 results[cli] = {"installed": False, "error": f"not supported for {cli}"}
         except Exception as exc:  # noqa: BLE001

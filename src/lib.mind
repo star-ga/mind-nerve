@@ -50,6 +50,26 @@ module mind_nerve {
     pub const ATTN_WINDOW_STRIDE:    u32 = 192;
     pub const ATTN_WINDOW_OVERLAP:   u32 = 64;   // WINDOW_SIZE - WINDOW_STRIDE
 
+    // RFC-003 — Content-fingerprinted adaptive window stride.
+    //
+    // When ADAPTIVE_STRIDE_ENABLED = 0 (default), the inference path uses
+    // ATTN_WINDOW_STRIDE unconditionally. This is the compile-time constant
+    // path preserved for ablation and bit-identity gating.
+    //
+    // When ADAPTIVE_STRIDE_ENABLED = 1, the runtime reads STRIDE_FP_T_LOW
+    // and STRIDE_FP_T_HIGH from the catalog manifest's [stride] table and
+    // selects:
+    //   request_len < T_LOW  → ATTN_WINDOW_STRIDE_COMPACT
+    //   request_len > T_HIGH → ATTN_WINDOW_STRIDE_LONG
+    //   otherwise            → ATTN_WINDOW_STRIDE  (unchanged)
+    //
+    // Flipping ADAPTIVE_STRIDE_ENABLED to 1 is an inference-path-visible
+    // architecture change and REQUIRES a new model_hash. The thresholds
+    // T_LOW and T_HIGH are emitted by catalog-builder/calibrate_stride.py.
+    pub const ADAPTIVE_STRIDE_ENABLED:    u32 = 0;
+    pub const ATTN_WINDOW_STRIDE_COMPACT: u32 = 192;  // compact = same as default
+    pub const ATTN_WINDOW_STRIDE_LONG:    u32 = 128;  // more overlap for long ctx
+
     pub const VOCAB_SIZE:            u32 = 32768;
     // Hard wire-level input cap. 1024 BPE tokens covers ≥99% of realistic
     // agent-CLI requests; requests exceeding the cap are rejected at the

@@ -222,6 +222,16 @@ AND on deserialize — a verifier that sees non-zero reserved bytes refuses
 the envelope and emits `ReservedByteNonZero`. This catches future-version
 envelopes being forced through a v2 verifier.
 
+`request_hash` MUST be non-zero in every valid envelope (SOTA-track #2:
+input-fingerprinted attestation). An all-zero `request_hash` is rejected by
+both `emit()` (construction gate) and `deserialize()` / `verify()` (inbound
+gate) with `ZeroRequestHash`. This invariant ensures that every attested
+envelope is bound to a concrete, non-sentinel request fingerprint — a hand-
+crafted or replayed envelope with an unbound `request_hash` cannot pass
+verification. `chain_prev = zeros32()` remains valid for the first envelope
+in a chain (chain-start sentinel); the non-zero invariant applies only to
+`request_hash`.
+
 Phase 1 architecture enum covers `x86_64`, `aarch64`, `cuda`. Phase 2 extends
 to `webgpu` (= 4) and `npu` (= 5) without bumping `version` — the u8 field
 reserves all 256 slots for future backends.

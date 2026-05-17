@@ -131,6 +131,7 @@ pub enum VerificationError {
     InvalidLength,         // bytes.len() != ATTESTATION_V2_SIZE
     InvalidEntryKind,      // entry_kind not in {1,2,3}
     InvalidK,              // k == 0 or k > MAX_TOP_K
+    ZeroRequestHash,       // request_hash is all-zero bytes (SOTA-track #2)
 }
 
 // Coarse pass/fail outcome retained for non-test callers that don't need
@@ -266,6 +267,28 @@ fn read_hash(buf: &[u8; ATTESTATION_V2_SIZE], offset: usize) -> [u8; 32] {
 }
 
 // ---------------------------------------------------------------------------
+// Hash validation helpers.
+// ---------------------------------------------------------------------------
+
+// Returns true if every byte of `hash` is zero. Used to enforce the
+// request_hash non-zero invariant (SOTA-track #2): an all-zero request_hash
+// is indistinguishable from an uninitialised or scrubbed input fingerprint
+// and MUST be rejected on both the construction path (emit) and the
+// verification path (deserialize / verify).
+@[determinism(BitIdentical)]
+fn hash_is_zero(hash: [u8; 32]) -> bool {
+    let mut i: usize = 0;
+    let mut all_zero: bool = true;
+    while i < 32 {
+        if hash[i] != 0u8 {
+            all_zero = false;
+        }
+        i = i + 1;
+    }
+    all_zero
+}
+
+// ---------------------------------------------------------------------------
 // Entry-kind / arch / reason decode helpers.
 // ---------------------------------------------------------------------------
 
@@ -369,6 +392,13 @@ pub fn deserialize(
     let result_hash    = read_hash(&bytes, OFFSET_RESULT_HASH);
     let chain_prev     = read_hash(&bytes, OFFSET_CHAIN_PREV);
 
+    // request_hash non-zero invariant (SOTA-track #2). An all-zero request_hash
+    // is ambiguous with the uninitialised sentinel and MUST be rejected here so
+    // that hand-crafted or replayed envelopes cannot bypass the binding check.
+    if hash_is_zero(request_hash) {
+        return Err(VerificationError::ZeroRequestHash);
+    }
+
     Ok(AttestationEnvelopeV2 {
         version:            version,
         entry_kind:         entry_kind_raw,
@@ -429,6 +459,11 @@ pub fn emit(
     }
     if !architecture_is_valid(architecture) {
         return Err(VerificationError::InvalidEntryKind);
+    }
+    // request_hash non-zero invariant (SOTA-track #2). Reject on construction
+    // so the chain log never contains an uninitialised-fingerprint envelope.
+    if hash_is_zero(request_hash) {
+        return Err(VerificationError::ZeroRequestHash);
     }
 
     let env = AttestationEnvelopeV2 {

@@ -1143,4 +1143,95 @@ fn test_chain_verify_rejects_wrong_expected_predecessor() {
     assert_eq!(result.unwrap_err(), VerificationError::ChainBroken);
 }
 
+// ---------------------------------------------------------------------------
+// §12. request_hash non-zero invariant (SOTA-track #2)
+//
+// request_hash MUST be non-zero in every valid envelope. An all-zero
+// request_hash is ambiguous with the chain-start sentinel used by chain_prev
+// and signals an uninitialised or scrubbed input fingerprint. The verifier
+// MUST reject such envelopes with ZeroRequestHash rather than silently
+// attesting over an unbound request.
+//
+// emit() enforces this on construction; verify() / deserialize() enforces it
+// on the inbound path so that replayed or hand-crafted envelopes cannot bypass
+// the check.
+// ---------------------------------------------------------------------------
+
+// RED: verify() must reject an envelope whose request_hash bytes are all zero.
+// This test FAILS before the verifier invariant is added.
+#[test]
+fn test_verify_rejects_zero_request_hash() {
+    // Build an otherwise-valid envelope but with request_hash forced to zeros.
+    // We bypass emit()'s construction-time gate by directly patching the bytes
+    // after serialization, mimicking a replayed / hand-crafted envelope.
+    let bytes = emit(
+        PLACEHOLDER_HASH_MODEL,
+        PLACEHOLDER_HASH_TOKENIZER,
+        PLACEHOLDER_HASH_CATALOG,
+        PLACEHOLDER_HASH_REQUEST,   // non-zero on construction
+        PLACEHOLDER_HASH_RESULT,
+        k             = DEFAULT_K,
+        wire_version  = DEFAULT_WIRE_VERSION,
+        architecture  = DEFAULT_ARCH,
+        timestamp_ms  = DEFAULT_TIMESTAMP,
+        entry_kind    = EntryKind::Inference,
+        chain_prev    = zeros32(),
+        chain_reset_reason = ChainResetReason::Continuation,
+    );
+    // Overwrite the request_hash field (offset 116..148) with zeros to
+    // simulate an uninitialised or scrubbed fingerprint.
+    let mut tampered = bytes.clone();
+    let mut idx: usize = 116;
+    while idx < 148 {
+        tampered[idx] = 0u8;
+        idx = idx + 1;
+    }
+    let result = verify(tampered, zeros32());
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), VerificationError::ZeroRequestHash);
+}
+
+// RED: emit() must refuse to construct an envelope with an all-zero request_hash.
+#[test]
+fn test_emit_rejects_zero_request_hash() {
+    let result = emit(
+        PLACEHOLDER_HASH_MODEL,
+        PLACEHOLDER_HASH_TOKENIZER,
+        PLACEHOLDER_HASH_CATALOG,
+        zeros32(),                  // zero request_hash — must be rejected
+        PLACEHOLDER_HASH_RESULT,
+        k             = DEFAULT_K,
+        wire_version  = DEFAULT_WIRE_VERSION,
+        architecture  = DEFAULT_ARCH,
+        timestamp_ms  = DEFAULT_TIMESTAMP,
+        entry_kind    = EntryKind::Inference,
+        chain_prev    = zeros32(),
+        chain_reset_reason = ChainResetReason::Continuation,
+    );
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), VerificationError::ZeroRequestHash);
+}
+
+// GREEN guard: a non-zero request_hash (even a single non-zero byte) is accepted.
+#[test]
+fn test_emit_accepts_nonzero_request_hash() {
+    let mut nonzero_request: [u8; 32] = [0u8; 32];
+    nonzero_request[0] = 0x01u8;
+    let result = emit(
+        PLACEHOLDER_HASH_MODEL,
+        PLACEHOLDER_HASH_TOKENIZER,
+        PLACEHOLDER_HASH_CATALOG,
+        nonzero_request,
+        PLACEHOLDER_HASH_RESULT,
+        k             = DEFAULT_K,
+        wire_version  = DEFAULT_WIRE_VERSION,
+        architecture  = DEFAULT_ARCH,
+        timestamp_ms  = DEFAULT_TIMESTAMP,
+        entry_kind    = EntryKind::Inference,
+        chain_prev    = zeros32(),
+        chain_reset_reason = ChainResetReason::Continuation,
+    );
+    assert!(result.is_ok());
+}
+
 // TODO(P1.1.16): replace any PLACEHOLDER_HASH_* after first green run.

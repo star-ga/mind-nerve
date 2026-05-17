@@ -33,6 +33,7 @@ dependencies = [
     "sentence-transformers>=3.0",
     "torch>=2.0",
     "huggingface_hub>=0.20",
+    "cryptography>=41.0",
 ]
 
 [project.optional-dependencies]

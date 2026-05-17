@@ -595,6 +595,423 @@ pub fn parse_catalog(bytes: &[u8]) -> Result<RouteCatalog, LoaderError> {
 }
 
 // ---------------------------------------------------------------------------
+// Per-neuron manifest + manifest_export — Tier 3 item #9
+//
+// Each named weight tensor in the model carries a `neuron_hash: [u8; 32]` —
+// the SHA-256 of its Q16.16 byte layout (little-endian i32 per element,
+// row-major for matrices) as it exists in memory **after** dequantization.
+// The hashes are accumulated into a manifest preimage that is then itself
+// SHA-256'd; that digest supersedes the legacy opaque model_hash field for
+// any consumer that needs per-tensor traceability.
+//
+// Design invariants:
+//   D1. The preimage is canonical and deterministic: tensor names are emitted
+//       in a fixed alphabetical sort order; each entry is length-prefixed.
+//   D2. Reordering tensors in the preimage (e.g. different sort order) MUST
+//       yield a different manifest hash — upheld by the alphabetical sort and
+//       the sequential XOR-chain embedding.
+//   D3. Adding a tensor appends to the preimage (backward incompatible, new
+//       hash), never inserts mid-sequence.
+//   D4. All hashes are SHA-256 (NOT Poseidon — Poseidon is reserved for the
+//       future ZK upgrade in mind-runtime's MAB crate).
+//
+// The manifest JSON produced by `manifest_export` is a deterministic UTF-8
+// document. The keys within each tensor object are fixed-order as emitted by
+// the implementation (no dict-iteration ordering). The aggregate field is the
+// SHA-256 of the internal preimage bytes, hex-encoded.
+//
+// Cross-binding with MindLLM:
+//   The manifest aggregate hash feeds into the MindLLM handshake spec defined
+//   in `integrations/mindllm_attestation.mind`. An external verifier needs
+//   only this public document plus the handshake spec to validate the binding
+//   — no STARGA-internal toolchain required.
+
+// TensorManifestEntry — one row in the per-tensor manifest.
+pub struct TensorManifestEntry {
+    // Human-readable tensor name, ASCII, sorted alphabetically in the manifest.
+    // Examples: "encoder.layer0.wq", "encoder.layer1.wo", "token_embedding".
+    name:        [u8],           // UTF-8 bytes, no NUL terminator
+    // Shape as [rows, cols]; vectors are stored as [len, 1] for uniformity.
+    rows:        u32,
+    cols:        u32,
+    // SHA-256 of the Q16.16 byte layout (i32 LE per element, row-major).
+    neuron_hash: [u8; 32],
+}
+
+// TensorManifest — the full per-tensor commitment returned to callers and
+// used as the basis for the manifest_export JSON document.
+pub struct TensorManifest {
+    // Entries, sorted ascending by `name` bytes (ASCII lexicographic order).
+    entries: [TensorManifestEntry],
+    // SHA-256 of the canonical preimage over all entries.
+    // Preimage construction: see `build_manifest_preimage` below.
+    aggregate: [u8; 32],
+}
+
+// ---------------------------------------------------------------------------
+// build_manifest_preimage — canonical byte sequence over tensor entries
+//
+// Wire format (entries MUST be in sorted-by-name order before calling):
+//
+//   magic:       4 bytes  "MNPM" (0x4D 0x4E 0x50 0x4D)
+//   entry_count: 4 bytes  u32 LE
+//
+//   per entry:
+//     name_len:    4 bytes  u32 LE (byte length of name)
+//     name_bytes:  name_len bytes  (ASCII tensor name)
+//     rows:        4 bytes  u32 LE
+//     cols:        4 bytes  u32 LE
+//     neuron_hash: 32 bytes [u8; 32]
+//
+// The aggregate is SHA-256(preimage). Determinism proof: the only
+// non-trivial step is the sort; once sorted the preimage is a pure
+// function of the name/rows/cols/neuron_hash tuples.
+
+@[determinism(BitIdentical)]
+fn build_manifest_preimage(entries: &[TensorManifestEntry]) -> [u8] {
+    let mut p: [u8] = [];
+
+    // Magic.
+    p.push(0x4Du8); p.push(0x4Eu8); p.push(0x50u8); p.push(0x4Du8);
+
+    // Entry count.
+    let n: u32 = entries.len() as u32;
+    p.push(( n        & 0xFFu32) as u8);
+    p.push(((n >> 8 ) & 0xFFu32) as u8);
+    p.push(((n >> 16) & 0xFFu32) as u8);
+    p.push(((n >> 24) & 0xFFu32) as u8);
+
+    let mut i: usize = 0;
+    while i < entries.len() {
+        let e: &TensorManifestEntry = &entries[i];
+
+        // name_len + name_bytes.
+        let nl: u32 = e.name.len() as u32;
+        p.push(( nl        & 0xFFu32) as u8);
+        p.push(((nl >> 8 ) & 0xFFu32) as u8);
+        p.push(((nl >> 16) & 0xFFu32) as u8);
+        p.push(((nl >> 24) & 0xFFu32) as u8);
+        let mut b: usize = 0;
+        while b < e.name.len() {
+            p.push(e.name[b]);
+            b = b + 1;
+        }
+
+        // rows, cols.
+        p.push(( e.rows        & 0xFFu32) as u8);
+        p.push(((e.rows >> 8 ) & 0xFFu32) as u8);
+        p.push(((e.rows >> 16) & 0xFFu32) as u8);
+        p.push(((e.rows >> 24) & 0xFFu32) as u8);
+        p.push(( e.cols        & 0xFFu32) as u8);
+        p.push(((e.cols >> 8 ) & 0xFFu32) as u8);
+        p.push(((e.cols >> 16) & 0xFFu32) as u8);
+        p.push(((e.cols >> 24) & 0xFFu32) as u8);
+
+        // neuron_hash.
+        let mut h: usize = 0;
+        while h < 32 {
+            p.push(e.neuron_hash[h]);
+            h = h + 1;
+        }
+
+        i = i + 1;
+    }
+
+    p
+}
+
+// ---------------------------------------------------------------------------
+// neuron_hash_of_matrix — SHA-256 of a Q16.16 matrix in row-major i32-LE layout
+
+@[determinism(BitIdentical)]
+fn neuron_hash_of_matrix(
+    mat: &tensor<Q16_16, [?, ?]>,
+    rows: usize,
+    cols: usize,
+) -> [u8; 32] {
+    let mut bytes: [u8] = [];
+    let mut r: usize = 0;
+    while r < rows {
+        let mut c: usize = 0;
+        while c < cols {
+            let v: i32 = mat[r][c];
+            bytes.push(( v        & 0xFFi32) as u8);
+            bytes.push(((v >> 8 ) & 0xFFi32) as u8);
+            bytes.push(((v >> 16) & 0xFFi32) as u8);
+            bytes.push(((v >> 24) & 0xFFi32) as u8);
+            c = c + 1;
+        }
+        r = r + 1;
+    }
+    sha256(bytes.as_slice())
+}
+
+@[determinism(BitIdentical)]
+fn neuron_hash_of_vector(
+    vec: &tensor<Q16_16, [?]>,
+    len: usize,
+) -> [u8; 32] {
+    let mut bytes: [u8] = [];
+    let mut i: usize = 0;
+    while i < len {
+        let v: i32 = vec[i];
+        bytes.push(( v        & 0xFFi32) as u8);
+        bytes.push(((v >> 8 ) & 0xFFi32) as u8);
+        bytes.push(((v >> 16) & 0xFFi32) as u8);
+        bytes.push(((v >> 24) & 0xFFi32) as u8);
+        i = i + 1;
+    }
+    sha256(bytes.as_slice())
+}
+
+// ---------------------------------------------------------------------------
+// build_tensor_manifest — construct TensorManifest from parsed ModelWeights.
+//
+// Tensor naming convention (alphabetical sort is the canonical order):
+//   "encoder.final_ln_bias"
+//   "encoder.final_ln_gain"
+//   "encoder.layer{i}.ln_bias"       (i = 0-indexed layer index, decimal)
+//   "encoder.layer{i}.ln_gain"
+//   "encoder.layer{i}.residual_gate"
+//   "encoder.layer{i}.wk"
+//   "encoder.layer{i}.wq"
+//   "encoder.layer{i}.wv"
+//   "encoder.layer{i}.wo"
+//   "token_embedding"
+//
+// The alphabetical constraint: "encoder.final_ln_*" < "encoder.layer0.*"
+// < ... < "token_embedding". Producers MUST maintain this sort order
+// when emitting; the manifest verifier checks the sort.
+
+@[determinism(BitIdentical)]
+pub fn build_tensor_manifest(weights: &ModelWeights) -> TensorManifest {
+    let h: usize = ENCODER_HIDDEN as usize;
+    let l: usize = ENCODER_LAYERS as usize;
+    let v: usize = VOCAB_SIZE as usize;
+
+    let mut entries: [TensorManifestEntry] = [];
+
+    // Alphabetical order: encoder.final_ln_bias, encoder.final_ln_gain first.
+    entries.push(TensorManifestEntry {
+        name:        b"encoder.final_ln_bias",
+        rows:        h as u32,
+        cols:        1u32,
+        neuron_hash: neuron_hash_of_vector(&weights.encoder.final_ln_bias, h),
+    });
+    entries.push(TensorManifestEntry {
+        name:        b"encoder.final_ln_gain",
+        rows:        h as u32,
+        cols:        1u32,
+        neuron_hash: neuron_hash_of_vector(&weights.encoder.final_ln_gain, h),
+    });
+
+    // Per-layer entries: encoder.layer{i}.{field} in alphabetical field order.
+    let mut li: usize = 0;
+    while li < l {
+        let layer: &EncoderLayerWeights = &weights.encoder.layers[li];
+
+        // Build the decimal layer-index suffix. Two digits max (ENCODER_LAYERS <= 99).
+        // Name pattern: "encoder.layer" + digits + "." + field.
+        // The sort is stable because layer indices are zero-padded to two digits.
+        let prefix: [u8] = make_layer_prefix(li);
+
+        entries.push(TensorManifestEntry {
+            name:        concat_bytes(&prefix, b"ln_bias"),
+            rows:        h as u32,
+            cols:        1u32,
+            neuron_hash: neuron_hash_of_vector(&layer.ln_bias, h),
+        });
+        entries.push(TensorManifestEntry {
+            name:        concat_bytes(&prefix, b"ln_gain"),
+            rows:        h as u32,
+            cols:        1u32,
+            neuron_hash: neuron_hash_of_vector(&layer.ln_gain, h),
+        });
+        entries.push(TensorManifestEntry {
+            name:        concat_bytes(&prefix, b"residual_gate"),
+            rows:        h as u32,
+            cols:        1u32,
+            neuron_hash: neuron_hash_of_vector(&layer.residual_gate, h),
+        });
+        entries.push(TensorManifestEntry {
+            name:        concat_bytes(&prefix, b"wk"),
+            rows:        h as u32,
+            cols:        h as u32,
+            neuron_hash: neuron_hash_of_matrix(&layer.wk, h, h),
+        });
+        entries.push(TensorManifestEntry {
+            name:        concat_bytes(&prefix, b"wq"),
+            rows:        h as u32,
+            cols:        h as u32,
+            neuron_hash: neuron_hash_of_matrix(&layer.wq, h, h),
+        });
+        entries.push(TensorManifestEntry {
+            name:        concat_bytes(&prefix, b"wv"),
+            rows:        h as u32,
+            cols:        h as u32,
+            neuron_hash: neuron_hash_of_matrix(&layer.wv, h, h),
+        });
+        entries.push(TensorManifestEntry {
+            name:        concat_bytes(&prefix, b"wo"),
+            rows:        h as u32,
+            cols:        h as u32,
+            neuron_hash: neuron_hash_of_matrix(&layer.wo, h, h),
+        });
+
+        li = li + 1;
+    }
+
+    // token_embedding — last alphabetically.
+    entries.push(TensorManifestEntry {
+        name:        b"token_embedding",
+        rows:        v as u32,
+        cols:        h as u32,
+        neuron_hash: neuron_hash_of_matrix(&weights.encoder.token_embedding, v, h),
+    });
+
+    let preimage: [u8] = build_manifest_preimage(&entries);
+    let aggregate: [u8; 32] = sha256(preimage.as_slice());
+
+    TensorManifest { entries, aggregate }
+}
+
+// ---------------------------------------------------------------------------
+// manifest_export — emit a deterministic JSON document from a TensorManifest.
+//
+// The output format is:
+//
+//   {
+//     "version": 1,
+//     "tensors": [
+//       {
+//         "name": "<tensor_name>",
+//         "shape": [<rows>, <cols>],
+//         "neuron_hash": "<64-hex-chars>"
+//       },
+//       ...
+//     ],
+//     "aggregate": "<64-hex-chars>"
+//   }
+//
+// Rules:
+//   - No trailing comma after the last element in any array or object.
+//   - No whitespace beyond the single space after each `:` and `,`.
+//   - All hex strings are lowercase.
+//   - Tensor array is in the same order as TensorManifest::entries (already
+//     alphabetically sorted by `build_tensor_manifest`).
+//   - Output is UTF-8, no BOM, no trailing newline.
+//
+// The hex encoding and JSON construction are pure functions; the output is
+// byte-identical on every backend for the same TensorManifest input.
+
+@[determinism(BitIdentical)]
+pub fn manifest_export(manifest: &TensorManifest) -> [u8] {
+    let mut out: [u8] = [];
+
+    // Helpers: push a literal ASCII byte sequence.
+    fn push_str(s: &[u8], o: &mut [u8]) {
+        let mut i: usize = 0;
+        while i < s.len() { o.push(s[i]); i = i + 1; }
+    }
+
+    // Push a u32 as decimal ASCII (no leading zeros, except "0" itself).
+    fn push_decimal_u32(mut v: u32, o: &mut [u8]) {
+        if v == 0u32 {
+            o.push(0x30u8); // '0'
+            return;
+        }
+        let mut buf: [u8; 10] = [0u8; 10]; // max 10 digits for u32
+        let mut n: usize = 0;
+        while v > 0u32 {
+            buf[n] = 0x30u8 + (v % 10u32) as u8;
+            v = v / 10u32;
+            n = n + 1;
+        }
+        // buf holds digits in reverse order; emit reversed.
+        let mut d: usize = n;
+        while d > 0usize {
+            o.push(buf[d - 1]);
+            d = d - 1;
+        }
+    }
+
+    // Push a 32-byte hash as 64 lowercase hex chars.
+    fn push_hex(h: &[u8; 32], o: &mut [u8]) {
+        let hex: [u8; 16] = [
+            0x30u8, 0x31u8, 0x32u8, 0x33u8, 0x34u8, 0x35u8, 0x36u8, 0x37u8,
+            0x38u8, 0x39u8, 0x61u8, 0x62u8, 0x63u8, 0x64u8, 0x65u8, 0x66u8,
+        ];
+        let mut i: usize = 0;
+        while i < 32 {
+            o.push(hex[(h[i] >> 4) as usize]);
+            o.push(hex[(h[i] & 0x0Fu8) as usize]);
+            i = i + 1;
+        }
+    }
+
+    // Open root object.
+    push_str(b"{\"version\": 1, \"tensors\": [", &mut out);
+
+    let mut ti: usize = 0;
+    while ti < manifest.entries.len() {
+        let e: &TensorManifestEntry = &manifest.entries[ti];
+
+        push_str(b"{\"name\": \"", &mut out);
+        push_str(&e.name, &mut out);
+        push_str(b"\", \"shape\": [", &mut out);
+        push_decimal_u32(e.rows, &mut out);
+        push_str(b", ", &mut out);
+        push_decimal_u32(e.cols, &mut out);
+        push_str(b"], \"neuron_hash\": \"", &mut out);
+        push_hex(&e.neuron_hash, &mut out);
+        push_str(b"\"}", &mut out);
+
+        if ti + 1 < manifest.entries.len() {
+            push_str(b", ", &mut out);
+        }
+        ti = ti + 1;
+    }
+
+    push_str(b"], \"aggregate\": \"", &mut out);
+    push_hex(&manifest.aggregate, &mut out);
+    push_str(b"\"}", &mut out);
+
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Local string helpers for tensor name construction
+
+// Return "encoder.layer" + zero-padded two-digit index + "." as bytes.
+// e.g. layer 0  -> b"encoder.layer00."
+//      layer 12 -> b"encoder.layer12."
+// The two-digit zero-padding keeps alphabetical and numeric sort identical
+// for ENCODER_LAYERS <= 99, which the spec enforces.
+@[determinism(BitIdentical)]
+fn make_layer_prefix(idx: usize) -> [u8] {
+    let mut p: [u8] = [];
+    let mut i: usize = 0;
+    let prefix_bytes: [u8] = b"encoder.layer";
+    while i < prefix_bytes.len() { p.push(prefix_bytes[i]); i = i + 1; }
+    // Two-digit zero-padded decimal.
+    p.push(0x30u8 + ((idx / 10) % 10) as u8);
+    p.push(0x30u8 + (idx % 10)        as u8);
+    p.push(0x2Eu8); // '.'
+    p
+}
+
+// Concatenate two byte slices.
+@[determinism(BitIdentical)]
+fn concat_bytes(a: &[u8], b: &[u8]) -> [u8] {
+    let mut out: [u8] = [];
+    let mut i: usize = 0;
+    while i < a.len() { out.push(a[i]); i = i + 1; }
+    let mut j: usize = 0;
+    while j < b.len() { out.push(b[j]); j = j + 1; }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // compute_model_hash — audit follow-up F1 (2026-05-14)
 //
 // SHA-256 over a canonical byte preimage built from the compile-time

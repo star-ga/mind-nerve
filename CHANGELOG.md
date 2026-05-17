@@ -2,6 +2,52 @@
 
 All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased] — v0.2.0 preparation
+
+### Added
+
+- **Per-tensor weight manifest** (`src/loader.mind`): each weight tensor now
+  carries a `neuron_hash: [u8; 32]` — the SHA-256 of its Q16.16 byte layout
+  (i32 LE, row-major). The hashes are accumulated via `build_manifest_preimage`
+  (magic `"MNPM"`, canonical alphabetical-name sort) into a manifest aggregate
+  that supersedes the opaque `model_hash` field for consumers that need
+  per-tensor traceability. New public types: `TensorManifestEntry`,
+  `TensorManifest`. New public functions: `build_tensor_manifest()`,
+  `manifest_export()`.
+
+- **`manifest_export()`** emits a deterministic UTF-8 JSON document from a
+  `TensorManifest`. Output is byte-identical across runs and platforms (no
+  dict-iteration ordering, no timestamps). The `aggregate` field is the
+  SHA-256 of the canonical preimage, hex-encoded lowercase.
+
+- **MindLLM cross-binding handshake spec** (`integrations/mindllm_attestation.mind`):
+  typed protocol `(mind_nerve_model_hash, mindllm_model_hash, shared_nonce) ->
+  BindingSignature` using `SHA-256` for the binding message and `Ed25519`
+  (RFC 8032) for signing. The spec is fully self-contained for external
+  consumers — no STARGA-internal toolchain required to implement a verifier.
+  New public types: `BindingRecord`, `BindingVerifyError`. New public
+  functions: `binding_message()`, `sign_binding()`, `verify_binding()`,
+  `serialize_binding()`. Wire format: 200-byte packed record, magic `"MNBA"`.
+
+- **`spec/architecture.md`** extended with two new sections: §"Per-neuron
+  manifest" (tensor naming convention, `manifest_export` JSON format,
+  neuron-hash aggregation rule) and §"MindLLM cross-binding handshake"
+  (protocol summary, verifier algorithm, `BindingRecord` wire format, chain
+  discipline).
+
+- **`cryptography>=41.0`** added to `pyproject.toml` runtime dependencies
+  to support Ed25519 operations in Python test and integration code.
+
+- **Unit tests** `tests/unit/test_manifest_export.mind` (7 properties: P1
+  determinism, P2 known-vector reference, P3 order-sensitivity, P4 sort
+  stability, P5 JSON structure, P6 all-zero anchor, P7 tamper detection).
+
+- **Integration tests** `tests/integration/test_mindllm_handshake.py` (10
+  properties: H1–H10 covering binding_message determinism, input sensitivity,
+  sign/verify round-trip, signature corruption, hash/nonce alteration, zero-
+  field guard, serialization determinism + size, and manifest_export
+  determinism with SHA-256 byte-identity check).
+
 ## [0.1.0-alpha.13] — 2026-05-16
 
 ### Fixed

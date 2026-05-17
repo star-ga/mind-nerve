@@ -269,6 +269,121 @@ the manifest hash, which breaks the model_hash, which breaks the chain — a
 single tampered byte at any layer of the artefact is detected before the
 first inference runs.
 
+### Neuron-hash aggregation rule
+
+Each tensor entry in the manifest carries a `neuron_hash: [u8; 32]` field —
+the SHA-256 of the tensor's Q16.16 byte layout (i32 little-endian per element,
+row-major for matrices). The hashes are committed into the manifest aggregate
+via the `build_manifest_preimage` function in `src/loader.mind`:
+
+1. Entries are sorted ascending by tensor name (ASCII lexicographic order).
+2. A fixed-layout preimage is built:
+   - 4-byte magic `"MNPM"` (0x4D 0x4E 0x50 0x4D).
+   - u32 LE entry count.
+   - Per entry: u32 LE name length, name bytes, u32 LE rows, u32 LE cols,
+     32-byte `neuron_hash`.
+3. `manifest_aggregate = SHA-256(preimage)`.
+
+The aggregate is the value embedded in the weights file `model_hash` field
+and compared at load time. Because the sort is canonical and the preimage is
+self-describing, any reordering of tensors in the catalog (e.g. by a
+different build tool) that produces the same sorted order yields the same
+aggregate.
+
+## Per-neuron manifest
+
+The public function `manifest_export(manifest: &TensorManifest) -> [u8]` in
+`src/loader.mind` emits a deterministic UTF-8 JSON document:
+
+```json
+{
+  "version": 1,
+  "tensors": [
+    {
+      "name": "<tensor_name>",
+      "shape": [<rows>, <cols>],
+      "neuron_hash": "<64-hex-chars>"
+    }
+  ],
+  "aggregate": "<64-hex-chars>"
+}
+```
+
+Rules:
+- Keys within each tensor object are emitted in the fixed order: `name`,
+  `shape`, `neuron_hash`.
+- The `tensors` array is sorted by tensor name (ascending, alphabetical).
+- All hex strings are lowercase.
+- No trailing comma after the last element in any array or object.
+- The output is byte-identical on every backend for the same input manifest.
+
+The `aggregate` field is the hex encoding of `TensorManifest::aggregate` —
+the SHA-256 of the canonical `build_manifest_preimage` bytes. This is the
+value that crosses into the MindLLM handshake as `mind_nerve_hash`.
+
+Tensor naming convention (alphabetical = canonical order):
+- `encoder.final_ln_bias`
+- `encoder.final_ln_gain`
+- `encoder.layer{NN}.ln_bias`   (NN = zero-padded two-digit layer index)
+- `encoder.layer{NN}.ln_gain`
+- `encoder.layer{NN}.residual_gate`
+- `encoder.layer{NN}.wk`
+- `encoder.layer{NN}.wq`
+- `encoder.layer{NN}.wv`
+- `encoder.layer{NN}.wo`
+- `token_embedding`
+
+## MindLLM cross-binding handshake
+
+The handshake protocol is defined in `integrations/mindllm_attestation.mind`.
+It produces a `BindingRecord` that allows an independent verifier to confirm
+that a given mind-nerve model and a given MindLLM model were attested together
+at a specific point in time.
+
+### Protocol summary
+
+```
+binding_msg = SHA-256(mind_nerve_model_hash ++ mindllm_model_hash ++ nonce)
+signature   = Ed25519_sign(private_key, binding_msg)
+```
+
+where `++` is byte concatenation and `mind_nerve_model_hash` is the
+`aggregate` field from `manifest_export()`.
+
+### Verifier algorithm (no private key required)
+
+1. Assert that none of `mind_nerve_hash`, `mindllm_hash`, `nonce`,
+   `signature`, or `signer_pubkey` is all-zero bytes.
+2. Recompute `binding_msg = SHA-256(mind_nerve_hash ++ mindllm_hash ++ nonce)`.
+3. Call `Ed25519_verify(signer_pubkey, binding_msg, signature)`.
+4. Accept if and only if the signature is valid.
+
+The verifier needs only:
+- The published `BindingRecord` (200 bytes, format in
+  `integrations/mindllm_attestation.mind §SERIALIZATION`).
+- The signer's public key (32 bytes, from a trust anchor).
+- A SHA-256 implementation and an Ed25519 verifier per RFC 8032.
+
+### BindingRecord wire format (200 bytes)
+
+```
+offset  size  field
+  0     4     magic "MNBA" (0x4D 0x4E 0x42 0x41)
+  4     2     version u16 LE = 1
+  6     2     reserved = 0
+  8    32     mind_nerve_hash  (SHA-256 manifest aggregate)
+ 40    32     mindllm_hash     (SHA-256 MindLLM manifest aggregate)
+ 72    32     nonce            (caller-supplied, 32 bytes)
+104    64     signature        (Ed25519, 64 bytes)
+168    32     signer_pubkey    (Ed25519 public key, 32 bytes)
+---
+200 bytes total
+```
+
+`chain_curr` for this record is `SHA-256(200 bytes)`, analogous to the
+attestation envelope chain discipline, and allows binding records to be
+chained across model upgrades.
+
 ## What this architecture is not
 
 - Not a small generative model. The scoring head emits discrete route IDs;

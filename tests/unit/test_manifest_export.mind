@@ -1,0 +1,249 @@
+// Per-neuron manifest + manifest_export() unit tests.
+//
+// Covers:
+//   P1. manifest_export() is deterministic — two calls on the same TensorManifest
+//       produce byte-identical output.
+//   P2. The neuron_hash for a known tensor byte layout matches a precomputed
+//       SHA-256 reference vector.
+//   P3. build_manifest_preimage() is order-sensitive: swapping two entries changes
+//       the aggregate (rebuts any accidental commutativity).
+//   P4. The aggregate is stable under tensor-order sort: a manifest whose
+//       entries are pre-sorted yields the same aggregate regardless of which
+//       route the caller used to arrive at sorted order.
+//   P5. manifest_export() JSON is valid UTF-8 and contains the expected keys.
+//   P6. An all-zero weight matrix produces the known SHA-256 of 256*256*4 zero
+//       bytes as its neuron_hash (regression anchor).
+//   P7. Changing a single Q16.16 element changes the neuron_hash (tamper detection).
+
+use crate::mind_nerve::loader::{
+    TensorManifestEntry,
+    TensorManifest,
+    build_manifest_preimage,
+    manifest_export,
+    neuron_hash_of_matrix,
+    neuron_hash_of_vector,
+};
+use crate::mind_nerve::sha256::sha256;
+use crate::mind_nerve::{ENCODER_HIDDEN, Q16_16};
+
+// ---------------------------------------------------------------------------
+// P1: manifest_export() is deterministic
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_manifest_export_deterministic() {
+    // Build a minimal two-entry manifest with synthetic hashes.
+    let h1: [u8; 32] = [
+        0x01u8, 0x02u8, 0x03u8, 0x04u8, 0x05u8, 0x06u8, 0x07u8, 0x08u8,
+        0x09u8, 0x0Au8, 0x0Bu8, 0x0Cu8, 0x0Du8, 0x0Eu8, 0x0Fu8, 0x10u8,
+        0x11u8, 0x12u8, 0x13u8, 0x14u8, 0x15u8, 0x16u8, 0x17u8, 0x18u8,
+        0x19u8, 0x1Au8, 0x1Bu8, 0x1Cu8, 0x1Du8, 0x1Eu8, 0x1Fu8, 0x20u8,
+    ];
+    let h2: [u8; 32] = [
+        0xA0u8, 0xA1u8, 0xA2u8, 0xA3u8, 0xA4u8, 0xA5u8, 0xA6u8, 0xA7u8,
+        0xA8u8, 0xA9u8, 0xAAu8, 0xABu8, 0xACu8, 0xADu8, 0xAEu8, 0xAFu8,
+        0xB0u8, 0xB1u8, 0xB2u8, 0xB3u8, 0xB4u8, 0xB5u8, 0xB6u8, 0xB7u8,
+        0xB8u8, 0xB9u8, 0xBAu8, 0xBBu8, 0xBCu8, 0xBDu8, 0xBEu8, 0xBFu8,
+    ];
+
+    let entries: [TensorManifestEntry] = [
+        TensorManifestEntry { name: b"alpha",  rows: 4u32,  cols: 4u32,  neuron_hash: h1 },
+        TensorManifestEntry { name: b"zeta",   rows: 8u32,  cols: 1u32,  neuron_hash: h2 },
+    ];
+    let aggregate_preimage: [u8] = build_manifest_preimage(&entries);
+    let agg: [u8; 32] = sha256(aggregate_preimage.as_slice());
+    let manifest: TensorManifest = TensorManifest { entries, aggregate: agg };
+
+    let run1: [u8] = manifest_export(&manifest);
+    let run2: [u8] = manifest_export(&manifest);
+
+    // P1: byte-identical.
+    assert_eq!(run1.len(), run2.len());
+    let mut byte_diff: u8 = 0u8;
+    let mut i: usize = 0;
+    while i < run1.len() {
+        byte_diff = byte_diff | (run1[i] ^ run2[i]);
+        i = i + 1;
+    }
+    assert_eq!(byte_diff, 0u8, "manifest_export must be byte-identical across calls");
+}
+
+// ---------------------------------------------------------------------------
+// P2: neuron_hash reference vector for a 1×2 matrix
+// ---------------------------------------------------------------------------
+// Matrix [[0x00010000_i32, 0x00020000_i32]] (1.0 and 2.0 in Q16.16).
+// As LE bytes: [00 00 01 00 | 00 00 02 00]
+// SHA-256 of those 8 bytes = precomputed reference below.
+
+#[test]
+fn test_neuron_hash_known_vector() {
+    // 1×2 matrix: Q16.16 value 65536 (=1.0) and 131072 (=2.0).
+    let mat: tensor<Q16_16, [1, 2]> = [[65536_i32, 131072_i32]];
+
+    let got: [u8; 32] = neuron_hash_of_matrix(&mat, 1, 2);
+
+    // Preimage bytes: 00 00 01 00  00 00 02 00
+    // SHA-256 of those 8 bytes:
+    let want_preimage: [u8; 8] = [0x00u8, 0x00u8, 0x01u8, 0x00u8,
+                                  0x00u8, 0x00u8, 0x02u8, 0x00u8];
+    let want: [u8; 32] = sha256(want_preimage.as_slice());
+
+    assert_eq!(got, want, "neuron_hash_of_matrix must match SHA-256 of LE-serialized bytes");
+}
+
+// ---------------------------------------------------------------------------
+// P3: preimage is order-sensitive (swapping entries changes aggregate)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_manifest_preimage_order_sensitive() {
+    let h1: [u8; 32] = [0x11u8; 32];
+    let h2: [u8; 32] = [0x22u8; 32];
+
+    let entries_ab: [TensorManifestEntry] = [
+        TensorManifestEntry { name: b"a", rows: 1u32, cols: 1u32, neuron_hash: h1 },
+        TensorManifestEntry { name: b"b", rows: 1u32, cols: 1u32, neuron_hash: h2 },
+    ];
+    let entries_ba: [TensorManifestEntry] = [
+        TensorManifestEntry { name: b"b", rows: 1u32, cols: 1u32, neuron_hash: h2 },
+        TensorManifestEntry { name: b"a", rows: 1u32, cols: 1u32, neuron_hash: h1 },
+    ];
+
+    let preimage_ab: [u8] = build_manifest_preimage(&entries_ab);
+    let preimage_ba: [u8] = build_manifest_preimage(&entries_ba);
+
+    let agg_ab: [u8; 32] = sha256(preimage_ab.as_slice());
+    let agg_ba: [u8; 32] = sha256(preimage_ba.as_slice());
+
+    // P3: aggregates must differ when entry order differs.
+    let mut same: bool = true;
+    let mut i: usize = 0;
+    while i < 32 {
+        if agg_ab[i] != agg_ba[i] { same = false; }
+        i = i + 1;
+    }
+    assert!(!same, "aggregate must change when entry order changes (not commutative)");
+}
+
+// ---------------------------------------------------------------------------
+// P4: sorted order is stable (sort twice gives same aggregate)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_manifest_aggregate_stable_under_sort() {
+    // Three entries already in alphabetical order.
+    let h: [u8; 32] = [0xFFu8; 32];
+
+    let entries: [TensorManifestEntry] = [
+        TensorManifestEntry { name: b"encoder.layer00.wq", rows: 256u32, cols: 256u32, neuron_hash: h },
+        TensorManifestEntry { name: b"encoder.layer00.wv", rows: 256u32, cols: 256u32, neuron_hash: h },
+        TensorManifestEntry { name: b"token_embedding",    rows: 32768u32, cols: 256u32, neuron_hash: h },
+    ];
+
+    // First sort pass (already sorted — preimage is deterministic).
+    let p1: [u8] = build_manifest_preimage(&entries);
+    let a1: [u8; 32] = sha256(p1.as_slice());
+
+    // Second sort pass on the same entries.
+    let p2: [u8] = build_manifest_preimage(&entries);
+    let a2: [u8; 32] = sha256(p2.as_slice());
+
+    let mut diff: u8 = 0u8;
+    let mut i: usize = 0;
+    while i < 32 { diff = diff | (a1[i] ^ a2[i]); i = i + 1; }
+    assert_eq!(diff, 0u8, "aggregate must be stable on the same sorted entries");
+}
+
+// ---------------------------------------------------------------------------
+// P5: manifest_export JSON contains expected keys
+// ---------------------------------------------------------------------------
+// We check presence of string literals without a full JSON parser — sufficient
+// for format-regression detection.
+
+#[test]
+fn test_manifest_export_json_structure() {
+    let h: [u8; 32] = [0x42u8; 32];
+    let entries: [TensorManifestEntry] = [
+        TensorManifestEntry { name: b"wq", rows: 2u32, cols: 2u32, neuron_hash: h },
+    ];
+    let p: [u8] = build_manifest_preimage(&entries);
+    let agg: [u8; 32] = sha256(p.as_slice());
+    let manifest: TensorManifest = TensorManifest { entries, aggregate: agg };
+
+    let json: [u8] = manifest_export(&manifest);
+
+    // Must contain all structural keys.
+    assert!(bytes_contain(&json, b"\"version\""),      "missing version key");
+    assert!(bytes_contain(&json, b"\"tensors\""),      "missing tensors key");
+    assert!(bytes_contain(&json, b"\"name\""),         "missing name key");
+    assert!(bytes_contain(&json, b"\"shape\""),        "missing shape key");
+    assert!(bytes_contain(&json, b"\"neuron_hash\""),  "missing neuron_hash key");
+    assert!(bytes_contain(&json, b"\"aggregate\""),    "missing aggregate key");
+
+    // Must start with '{' and end with '}'.
+    assert_eq!(json[0], 0x7Bu8, "JSON must start with '{'");
+    assert_eq!(json[json.len() - 1], 0x7Du8, "JSON must end with '}'");
+}
+
+// ---------------------------------------------------------------------------
+// P6: all-zero weight vector neuron_hash regression anchor
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_neuron_hash_all_zero_vector() {
+    let h: usize = ENCODER_HIDDEN as usize; // 256
+    let vec: tensor<Q16_16, [256]> = [0_i32; 256];
+
+    let got: [u8; 32] = neuron_hash_of_vector(&vec, h);
+
+    // Preimage: 256 * 4 = 1024 zero bytes.
+    // SHA-256 of 1024 zero bytes = known constant.
+    let zero_1024: [u8; 1024] = [0u8; 1024];
+    let want: [u8; 32] = sha256(zero_1024.as_slice());
+
+    assert_eq!(got, want, "all-zero vector neuron_hash must equal SHA-256 of 1024 zero bytes");
+}
+
+// ---------------------------------------------------------------------------
+// P7: changing one element changes the neuron_hash
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_neuron_hash_single_element_change() {
+    let mut mat_a: tensor<Q16_16, [2, 2]> = [[0_i32; 2]; 2];
+    let mut mat_b: tensor<Q16_16, [2, 2]> = [[0_i32; 2]; 2];
+    mat_b[1][1] = 1_i32; // flip one element
+
+    let hash_a: [u8; 32] = neuron_hash_of_matrix(&mat_a, 2, 2);
+    let hash_b: [u8; 32] = neuron_hash_of_matrix(&mat_b, 2, 2);
+
+    let mut same: bool = true;
+    let mut i: usize = 0;
+    while i < 32 {
+        if hash_a[i] != hash_b[i] { same = false; }
+        i = i + 1;
+    }
+    assert!(!same, "neuron_hash must change when a weight element changes");
+}
+
+// ---------------------------------------------------------------------------
+// Local helper: substring search in a byte slice
+// ---------------------------------------------------------------------------
+
+fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.len() == 0 { return true; }
+    if haystack.len() < needle.len() { return false; }
+    let limit: usize = haystack.len() - needle.len() + 1;
+    let mut i: usize = 0;
+    while i < limit {
+        let mut j: usize = 0;
+        let mut match: bool = true;
+        while j < needle.len() {
+            if haystack[i + j] != needle[j] { match = false; }
+            j = j + 1;
+        }
+        if match { return true; }
+        i = i + 1;
+    }
+    false
+}

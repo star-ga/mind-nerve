@@ -1,0 +1,265 @@
+// MindLLM cross-binding handshake specification.
+//
+// This file defines the typed handshake protocol that allows an evidence chain
+// produced by mind-nerve and an evidence chain produced by MindLLM to be
+// cryptographically reconciled by an independent verifier.
+//
+// References:
+//   - spec/architecture.md §"Attestation envelope"
+//   - spec/architecture.md §"Per-neuron manifest"           (added in Tier 3 #9)
+//   - spec/architecture.md §"Model-hash discipline"
+//   - integrations/mindllm_attestation.mind (this file)
+//
+// DESIGN PRINCIPLE:
+//   The handshake is entirely defined over public artifacts (two model hashes
+//   and a caller-supplied nonce). No STARGA-internal magic is required. Any
+//   consumer that holds:
+//     (a) a mind-nerve manifest_export() JSON document,
+//     (b) a MindLLM evidence manifest (format defined by MindLLM separately),
+//     (c) the public verification key corresponding to the signer,
+//     (d) the shared nonce agreed by both parties at handshake time,
+//   can reconstruct and verify the binding signature without the signing key.
+//
+// CRYPTOGRAPHY:
+//   - Signing: Ed25519 per RFC 8032 (deterministic — no per-signature randomness).
+//   - Hashing: SHA-256 (all intermediate digests and the final signed message).
+//   - NOT Poseidon: reserved for the future ZK upgrade in mind-runtime's MAB
+//     crate; use SHA-256 here for broad external verifier compatibility.
+//
+// ============================================================================
+// TYPES
+// ============================================================================
+
+// ModelHash — a 32-byte SHA-256 digest identifying one model's full artifact.
+// For mind-nerve: the aggregate field from manifest_export() (TensorManifest.aggregate).
+// For MindLLM:    the analogous aggregate over MindLLM weight tensors.
+type ModelHash = [u8; 32];
+
+// Nonce — a 32-byte value supplied by the caller at handshake time.
+// MUST be fresh (not reused across bindings). Callers SHOULD use
+// crypto-random bytes or a monotonic counter hash.
+type Nonce = [u8; 32];
+
+// BindingSignature — an Ed25519 signature over the signed message
+// SHA-256(mind_nerve_model_hash ++ mindllm_model_hash ++ shared_nonce).
+// 64 bytes, as defined in RFC 8032 §5.1.6.
+type BindingSignature = [u8; 64];
+
+// PublicKey — Ed25519 public key, 32 bytes, compressed Edwards y-coordinate.
+type PublicKey = [u8; 32];
+
+// BindingRecord — the complete serializable record for a single cross-binding
+// event. Both the signer and verifier derive the same `signed_message` field
+// from the three public inputs (mind_nerve_hash, mindllm_hash, nonce), so
+// the record is self-verifying.
+pub struct BindingRecord {
+    // The mind-nerve manifest aggregate — from TensorManifest::aggregate.
+    mind_nerve_hash: ModelHash,
+
+    // The MindLLM evidence manifest aggregate (format owned by MindLLM;
+    // must be a 32-byte SHA-256 digest of MindLLM's canonical tensor manifest).
+    mindllm_hash: ModelHash,
+
+    // Caller-supplied nonce, fresh per binding.
+    nonce: Nonce,
+
+    // Ed25519 signature over the binding_message() digest.
+    signature: BindingSignature,
+
+    // The public key whose private counterpart produced `signature`.
+    // MUST match the well-known STARGA cross-binding verification key.
+    signer_pubkey: PublicKey,
+}
+
+// BindingVerifyError — reasons a binding record is invalid.
+pub enum BindingVerifyError {
+    // SHA-256 of the binding message did not match what the signature commits to.
+    SignatureInvalid,
+
+    // A required field contains only zero bytes (likely uninitialized).
+    ZeroField,
+}
+
+// ============================================================================
+// BINDING MESSAGE CONSTRUCTION
+// ============================================================================
+//
+// The signed message is:
+//
+//   binding_msg = SHA-256(mind_nerve_hash ++ mindllm_hash ++ nonce)
+//
+// where `++` denotes byte concatenation.
+//
+// This construction satisfies:
+//   1. Domain separation: the 96-byte preimage is unambiguous (three fixed-
+//      length fields, no length prefixes needed).
+//   2. Commitment hiding: the SHA-256 digest is what is signed, not the raw
+//      96 bytes, reducing the sign-key exposure surface.
+//   3. Associativity of evidence: a verifier can verify either side
+//      (mind-nerve or MindLLM) independently by computing the same digest
+//      from the published BindingRecord.
+
+@[determinism(BitIdentical)]
+pub fn binding_message(
+    mind_nerve_hash: ModelHash,
+    mindllm_hash:    ModelHash,
+    nonce:           Nonce,
+) -> [u8; 32] {
+    // Build the 96-byte preimage.
+    let mut preimage: [u8; 96] = [0u8; 96];
+    let mut i: usize = 0;
+    while i < 32 {
+        preimage[i]      = mind_nerve_hash[i];
+        preimage[32 + i] = mindllm_hash[i];
+        preimage[64 + i] = nonce[i];
+        i = i + 1;
+    }
+    sha256(preimage.as_slice())
+}
+
+// ============================================================================
+// SIGNING (mind-nerve side only — private key is NEVER shipped in this file)
+// ============================================================================
+//
+// Signing is performed by the party that holds the STARGA cross-binding
+// private key. This function takes a pre-computed binding_message digest and
+// produces an Ed25519 signature per RFC 8032 §5.1.6.
+//
+// NOTE: The private key is an external parameter — this function takes it as
+// input and does NOT embed or reference any STARGA key material. This file is
+// public (Apache-2.0); key management is the caller's responsibility.
+//
+// The runtime FFI surface (`mind_nerve::runtime_ffi::ed25519_sign`) maps to
+// the host Ed25519 primitive. Cross-arch bit-identity is guaranteed by RFC
+// 8032's deterministic nonce derivation (H(k || M)), which is a pure function
+// of the private key scalar and the message bytes.
+
+@[determinism(BitIdentical)]
+pub fn sign_binding(
+    private_key_scalar: &[u8; 32],
+    msg:                &[u8; 32],
+) -> BindingSignature {
+    // Delegates to the host runtime's RFC-8032-compliant Ed25519 primitive.
+    // The host primitive is declared NotBitIdentical at the FFI boundary but
+    // is deterministic for the same (key, message) inputs on every conformant
+    // implementation — RFC 8032 mandates deterministic nonce derivation.
+    crate::mind_nerve::runtime_ffi::ed25519_sign(private_key_scalar, msg)
+}
+
+// ============================================================================
+// VERIFICATION (public — no private key required)
+// ============================================================================
+//
+// Verifier algorithm:
+//   1. Assert no field in the record is all-zero (zero = uninitialized guard).
+//   2. Recompute binding_message(mind_nerve_hash, mindllm_hash, nonce).
+//   3. Call ed25519_verify(signer_pubkey, recomputed_msg, signature).
+//   4. Accept if and only if the signature is valid.
+//
+// A verifier that holds the signer_pubkey independently (e.g. from a
+// well-known STARGA certificate endpoint) can substitute it instead of
+// trusting the embedded signer_pubkey field. Callers that are security-
+// sensitive SHOULD verify signer_pubkey against an out-of-band trust anchor.
+
+@[determinism(BitIdentical)]
+pub fn verify_binding(record: &BindingRecord) -> Result<(), BindingVerifyError> {
+    // Guard: reject uninitialized records.
+    if is_all_zero_32(record.mind_nerve_hash) { return Err(BindingVerifyError::ZeroField); }
+    if is_all_zero_32(record.mindllm_hash)    { return Err(BindingVerifyError::ZeroField); }
+    if is_all_zero_32(record.nonce)           { return Err(BindingVerifyError::ZeroField); }
+    if is_all_zero_64(record.signature)       { return Err(BindingVerifyError::ZeroField); }
+    if is_all_zero_32(record.signer_pubkey)   { return Err(BindingVerifyError::ZeroField); }
+
+    // Recompute the message that was signed.
+    let msg: [u8; 32] = binding_message(
+        record.mind_nerve_hash,
+        record.mindllm_hash,
+        record.nonce,
+    );
+
+    // Delegate Ed25519 signature check to the host runtime primitive.
+    let valid: bool = crate::mind_nerve::runtime_ffi::ed25519_verify(
+        &record.signer_pubkey,
+        &msg,
+        &record.signature,
+    );
+
+    if valid { Ok(()) } else { Err(BindingVerifyError::SignatureInvalid) }
+}
+
+// ============================================================================
+// SERIALIZATION — deterministic wire encoding of BindingRecord
+//
+// Format (all fields packed, no padding, little-endian for multi-byte
+// integers — but all fields here are byte arrays so endianness is moot):
+//
+//   magic:            4 bytes  "MNBA" (0x4D 0x4E 0x42 0x41)
+//   version:          2 bytes  u16 LE = 1
+//   reserved:         2 bytes  = 0
+//   mind_nerve_hash: 32 bytes
+//   mindllm_hash:    32 bytes
+//   nonce:           32 bytes
+//   signature:       64 bytes
+//   signer_pubkey:   32 bytes
+//   TOTAL:          200 bytes
+//
+// chain_curr for this record is SHA-256(200 bytes), analogous to the
+// attestation envelope chain discipline.
+
+pub const BINDING_RECORD_SIZE: usize = 200;
+const MNBA_MAGIC: [u8; 4] = [0x4Du8, 0x4Eu8, 0x42u8, 0x41u8];
+const BINDING_VERSION: u16 = 1u16;
+
+@[determinism(BitIdentical)]
+pub fn serialize_binding(record: &BindingRecord) -> [u8; BINDING_RECORD_SIZE] {
+    let mut out: [u8; BINDING_RECORD_SIZE] = [0u8; BINDING_RECORD_SIZE];
+
+    // Magic.
+    out[0] = MNBA_MAGIC[0];
+    out[1] = MNBA_MAGIC[1];
+    out[2] = MNBA_MAGIC[2];
+    out[3] = MNBA_MAGIC[3];
+
+    // Version u16 LE.
+    out[4] = ( BINDING_VERSION        & 0xFFu16) as u8;
+    out[5] = ((BINDING_VERSION >> 8 ) & 0xFFu16) as u8;
+
+    // reserved bytes 6, 7 remain 0.
+
+    // Fields.
+    let mut i: usize = 0;
+    while i < 32 { out[8  + i] = record.mind_nerve_hash[i]; i = i + 1; }
+    let mut j: usize = 0;
+    while j < 32 { out[40 + j] = record.mindllm_hash[j];    j = j + 1; }
+    let mut k: usize = 0;
+    while k < 32 { out[72 + k] = record.nonce[k];           k = k + 1; }
+    let mut s: usize = 0;
+    while s < 64 { out[104 + s] = record.signature[s];      s = s + 1; }
+    let mut p: usize = 0;
+    while p < 32 { out[168 + p] = record.signer_pubkey[p];  p = p + 1; }
+
+    out
+}
+
+// ============================================================================
+// LOCAL HELPERS
+// ============================================================================
+
+@[determinism(BitIdentical)]
+fn is_all_zero_32(a: [u8; 32]) -> bool {
+    let mut acc: u8 = 0u8;
+    let mut i: usize = 0;
+    while i < 32 { acc = acc | a[i]; i = i + 1; }
+    acc == 0u8
+}
+
+@[determinism(BitIdentical)]
+fn is_all_zero_64(a: [u8; 64]) -> bool {
+    let mut acc: u8 = 0u8;
+    let mut i: usize = 0;
+    while i < 64 { acc = acc | a[i]; i = i + 1; }
+    acc == 0u8
+}
+
+// sha256 re-exported from the loader module's import path.
+use crate::mind_nerve::sha256::sha256;

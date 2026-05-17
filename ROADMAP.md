@@ -170,6 +170,21 @@ Q16.16 in flight, INT8 weights, cross-arch bit-identity, 30 ms p95).
 - mind-mem v4 cognitive-kernel integration so route history becomes a
   first-class memory class
 
+### Phase 3 design landables (status: 2026-05-17)
+
+| Item | Status |
+|---|---|
+| Skill marketplace adapter spec (`spec/skill_marketplace.md`) | **DONE** (design-only) |
+| Skill marketplace typed-interface stub (`python/mind_nerve/marketplace.py`) | **DONE** (design-only) |
+| Skill marketplace contract tests (`tests/integration/test_marketplace_registration.py`) | **DONE** (design-only) |
+| Federated routing spec (`spec/federated_routing.md`) | **DONE** (design-only) |
+| Federated routing typed-interface stub (`python/mind_nerve/federation.py`) | **DONE** (design-only) |
+| Federated routing contract tests (`tests/integration/test_federation_reconcile.py`) | **DONE** (design-only) |
+| mind-mem v4 cognitive-kernel binding spec (`spec/mind_mem_v4_integration.md`) | **DONE** (design-only) |
+| Skill marketplace functional ship | **BLOCKED** — requires Phase 2 completion |
+| Federated routing functional ship | **BLOCKED** — requires Phase 2 + mind-flow typed-edges |
+| mind-mem v4 cognitive-kernel integration functional ship | **BLOCKED** — requires mind-mem v4 |
+
 ## Non-goals (now and ever)
 
 - Generative output. mind-nerve emits route IDs and relevance scores, never

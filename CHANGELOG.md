@@ -4,9 +4,117 @@ All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](htt
 
 ## [Unreleased] — v0.2.0 preparation
 
-### Added
+(empty — next release in this slot)
 
-- **Per-tensor weight manifest** (`src/loader.mind`): each weight tensor now
+## [0.1.0-beta.1] — 2026-05-17
+
+First beta. Closes Tier 1 + Tier 2 + Tier 3 of the locked Phase 2 +
+Phase 3 ship plan (`docs/plans/FINAL_SHIP_PLAN_2026_05_17.md`). The
+remaining `v1.0.0` blockers are external (mindc 0.3.0 cdylib emit,
+mind-mem v4 cognitive kernel, ARM CI runner) and remain deferred.
+
+### Added — Tier 1: installer matrix expansion
+
+- **Native Gemini CLI extension installer** — registers mind-nerve as a
+  first-class extension under `~/.gemini/extensions/` with manifest,
+  shim, and uninstall path. Activates `--with-gemini`.
+- **Vibe MCP installer** — wires mind-nerve into Vibe's MCP server
+  registry with the standard MIND-MEM-style entry. Activates
+  `--with-vibe`.
+- **Claw-family installers** — five sibling targets (`--with-codeclaw`,
+  `--with-cursorclaw`, `--with-graviton`, `--with-tirex`,
+  `--with-claudeclaw`) using a shared shim writer. Each forwards
+  request strings to `mind_nerve.route()` and prints the JSON result.
+
+### Added — Tier 1: evidence-chain hardening
+
+- **Reject envelopes with zero `request_hash`** in the verifier
+  (`request_hash != 0` is now a verifier invariant, not advisory).
+  Closes SOTA-track #2 from the ship plan: input-fingerprinted
+  attestation. Mirrors the `model_hash == 0` rule already enforced.
+
+### Added — Tier 2: adaptive window stride
+
+- **Content-fingerprinted stride** — window/stride is now computed
+  from a content fingerprint per request, replacing the hard-coded
+  `stride=192`. Calibrated thresholds shipped in
+  `tools/calibrate_stride.py`. Closes SOTA-track #3.
+
+### Added — Tier 3: Phase 3 scaffolds
+
+- **Skill-marketplace adapter** — typed interface (`adapter.mind` +
+  Python stub) for routing requests to external skill registries.
+  Stub-only ship; functional ship awaits the rest of Phase 2.
+- **Federated cross-host routing** — typed-port design + stub for
+  routing requests across mind-nerve instances on different hosts.
+  Stub-only ship; functional ship awaits mind-flow typed-edges.
+- **mind-mem v4 cognitive-kernel binding spec** — the published
+  contract for plugging mind-nerve into mind-mem's cognitive kernel
+  (route-history as memory class). Spec ships now; functional ship
+  awaits mind-mem v4 (external).
+
+### Added — Tier 3: attestation cross-binding
+
+- **Per-tensor weight manifest** (`src/loader.mind`): each weight tensor
+  now carries a `neuron_hash: [u8; 32]` — the SHA-256 of its Q16.16 byte
+  layout (i32 LE, row-major). The hashes are accumulated via
+  `build_manifest_preimage` (magic `"MNPM"`, canonical alphabetical-name
+  sort) into a manifest aggregate that supersedes the opaque `model_hash`
+  field for consumers that need per-tensor traceability. New public
+  types: `TensorManifestEntry`, `TensorManifest`. New public functions:
+  `build_tensor_manifest()`, `manifest_export()`.
+
+- **`manifest_export()`** emits a deterministic UTF-8 JSON document from
+  a `TensorManifest`. Output is byte-identical across runs and platforms
+  (no dict-iteration ordering, no timestamps). The `aggregate` field is
+  the SHA-256 of the canonical preimage, hex-encoded lowercase.
+
+- **MindLLM cross-binding handshake spec**
+  (`integrations/mindllm_attestation.mind`): typed protocol
+  `(mind_nerve_model_hash, mindllm_model_hash, shared_nonce) ->
+  BindingSignature` using `SHA-256` for the binding message and
+  `Ed25519` (RFC 8032) for signing. The spec is fully self-contained
+  for external consumers — no STARGA-internal toolchain required to
+  implement a verifier. New public types: `BindingRecord`,
+  `BindingVerifyError`. New public functions: `binding_message()`,
+  `sign_binding()`, `verify_binding()`, `serialize_binding()`. Wire
+  format: 200-byte packed record, magic `"MNBA"`.
+
+- **`spec/architecture.md`** extended with two new sections:
+  §"Per-neuron manifest" and §"MindLLM cross-binding handshake"
+  (protocol summary, verifier algorithm, `BindingRecord` wire format,
+  chain discipline).
+
+- **`cryptography>=41.0`** added to `pyproject.toml` runtime
+  dependencies to support Ed25519 operations in Python test and
+  integration code.
+
+- **Unit tests** `tests/unit/test_manifest_export.mind` (7 properties).
+- **Integration tests** `tests/integration/test_mindllm_handshake.py`
+  (10 properties).
+
+### Added — docs
+
+- `docs/plans/FINAL_SHIP_PLAN_2026_05_17.md` — locked block-status
+  matrix and version cadence from a13 → 1.0.0.
+
+### Deferred (gated)
+
+Tracked but not in this release; see `docs/plans/FINAL_SHIP_PLAN_2026_05_17.md`:
+
+- 18-backend cross-arch bit-identity — needs mindc 0.3.0 cdylib emit.
+- Native MIND inference replacing PyTorch — needs mindc 0.3.0.
+- p95 ≤ 30 ms on 4-core CPU (native) — needs mindc 0.3.0.
+- p95 ≤ 30 ms on ARM — needs mindc 0.3.0 + ARM CI runner.
+- Russian intent classification ≥ 90% top-5 — compute-bound training
+  run, scheduled for v0.2.0.
+- Native MIND `mind-train` pipeline — standalone bring-up shippable,
+  deep work continues in v0.3.0.
+- Per-head learned drop masks (SOTA-track #5) — depends on
+  `mind-train`.
+
+## [0.1.0-alpha.13] — 2026-05-16
+
   carries a `neuron_hash: [u8; 32]` — the SHA-256 of its Q16.16 byte layout
   (i32 LE, row-major). The hashes are accumulated via `build_manifest_preimage`
   (magic `"MNPM"`, canonical alphabetical-name sort) into a manifest aggregate
@@ -49,6 +157,8 @@ All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](htt
   determinism with SHA-256 byte-identity check).
 
 ## [0.1.0-alpha.13] — 2026-05-16
+
+> Final alpha. Beta cut as 0.1.0-beta.1 on 2026-05-17.
 
 ### Fixed
 - **CUDA OOM no longer crashes `route()`.** Hit while installing 0.1.0a12

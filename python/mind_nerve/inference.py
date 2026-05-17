@@ -159,6 +159,23 @@ class _Runtime:
         norms = np.linalg.norm(self.embeddings, axis=1, keepdims=True) + 1e-12
         self.embeddings = (self.embeddings / norms).astype(np.float32)
 
+        # Catalog v2: optional per-route log-prior column. When present, it
+        # is added to the dot-product score before top-k selection (Bayesian
+        # combination of likelihood + frequency prior). Loaded from
+        # `route_table_prior.npy` if it exists; absent file means v1 catalog
+        # and the runtime falls through to the plain dot-product path.
+        prior_path = runtime_dir / "route_table_prior.npy"
+        if prior_path.exists():
+            log_prior = np.load(prior_path).astype(np.float32)
+            if log_prior.shape != (self.embeddings.shape[0],):
+                raise RuntimeError(
+                    f"Route prior shape mismatch: expected ({self.embeddings.shape[0]},), "
+                    f"got {log_prior.shape}"
+                )
+            self.log_prior: "np.ndarray | None" = log_prior
+        else:
+            self.log_prior = None
+
     @property
     def catalog_size(self) -> int:
         return len(self.routes)
@@ -204,6 +221,11 @@ def route(query: str, top_k: int = 5, *, runtime_dir: str | None = None) -> Rout
 
     t0 = time.perf_counter()
     scores = rt.embeddings @ qv  # (N,)
+    # Catalog v2: combine the dot-product likelihood with the per-route
+    # log-prior, when present. log-space addition is equivalent to
+    # P(route|query) ∝ P(query|route) · P(route).
+    if rt.log_prior is not None:
+        scores = scores + rt.log_prior
     k = min(top_k, scores.shape[0])
     top = np.argpartition(-scores, k - 1)[:k]
     top = top[np.argsort(-scores[top])]  # exact sort over the k

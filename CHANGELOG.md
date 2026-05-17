@@ -6,6 +6,35 @@ All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](htt
 
 (empty — next release in this slot)
 
+## [0.1.0-beta.2] — 2026-05-17
+
+### Added — catalog-v2 runtime readiness (SOTA-track #1)
+
+- **Optional `route_table_prior.npy` column.** When present in the
+  runtime dir, the runtime loads it as a per-route log-prior and adds
+  it to the dot-product score before top-k selection. Bayesian
+  combination: `P(route|query) ∝ P(query|route) · P(route)`.
+- Absent prior file leaves the scoring path unchanged — v1 catalogs
+  continue to work without modification.
+- Shape mismatch at load time raises `RuntimeError` early rather than
+  producing wrong results.
+- The catalog-builder side already emits the v2 wire format
+  (`catalog-builder/format/cat_v2.py`, magic `MNC2` + `PRIR` tail)
+  with `freq_adaptive_scale` applied per-route. This release wires
+  the runtime to consume it.
+
+### Added — tests
+
+- `tests/integration/test_route_prior.py` (4 properties: absent file,
+  present file, shape mismatch, prior changes top-1 result).
+
+### Note
+
+The publicly shipped HF Phase-1 weights remain catalog-v1. This
+release makes the runtime forward-compatible with v2; the v2 weights
+arrive in `v0.2.0-beta.1` together with the documented model_hash
+bump and the Russian intent run.
+
 ## [0.1.0-beta.1] — 2026-05-17
 
 First beta. Closes Tier 1 + Tier 2 + Tier 3 of the locked Phase 2 +

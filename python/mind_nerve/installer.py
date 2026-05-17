@@ -53,6 +53,14 @@ MCP_CAPABLE = {
     },
     "cursor": {"detect": HOME / ".cursor" / "mcp.json", "method": "json_mcp_servers"},
     "codex": {"detect": HOME / ".codex" / "config.toml", "method": "toml_mcp_servers"},
+    "gemini": {
+        "detect": HOME / ".gemini" / "extensions",
+        "method": "gemini_extension_manifest",
+    },
+    "vibe": {"detect": HOME / ".vibe" / "mcp.json", "method": "json_mcp_servers"},
+    "openclaw": {"detect": HOME / ".openclaw" / "mcp.json", "method": "json_mcp_servers"},
+    "nanoclaw": {"detect": HOME / ".nanoclaw" / "mcp.json", "method": "json_mcp_servers"},
+    "nemoclaw": {"detect": HOME / ".nemoclaw" / "mcp.json", "method": "json_mcp_servers"},
 }
 HOOK_BASED = {
     "claude-code-hook": {
@@ -61,13 +69,8 @@ HOOK_BASED = {
     },
 }
 STUB_CLIS = [
-    "gemini",  # extension format not verified yet
     "windsurf",  # dir not standardly present
     "aider",  # no MCP support; needs bespoke integration
-    "vibe",
-    "openclaw",
-    "nanoclaw",
-    "nemoclaw",
     "continue",
     "cline",
     "roo",
@@ -230,12 +233,101 @@ def install_claude_code_hook(cfg: dict) -> dict:
     return {"installed": True, "method": "claude_user_prompt_hook", "path": str(cfg_path)}
 
 
+def install_gemini(cfg: dict) -> dict:
+    """Write a Gemini CLI extension manifest at ~/.gemini/extensions/mind-nerve/.
+
+    The Gemini CLI discovers extensions by scanning ~/.gemini/extensions/. Each
+    extension lives in its own subdirectory and must contain an extension.json
+    manifest. The manifest declares the extension name, version, and optional
+    MCP server registrations. Idempotent: re-running replaces the manifest in
+    place without touching sibling extension directories.
+
+    Reference: https://github.com/google-gemini/gemini-cli/blob/main/docs/extension.md
+    """
+    ext_dir = HOME / ".gemini" / "extensions" / "mind-nerve"
+    ext_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = ext_dir / "extension.json"
+
+    manifest = {
+        "name": "mind-nerve",
+        "version": "1",
+        "description": "mind-nerve intent router — preselects top-K skills/routes before prompt dispatch",
+        "mcpServers": {
+            "mind-nerve": _mcp_entry(),
+        },
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+    return {"installed": True, "method": "gemini_extension_manifest", "path": str(manifest_path)}
+
+
+def install_vibe(cfg: dict) -> dict:
+    """Write the vibe (Mistral CLI) MCP config at ~/.vibe/mcp.json.
+
+    vibe follows the same JSON ``mcpServers`` shape as Claude Desktop and
+    Cursor. Idempotent: re-running updates the mind-nerve entry without
+    removing other server registrations already present in the file.
+    """
+    cfg_path = HOME / ".vibe" / "mcp.json"
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    existing: dict = {}
+    if cfg_path.exists():
+        try:
+            existing = json.loads(cfg_path.read_text())
+        except json.JSONDecodeError:
+            existing = {}
+    servers = existing.setdefault("mcpServers", {})
+    servers["mind-nerve"] = _mcp_entry()
+    cfg_path.write_text(json.dumps(existing, indent=2) + "\n")
+    return {"installed": True, "method": "json_mcp_servers", "path": str(cfg_path)}
+
+
+def _install_claw(claw_name: str) -> dict:
+    """Shared implementation for the claw-family installers (openclaw / nanoclaw / nemoclaw).
+
+    All three runtimes share the same JSON ``mcpServers`` config shape, each
+    rooted at ~/.<claw>/mcp.json. Idempotent: re-running updates the
+    mind-nerve entry without removing other server registrations.
+    """
+    cfg_path = HOME / f".{claw_name}" / "mcp.json"
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    existing: dict = {}
+    if cfg_path.exists():
+        try:
+            existing = json.loads(cfg_path.read_text())
+        except json.JSONDecodeError:
+            existing = {}
+    servers = existing.setdefault("mcpServers", {})
+    servers["mind-nerve"] = _mcp_entry()
+    cfg_path.write_text(json.dumps(existing, indent=2) + "\n")
+    return {"installed": True, "method": "json_mcp_servers", "path": str(cfg_path)}
+
+
+def install_openclaw(cfg: dict) -> dict:
+    """Wire mind-nerve MCP into ~/.openclaw/mcp.json."""
+    return _install_claw("openclaw")
+
+
+def install_nanoclaw(cfg: dict) -> dict:
+    """Wire mind-nerve MCP into ~/.nanoclaw/mcp.json."""
+    return _install_claw("nanoclaw")
+
+
+def install_nemoclaw(cfg: dict) -> dict:
+    """Wire mind-nerve MCP into ~/.nemoclaw/mcp.json."""
+    return _install_claw("nemoclaw")
+
+
 INSTALLERS = {
     "claude-code": install_claude_code,
     "claude-code-hook": install_claude_code_hook,
     "claude-desktop": install_claude_desktop,
     "cursor": install_cursor,
     "codex": install_codex,
+    "gemini": install_gemini,
+    "vibe": install_vibe,
+    "openclaw": install_openclaw,
+    "nanoclaw": install_nanoclaw,
+    "nemoclaw": install_nemoclaw,
 }
 
 
@@ -530,12 +622,24 @@ def install_mind_mem_companion(targets: list[str]) -> dict:
                 results[cli] = _register_mind_mem_in(HOME / ".cursor" / "mcp.json", "json")
             elif cli == "codex":
                 results[cli] = _register_mind_mem_in(HOME / ".codex" / "config.toml", "toml")
+            elif cli == "vibe":
+                results[cli] = _register_mind_mem_in(HOME / ".vibe" / "mcp.json", "json")
+            elif cli in {"openclaw", "nanoclaw", "nemoclaw"}:
+                results[cli] = _register_mind_mem_in(HOME / f".{cli}" / "mcp.json", "json")
+            elif cli == "gemini":
+                # Gemini uses extension.json, not a flat mcp.json; inject into
+                # the existing extension manifest produced by install_gemini().
+                ext_manifest = HOME / ".gemini" / "extensions" / "mind-nerve" / "extension.json"
+                results[cli] = _register_mind_mem_in(ext_manifest, "json") if ext_manifest.exists() else {
+                    "installed": False,
+                    "error": "install mind-nerve for gemini first (mind-nerve install --cli gemini)",
+                }
             else:
                 results[cli] = {"installed": False, "error": f"not supported for {cli}"}
         except Exception as exc:  # noqa: BLE001
             results[cli] = {"installed": False, "error": str(exc)}
 
-    out = {"results": results}
+    out: dict = {"results": results}
     if warning:
         out["warning"] = warning
     return out
@@ -549,7 +653,8 @@ def install_mind_mem_companion(targets: list[str]) -> dict:
 def detect() -> dict[str, dict]:
     out: dict[str, dict] = {}
     for cli, info in {**MCP_CAPABLE, **HOOK_BASED}.items():
-        present = info["detect"].exists()
+        detect_path: Path = info["detect"]  # type: ignore[assignment]
+        present = detect_path.exists()
         out[cli] = {
             "config_probe": str(info["detect"]),
             "present": present,

@@ -186,6 +186,7 @@ mind-nerve-install install --cli all
 | Env var                       | Default                                     | What it controls |
 | ----------------------------- | ------------------------------------------- | ---------------- |
 | `MIND_NERVE_RUNTIME_DIR`      | `~/.local/share/mind-nerve/runtime/`        | model + catalog cache |
+| `MIND_NERVE_DEVICE`           | auto (CUDA → MPS → CPU)                     | force device (e.g. `cpu` when sharing a GPU with another model — auto-fallback to CPU also happens on CUDA OOM) |
 | `MIND_NERVE_SOCKET`           | `$XDG_RUNTIME_DIR/mind-nerve.sock`          | daemon UNIX socket |
 | `MIND_NERVE_SOURCE_DIR`       | auto-detected (`~/.claude/skills.full` or `~/.agents/skills`) | preselect source catalog |
 | `MIND_NERVE_PROJECTED_DIR`    | `~/.claude/skills`                          | preselect projection target |
@@ -226,9 +227,13 @@ the same ranking. Full spec in [`spec/architecture.md`](spec/architecture.md).
 catalog.
 
 **Phase 2 (next)** — Native MIND Q16.16 inference loop replaces PyTorch.
-Cross-architecture bit-identity gate. p95 budget tightens. Gated on
+Cross-architecture bit-identity gate. p95 budget tightens. The HF artifact
+will be `star-ga/mind-nerve-phase2` (parallel to the current
+[`star-ga/mind-nerve-phase1`](https://huggingface.co/star-ga/mind-nerve-phase1)) —
+same corpus + tokenizer + model hash contract, different inference path.
+Gated on
 [`mindc` 0.2.6](https://github.com/star-ga/mind/blob/main/docs/roadmap.md#phase-106--library-output--c-abi-mindc-026--030)
-(C-ABI export) and `mindc` 0.3.0 (cdylib emit).
+(C-ABI export — landed) and `mindc` 0.3.0 (cdylib emit — next).
 
 **Phase 3** — Catalog v2: license-aware ingest at scale, evidence-chain
 proofs, per-tenant route tables.

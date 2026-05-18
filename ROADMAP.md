@@ -43,11 +43,16 @@ Three blockers were raised 2026-05-14. Status after the Phase 1 alpha sprint:
    not part of this public surface; the public wheel passes an automated
    leak-verifier before each release.
 
-**Release status (2026-05-18):** `v0.2.0` is the current PyPI public,
-`v0.3.0-beta.1` is tagged + GitHub-released with the wheel built locally
-(PyPI push pending). Weights on Hugging Face under Apache-2.0
-(`star-ga/mind-nerve-phase1`). The PyTorch-based inference path remains the
-trial surface that drives adoption; Phase-2 native MIND inference +
+**Release status (2026-05-18):** `v0.3.0-beta.2` is the current PyPI
+public — wheel + sdist live at
+[pypi.org/project/mind-nerve/0.3.0b2](https://pypi.org/project/mind-nerve/0.3.0b2/),
+GitHub release at
+[v0.3.0-beta.2](https://github.com/star-ga/mind-nerve/releases/tag/v0.3.0-beta.2).
+Single change on top of beta.1 is the flock-guarded `ensure()` daemon
+spawn (closes the multi-spawn race that was producing zombie daemons
+under concurrent CLI use). Weights on Hugging Face under Apache-2.0
+(`star-ga/mind-nerve-phase1`). The PyTorch-based inference path remains
+the trial surface that drives adoption; Phase-2 native MIND inference +
 cross-arch bit-identity + p95 ≤ 30 ms remain on the deferred list below,
 but the upstream `mindc` blockers underneath that list have moved — see
 the §"Deferred to Phase 2 — gated on `mindc` toolchain" table for current
@@ -91,7 +96,7 @@ path until the native cdylib path lands.
 | Task | Blocker | mindc milestone | Status |
 |---|---|---|---|
 | Cross-arch bit-identity (x86-CPU vs CUDA) | `pub fn` → C symbol export so the native MIND inference kernel is callable as a `cdylib` | **0.2.6** — `pub fn`-to-C, `[exports]`, `--profile` flag | **mindc-side SHIPPED** (RFC 0002 D2–D5 in `0a408e3`, `_v1` ABI lock in `de6cf18`, RFC 0003 cdylib seam). mind-nerve-side validation (mindc CUDA build + bit-identical SHA) still pending hardware — task #57 stays open. |
-| p95 ≤ 30 ms on 4-core CPU | Native `cdylib` emit so the PyTorch encode-cost (~270 ms today) can be replaced by a Q16.16 native kernel | **0.3.0** — `--lib` cdylib, AOT codegen, MIC profile-locked headers | **mindc-side IN PROGRESS**. `--emit-shared` cdylib flag (`c444c77`) + Phase 0/1/1.5 std-surface intrinsics + P0d `Instr::FnDef`→`func.func` (`aacebe1`) all landed. Remaining mindc blocker: RFC 0005 P0e struct-ABI lowering — 9-LLM consensus (2026-05-18) locked option C (heap record via `__mind_alloc` + `__mind_load_i64`/`__mind_store_i64`); implementation pending. |
+| p95 ≤ 30 ms on 4-core CPU | Native `cdylib` emit so the PyTorch encode-cost (~270 ms today) can be replaced by a Q16.16 native kernel | **0.3.0** — `--lib` cdylib, AOT codegen, MIC profile-locked headers | **mindc-side IN PROGRESS**. `--emit-shared` cdylib flag (`c444c77`) + Phase 0/1/1.5 std-surface intrinsics + P0d `Instr::FnDef`→`func.func` (`aacebe1`) + RFC 0005 **P0e Step 1** struct heap-record write path (`2f98a4f`) all landed. Remaining mindc blocker: **P0f** — `FieldAccess` read path (`__mind_load_i64` via a `struct_env` binding-table that maps local `let` names to their struct schemas). |
 
 Both tasks remain tracked (#57 and #59 in the work queue). `#57` re-opens
 the moment mind-nerve has a CUDA host to run the bit-identical-SHA harness

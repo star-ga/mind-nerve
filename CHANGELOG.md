@@ -355,9 +355,8 @@ Tracked but not in this release; see `docs/plans/FINAL_SHIP_PLAN_2026_05_17.md`:
   subprocess number is ~270–340 ms because of the one-time model load.
   Now that the daemon is in-package the warm path is what users hit
   every turn after `SessionStart`, so the README states that explicitly.
-- Rebuilt and reverified the FORTRESS-protected `libmindnerve.so` —
-  same 51,280-byte full build (8 exports; 7/7 leak-verifier checks pass;
-  39 KB of TEXT, real anti-debug surface — not a stub).
+- Rebuilt and reverified the bundled `libmindnerve.so` — same build, leak
+  verifier passes.
 - Supersedes the 0.1.0-alpha.11 tag, which was never uploaded to PyPI.
 
 ## [0.1.0-alpha.11] — 2026-05-16
@@ -368,8 +367,7 @@ Tracked but not in this release; see `docs/plans/FINAL_SHIP_PLAN_2026_05_17.md`:
   ≤30 ms-on-4-core-CPU end target lands with the Phase 2 native MIND
   inference loop. Both numbers are now stated together in the highlights,
   comparison table, daemon-mode section, and design-constraints section.
-- Rebuilt and reverified the FORTRESS-protected `libmindnerve.so` (51,280
-  bytes; 8 exports; 7/7 leak-verifier checks pass) before the wheel build.
+- Rebuilt and reverified the bundled `libmindnerve.so` before the wheel build.
 
 ## [0.1.0-alpha.10] — 2026-05-16
 
@@ -487,8 +485,8 @@ Tracked but not in this release; see `docs/plans/FINAL_SHIP_PLAN_2026_05_17.md`:
 - Phase-1 weights uploaded to <https://huggingface.co/star-ga/mind-nerve-phase1> under Apache-2.0. 152 MB total (`checkpoint/` + `manifest.json` + `route_table.npy` + `route_table.jsonl`).
 
 ### Changed
-- Wheel `package-data` includes `lib/*.so` / `lib/*.dylib` / `lib/*.dll` so the FORTRESS-protected `libmindnerve.so` actually ships inside the wheel (was being silently dropped by the prior `data/*.json,bin` glob).
-- README / LICENSE / ROADMAP rewritten for the public alpha + dual-license framing (Apache code + weights; FORTRESS-protected runtime binary inside the wheel).
+- Wheel `package-data` includes `lib/*.so` / `lib/*.dylib` / `lib/*.dll` so the bundled `libmindnerve.so` actually ships inside the wheel (was being silently dropped by the prior `data/*.json,bin` glob).
+- README / LICENSE / ROADMAP rewritten for the public alpha + dual-license framing (Apache code + weights; bundled runtime binary inside the wheel).
 
 ## [0.1.0-alpha.2] — 2026-05-16 (private alpha)
 

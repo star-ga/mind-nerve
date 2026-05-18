@@ -731,8 +731,91 @@ def cmd_install(args) -> int:
             [t for t in targets if t in {"claude-code", "claude-desktop", "cursor", "codex"}]
         )
 
+    if getattr(args, "with_systemd", False):
+        results["__systemd__"] = install_systemd_user_unit()
+
     print(json.dumps(results, indent=2))
     return 0
+
+
+# ---------------------------------------------------------------------------
+# --with-systemd: install mind-nerve-routed.service as a long-lived user unit
+# ---------------------------------------------------------------------------
+
+
+def install_systemd_user_unit() -> dict:
+    """Install the long-lived `mind-nerve-routed.service` user unit so the
+    route daemon runs in its own cgroup and survives parent-CLI restarts.
+
+    Without this unit, every CLI invocation that trips `ensure.py`
+    inherits whatever cgroup spawned it. Concurrent invocations during
+    the daemon's 5 s weight-load window are guarded by the flock from
+    0.3.0-beta.2 onward, but a long-running parent process restart
+    still orphans the daemon. This unit lifts the daemon out entirely:
+    own cgroup, real Restart= semantics, memory cap.
+
+    Idempotent: re-running over an existing unit is a no-op apart from
+    `daemon-reload` + `restart`.
+    """
+    if sys.platform != "linux":
+        return {
+            "installed": False,
+            "reason": f"systemd user units only supported on Linux (got {sys.platform})",
+        }
+    if shutil.which("systemctl") is None:
+        return {"installed": False, "reason": "systemctl not found on PATH"}
+
+    unit_src = Path(__file__).parent / "templates" / "mind-nerve-routed.service"
+    if not unit_src.exists():
+        return {
+            "installed": False,
+            "reason": f"unit template missing: {unit_src} — package install incomplete",
+        }
+
+    unit_dst_dir = Path.home() / ".config" / "systemd" / "user"
+    unit_dst = unit_dst_dir / "mind-nerve-routed.service"
+    log_dir = Path.home() / ".mind-nerve"
+
+    try:
+        unit_dst_dir.mkdir(parents=True, exist_ok=True)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        unit_dst.write_text(unit_src.read_text())
+    except OSError as exc:
+        return {"installed": False, "reason": f"could not write unit: {exc}"}
+
+    try:
+        subprocess.run(
+            ["systemctl", "--user", "daemon-reload"],
+            check=True,
+            capture_output=True,
+            timeout=15,
+        )
+        subprocess.run(
+            ["systemctl", "--user", "enable", "--now", "mind-nerve-routed.service"],
+            check=True,
+            capture_output=True,
+            timeout=30,
+        )
+    except subprocess.CalledProcessError as exc:
+        return {
+            "installed": False,
+            "unit_path": str(unit_dst),
+            "reason": f"systemctl returned {exc.returncode}",
+            "stderr": exc.stderr.decode("utf-8", "replace")[:400],
+        }
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        return {
+            "installed": False,
+            "unit_path": str(unit_dst),
+            "reason": f"systemctl invocation failed: {exc}",
+        }
+
+    return {
+        "installed": True,
+        "unit_path": str(unit_dst),
+        "log_path": str(log_dir / "daemon.log"),
+        "note": "service is enabled and started; survives parent-CLI restarts",
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -758,6 +841,12 @@ def main(argv: list[str] | None = None) -> int:
         "--with-mind-mem",
         action="store_true",
         help="Also register the mind-mem-mcp server next to mind-nerve (requires mind-mem installed)",
+    )
+    p_ins.add_argument(
+        "--with-systemd",
+        action="store_true",
+        help="Also install mind-nerve-routed.service as a long-lived systemd user unit "
+        "so the route daemon owns its own cgroup and survives parent-CLI restarts (Linux only)",
     )
     p_ins.set_defaults(func=cmd_install)
 

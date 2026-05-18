@@ -4,6 +4,23 @@ All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](htt
 
 ## [Unreleased] — v0.3.0 preparation
 
+## [0.3.0-beta.3] — 2026-05-18
+
+### Changed — documentation polish
+
+- Replaced internal-jargon phrasing in `ensure.py` and `installer.py`
+  docstrings, the bundled `templates/mind-nerve-routed.service` unit
+  comment, and the v0.3.0-beta.2 CHANGELOG entry with neutral
+  product-facing language. The shipped behaviour is unchanged from
+  v0.3.0-beta.2; only comments and prose were edited. Bumping the
+  release so the language in the PyPI wheel matches the language in
+  the source tree.
+
+### Added — `spec/` reference to downstream orchestrators
+
+- `spec/mind_mem_v4_integration.md` now references "downstream
+  orchestrators" generically instead of naming a specific consumer.
+
 ## [0.3.0-beta.2] — 2026-05-18
 
 ### Fixed — concurrent ensure() spawning multiple daemons
@@ -12,9 +29,9 @@ All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](htt
   a sibling `mind-nerve.sock.lock` `flock`. Prior to this fix, parallel
   CLI invocations during the daemon's ~5 s weight-load window all saw
   an unresponsive socket from their fast-path probe and each spawned a
-  fresh `mind-nerve-routed` process. A real-world bot-thrash incident
-  left 9 zombie daemons (~1.3 GB each) under a single user systemd
-  cgroup.
+  fresh `mind-nerve-routed` process. In a high-concurrency workload
+  this accumulates 10+ zombie daemons (~1.3 GB each), pinning memory
+  until the parent process is restarted.
 - The flock guard makes the spawn decision exclusive: one ensure()
   caller wins, spawns, then **holds the lock while waiting for the
   socket to come up** (`WAIT_SECONDS = 20`). All other parallel

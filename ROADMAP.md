@@ -49,8 +49,8 @@ public — wheel + sdist live at
 GitHub release at
 [v0.3.0-beta.2](https://github.com/star-ga/mind-nerve/releases/tag/v0.3.0-beta.2).
 Single change on top of beta.1 is the flock-guarded `ensure()` daemon
-spawn (closes the multi-spawn race that was producing zombie daemons
-under concurrent CLI use). Weights on Hugging Face under Apache-2.0
+spawn (closes the multi-spawn race that pinned memory under
+high-concurrency CLI use). Weights on Hugging Face under Apache-2.0
 (`star-ga/mind-nerve-phase1`). The PyTorch-based inference path remains
 the trial surface that drives adoption; Phase-2 native MIND inference +
 cross-arch bit-identity + p95 ≤ 30 ms remain on the deferred list below,

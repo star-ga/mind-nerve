@@ -1,0 +1,48 @@
+[Unit]
+# mind-nerve route daemon — long-lived, owns its own cgroup.
+#
+# Why install this unit (rather than letting your CLI's ensure() hook spawn it):
+#   * `ensure()` is correct under concurrent invocations as of 0.3.0-beta.2
+#     (flock-guarded spawn), but the daemon still inherits whatever cgroup
+#     spawned it. If a long-running parent process restarts, the daemon
+#     is orphaned or killed.
+#   * Owning a real systemd user unit gives mind-nerve-routed its own
+#     cgroup, real `Restart=` semantics, memory guardrails, and survival
+#     across parent restarts. `ensure()` then becomes a pure socket-
+#     readiness check; it never spawns.
+#
+# Install (one-time, per user account):
+#   mkdir -p ~/.config/systemd/user ~/.mind-nerve
+#   cp <pkg>/templates/mind-nerve-routed.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now mind-nerve-routed.service
+#
+# Uninstall:
+#   systemctl --user disable --now mind-nerve-routed.service
+#   rm ~/.config/systemd/user/mind-nerve-routed.service
+#
+# Tune the limits below if your model is larger than the Phase-1 weights.
+Description=mind-nerve route daemon (UNIX socket, intent-classification preselector)
+Documentation=https://github.com/star-ga/mind-nerve
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/share/mind-nerve-venv/bin/mind-nerve-routed
+Restart=on-failure
+RestartSec=5s
+# Memory guardrails. The daemon loads sentence-transformer weights at
+# startup (~1.1 GB), idles flat after that. 2 GB cap leaves headroom
+# but trips OOM-kill on a slow-leak so failures are loud.
+MemoryMax=2G
+MemoryHigh=1.5G
+CPUQuota=400%
+# Canonical XDG runtime socket path. `ensure()` and every CLI hook
+# probe this; do not change unless you also override $MIND_NERVE_SOCKET
+# in your shell rc.
+Environment=MIND_NERVE_SOCKET=%t/mind-nerve.sock
+StandardOutput=append:%h/.mind-nerve/daemon.log
+StandardError=append:%h/.mind-nerve/daemon.log
+
+[Install]
+WantedBy=default.target

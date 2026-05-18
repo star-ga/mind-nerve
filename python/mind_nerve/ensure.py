@@ -7,14 +7,14 @@ if it's already responsive, returns immediately. Otherwise spawns
 performance optimisation, not a correctness requirement, so this
 script must never block session start.
 
-Concurrency contract (added 2026-05-18 after a multi-claude-CLI
-incident that spawned 9 zombie daemons under one user systemd cgroup):
-parallel invocations during the daemon's 5 s weight-load window must
-not all decide to spawn. A non-blocking `flock` on a sibling lock file
-serialises the "should I spawn?" decision; losers poll the socket for
-up to `WAIT_SECONDS` instead of spawning, then exit fail-open. Net
-effect: at most one daemon process per socket, ever, across any number
-of parallel `ensure` invocations.
+Concurrency contract (added 2026-05-18): parallel invocations during
+the daemon's 5 s weight-load window must not all decide to spawn —
+that produced a multi-spawn race in prior releases where each caller
+saw an unresponsive socket and forked its own daemon. A non-blocking
+`flock` on a sibling lock file serialises the "should I spawn?"
+decision; losers poll the socket for up to `WAIT_SECONDS` instead of
+spawning, then exit fail-open. Net effect: at most one daemon process
+per socket, ever, across any number of parallel `ensure` invocations.
 """
 
 from __future__ import annotations

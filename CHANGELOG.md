@@ -4,6 +4,8 @@ All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](htt
 
 ## [Unreleased] — v0.3.0 preparation
 
+## [0.3.0-beta.2] — 2026-05-18
+
 ### Fixed — concurrent ensure() spawning multiple daemons
 
 - `python/mind_nerve/ensure.py` now serialises the spawn decision under

@@ -84,8 +84,13 @@ introduce non-determinism — keep that disabled at release time.
 ## Open caveats
 
 - Sub-2-second training implies the corpus is small. Phase 2 will
-  enlarge the corpus (Russian, more skill repos, mined CLI traces)
-  and retrain to `v1.1` or `v2.0`.
+  enlarge the corpus across the 12 Tier-1 languages (see
+  [`spec/quality_targets.md`](../../spec/quality_targets.md)
+  §"Multilingual language policy"), additional skill repos, and mined
+  CLI traces, then retrain to `v1.1` or `v2.0`. The 32k vocab is
+  likely insufficient for proper CJK + Devanagari + Arabic-script
+  coverage; expansion to 48k or 64k is a tracked decision in the
+  Phase 2 catalog-builder workstream.
 - Special-token IDs are frozen even if the vocab grows; new
   special tokens enter at high IDs only.
 - The byte-level GPT-2 mark (`Ġ`) is part of the tokenizer's encoded

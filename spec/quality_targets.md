@@ -18,12 +18,12 @@ target.
 
 ## Accuracy
 
-| Metric | Phase 1 target (EN) | Phase 2 target (EN + RU) |
+| Metric | Phase 1 target (EN reference) | Phase 2 target (multilingual) |
 |---|---|---|
-| Top-1 accuracy | ≥ 78% | ≥ 80% |
-| Top-5 accuracy | ≥ 92% | ≥ 93% |
-| Top-10 accuracy | ≥ 97% | ≥ 97% |
-| Mean Reciprocal Rank | ≥ 0.84 | ≥ 0.85 |
+| Top-1 accuracy | ≥ 78% | ≥ 80% on EN; ≥ 70% per Tier-1 language |
+| Top-5 accuracy | ≥ 92% | ≥ 93% on EN; ≥ 85% per Tier-1 language |
+| Top-10 accuracy | ≥ 97% | ≥ 97% on EN; ≥ 92% per Tier-1 language |
+| Mean Reciprocal Rank | ≥ 0.84 | ≥ 0.85 on EN; ≥ 0.76 per Tier-1 language |
 
 Evaluated on a held-out corpus of intent-labelled requests against the
 production STARGA agent skill catalog (440 skills as of 2026-05).
@@ -33,10 +33,47 @@ production STARGA agent skill catalog (440 skills as of 2026-05).
 - Top-1 accuracy ≥ 84% on English
 - Top-5 accuracy ≥ 95% on English
 - Per-route precision ≥ 0.80 on the 50 most-frequently-used skills
+- Top-5 accuracy ≥ 90% averaged across Tier-1 languages
 
-Russian-only metrics are tracked separately; cross-lingual transfer is not
-the goal. mind-nerve is bilingual from Phase 2, not multilingual through
-English.
+### Multilingual language policy
+
+mind-nerve commits to **broad multilingual coverage**. Singling out one
+non-English language as a gate is out of scope; either the major
+languages clear measured thresholds or none do.
+
+**Tier 1 — measured & gated.** Each language ships a held-out
+intent-labelled eval set and clears the Phase 2 targets above. Per-
+language CI gate; one language failing fails the ship:
+
+- English (`en`)
+- Spanish (`es`)
+- Mandarin Chinese, Simplified (`zh-Hans`)
+- Hindi (`hi`)
+- Arabic, MSA (`ar`)
+- Portuguese (`pt`)
+- Russian (`ru`)
+- Japanese (`ja`)
+- French (`fr`)
+- German (`de`)
+- Bengali (`bn`)
+- Korean (`ko`)
+
+Twelve languages cover ~70% of internet users by speaker count.
+
+**Tier 2 — measured & monitored, not gated.** Eval sets exist; results
+published per release as a quality dashboard, but a regression here
+does not block a ship. Covers all remaining UN official languages and
+the next 20 by speaker count. Examples: Italian, Turkish, Vietnamese,
+Polish, Persian, Indonesian, Thai, Tamil, Telugu, Urdu, Marathi, Swahili.
+
+**Tier 3 — script coverage only.** Every other language the 32k BPE
+encodes survives the tokenizer round-trip and produces a deterministic
+embedding. No per-language eval set; smoke-tested via a
+"tokenizer.encode().decode() == input" gate over the FLORES-200 dev set.
+
+The Tier-1 gate is the production promise. Tier-2 is the
+quality dashboard. Tier-3 is the "no language silently breaks"
+floor.
 
 ## Latency
 

@@ -32,11 +32,17 @@ All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](htt
   primitives, so the published Python surface IS the contract. Added
   3 new invariants (round-trip, magic mismatch, short buffer).
 
-### Note — Russian-intent ≥ 90% top-5
+### Language policy
 
-- Verification of the Russian-intent target remains deferred to the
-  compute-bound training run (1-2 day GPU pod). Tier 3 closes the
-  attestation surface; the accuracy gate sits in the next ship.
+- Singling out one non-English language as a release gate is now
+  explicitly out of scope. The Russian-specific top-5 target referenced
+  in earlier plans is replaced by the **multilingual policy** in
+  [`spec/quality_targets.md`](spec/quality_targets.md): Tier 1 (twelve
+  major languages, measured and gated), Tier 2 (next ~20, measured and
+  monitored, not gated), Tier 3 (script floor — tokenizer round-trip
+  CI gate over FLORES-200, no language silently breaks). v0.2.0 ships
+  English as the certified target; Tier 1–3 land in their own
+  multilingual workstream.
 
 ## [0.2.0-beta.1] — 2026-05-17
 
@@ -80,8 +86,9 @@ All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](htt
 
 - Public HF Phase-1 weights remain catalog-v1; flipping a runtime to
   v2 still requires the matching catalog emit. v2 weights with the
-  full model_hash bump arrive in `v0.2.0` together with the verified
-  Russian-intent run.
+  full model_hash bump arrive on the next training cadence; per-
+  language eval coverage rolls in via the multilingual workstream
+  (see `spec/quality_targets.md` §"Multilingual language policy").
 
 ## [0.1.0-beta.2] — 2026-05-17
 
@@ -109,8 +116,9 @@ All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](htt
 
 The publicly shipped HF Phase-1 weights remain catalog-v1. This
 release makes the runtime forward-compatible with v2; the v2 weights
-arrive in `v0.2.0-beta.1` together with the documented model_hash
-bump and the Russian intent run.
+arrive on the next multilingual training cadence (see
+`spec/quality_targets.md` §"Multilingual language policy" for the
+Tier-1 / Tier-2 / Tier-3 coverage commitments).
 
 ## [0.1.0-beta.1] — 2026-05-17
 
@@ -212,8 +220,9 @@ Tracked but not in this release; see `docs/plans/FINAL_SHIP_PLAN_2026_05_17.md`:
 - Native MIND inference replacing PyTorch — needs mindc 0.3.0.
 - p95 ≤ 30 ms on 4-core CPU (native) — needs mindc 0.3.0.
 - p95 ≤ 30 ms on ARM — needs mindc 0.3.0 + ARM CI runner.
-- Russian intent classification ≥ 90% top-5 — compute-bound training
-  run, scheduled for v0.2.0.
+- Tier-1 multilingual coverage (12 languages, gated) — compute-bound
+  training run on the merged multilingual corpus; lives in the
+  multilingual workstream (see `spec/quality_targets.md`).
 - Native MIND `mind-train` pipeline — standalone bring-up shippable,
   deep work continues in v0.3.0.
 - Per-head learned drop masks (SOTA-track #5) — depends on

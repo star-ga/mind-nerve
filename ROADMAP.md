@@ -71,7 +71,6 @@ without measurable accuracy impact on agent-CLI request distributions.
 
 **Deferred to Phase 2**:
 
-- Russian intent classification (English-only in Phase 1)
 - ARM, WebGPU, NPU backends (CUDA + CPU only in Phase 1)
 - Native-MIND training pipeline (Phase 1 uses external training framework,
   reads weights into MIND inference)
@@ -98,12 +97,51 @@ moment the matching `mindc` release ships.
 **Exit criteria**:
 
 - All 18 mind-runtime backends pass cross-arch bit-identity tests
-- Russian intent classification at ≥ 90% top-5 accuracy
 - Native-MIND training pipeline; reproducibility on identical
   (corpus, config, seed) tuples
 - codex, gemini, vibe shims merged
 - Per-neuron weight attestation integrated with MindLLM evidence chain
 - Latency p95 ≤ 30 ms on ARM (Apple silicon, Snapdragon)
+- **Tier-1 multilingual coverage** — twelve languages (English, Spanish,
+  Mandarin Simplified, Hindi, Arabic, Portuguese, Russian, Japanese,
+  French, German, Bengali, Korean) each clear the per-language
+  accuracy gates in
+  [`spec/quality_targets.md`](spec/quality_targets.md)
+  §"Multilingual language policy". One language failing fails the ship.
+- **Tier-2 monitoring dashboard** — next 20 languages by speaker count
+  + remaining UN official languages have published per-release eval
+  numbers (no gate; regressions logged).
+- **Tier-3 script floor** — every BPE-encodable language survives a
+  `tokenizer.encode().decode()` round-trip CI gate over the FLORES-200
+  dev set. No language silently breaks.
+
+### Phase 2 multilingual workstream
+
+Splitting the language deliverables from the SOTA-track items so the
+compute budget is honest about what each ship gate costs.
+
+**Tier 1 (gated, twelve languages).** Per-language deliverables:
+1. Held-out intent-labelled eval set (≥ 5,000 requests per language).
+2. Trained reference checkpoint at the current `model_hash` cadence.
+3. CI gate against the language's eval set in `tests/multilingual/`.
+4. Published quality numbers on the model card.
+
+Twelve languages × five-thousand requests is a multi-pod compute
+spend. The expected shape is a single multilingual training run over
+the merged corpus, followed by per-language eval passes; not twelve
+isolated trainings.
+
+**Tier 2 (monitored, ~20 additional languages).** Eval sets exist;
+results are published per release as a dashboard. Regressions logged
+but not blocking.
+
+**Tier 3 (script floor, all other languages).** Tokenizer round-trip
+CI gate over FLORES-200 dev. No model eval; the contract is "no
+language silently breaks at the tokenizer layer."
+
+The 32k BPE vocab from Phase 1 is almost certainly insufficient for
+proper CJK + Devanagari + Arabic-script coverage; expansion to 48-64k
+is a tracked decision in the Phase 2 catalog-builder workstream.
 
 ### Phase 2 accuracy & latency enhancements (SOTA-track)
 

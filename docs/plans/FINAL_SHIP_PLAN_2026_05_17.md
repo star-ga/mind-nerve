@@ -16,7 +16,9 @@ Authoritative scoping output for the FINAL mind-nerve ship — Phase 2 + Phase 3
 | Native MIND inference replacing PyTorch | **BLOCKED** — needs mindc 0.3.0 cdylib emit |
 | p95 ≤ 30 ms on 4-core CPU (native) | **BLOCKED** — needs mindc 0.3.0 |
 | p95 ≤ 30 ms on ARM | **BLOCKED** — needs mindc 0.3.0 + ARM CI runner |
-| Russian intent classification ≥ 90% top-5 | **SHIPPABLE NOW** — compute-bound training run |
+| Tier-1 multilingual coverage (12 languages) | **PARTIAL** — corpus mining + per-language eval sets staged; runs in [[multilingual-workstream]] |
+| Tier-2 monitoring dashboard (~20 languages) | **DEFERRED** — corpus mining staged, dashboard not yet built |
+| Tier-3 script-floor CI (FLORES-200 round-trip) | **SHIPPABLE NOW** — pure CI gate, no compute |
 | Native-MIND training pipeline (`mind-train`) | **PARTIAL** — standalone bring-up shippable; deep work |
 | codex shim | **DONE** |
 | gemini shim | **SHIPPABLE NOW** |
@@ -41,15 +43,18 @@ Authoritative scoping output for the FINAL mind-nerve ship — Phase 2 + Phase 3
 ```
 v0.1.0a13   (current, shipped 2026-05-16)
   ↓
-v0.1.0-beta.1   — Tier 1 (Russian weights, gemini/vibe/claw installers,
-                  evidence verifier hardening, Phase 3 scaffolds)
+v0.1.0-beta.1   — Tier 1 (gemini/vibe/claw installers, evidence
+                  verifier hardening, Phase 3 scaffolds)
   ↓
 v0.2.0-beta.1   — Tier 2 catalog-builder v2
                   (route prior, freq-adaptive scaling, stride thresholds)
                   model_hash bump #1
   ↓
-v0.2.0          — Tier 3 attestation cross-binding + Russian ≥ 90% verified
-                  All Phase 2 SHIPPABLE / PARTIAL items landed
+v0.2.0          — Tier 3 attestation cross-binding (Python public surface)
+                  All Phase 2 SHIPPABLE / PARTIAL items landed.
+                  Multilingual coverage explicitly carved into its own
+                  workstream (see `spec/quality_targets.md`); not gating
+                  this ship.
   ↓
 v0.3.0-beta.1   — Native-MIND training pipeline (mind-train)
                   First locally-reproducible reference checkpoint
@@ -71,7 +76,10 @@ v1.0.0          — Native cdylib inference path (gated mindc 0.3.0)
 - **mind-mem v4 cognitive kernel** — Phase 3 route-history-as-memory-class binding
 - **ARM CI runner** — Apple Silicon or `macos-14-arm64` GitHub runner
 - **rfn-mind Phase 6** — only if `mind-train` defers to rfn-mind's trainer (decoupled by Tier 3 item #10)
-- **Russian training corpus** — 1-2 d GPU pod (terminate after eval)
+- **Multilingual training corpus** — Tier-1 (12 languages) corpus
+  mining + multi-pod GPU run. Tier-2 (~20 languages) staged but not
+  gating any ship. Tier-3 script-floor CI gate ships independently
+  (no compute).
 
 ## Implementation tiers
 

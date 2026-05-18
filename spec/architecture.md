@@ -66,8 +66,11 @@ budget on 4-core x86:
   contributions from both adjacent windows. Reduction is sum (not mean) —
   pinning the reduction order is the compiler's responsibility, not a
   runtime decision (see [`numerics.md`](numerics.md)).
-- Vocabulary: 32k BPE, multilingual base (English + Russian targeted; CJK and
-  others handled by base BPE coverage but not benchmarked in Phase 1).
+- Vocabulary: 32k BPE in Phase 1 (English-only). Phase 2 expands to a
+  multilingual vocab (likely 48-64k) sized to cover the 12 Tier-1
+  languages and the Tier-2 / Tier-3 fallbacks under
+  [`quality_targets.md`](quality_targets.md) §"Multilingual language
+  policy". Per-language eval gates are tracked there.
 
 ### Weight storage discipline
 
@@ -437,10 +440,7 @@ These are explicitly unresolved and will be answered by Phase 1 implementation:
    sliding-window receptive field at calibrated accuracy targets, or
    whether 3-4 layers become necessary on long requests where intent
    depends on cross-window context
-2. Whether 32k BPE vocabulary is sufficient for Russian intent classification,
-   or whether a 48k vocabulary becomes necessary at the cost of embedding
-   table size
-3. Whether the route embedding table benefits from frozen vs trainable
+2. Whether the route embedding table benefits from frozen vs trainable
    embeddings at scale (1000+ routes vs 100 routes)
 4. Whether attestation envelope SHA-256 dominates p99 latency at large
    catalog sizes (10,000+ routes) and needs a hash cache

@@ -502,12 +502,12 @@ First private alpha tag. Phase 1 (Python-side inference) is complete; Phase 2 (n
 - **MCP server façade** — stdio JSON-RPC, exposes `mind_nerve_route` tool to any MCP-capable client.
 - **17-CLI installer** — MCP-first (`claude-code`, `claude-desktop`, `cursor`, `codex`) + `claude-code-hook` fallback + 10 stub adapters for vendor CLIs that don't speak MCP yet.
 - **Discovery layer** — `scan()`, `Watcher`, `add_route()` with license-gated ingest (refuses `commercial_risk`, requires `--include-unknown` for unknown-license sources).
-- **Protected runtime shell** — `libmindnerve.so` (51 KB) bundled in the wheel; 8 FORTRESS C-side primitives (`mindnerve_protection_init`, `mindnerve_heartbeat`, `mindnerve_auth_challenge`, `mindnerve_auth_verify`, `mindnerve_auth_is_verified`, `mindnerve_is_protected`, `mindnerve_get_version`, `mindnerve_shutdown_protection`). Build pipeline + protection sources live in private `star-ga/mind-nerve-protected`.
+- **Bundled runtime component** — `libmindnerve.so` ships inside the wheel. Source lives outside this repository under a separate STARGA agreement; the wheel goes through an automated leak-verifier before release.
 
 ### Security
-- Public mind-nerve repo history scrubbed of proprietary protection sources via `git filter-repo` on 2026-05-16. The FORTRESS toolchain (846-line `protection.mind`, 1199-line `protection.c`, build pipeline, exports.map, verify_leak.sh) lives only in the private sibling repo and never enters this tree.
+- Public mind-nerve repo history scrubbed of non-public build artefacts via `git filter-repo` on 2026-05-16. The build pipeline and runtime-component sources live outside this tree.
 - `.gitignore` hardened to block re-introduction of `protected-build/`, `dist/`, `*.so`, `*.dylib`, `*.dll`.
-- Shipped `libmindnerve.so` passes 7-check leak verifier: 8 expected exports, no STARGA-private markers, no developer-machine paths, no API-key fingerprints, no embedded MIND source / mindc-getter symbols, `.comment` is the STARGA toolchain stamp only, and `ptrace` is referenced (anti-debug present).
+- Each release of the wheel passes an automated leak verifier covering: expected export surface, no developer-machine paths, no credential fingerprints, no embedded compiler-getter symbols, and the `.comment` section is the STARGA toolchain stamp only.
 
 ### Known limitations
 - Inference path runs Python-side (PyTorch via the wheel). Native MIND Q16.16 inference is Phase 2.

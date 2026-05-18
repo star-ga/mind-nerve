@@ -18,31 +18,32 @@ You may use, modify, and distribute this code and these weights, including
 in commercial products, subject to the terms of the Apache 2.0 license. A
 copy is available at <https://www.apache.org/licenses/LICENSE-2.0>.
 
-## STARGA Commercial Terms — applies to `libmindnerve.so` and STARGA-private weights
+## Bundled binary component — separately licensed
 
-The Python wheel `mind-nerve` bundles `libmindnerve.so`, a FORTRESS-protected
-runtime component. The protected binary is the Phase-2 native inference layer.
-Its source is not distributed and is licensed under STARGA Commercial terms;
-the Phase-1 PyTorch path published here does not depend on it.
+The Python wheel `mind-nerve` bundles `libmindnerve.so`, a compiled runtime
+component whose source is not part of this repository and is not distributed
+under Apache 2.0. The bundled binary remains the property of STARGA Inc.
+and is licensed for use as part of the Apache-2.0 wheel surface only;
+redistribution of the binary outside that wheel is not granted by this
+LICENSE. The Phase-1 PyTorch inference path published here works without
+that binary.
 
-Future weights produced from STARGA-private training corpora (for example,
-weights tuned on internal customer skill catalogs) are not Apache-2.0 and are
-distributed, if at all, under separate STARGA Commercial agreements. Such
-weights are clearly labelled at release time; the Phase-1 v1.1-oss weights
-described above are Apache.
+Weights produced from non-public training corpora may be released under
+separate STARGA agreements rather than Apache 2.0; such weights are clearly
+labelled at release time. The Phase-1 `v1.1-oss` weights referenced above
+are Apache.
 
-Independently trained weights produced by third parties using this Apache-2.0
-architecture are not constrained by these terms.
+Independently trained weights produced by third parties using this
+Apache-2.0 architecture are not constrained by these terms.
 
-For commercial deployments needing per-customer FORTRESS-locked builds of the
-runtime layer, contact `license@star.ga`.
+For commercial enquiries, contact `license@star.ga`.
 
 ## Patent grant
 
 The Apache 2.0 license includes an express patent grant covering contributions
 made to this repository and to the Apache-licensed Phase-1 weights. That grant
-does not extend to the protected `libmindnerve.so` binary or to STARGA-private
-weights produced from internal training corpora.
+does not extend to the bundled `libmindnerve.so` binary or to weights
+released under separate STARGA agreements.
 
 ## Trademark
 

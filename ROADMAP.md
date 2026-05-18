@@ -38,10 +38,10 @@ Three blockers were raised 2026-05-14. Status after the Phase 1 alpha sprint:
    is allowed to remain external until Phase 2's native-MIND trainer
    (`mind-train`) is built.
 3. **Wire MIND with protected libs — DONE.** `libmindnerve.so` ships
-   bundled inside the wheel at 51,280 bytes with 8 FORTRESS C-side
-   primitives. The build pipeline + 846-line `protection.mind` + 1199-line
-   `protection.c` live in the private `star-ga/mind-nerve-protected`
-   sibling repo. Public surface passes a 7-check leak verifier.
+   bundled inside the wheel. The build pipeline and protection sources
+   live in a private sibling toolchain repo maintained by STARGA and
+   not part of this public surface; the public wheel passes an automated
+   leak-verifier before each release.
 
 **Release status (2026-05-18):** `v0.2.0` is the current PyPI public,
 `v0.3.0-beta.1` is tagged + GitHub-released with the wheel built locally

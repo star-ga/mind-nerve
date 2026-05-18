@@ -263,14 +263,13 @@ mind-nerve/
 
 mind-nerve ships under **Apache-2.0** — repository, Python wheel, and the
 Phase-1 trained weights on Hugging Face all carry the same license. The wheel
-additionally bundles `libmindnerve.so`, a FORTRESS-protected runtime
-component whose source remains private under STARGA Commercial terms. The
-protected binary is the future Phase-2 native inference layer; the Phase-1
-PyTorch path does not depend on it.
+additionally bundles `libmindnerve.so`, a compiled runtime component whose
+source is not part of this repository and is not distributed under Apache
+2.0. The Phase-1 PyTorch path does not depend on it.
 
-For commercial deployments needing per-customer FORTRESS-locked builds of
-the runtime layer, contact [`license@star.ga`](mailto:license@star.ga). See
-[`LICENSE.md`](LICENSE.md) for the full split.
+For commercial enquiries, contact
+[`license@star.ga`](mailto:license@star.ga). See
+[`LICENSE.md`](LICENSE.md) for the full text.
 
 ## Citation
 

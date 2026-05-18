@@ -282,7 +282,7 @@ If mind-nerve helps your work, a citation is appreciated:
   title   = {mind-nerve: Intent-classification preselector for agent runtimes},
   year    = {2026},
   url     = {https://github.com/star-ga/mind-nerve},
-  version = {0.2.0-beta.1}
+  version = {0.2.0}
 }
 ```
 

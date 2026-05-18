@@ -93,6 +93,102 @@ def cmd_learn(args) -> int:
     return 0
 
 
+def cmd_attest_sign(args) -> int:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+    from .attestation import binding_message, serialize_binding_record, sign_binding
+
+    try:
+        mn = bytes.fromhex(args.mind_nerve_hash)
+        ml = bytes.fromhex(args.mindllm_hash)
+        nonce = bytes.fromhex(args.nonce)
+        sk = bytes.fromhex(args.private_key_hex)
+    except ValueError as e:
+        print(json.dumps({"error": f"hex decode: {e}"}), file=sys.stderr)
+        return 2
+
+    if len(sk) != 32:
+        print(json.dumps({"error": "private key must be 32 bytes hex"}), file=sys.stderr)
+        return 2
+
+    private_key = Ed25519PrivateKey.from_private_bytes(sk)
+    pub_bytes = private_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    msg = binding_message(mn, ml, nonce)
+    sig = sign_binding(private_key, msg)
+    record = serialize_binding_record(mn, ml, nonce, sig, pub_bytes)
+    print(
+        json.dumps(
+            {
+                "record_hex": record.hex(),
+                "record_bytes": len(record),
+                "signer_pubkey_hex": pub_bytes.hex(),
+                "binding_msg_hex": msg.hex(),
+            },
+            indent=2 if args.indent else None,
+            separators=None if args.indent else (",", ":"),
+        )
+    )
+    return 0
+
+
+def cmd_attest_verify(args) -> int:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+    from .attestation import application_verify_binding, deserialize_binding_record
+
+    try:
+        wire = bytes.fromhex(args.record_hex)
+    except ValueError as e:
+        print(json.dumps({"error": f"hex decode: {e}"}), file=sys.stderr)
+        return 2
+
+    try:
+        rec = deserialize_binding_record(wire)
+    except ValueError as e:
+        print(json.dumps({"result": "ParseError", "error": str(e)}, separators=(",", ":")))
+        return 1
+
+    trust_anchor = args.pubkey_hex
+    if trust_anchor:
+        try:
+            anchor_bytes = bytes.fromhex(trust_anchor)
+        except ValueError as e:
+            print(json.dumps({"error": f"hex decode: {e}"}), file=sys.stderr)
+            return 2
+        if anchor_bytes != rec.signer_pubkey:
+            print(
+                json.dumps(
+                    {"result": "UntrustedSigner", "record_pubkey": rec.signer_pubkey.hex()},
+                    separators=(",", ":"),
+                )
+            )
+            return 1
+        pubkey_bytes = anchor_bytes
+    else:
+        pubkey_bytes = rec.signer_pubkey
+
+    public_key = Ed25519PublicKey.from_public_bytes(pubkey_bytes)
+    result = application_verify_binding(
+        rec.mind_nerve_hash, rec.mindllm_hash, rec.nonce, rec.signature, public_key
+    )
+    print(
+        json.dumps(
+            {
+                "result": result,
+                "mind_nerve_hash": rec.mind_nerve_hash.hex(),
+                "mindllm_hash": rec.mindllm_hash.hex(),
+                "nonce": rec.nonce.hex(),
+                "signer_pubkey": rec.signer_pubkey.hex(),
+                "version": rec.version,
+            },
+            indent=2 if args.indent else None,
+            separators=None if args.indent else (",", ":"),
+        )
+    )
+    return 0 if result == "ok" else 1
+
+
 def cmd_watch(args) -> int:
     dirs = [(d, args.source or "local") for d in args.dirs]
     w = Watcher(
@@ -184,6 +280,36 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_learn.add_argument("--dry-run", action="store_true")
     p_learn.set_defaults(func=cmd_learn)
+
+    p_attest = sub.add_parser(
+        "attest", help="MindLLM cross-binding handshake (sign/verify BindingRecords)"
+    )
+    attest_sub = p_attest.add_subparsers(dest="attest_cmd", required=True)
+
+    p_sign = attest_sub.add_parser("sign", help="Produce a 200-byte BindingRecord (hex)")
+    p_sign.add_argument("--mind-nerve-hash", required=True, help="SHA-256 manifest aggregate (hex)")
+    p_sign.add_argument("--mindllm-hash", required=True, help="MindLLM manifest aggregate (hex)")
+    p_sign.add_argument("--nonce", required=True, help="Caller-supplied 32-byte nonce (hex)")
+    p_sign.add_argument(
+        "--private-key-hex",
+        required=True,
+        help="Ed25519 32-byte private key seed (hex). Treat as secret.",
+    )
+    p_sign.add_argument("--indent", action="store_true", help="Pretty-print JSON output")
+    p_sign.set_defaults(func=cmd_attest_sign)
+
+    p_verify = attest_sub.add_parser(
+        "verify", help="Verify a 200-byte BindingRecord. Exit 0 if 'ok', else non-zero."
+    )
+    p_verify.add_argument("--record-hex", required=True, help="200-byte BindingRecord (hex)")
+    p_verify.add_argument(
+        "--pubkey-hex",
+        default=None,
+        help="Optional trust-anchor Ed25519 pubkey (hex). If supplied, the "
+        "embedded signer_pubkey MUST match it or the result is UntrustedSigner.",
+    )
+    p_verify.add_argument("--indent", action="store_true", help="Pretty-print JSON output")
+    p_verify.set_defaults(func=cmd_attest_verify)
 
     p_watch = sub.add_parser(
         "watch", help="Daemon: poll one or more dirs for new skills (no inotify dep)"

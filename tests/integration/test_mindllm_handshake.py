@@ -25,91 +25,25 @@ import struct
 from typing import Any
 
 import pytest
-from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
     Ed25519PublicKey,
 )
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
-# ---------------------------------------------------------------------------
-# Pure-Python reference implementations of the handshake spec primitives.
-# These mirror the MIND-language definitions in
-# integrations/mindllm_attestation.mind and serve as the Python-side
-# conformance reference.
-# ---------------------------------------------------------------------------
-
-def binding_message(
-    mind_nerve_hash: bytes,
-    mindllm_hash: bytes,
-    nonce: bytes,
-) -> bytes:
-    """SHA-256(mind_nerve_hash ++ mindllm_hash ++ nonce) — 96-byte preimage."""
-    assert len(mind_nerve_hash) == 32
-    assert len(mindllm_hash) == 32
-    assert len(nonce) == 32
-    preimage = mind_nerve_hash + mindllm_hash + nonce
-    return hashlib.sha256(preimage).digest()
-
-
-def sign_binding(private_key: Ed25519PrivateKey, msg: bytes) -> bytes:
-    """Ed25519 sign per RFC 8032. Returns 64-byte signature."""
-    return private_key.sign(msg)
-
-
-def verify_binding(
-    public_key: Ed25519PublicKey,
-    mind_nerve_hash: bytes,
-    mindllm_hash: bytes,
-    nonce: bytes,
-    signature: bytes,
-) -> bool:
-    """Return True iff the signature is valid for the binding message."""
-    msg = binding_message(mind_nerve_hash, mindllm_hash, nonce)
-    try:
-        public_key.verify(signature, msg)
-        return True
-    except InvalidSignature:
-        return False
-
-
-def serialize_binding_record(
-    mind_nerve_hash: bytes,
-    mindllm_hash: bytes,
-    nonce: bytes,
-    signature: bytes,
-    signer_pubkey_bytes: bytes,
-) -> bytes:
-    """Pack a BindingRecord to the 200-byte wire format.
-
-    Wire layout (from integrations/mindllm_attestation.mind §SERIALIZATION):
-      4   magic "MNBA"
-      2   version u16 LE = 1
-      2   reserved = 0
-     32   mind_nerve_hash
-     32   mindllm_hash
-     32   nonce
-     64   signature
-     32   signer_pubkey
-    ---
-    200 bytes total
-    """
-    magic = b"MNBA"
-    version = struct.pack("<H", 1)
-    reserved = b"\x00\x00"
-    record = (
-        magic
-        + version
-        + reserved
-        + mind_nerve_hash
-        + mindllm_hash
-        + nonce
-        + signature
-        + signer_pubkey_bytes
-    )
-    assert len(record) == 200, f"serialized binding must be 200 bytes, got {len(record)}"
-    return record
-
+# The handshake primitives live in the public mind_nerve.attestation module;
+# importing them here keeps the tests as the conformance reference for the
+# published Python surface.
+from mind_nerve.attestation import (
+    application_verify_binding as _application_verify_binding,
+)
+from mind_nerve.attestation import (
+    binding_message,
+    deserialize_binding_record,
+    serialize_binding_record,
+    sign_binding,
+    verify_binding,
+)
 
 # ---------------------------------------------------------------------------
 # Test fixture: deterministic key pair from a fixed seed.
@@ -117,6 +51,7 @@ def serialize_binding_record(
 # ---------------------------------------------------------------------------
 
 _TEST_SEED = b"mind-nerve-test-vector-seed-v1.0"  # 32 bytes
+
 
 def _make_test_keypair() -> tuple[Ed25519PrivateKey, Ed25519PublicKey]:
     """Derive a deterministic Ed25519 key pair from the fixed test seed."""
@@ -137,6 +72,7 @@ _NONCE: bytes = hashlib.sha256(b"test-nonce-value-1234").digest()
 # H1: binding_message is deterministic
 # ---------------------------------------------------------------------------
 
+
 def test_binding_message_deterministic() -> None:
     """Two calls with identical inputs produce the same 32-byte digest."""
     msg1 = binding_message(_MIND_NERVE_HASH, _MINDLLM_HASH, _NONCE)
@@ -149,10 +85,11 @@ def test_binding_message_deterministic() -> None:
 # H2: binding_message is non-trivially injective on inputs
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.parametrize("altered_field", ["mind_nerve", "mindllm", "nonce"])
 def test_binding_message_changes_on_input_change(altered_field: str) -> None:
     """Changing any single input changes the digest."""
-    alt = bytes(b ^ 0xFF for b in (b"\xAB" * 32))
+    alt = bytes(b ^ 0xFF for b in (b"\xab" * 32))
 
     kwargs: dict[str, bytes] = {
         "mind_nerve_hash": _MIND_NERVE_HASH,
@@ -174,6 +111,7 @@ def test_binding_message_changes_on_input_change(altered_field: str) -> None:
 # H3: full round-trip sign -> verify
 # ---------------------------------------------------------------------------
 
+
 def test_binding_sign_verify_roundtrip() -> None:
     """Sign a binding message with the test private key; verify with public key."""
     msg = binding_message(_MIND_NERVE_HASH, _MINDLLM_HASH, _NONCE)
@@ -193,6 +131,7 @@ def test_binding_sign_verify_roundtrip() -> None:
 # H4: corrupted signature is rejected
 # ---------------------------------------------------------------------------
 
+
 def test_binding_corrupted_signature_rejected() -> None:
     """Flip a single bit in the signature; verification must fail."""
     msg = binding_message(_MIND_NERVE_HASH, _MINDLLM_HASH, _NONCE)
@@ -211,6 +150,7 @@ def test_binding_corrupted_signature_rejected() -> None:
 # ---------------------------------------------------------------------------
 # H5: altered model hash in the record is rejected
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.parametrize("which_hash", ["mind_nerve", "mindllm"])
 def test_binding_altered_hash_rejected(which_hash: str) -> None:
@@ -239,6 +179,7 @@ def test_binding_altered_hash_rejected(which_hash: str) -> None:
 # H6: altered nonce in the record is rejected
 # ---------------------------------------------------------------------------
 
+
 def test_binding_altered_nonce_rejected() -> None:
     """Flip the last byte of the nonce; verification must fail."""
     msg = binding_message(_MIND_NERVE_HASH, _MINDLLM_HASH, _NONCE)
@@ -259,6 +200,7 @@ def test_binding_altered_nonce_rejected() -> None:
 # ---------------------------------------------------------------------------
 # H7: all-zero model hash is semantically rejected
 # ---------------------------------------------------------------------------
+
 
 def test_binding_zero_model_hash_rejected() -> None:
     """A ZeroField guard: verify_binding must reject all-zero mind_nerve_hash."""
@@ -282,41 +224,45 @@ def test_binding_zero_model_hash_rejected() -> None:
     assert result == "ZeroField", "all-zero model hash must trigger ZeroField rejection"
 
 
-def _application_verify_binding(
-    mind_nerve_hash: bytes,
-    mindllm_hash: bytes,
-    nonce: bytes,
-    signature: bytes,
-    public_key: Ed25519PublicKey,
-) -> str:
-    """Application-level verify that includes the ZeroField guard from the spec."""
-    if mind_nerve_hash == bytes(32):
-        return "ZeroField"
-    if mindllm_hash == bytes(32):
-        return "ZeroField"
-    if nonce == bytes(32):
-        return "ZeroField"
-    if signature == bytes(64):
-        return "ZeroField"
-    ok = verify_binding(public_key, mind_nerve_hash, mindllm_hash, nonce, signature)
-    return "ok" if ok else "SignatureInvalid"
+def test_deserialize_binding_record_round_trip() -> None:
+    """serialize -> deserialize -> serialize is byte-identical."""
+    msg = binding_message(_MIND_NERVE_HASH, _MINDLLM_HASH, _NONCE)
+    sig = sign_binding(_PRIVATE_KEY, msg)
+    wire = serialize_binding_record(_MIND_NERVE_HASH, _MINDLLM_HASH, _NONCE, sig, _PUBLIC_KEY_BYTES)
+    rec = deserialize_binding_record(wire)
+    assert rec.mind_nerve_hash == _MIND_NERVE_HASH
+    assert rec.mindllm_hash == _MINDLLM_HASH
+    assert rec.nonce == _NONCE
+    assert rec.signature == sig
+    assert rec.signer_pubkey == _PUBLIC_KEY_BYTES
+    assert rec.to_bytes() == wire
+
+
+def test_deserialize_binding_record_rejects_bad_magic() -> None:
+    """A corrupt magic prefix raises ValueError early."""
+    wire = bytearray(200)
+    wire[:4] = b"XXXX"
+    with pytest.raises(ValueError, match="magic mismatch"):
+        deserialize_binding_record(bytes(wire))
+
+
+def test_deserialize_binding_record_rejects_short_buffer() -> None:
+    with pytest.raises(ValueError, match="must be 200 bytes"):
+        deserialize_binding_record(b"\x00" * 100)
 
 
 # ---------------------------------------------------------------------------
 # H8: serialize_binding is deterministic
 # ---------------------------------------------------------------------------
 
+
 def test_serialize_binding_deterministic() -> None:
     """Two serialization calls with the same record produce identical bytes."""
     msg = binding_message(_MIND_NERVE_HASH, _MINDLLM_HASH, _NONCE)
     sig = sign_binding(_PRIVATE_KEY, msg)
 
-    rec1 = serialize_binding_record(
-        _MIND_NERVE_HASH, _MINDLLM_HASH, _NONCE, sig, _PUBLIC_KEY_BYTES
-    )
-    rec2 = serialize_binding_record(
-        _MIND_NERVE_HASH, _MINDLLM_HASH, _NONCE, sig, _PUBLIC_KEY_BYTES
-    )
+    rec1 = serialize_binding_record(_MIND_NERVE_HASH, _MINDLLM_HASH, _NONCE, sig, _PUBLIC_KEY_BYTES)
+    rec2 = serialize_binding_record(_MIND_NERVE_HASH, _MINDLLM_HASH, _NONCE, sig, _PUBLIC_KEY_BYTES)
     assert rec1 == rec2, "serialize_binding must be byte-identical across calls"
 
 
@@ -324,20 +270,20 @@ def test_serialize_binding_deterministic() -> None:
 # H9: serialize_binding output is exactly 200 bytes
 # ---------------------------------------------------------------------------
 
+
 def test_serialize_binding_size() -> None:
     """Serialized BindingRecord is exactly 200 bytes."""
     msg = binding_message(_MIND_NERVE_HASH, _MINDLLM_HASH, _NONCE)
     sig = sign_binding(_PRIVATE_KEY, msg)
 
-    rec = serialize_binding_record(
-        _MIND_NERVE_HASH, _MINDLLM_HASH, _NONCE, sig, _PUBLIC_KEY_BYTES
-    )
+    rec = serialize_binding_record(_MIND_NERVE_HASH, _MINDLLM_HASH, _NONCE, sig, _PUBLIC_KEY_BYTES)
     assert len(rec) == 200
 
 
 # ---------------------------------------------------------------------------
 # H10: manifest_export determinism (Python reference)
 # ---------------------------------------------------------------------------
+
 
 def _build_manifest_json(
     tensors: list[dict[str, Any]],
@@ -394,8 +340,8 @@ def test_manifest_export_deterministic_python() -> None:
     entry = (
         struct.pack("<I", len(name))
         + name
-        + struct.pack("<II", 4, 4)          # rows=4, cols=4
-        + bytes.fromhex(neuron_hash)         # 32-byte neuron_hash
+        + struct.pack("<II", 4, 4)  # rows=4, cols=4
+        + bytes.fromhex(neuron_hash)  # 32-byte neuron_hash
     )
     preimage = b"MNPM" + struct.pack("<I", 1) + entry
     aggregate_hex = hashlib.sha256(preimage).hexdigest()

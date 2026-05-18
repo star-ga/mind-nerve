@@ -2,9 +2,41 @@
 
 All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased] — v0.2.0 preparation
+## [Unreleased] — v0.3.0 preparation
 
 (empty — next release in this slot)
+
+## [0.2.0] — 2026-05-17
+
+### Added — Tier 3 attestation cross-binding (public Python surface)
+
+- **New `mind_nerve.attestation` module.** Publishes the MindLLM
+  cross-binding handshake primitives as stable Python API:
+  `binding_message`, `sign_binding`, `verify_binding`,
+  `application_verify_binding` (with ZeroField guard),
+  `serialize_binding_record`, `deserialize_binding_record`,
+  `manifest_export_bytes`, `neuron_hash_hex`, and a frozen
+  `BindingRecord` dataclass. Mirrors `integrations/mindllm_attestation.mind`
+  exactly — same wire format (200 bytes, magic `MNBA`, version 1),
+  same Ed25519 over `SHA-256(mind_nerve ‖ mindllm ‖ nonce)`.
+- **New `mind-nerve attest` CLI subcommand.**
+  - `mind-nerve attest sign --mind-nerve-hash HEX --mindllm-hash HEX
+    --nonce HEX --private-key-hex HEX` → prints the 200-byte
+    `BindingRecord` as JSON `{record_hex, signer_pubkey_hex,
+    binding_msg_hex}`.
+  - `mind-nerve attest verify --record-hex HEX [--pubkey-hex HEX]`
+    → exits 0 on `result == "ok"`, non-zero otherwise. Optional
+    `--pubkey-hex` enforces a trust anchor.
+- **Refactored tests.** `tests/integration/test_mindllm_handshake.py`
+  now imports the public module instead of inlining reference
+  primitives, so the published Python surface IS the contract. Added
+  3 new invariants (round-trip, magic mismatch, short buffer).
+
+### Note — Russian-intent ≥ 90% top-5
+
+- Verification of the Russian-intent target remains deferred to the
+  compute-bound training run (1-2 day GPU pod). Tier 3 closes the
+  attestation surface; the accuracy gate sits in the next ship.
 
 ## [0.2.0-beta.1] — 2026-05-17
 

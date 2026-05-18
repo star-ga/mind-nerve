@@ -101,6 +101,14 @@ runtime libraries that mind-nerve's Phase-2 Q16.16 native encoder will
 build on top of.  Compile-speed gate clean (small_matmul -2.24% /
 medium_mlp -1.95% / large_network -0.61%) — the IP moat held.
 
+**`mindc` 0.4.1 landed 2026-05-18** — RFC 0005 **Phase B** (per-arg
+signature matching) closes the v0.4.0 deferred loose-end.  Imported
+`pub fn` calls under `use std.foo` now validate arity + per-arg types
+against the imported declaration and return the declared return type
+(falling back to Phase-A loose typing for `export { ... }`-block
+donors).  Bench gate clean against the new
+`.bench-baseline-2026-05-18-rfc0005.txt` floor.
+
 | Task | Blocker | mindc milestone | Status |
 |---|---|---|---|
 | Cross-arch bit-identity (x86-CPU vs CUDA) | `pub fn` → C symbol export so the native MIND inference kernel is callable as a `cdylib` | **0.2.6** — `pub fn`-to-C, `[exports]`, `--profile` flag | **mindc-side SHIPPED** (RFC 0002 D2–D5 in `0a408e3`, `_v1` ABI lock in `de6cf18`, RFC 0003 cdylib seam). mind-nerve-side validation (mindc CUDA build + bit-identical SHA) still pending hardware — task #57 stays open. |

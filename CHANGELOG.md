@@ -4,7 +4,24 @@ All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](htt
 
 ## [Unreleased] — v0.3.0 preparation
 
-(empty — next release in this slot)
+### Added — Tier-3 script-floor CI gate (multilingual policy)
+
+- `tests/python/test_tier3_script_floor.py` enforces the Tier-3
+  contract from `spec/quality_targets.md` §"Multilingual language
+  policy": the byte-level tokenizer round-trips losslessly
+  (`decode(encode(x)) == x`) for every script, so no language
+  silently breaks at the tokenizer layer. 42 checks across a
+  UDHR-Article-1 / FLORES-200-proxy corpus covering Latin, Cyrillic,
+  Han (Simplified), Japanese, Hangul, Devanagari, Bengali, Arabic,
+  Greek, Hebrew, Thai, Tamil, Telugu + emoji / combining-mark /
+  mixed-script edge cases.
+- Hermetic: a pure-Python reference of the exact GPT-2 / `ByteLevel`
+  byte↔unicode bijection. No torch / tokenizers / network — runs in
+  CI's `tests` job (`pytest tests/python`) in ~0.2 s.
+- Includes a structural bijection proof over all 256 byte values
+  (guarantees *any* UTF-8 language round-trips, not only the sampled
+  ones) and a corpus-coverage guard so the fixture cannot silently
+  lose a required script.
 
 ## [0.3.0-beta.1] — 2026-05-17
 

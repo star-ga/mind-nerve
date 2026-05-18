@@ -89,9 +89,17 @@ without measurable accuracy impact on agent-CLI request distributions.
 **Deferred to Phase 2 — gated on `mindc` toolchain** (status 2026-05-18):
 
 These exit criteria from the original Phase-1 list are sequenced behind
-the `mindc` 0.2.6 / 0.3.0 milestones in the STARGA ecosystem roadmap. The
-Phase-1 alpha ships without them by design; PyTorch covers the inference
-path until the native cdylib path lands.
+the `mindc` 0.2.6 / 0.3.0 / **0.4.0** milestones in the STARGA ecosystem
+roadmap. The Phase-1 alpha ships without them by design; PyTorch covers
+the inference path until the native cdylib path lands.
+
+**`mindc` 0.4.0 landed 2026-05-18** — RFC 0005 Phase 2 fully shipped:
+`std/vec.mind`, `std/string.mind`, `std/map.mind`, `std/io.mind` (the
+four pure-MIND collections + I/O on the seven `__mind_*` intrinsics)
+plus `use std.foo` cross-module resolution.  This unblocks pure-MIND
+runtime libraries that mind-nerve's Phase-2 Q16.16 native encoder will
+build on top of.  Compile-speed gate clean (small_matmul -2.24% /
+medium_mlp -1.95% / large_network -0.61%) — the IP moat held.
 
 | Task | Blocker | mindc milestone | Status |
 |---|---|---|---|

@@ -176,6 +176,34 @@ class _Runtime:
         else:
             self.log_prior = None
 
+        # Catalog v2 (SOTA-track #4): optional per-route frequency-adaptive
+        # scale column. Multiplies each L2-normalized embedding row in
+        # place at load — zero runtime cost. Rare routes get higher scale,
+        # common routes get lower scale (floor 0.5), addressing the long-
+        # tail drown-out problem. Absent file = unchanged v1 behavior.
+        freq_path = runtime_dir / "route_table_freq_scale.npy"
+        if freq_path.exists():
+            freq_scale = np.load(freq_path).astype(np.float32)
+            if freq_scale.shape != (self.embeddings.shape[0],):
+                raise RuntimeError(
+                    f"Route freq_scale shape mismatch: expected ({self.embeddings.shape[0]},), "
+                    f"got {freq_scale.shape}"
+                )
+            self.embeddings = (self.embeddings * freq_scale[:, None]).astype(np.float32)
+            self.freq_scale: "np.ndarray | None" = freq_scale
+        else:
+            self.freq_scale = None
+
+        # Catalog v2 (SOTA-track #3): optional entropy → stride threshold
+        # table. Consumed by the native-MIND windowed encoder once mindc
+        # 0.3.0 cdylib lands; in the Phase 1 sentence-transformers path
+        # it's load-only metadata for forward compatibility.
+        stride_path = runtime_dir / "stride_thresholds.json"
+        if stride_path.exists():
+            self.stride_thresholds: "dict | None" = json.loads(stride_path.read_text())
+        else:
+            self.stride_thresholds = None
+
     @property
     def catalog_size(self) -> int:
         return len(self.routes)
@@ -262,6 +290,8 @@ def precompute_routes(
     catalog_path: str | None = None,
     cooccurrence_path: str | None = None,
     emit_prior: bool = False,
+    emit_freq_scale: bool = False,
+    emit_stride_thresholds: bool = False,
 ) -> dict[str, Any]:
     """Encode every catalog item and write route_table.npy + .jsonl.
 
@@ -275,6 +305,20 @@ def precompute_routes(
     co-occurrence stats the priors default to ``log(2) ≈ 0.693`` per route
     (uniform Laplace prior), making the file behaviorally a no-op until
     real frequency data is available.
+
+    Catalog-v2 (SOTA-track #4): when ``emit_freq_scale=True`` or a
+    ``cooccurrence_path`` is provided, also emit
+    ``route_table_freq_scale.npy`` with one ``float32`` scalar per route
+    equal to ``max(1/sqrt(freq), 0.5)`` (Laplace-smoothed). The runtime
+    multiplies each embedding row by this scale at load time. With no
+    co-occurrence stats every scale defaults to ``1.0`` (raw_count=0 →
+    freq=1 → 1/sqrt(1)=1), which is behaviorally identical to v1.
+
+    Catalog-v2 (SOTA-track #3): when ``emit_stride_thresholds=True`` also
+    emit ``stride_thresholds.json`` with a calibrated entropy → stride map
+    consumed by the native-MIND windowed encoder once mindc 0.3.0 lands.
+    The Phase-1 sentence-transformers path ignores this file; emit is
+    forward-compatible bookkeeping.
     """
     import math
 
@@ -325,23 +369,26 @@ def precompute_routes(
         "bytes_jsonl": (rdir / "route_table.jsonl").stat().st_size,
     }
 
+    # Catalog-v2: load co-occurrence counts once; reused by prior +
+    # freq_scale emit paths. Empty dict when no log provided.
+    counts: dict[str, int] = {}
+    if cooccurrence_path is not None:
+        with open(cooccurrence_path, "r", encoding="utf-8") as cf:
+            for line in cf:
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                rid = obj.get("route_id")
+                if rid is None:
+                    continue
+                counts[rid] = counts.get(rid, 0) + int(obj.get("count", 1))
+
     # Catalog-v2: optional log-prior column. Drop the file even when no
     # co-occurrence stats are provided so installers can ship a v2 runtime
     # by default; the uniform prior is behaviorally identical to v1
     # scoring until real frequency data lands.
     if emit_prior or cooccurrence_path is not None:
-        counts: dict[str, int] = {}
-        if cooccurrence_path is not None:
-            with open(cooccurrence_path, "r", encoding="utf-8") as cf:
-                for line in cf:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    obj = json.loads(line)
-                    rid = obj.get("route_id")
-                    if rid is None:
-                        continue
-                    counts[rid] = counts.get(rid, 0) + int(obj.get("count", 1))
         # Laplace smoothing: freq_r = raw_count + 1, log_prior = log(1+freq_r).
         log_prior = np.empty(len(items), dtype=np.float32)
         for i, item in enumerate(items):
@@ -351,5 +398,38 @@ def precompute_routes(
         np.save(prior_path, log_prior)
         result["bytes_prior"] = prior_path.stat().st_size
         result["prior_uniform"] = cooccurrence_path is None
+
+    # Catalog-v2 (SOTA-track #4): per-route freq-adaptive scale column.
+    # scale = max(1/sqrt(freq), 0.5) with freq = raw_count + 1 (Laplace).
+    # Floor at 0.5 caps the de-emphasis of very common routes.
+    if emit_freq_scale or cooccurrence_path is not None:
+        freq_scale = np.empty(len(items), dtype=np.float32)
+        for i, item in enumerate(items):
+            raw = counts.get(item.get("name", ""), 0)
+            freq = raw + 1
+            freq_scale[i] = float(max(1.0 / math.sqrt(freq), 0.5))
+        freq_path = rdir / "route_table_freq_scale.npy"
+        np.save(freq_path, freq_scale)
+        result["bytes_freq_scale"] = freq_path.stat().st_size
+        result["freq_scale_uniform"] = cooccurrence_path is None
+
+    # Catalog-v2 (SOTA-track #3): entropy → stride threshold table.
+    # Defaults chosen so widest stride covers the common low-entropy
+    # CLI commands; tightest stride reserved for multi-clause queries.
+    if emit_stride_thresholds:
+        stride_table = {
+            "schema_version": 1,
+            "feature": "token_entropy_first16",
+            "breakpoints": [
+                {"max_entropy": 0.4, "stride": 256},
+                {"max_entropy": 0.7, "stride": 192},
+                {"max_entropy": None, "stride": 96},
+            ],
+            "default_stride": 192,
+            "calibration": "default-uncalibrated",
+        }
+        stride_path = rdir / "stride_thresholds.json"
+        stride_path.write_text(json.dumps(stride_table, indent=2))
+        result["bytes_stride_thresholds"] = stride_path.stat().st_size
 
     return result

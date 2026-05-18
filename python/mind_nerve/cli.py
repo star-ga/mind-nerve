@@ -72,6 +72,10 @@ def cmd_precompute(args) -> int:
         kwargs["cooccurrence_path"] = args.cooccurrence
     if args.emit_prior:
         kwargs["emit_prior"] = True
+    if args.emit_freq_scale:
+        kwargs["emit_freq_scale"] = True
+    if args.emit_stride_thresholds:
+        kwargs["emit_stride_thresholds"] = True
     out = precompute_routes(**kwargs)
     print(json.dumps(out, indent=2))
     return 0
@@ -153,6 +157,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Emit `route_table_prior.npy` even without a co-occurrence log "
         "(uniform Laplace prior; behaviorally identical to v1 scoring).",
+    )
+    p_pre.add_argument(
+        "--emit-freq-scale",
+        action="store_true",
+        help="Emit `route_table_freq_scale.npy` (SOTA-track #4 freq-adaptive "
+        "scale). With no co-occurrence log, every scale defaults to 1.0.",
+    )
+    p_pre.add_argument(
+        "--emit-stride-thresholds",
+        action="store_true",
+        help="Emit `stride_thresholds.json` (SOTA-track #3 entropy → stride "
+        "map). Consumed by the native-MIND encoder; ignored on Phase 1.",
     )
     p_pre.set_defaults(func=cmd_precompute)
 

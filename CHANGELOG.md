@@ -6,6 +6,51 @@ All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](htt
 
 (empty — next release in this slot)
 
+## [0.2.0-beta.1] — 2026-05-17
+
+### Added — Tier 2 catalog-builder v2 (SOTA-tracks #3 + #4)
+
+- **SOTA-track #4 — frequency-adaptive route scaling.**
+  `precompute_routes(emit_freq_scale=True, ...)` (or any run with a
+  `cooccurrence_path`) now writes `route_table_freq_scale.npy`, a
+  per-route `float32` scalar equal to `max(1/sqrt(freq), 0.5)` under
+  Laplace smoothing (`freq = raw_count + 1`). At catalog load time, the
+  runtime multiplies each L2-normalized embedding row by this scale
+  in place — zero runtime cost. Addresses the long-tail drown-out
+  problem of rare-but-critical routes.
+- **SOTA-track #3 — entropy → stride threshold table.**
+  `precompute_routes(emit_stride_thresholds=True)` writes
+  `stride_thresholds.json` with a calibrated entropy → stride map
+  (`{<0.4: 256, <0.7: 192, else: 96}`, default 192). Consumed by the
+  native-MIND windowed encoder once mindc 0.3.0 cdylib lands;
+  forward-compatible bookkeeping in the Phase-1 sentence-transformers
+  path.
+- New `mind-nerve precompute-routes` flags: `--emit-freq-scale` and
+  `--emit-stride-thresholds`. Both files are also emitted automatically
+  when `--cooccurrence` is supplied, so a single catalog-builder run
+  fills all v2 columns.
+
+### Added — runtime consumers
+
+- Catalog-v2 freq_scale loader on the `_Runtime` constructor. Absent
+  file → unchanged v1 behavior; shape mismatch → early `RuntimeError`.
+- Stride-threshold loader exposes `_Runtime.stride_thresholds` as a
+  dict; ignored by the Phase-1 encoder, ready for the native path.
+
+### Added — tests
+
+- `tests/integration/test_route_freq_scale.py` (7 properties: absent
+  file, present file multiplies rows, shape mismatch raises, near-zero
+  scale suppresses a route, unit scale fallback, 0.5 floor for common
+  routes, stride table well-formedness).
+
+### Note
+
+- Public HF Phase-1 weights remain catalog-v1; flipping a runtime to
+  v2 still requires the matching catalog emit. v2 weights with the
+  full model_hash bump arrive in `v0.2.0` together with the verified
+  Russian-intent run.
+
 ## [0.1.0-beta.2] — 2026-05-17
 
 ### Added — catalog-v2 runtime readiness (SOTA-track #1)

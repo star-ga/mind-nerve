@@ -109,6 +109,19 @@ against the imported declaration and return the declared return type
 donors).  Bench gate clean against the new
 `.bench-baseline-2026-05-18-rfc0005.txt` floor.
 
+**`mindc` 0.4.2 landed 2026-05-18** — RFC 0005 **Phase C** (stdlib
+auto-bundled into mindc).  Closes the RFC 0005 stdlib-discovery loop:
+v0.4.0 (Phase A) wired the resolver, v0.4.1 (Phase B) added per-arg
+signature matching + return-type fidelity, v0.4.2 (Phase C) bakes
+`std/{vec,string,map,io}.mind` into the mindc binary via
+`include_str!` and seeds the project loader's module table with them
+before walking the user's src tree.  A downstream `mind build` of a
+project that says `use std.vec` now resolves with no external file
+dependency.  Phase C also lit a new gated-feature CI step (commit
+`996553e`) that runs the std-surface + cross-module-imports test
+suites separately + combined, closing a real CI blind spot — 65+
+gated tests are now under cloud guard against silent regression.
+
 | Task | Blocker | mindc milestone | Status |
 |---|---|---|---|
 | Cross-arch bit-identity (x86-CPU vs CUDA) | `pub fn` → C symbol export so the native MIND inference kernel is callable as a `cdylib` | **0.2.6** — `pub fn`-to-C, `[exports]`, `--profile` flag | **mindc-side SHIPPED** (RFC 0002 D2–D5 in `0a408e3`, `_v1` ABI lock in `de6cf18`, RFC 0003 cdylib seam). mind-nerve-side validation (mindc CUDA build + bit-identical SHA) still pending hardware — task #57 stays open. |

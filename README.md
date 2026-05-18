@@ -211,10 +211,12 @@ the same ranking. Full spec in [`spec/architecture.md`](spec/architecture.md).
 - **Latency p95 ≤ 30 ms** on 4-core CPU — non-negotiable end target. Phase 1
   hits 23 ms via the GPU+daemon path and ~90 ms with a warm daemon on
   4-core CPU; the full ≤30 ms-on-CPU budget closes with the Phase 2 native
-  MIND Q16.16 inference loop (gated on `mindc` 0.3.0).
+  MIND Q16.16 inference loop (toolchain-side mindc shipped through v0.4.2 /
+  RFC 0005 Phase C; mind-nerve-side native encoder is the remaining work).
 - **Cross-architecture bit-identity** — same request on x86, ARM, CUDA, and
   WebGPU returns the same top-K. Q16.16 fixed-point throughout, no IEEE-754
-  fallback in the inference path. (Phase 2 gate; landing with `mindc` 0.3.0.)
+  fallback in the inference path. (Phase 2 gate; mindc-side cdylib emit
+  landed in v0.3.0; mind-nerve-side hardware validation still pending.)
 - **No training-data leakage at inference** — the classifier reveals only
   route names, never the training corpora content.
 - **Tamper detection** — every inference emits an attestation envelope tying
@@ -231,9 +233,14 @@ Cross-architecture bit-identity gate. p95 budget tightens. The HF artifact
 will be `star-ga/mind-nerve-phase2` (parallel to the current
 [`star-ga/mind-nerve-phase1`](https://huggingface.co/star-ga/mind-nerve-phase1)) —
 same corpus + tokenizer + model hash contract, different inference path.
-Gated on
-[`mindc` 0.2.6](https://github.com/star-ga/mind/blob/main/docs/roadmap.md#phase-106--library-output--c-abi-mindc-026--030)
-(C-ABI export — landed) and `mindc` 0.3.0 (cdylib emit — next).
+Toolchain prerequisites all shipped: `mindc` 0.2.6 (C-ABI export),
+[`mindc` 0.3.0](https://github.com/star-ga/mind/releases/tag/v0.3.0)
+(cdylib emit + Phase 0/1/1.5 std-surface intrinsics + RFC 0005 P0e/P0f
+struct + FieldAccess ABI), and
+[`mindc` 0.4.2](https://github.com/star-ga/mind/releases/tag/v0.4.2)
+(RFC 0005 Phase 2 + B + C — pure-MIND std.vec/string/map/io bundled
+into the binary).  Remaining work is the mind-nerve-side native
+encoder kernel that links against the toolchain.
 
 **Phase 3** — Catalog v2: license-aware ingest at scale, evidence-chain
 proofs, per-tenant route tables.

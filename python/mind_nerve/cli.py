@@ -93,6 +93,51 @@ def cmd_learn(args) -> int:
     return 0
 
 
+def cmd_train(args) -> int:
+    from pathlib import Path
+
+    from .mind_train import TrainConfig, config_to_dict, train
+
+    config = TrainConfig(
+        catalog_path=Path(args.catalog),
+        output_dir=Path(args.out),
+        base_model=args.base_model,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        max_len=args.max_len,
+        seed=args.seed,
+        eval_frac=args.eval_frac,
+        smoke_test=args.smoke_test,
+        backend=args.backend,
+    )
+    try:
+        result = train(config)
+    except NotImplementedError as e:
+        print(json.dumps({"error": str(e), "backend": args.backend}), file=sys.stderr)
+        return 2
+    except RuntimeError as e:
+        print(json.dumps({"error": str(e)}), file=sys.stderr)
+        return 1
+
+    out = {
+        "config": config_to_dict(config),
+        "checkpoint_dir": str(result.checkpoint_dir),
+        "manifest_path": str(result.manifest_path),
+        "model_hash": result.model_hash,
+        "epochs_completed": result.epochs_completed,
+        "train_pairs": result.train_pairs,
+        "eval_pairs": result.eval_pairs,
+        "metrics": result.metrics,
+        "baseline_metrics": result.baseline_metrics,
+        "elapsed_seconds": result.elapsed_seconds,
+        "backend_used": result.backend_used,
+        "extras": result.extras,
+    }
+    print(json.dumps(out, indent=2))
+    return 0
+
+
 def cmd_attest_sign(args) -> int:
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
     from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
@@ -280,6 +325,39 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_learn.add_argument("--dry-run", action="store_true")
     p_learn.set_defaults(func=cmd_learn)
+
+    p_train = sub.add_parser(
+        "train",
+        help="Train a mind-nerve encoder checkpoint (v0.3.0-beta.1 bring-up: PyTorch)",
+    )
+    p_train.add_argument(
+        "--catalog",
+        required=True,
+        help="Path to corpus.tsv (tab-separated: name\\tkind\\tbody)",
+    )
+    p_train.add_argument(
+        "--out", required=True, help="Output directory (checkpoint + manifest written here)"
+    )
+    p_train.add_argument(
+        "--backend",
+        choices=["python", "native"],
+        default="python",
+        help="'python' = PyTorch bring-up (available now); 'native' = MIND cdylib "
+        "(NotImplementedError until mindc 0.3.0).",
+    )
+    p_train.add_argument("--base-model", default="BAAI/bge-small-en-v1.5")
+    p_train.add_argument("--epochs", type=int, default=3)
+    p_train.add_argument("--batch-size", type=int, default=32)
+    p_train.add_argument("--lr", type=float, default=2e-5)
+    p_train.add_argument("--max-len", type=int, default=256)
+    p_train.add_argument("--seed", type=int, default=1337)
+    p_train.add_argument("--eval-frac", type=float, default=0.1)
+    p_train.add_argument(
+        "--smoke-test",
+        action="store_true",
+        help="500 pairs, 1 epoch — ~1 min run to validate the pipeline.",
+    )
+    p_train.set_defaults(func=cmd_train)
 
     p_attest = sub.add_parser(
         "attest", help="MindLLM cross-binding handshake (sign/verify BindingRecords)"

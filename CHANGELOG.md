@@ -6,6 +6,52 @@ All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](htt
 
 (empty — next release in this slot)
 
+## [0.3.0-beta.1] — 2026-05-17
+
+### Added — public `mind_train` surface (bring-up trainer)
+
+- **New `mind_nerve.mind_train` module.** Publishes the trainer as a
+  stable, typed Python API:
+  - `TrainConfig(catalog_path, output_dir, base_model, epochs,
+    batch_size, lr, max_len, seed, eval_frac, smoke_test, backend)`
+    — frozen dataclass.
+  - `TrainResult(checkpoint_dir, manifest_path, model_hash,
+    epochs_completed, train_pairs, eval_pairs, metrics,
+    baseline_metrics, elapsed_seconds, backend_used, extras)` —
+    frozen dataclass.
+  - `train(config) -> TrainResult`
+  - `config_to_dict(config)` — JSON-safe view.
+- **Backend resolution.**
+  - `backend="python"` (default): PyTorch + sentence-transformers MNR
+    loss recipe ported from `catalog-builder/train_phase1.py`. Trains
+    on a `name\\tkind\\tbody` TSV corpus; produces a
+    sentence-transformers checkpoint + manifest with deterministic
+    `model_hash` (SHA-256 over the sorted file tree, paths bound in).
+  - `backend="native"`: raises `NotImplementedError` until mindc 0.3.0
+    `--emit-shared` cdylib + the Q16.16 native kernel land.
+- **New `mind-nerve train` CLI subcommand.** Same flags as the
+  underlying `TrainConfig`, including `--smoke-test` (500 pairs / 1
+  epoch / ~1 min) for pipeline validation without a full run.
+
+### Added — tests
+
+- `tests/integration/test_mind_train_contract.py` (9 invariants):
+  frozen-dataclass shape, parser handles malformed rows, deterministic
+  seeded split, checkpoint hash is deterministic and path-bound,
+  `native` raises `NotImplementedError`, unknown backend raises
+  `ValueError`, `config_to_dict` is JSON-safe, missing catalog fails
+  fast before downloading any models.
+
+### Note
+
+- v0.3.0-beta.1 is the **bring-up ship**: the trainer is real and
+  reproducible, but runs under PyTorch. v0.3.0 (final) replaces the
+  Python backend with the native MIND Q16.16 kernel via the mindc
+  0.3.0 cdylib emit foundation already landed in mindc 0.2.11
+  (`--emit-shared`). The Python backend stays available behind the
+  same `TrainConfig.backend` switch for reproducibility and
+  cross-backend bit-identity comparison.
+
 ## [0.2.0] — 2026-05-17
 
 ### Added — Tier 3 attestation cross-binding (public Python surface)

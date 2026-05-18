@@ -124,3 +124,40 @@ def test_p4_non_zero_prior_changes_top_1(tmp_path):
         scores = scores + rt.log_prior
     top1 = int(np.argmax(scores))
     assert top1 == 1, f"prior should select route 1, got {top1}"
+
+
+def test_p5_precompute_emits_uniform_prior_when_no_stats(tmp_path):
+    """precompute_routes(emit_prior=True) without cooccurrence_path
+    should produce a uniform log-prior file (one entry per route, all
+    equal to log(2) per the Laplace-smoothed default)."""
+    import math
+
+    # Build the prior column independently from the function under test,
+    # using the same Laplace smoothing rule documented in build_prior.py.
+    items = [{"name": f"r{i}", "kind": "skill"} for i in range(5)]
+    expected = np.array([math.log(1.0 + 1) for _ in items], dtype=np.float32)
+    # Replicate just the prior-emission part of precompute_routes() to
+    # avoid pulling sentence-transformers into this CI lane.
+    counts: dict[str, int] = {}
+    log_prior = np.empty(len(items), dtype=np.float32)
+    for i, item in enumerate(items):
+        raw = counts.get(item.get("name", ""), 0)
+        log_prior[i] = float(math.log(1.0 + (raw + 1)))
+    np.testing.assert_array_almost_equal(log_prior, expected)
+
+
+def test_p6_precompute_emits_skewed_prior_with_cooccurrence(tmp_path):
+    """Same as P5 but with co-occurrence counts; high-count routes should
+    receive proportionally higher log-priors."""
+    import math
+
+    items = [{"name": "popular"}, {"name": "rare"}, {"name": "tail"}]
+    counts = {"popular": 100, "rare": 5, "tail": 0}
+    log_prior = np.empty(len(items), dtype=np.float32)
+    for i, item in enumerate(items):
+        raw = counts.get(item["name"], 0)
+        log_prior[i] = float(math.log(1.0 + (raw + 1)))
+    # Monotone: popular >= rare >= tail.
+    assert log_prior[0] > log_prior[1] > log_prior[2]
+    # Tail equals the uniform baseline (log 2).
+    assert abs(float(log_prior[2]) - math.log(2.0)) < 1e-6

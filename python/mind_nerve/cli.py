@@ -68,6 +68,10 @@ def cmd_precompute(args) -> int:
     kwargs = {}
     if args.runtime_dir:
         kwargs["runtime_dir"] = args.runtime_dir
+    if args.cooccurrence:
+        kwargs["cooccurrence_path"] = args.cooccurrence
+    if args.emit_prior:
+        kwargs["emit_prior"] = True
     out = precompute_routes(**kwargs)
     print(json.dumps(out, indent=2))
     return 0
@@ -137,6 +141,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_pre = sub.add_parser(
         "precompute-routes", help="(One-time) encode the catalog into route_table.npy"
+    )
+    p_pre.add_argument(
+        "--cooccurrence",
+        default=None,
+        help="Path to a JSONL co-occurrence log; enables catalog-v2 prior emit "
+        "(`route_table_prior.npy`).",
+    )
+    p_pre.add_argument(
+        "--emit-prior",
+        action="store_true",
+        help="Emit `route_table_prior.npy` even without a co-occurrence log "
+        "(uniform Laplace prior; behaviorally identical to v1 scoring).",
     )
     p_pre.set_defaults(func=cmd_precompute)
 

@@ -260,12 +260,24 @@ def route(query: str, top_k: int = 5, *, runtime_dir: str | None = None) -> Rout
 def precompute_routes(
     runtime_dir: str | None = None,
     catalog_path: str | None = None,
+    cooccurrence_path: str | None = None,
+    emit_prior: bool = False,
 ) -> dict[str, Any]:
     """Encode every catalog item and write route_table.npy + .jsonl.
 
     Run once after training. The result lives inside runtime_dir so the
     runtime loader can pick it up at startup.
+
+    Catalog-v2 (SOTA-track #1): when ``emit_prior=True`` or
+    ``cooccurrence_path`` is provided, also emit ``route_table_prior.npy``
+    with one ``float32`` log-prior per route. The runtime adds this column
+    to the dot-product score before top-k selection. With no
+    co-occurrence stats the priors default to ``log(2) ≈ 0.693`` per route
+    (uniform Laplace prior), making the file behaviorally a no-op until
+    real frequency data is available.
     """
+    import math
+
     import numpy as np
     from sentence_transformers import SentenceTransformer
 
@@ -306,9 +318,38 @@ def precompute_routes(
         for item in items:
             f.write(json.dumps(item, separators=(",", ":")) + "\n")
 
-    return {
+    result: dict[str, Any] = {
         "count": len(items),
         "dim": int(emb.shape[1]),
         "bytes_npy": (rdir / "route_table.npy").stat().st_size,
         "bytes_jsonl": (rdir / "route_table.jsonl").stat().st_size,
     }
+
+    # Catalog-v2: optional log-prior column. Drop the file even when no
+    # co-occurrence stats are provided so installers can ship a v2 runtime
+    # by default; the uniform prior is behaviorally identical to v1
+    # scoring until real frequency data lands.
+    if emit_prior or cooccurrence_path is not None:
+        counts: dict[str, int] = {}
+        if cooccurrence_path is not None:
+            with open(cooccurrence_path, "r", encoding="utf-8") as cf:
+                for line in cf:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    obj = json.loads(line)
+                    rid = obj.get("route_id")
+                    if rid is None:
+                        continue
+                    counts[rid] = counts.get(rid, 0) + int(obj.get("count", 1))
+        # Laplace smoothing: freq_r = raw_count + 1, log_prior = log(1+freq_r).
+        log_prior = np.empty(len(items), dtype=np.float32)
+        for i, item in enumerate(items):
+            raw = counts.get(item.get("name", ""), 0)
+            log_prior[i] = float(math.log(1.0 + (raw + 1)))
+        prior_path = rdir / "route_table_prior.npy"
+        np.save(prior_path, log_prior)
+        result["bytes_prior"] = prior_path.stat().st_size
+        result["prior_uniform"] = cooccurrence_path is None
+
+    return result

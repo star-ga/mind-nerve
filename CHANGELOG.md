@@ -4,6 +4,27 @@ All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](htt
 
 ## [Unreleased] — v0.3.0 preparation
 
+### Fixed — concurrent ensure() spawning multiple daemons
+
+- `python/mind_nerve/ensure.py` now serialises the spawn decision under
+  a sibling `mind-nerve.sock.lock` `flock`. Prior to this fix, parallel
+  CLI invocations during the daemon's ~5 s weight-load window all saw
+  an unresponsive socket from their fast-path probe and each spawned a
+  fresh `mind-nerve-routed` process. A real-world bot-thrash incident
+  left 9 zombie daemons (~1.3 GB each) under a single user systemd
+  cgroup.
+- The flock guard makes the spawn decision exclusive: one ensure()
+  caller wins, spawns, then **holds the lock while waiting for the
+  socket to come up** (`WAIT_SECONDS = 20`). All other parallel
+  callers either lose the flock and poll the socket for the winner's
+  daemon, or acquire the lock after the winner exits and re-check the
+  socket before deciding whether to re-spawn. Net effect: at most one
+  spawn per WAIT_SECONDS window, regardless of caller concurrency.
+- New `tests/python/test_ensure_concurrency.py` — 6 regression tests
+  including a 16-thread race that asserts `spawn_count == 1` and a
+  4-thread fall-through scenario proving the script still exits 0
+  fail-open when the daemon never comes up.
+
 ### Added — Tier-3 script-floor CI gate (multilingual policy)
 
 - `tests/python/test_tier3_script_floor.py` enforces the Tier-3

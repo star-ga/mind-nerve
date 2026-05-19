@@ -24,6 +24,7 @@ and `route_table.jsonl`. Resolution order, first hit wins:
 from __future__ import annotations
 
 import functools
+import hashlib
 import json
 import os
 import sys
@@ -77,11 +78,25 @@ def _seed_from_hf(target: Path) -> None:
     """
     from huggingface_hub import snapshot_download
 
+    revision = os.environ.get("MIND_NERVE_HF_REVISION", "71221fd435f119cc50c92df4786352ac594efa17")
     print(
-        f"mind-nerve: downloading Phase-1 weights ({_HF_REPO_ID}, ~150 MB) to {target}",
+        f"mind-nerve: downloading Phase-1 weights ({_HF_REPO_ID}@{revision[:12]}, ~150 MB) to {target}",
         file=sys.stderr,
     )
-    cached = Path(snapshot_download(repo_id=_HF_REPO_ID, repo_type="model"))
+    cached = Path(
+        snapshot_download(
+            repo_id=_HF_REPO_ID,
+            repo_type="model",
+            revision=revision,
+            allow_patterns=[
+                "manifest.json",
+                "checkpoint/*",
+                "route_table*.npy",
+                "route_table.jsonl",
+                "stride_thresholds.json",
+            ],
+        )
+    )
     target.mkdir(parents=True, exist_ok=True)
     import shutil
 
@@ -418,6 +433,31 @@ def load_default_runtime(
     return _load_cached(str(p), _active_backend())
 
 
+def _count_bpe_tokens(query: str, rt: "_Runtime | _NativeEncoderRuntime") -> int:
+    """Return the BPE token count for *query* using the runtime's tokenizer.
+
+    For the pytorch backend we call SentenceTransformer.tokenize() directly,
+    which uses the same WordPiece vocabulary as the encoder. For the native
+    backend the tokenizer is already loaded as rt._tokenizer.
+    """
+    try:
+        if hasattr(rt, "_tokenizer") and rt._tokenizer is not None:
+            # Native backend: uses HF AutoTokenizer.
+            enc = rt._tokenizer(
+                query,
+                truncation=False,
+                return_attention_mask=False,
+                return_token_type_ids=False,
+            )
+            return len(enc["input_ids"])
+        # Pytorch backend: SentenceTransformer.tokenize().
+        tokens = rt.model.tokenize([query])
+        return int(tokens["input_ids"].shape[1])
+    except Exception:  # noqa: BLE001
+        # If tokenization is unavailable, skip the check rather than crashing.
+        return 0
+
+
 def route(query: str, top_k: int = 5, *, runtime_dir: str | None = None) -> RouteResult:
     """Return the top-K routing candidates for a query.
 
@@ -425,9 +465,20 @@ def route(query: str, top_k: int = 5, *, runtime_dir: str | None = None) -> Rout
     Dispatches to the native Q16.16 encoder path (MIND_NERVE_BACKEND=native,
     default) or the pytorch sentence-transformers path
     (MIND_NERVE_BACKEND=pytorch).
+
+    Raises:
+        ValueError: if top_k is outside [1, 64] or if the query exceeds
+            1024 BPE tokens (``RequestTooLong``).
     """
+    if not 1 <= top_k <= 64:
+        raise ValueError(f"top_k must be in [1, 64]; got {top_k}")
+
     rt = load_default_runtime(runtime_dir)
     backend = _active_backend()
+
+    token_count = _count_bpe_tokens(query, rt)
+    if token_count > 1024:
+        raise ValueError(f"RequestTooLong: query exceeds 1024 tokens (got {token_count})")
 
     if backend == _BACKEND_NATIVE:
         return _route_native(query, top_k, rt)  # type: ignore[arg-type]
@@ -483,6 +534,40 @@ def _route_native(
     )
 
 
+# ---------------------------------------------------------------------------
+# Deterministic top-K helpers
+# ---------------------------------------------------------------------------
+
+
+def _tie_key(route_id: str) -> bytes:
+    """Return SHA-256 digest of route_id for stable tie-breaking.
+
+    The spec mandates that equal-score routes are ordered ascending by
+    SHA-256(route_id) so that the same input produces the same ranking on
+    every architecture (x86, ARM, CUDA). This is the load-bearing contract
+    for cross-arch Q16.16 bit-identity.
+    """
+    return hashlib.sha256(route_id.encode("utf-8")).digest()
+
+
+def _deterministic_topk(
+    scores: "np.ndarray",
+    route_ids: list[str],
+    k: int,
+) -> "np.ndarray":
+    """Return indices of the top-k routes with stable SHA-256 tie-breaking.
+
+    Primary sort: descending score.
+    Tie-break: ascending SHA-256(route_id) digest (bytes comparison).
+    """
+    cand = np.argpartition(-scores, k - 1)[:k]
+    ordered = sorted(
+        cand.tolist(),
+        key=lambda i: (-float(scores[i]), _tie_key(route_ids[i])),
+    )
+    return np.asarray(ordered, dtype=np.int64)
+
+
 def _route_pytorch(
     query: str,
     top_k: int,
@@ -503,8 +588,8 @@ def _route_pytorch(
     if rt.log_prior is not None:
         scores = scores + rt.log_prior
     k = min(top_k, scores.shape[0])
-    top = np.argpartition(-scores, k - 1)[:k]
-    top = top[np.argsort(-scores[top])]  # exact sort over the k
+    route_ids = [str(r.get("id", "")) for r in rt.routes]
+    top = _deterministic_topk(scores, route_ids, k)
     t_rank = (time.perf_counter() - t0) * 1000.0
 
     out: list[Route] = []

@@ -39,9 +39,36 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 HOME = Path(os.path.expanduser("~"))
+
+
+# ---------------------------------------------------------------------------
+# Atomic write helper (backup-before-write + temp-file rename)
+# ---------------------------------------------------------------------------
+
+
+def safe_write(path: Path, content: str) -> None:
+    """Write *content* to *path* atomically with a .bak safety copy.
+
+    If *path* already exists its current bytes are copied to
+    ``path.with_suffix(path.suffix + ".bak")`` before the write.  The
+    new content lands via a temp file + :func:`os.replace` so a
+    concurrent reader never sees a partial file.
+
+    Args:
+        path: Destination file path (will be created if absent).
+        content: UTF-8 text to write.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        path.with_suffix(path.suffix + ".bak").write_bytes(path.read_bytes())
+    with tempfile.NamedTemporaryFile("w", dir=path.parent, delete=False, encoding="utf-8") as tmp:
+        tmp.write(content)
+        tmp_name = tmp.name
+    os.replace(tmp_name, path)
 
 
 # CLIs grouped by install mechanism.
@@ -130,7 +157,7 @@ def _install_claude_code_manual() -> dict:
             existing = {}
     servers = existing.setdefault("mcpServers", {})
     servers["mind-nerve"] = _mcp_entry()
-    cfg_path.write_text(json.dumps(existing, indent=2) + "\n")
+    safe_write(cfg_path, json.dumps(existing, indent=2) + "\n")
     return {"installed": True, "method": "manual_claude_json", "path": str(cfg_path)}
 
 
@@ -150,7 +177,7 @@ def install_claude_desktop(cfg: dict) -> dict:
             existing = {}
     servers = existing.setdefault("mcpServers", {})
     servers["mind-nerve"] = _mcp_entry()
-    cfg_path.write_text(json.dumps(existing, indent=2) + "\n")
+    safe_write(cfg_path, json.dumps(existing, indent=2) + "\n")
     return {"installed": True, "method": "json_mcp_servers", "path": str(cfg_path)}
 
 
@@ -166,7 +193,7 @@ def install_cursor(cfg: dict) -> dict:
             existing = {}
     servers = existing.setdefault("mcpServers", {})
     servers["mind-nerve"] = _mcp_entry()
-    cfg_path.write_text(json.dumps(existing, indent=2) + "\n")
+    safe_write(cfg_path, json.dumps(existing, indent=2) + "\n")
     return {"installed": True, "method": "json_mcp_servers", "path": str(cfg_path)}
 
 
@@ -195,7 +222,7 @@ def install_codex(cfg: dict) -> dict:
     else:
         updated = existing.rstrip() + block
 
-    cfg_path.write_text(updated)
+    safe_write(cfg_path, updated)
     return {"installed": True, "method": "toml_mcp_servers", "path": str(cfg_path)}
 
 
@@ -229,7 +256,7 @@ def install_claude_code_hook(cfg: dict) -> dict:
         }
     )
     hooks["UserPromptSubmit"] = ups
-    cfg_path.write_text(json.dumps(existing, indent=2) + "\n")
+    safe_write(cfg_path, json.dumps(existing, indent=2) + "\n")
     return {"installed": True, "method": "claude_user_prompt_hook", "path": str(cfg_path)}
 
 
@@ -256,7 +283,7 @@ def install_gemini(cfg: dict) -> dict:
             "mind-nerve": _mcp_entry(),
         },
     }
-    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+    safe_write(manifest_path, json.dumps(manifest, indent=2) + "\n")
     return {"installed": True, "method": "gemini_extension_manifest", "path": str(manifest_path)}
 
 
@@ -277,7 +304,7 @@ def install_vibe(cfg: dict) -> dict:
             existing = {}
     servers = existing.setdefault("mcpServers", {})
     servers["mind-nerve"] = _mcp_entry()
-    cfg_path.write_text(json.dumps(existing, indent=2) + "\n")
+    safe_write(cfg_path, json.dumps(existing, indent=2) + "\n")
     return {"installed": True, "method": "json_mcp_servers", "path": str(cfg_path)}
 
 
@@ -298,7 +325,7 @@ def _install_claw(claw_name: str) -> dict:
             existing = {}
     servers = existing.setdefault("mcpServers", {})
     servers["mind-nerve"] = _mcp_entry()
-    cfg_path.write_text(json.dumps(existing, indent=2) + "\n")
+    safe_write(cfg_path, json.dumps(existing, indent=2) + "\n")
     return {"installed": True, "method": "json_mcp_servers", "path": str(cfg_path)}
 
 
@@ -482,7 +509,7 @@ def _install_preselect_hook(layout: dict) -> dict:
     )
     hooks["UserPromptSubmit"] = ups
 
-    cfg_path.write_text(json.dumps(existing, indent=2) + "\n")
+    safe_write(cfg_path, json.dumps(existing, indent=2) + "\n")
     return {"installed": True, "method": "session_and_prompt_hooks", "path": str(cfg_path)}
 
 
@@ -551,8 +578,7 @@ def _register_mind_mem_in(cfg_path: Path, fmt: str) -> dict:
                 existing = {}
         servers = existing.setdefault("mcpServers", {})
         servers["mind-mem"] = _mcp_entry("mind-mem-mcp")
-        cfg_path.parent.mkdir(parents=True, exist_ok=True)
-        cfg_path.write_text(json.dumps(existing, indent=2) + "\n")
+        safe_write(cfg_path, json.dumps(existing, indent=2) + "\n")
         return {"installed": True, "path": str(cfg_path), "fmt": fmt}
 
     if fmt == "toml":
@@ -569,8 +595,7 @@ def _register_mind_mem_in(cfg_path: Path, fmt: str) -> dict:
             if pattern.search(existing_text)
             else (existing_text.rstrip() + block)
         )
-        cfg_path.parent.mkdir(parents=True, exist_ok=True)
-        cfg_path.write_text(updated)
+        safe_write(cfg_path, updated)
         return {"installed": True, "path": str(cfg_path), "fmt": fmt}
 
     return {"installed": False, "error": f"unknown fmt: {fmt}"}
@@ -779,7 +804,7 @@ def install_systemd_user_unit() -> dict:
     try:
         unit_dst_dir.mkdir(parents=True, exist_ok=True)
         log_dir.mkdir(parents=True, exist_ok=True)
-        unit_dst.write_text(unit_src.read_text())
+        safe_write(unit_dst, unit_src.read_text())
     except OSError as exc:
         return {"installed": False, "reason": f"could not write unit: {exc}"}
 

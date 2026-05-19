@@ -195,16 +195,23 @@ mind-nerve-install install --cli all
 | `MIND_NERVE_SOCKET_TIMEOUT`   | `2.0`                                       | daemon socket timeout (s) |
 | `MIND_NERVE_LOG`              | `~/.mind-nerve/hook.log`                    | jsonl log for the preselect hook |
 | `MIND_NERVE_CORE_ALWAYS_ON`   | `diagnose:code-review:git-workflow:…`       | colon-separated names always added to the projection |
+| `MIND_NERVE_HF_REVISION`      | pinned commit SHA in the package             | override the Hugging Face model revision to download; set to a specific commit SHA or tag for reproducible artifact pinning |
 
 ## How it works
 
-Asymmetric encoder/decoder with a classifier head. The encoder reads the
-request (no feed-forward blocks — attention + gated residuals only — for
-compact representation). The decoder cross-attends to the encoder output
-and to a fixed embedding of every available route. The classifier head
-emits per-route relevance scores. Top-K extraction is deterministic;
-ties break by route-ID hash so the same input on x86 / ARM / CUDA returns
-the same ranking. Full spec in [`spec/architecture.md`](spec/architecture.md).
+**Current architecture (Phase 1 — shipped):** Encoder + direct scoring head.
+The encoder is a sliding-window self-attention model (window 256 tokens,
+stride 192); the decoder is dropped entirely ("drop-the-decoder" design per
+[`spec/architecture.md`](spec/architecture.md)). The direct scoring head
+dot-products the encoded query against the precomputed catalog embeddings
+and returns the top-K routes. Top-K extraction is deterministic: ties break
+by ascending SHA-256(route_id) so the same input on x86, ARM, and CUDA
+returns the same ranking every time. Full spec in
+[`spec/architecture.md`](spec/architecture.md).
+
+**Target architecture (Phase 2 — in progress):** The same encoder design
+compiled to native MIND Q16.16 fixed-point, removing the PyTorch dependency
+and closing the CPU latency budget (≤30 ms p95 on 4-core CPU).
 
 ## Design constraints
 
@@ -270,15 +277,17 @@ mind-nerve/
 
 ## License
 
-mind-nerve ships under **Apache-2.0** — repository, Python wheel, and the
-Phase-1 trained weights on Hugging Face all carry the same license. The wheel
-additionally bundles `libmindnerve.so`, a compiled runtime component whose
+The repository source, the Python wheel surface, and the Phase-1 trained
+weights on Hugging Face are all **Apache-2.0**. The wheel additionally
+bundles `libmindnerve.so` — a compiled FORTRESS runtime component whose
 source is not part of this repository and is not distributed under Apache
-2.0. The Phase-1 PyTorch path does not depend on it.
+2.0; that component carries a separate STARGA commercial license documented
+in [`LICENSE.md`](LICENSE.md). The Phase-1 PyTorch inference path does not
+depend on `libmindnerve.so`; users running `MIND_NERVE_BACKEND=pytorch`
+operate entirely under Apache-2.0.
 
 For commercial enquiries, contact
-[`license@star.ga`](mailto:license@star.ga). See
-[`LICENSE.md`](LICENSE.md) for the full text.
+[`license@star.ga`](mailto:license@star.ga).
 
 ## Citation
 

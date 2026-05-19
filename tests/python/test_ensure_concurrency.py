@@ -14,13 +14,11 @@ the real daemon (we mock `subprocess.Popen` and `_socket_responsive`).
 
 from __future__ import annotations
 
-import os
 import threading
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-
 from mind_nerve import ensure
 
 
@@ -169,9 +167,13 @@ def test_lock_loser_falls_through_fail_open_on_timeout(isolated_paths, monkeypat
             # serialised through the flock the total is < 3s — set a comfortable
             # upper bound so a slow CI box doesn't false-fail.
             t.join(timeout=15)
-            assert not t.is_alive(), "ensure() must never block longer than ~WAIT_SECONDS per acquirer"
+            assert not t.is_alive(), (
+                "ensure() must never block longer than ~WAIT_SECONDS per acquirer"
+            )
 
-    assert all(rc == 0 for rc in rcs), "fail-open: every caller must return 0 even when daemon is broken"
+    assert all(rc == 0 for rc in rcs), (
+        "fail-open: every caller must return 0 even when daemon is broken"
+    )
 
 
 def test_no_daemon_binary_returns_zero_without_locking(isolated_paths):

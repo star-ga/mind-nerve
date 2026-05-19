@@ -4,6 +4,56 @@ All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](htt
 
 ## [Unreleased] — v0.3.0 preparation
 
+## [0.3.0-beta.4] — 2026-05-18
+
+Audit response (deep-research 2026-05-18): deterministic SHA-256 tie-break
+in route(), top_k/request-length bounds, atomic installer writes with .bak,
+HF revision pin, README architecture+latency+license clarifications.
+
+### Fixed — deterministic SHA-256 tie-break in `route()`
+
+- `_route_pytorch()` now uses `_deterministic_topk()` which sorts equal-score
+  routes by ascending `SHA-256(route_id)` digest, matching the spec contract
+  in `spec/architecture.md`. Previously equal-score routes could reorder
+  across platforms, undermining the cross-arch bit-identity guarantee.
+- Added `_tie_key(route_id)` and `_deterministic_topk(scores, route_ids, k)`
+  helpers in `inference.py`.
+
+### Added — `top_k` and request-length bounds in `route()`
+
+- `route()` now raises `ValueError("top_k must be in [1, 64]")` if `top_k`
+  is outside the spec-mandated range.
+- `route()` now raises `ValueError("RequestTooLong: query exceeds 1024 tokens")`
+  if the BPE token count of the query exceeds 1024, per spec `architecture.md`.
+- `_count_bpe_tokens()` helper handles both pytorch (SentenceTransformer.tokenize)
+  and native (AutoTokenizer) backends.
+
+### Fixed — atomic installer writes with `.bak` safety copy
+
+- Added `safe_write(path, content)` to `installer.py`: backs up the existing
+  file to `<path>.bak` before writing, uses `tempfile + os.replace` for
+  atomicity. All 12 `write_text` call-sites in `installer.py` now use this
+  helper, eliminating partial-write data loss on crash or power failure.
+
+### Fixed — HF revision pin in `_seed_from_hf()`
+
+- `snapshot_download` now passes `revision="71221fd435f119cc50c92df4786352ac594efa17"`
+  (the current `star-ga/mind-nerve-phase1` HEAD) and `allow_patterns` to
+  limit downloaded artifacts to the inference-required files.
+- Override with `MIND_NERVE_HF_REVISION=<sha-or-tag>` for reproducible builds.
+
+### Changed — README architecture, latency, and license clarifications
+
+- "How it works" now correctly describes the shipped architecture: encoder +
+  direct scoring head (drop-the-decoder, sliding-window encoder, window=256
+  stride=192). The stale "asymmetric encoder/decoder with a classifier head"
+  description has been removed.
+- Phase-1 Python latency (~90 ms warm-daemon CPU) and Phase-2 native target
+  (≤30 ms CPU) are now stated separately and clearly.
+- License section now has a single concise paragraph explaining the Apache-2.0
+  Python/weights surface and the separately licensed bundled FORTRESS binary.
+- `MIND_NERVE_HF_REVISION` env var added to the Configuration table.
+
 ## [0.3.0-beta.3] — 2026-05-18
 
 ### Changed — documentation polish

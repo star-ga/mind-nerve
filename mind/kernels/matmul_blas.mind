@@ -71,3 +71,22 @@ pub fn matmul_score_blas(catalog: i64, qv: i64, out: i64, n_rows: i64) -> i64 {
 pub fn dot_q16_blas(a: i64, b: i64, len: i64) -> i64 {
     __mind_nerve_blas_dot_q16_i64(a, b, len)
 }
+
+// matmul_q16_blas — full Q16.16 matrix multiply (M×K)·(K×N) → (M×N).
+//
+// Drop-in replacement for matmul_q16 in matmul_q16.mind.
+// a: (M×K) i64 row-major Q16.16 buffer.
+// b: (K×N) i64 row-major Q16.16 buffer.
+// c: (M×N) i64 output buffer (caller-allocated, overwritten).
+// M, K, N: matrix dimensions.
+//
+// Delegated to __mind_nerve_blas_matmul_q16_i64 in blas_shims_i64.c.
+// The C shim preserves the canonical (i,k,j) accumulation order from
+// matmul_q16.mind and produces byte-identical output to the scalar
+// tail-recursive path (integer accumulation is associative; the single
+// Q32.32→Q16.16 right-shift happens once per output element).
+// AVX2 dispatch: controlled by MIND_NERVE_BLAS env-var at .so load time,
+// same flag as the score path (task #57 invariant).
+pub fn matmul_q16_blas(a: i64, b: i64, c: i64, M: i64, K: i64, N: i64) -> i64 {
+    __mind_nerve_blas_matmul_q16_i64(a, b, c, M, K, N)
+}

@@ -401,3 +401,152 @@ void __mind_nerve_blas_reset_cache(void) {
     g_packed_cache.n_rows = 0;
     g_packed_cache.cols = 0;
 }
+
+// __mind_nerve_blas_matmul_q16_i64 — full Q16.16 matrix multiply.
+//
+// Computes C = A · B in Q16.16 fixed-point:
+//   A: (M × K) i64 row-major buffer (Q16.16 values in low 32 bits, stride 8)
+//   B: (K × N) i64 row-major buffer (same layout)
+//   C: (M × N) i64 row-major output buffer (written; must be caller-allocated)
+//   M, K, N: matrix dimensions
+//
+// Returns 0 on success, -1 if any pointer is null or dimension is zero.
+//
+// Accumulation order matches the canonical (i,k,j) triple-loop defined in
+// mind/kernels/matmul_q16.mind::matmul_q16 / matmul_rows / row_j / dot_k:
+//   For each output row i (0..M-1):
+//     For each contraction index k (0..K-1):
+//       For each output col j (0..N-1):
+//         acc[i,j] += A[i,k] * B[k,j]      (Q32.32 accumulation, no intermediate shift)
+//     C[i,j] = acc[i,j] >> 16              (narrow to Q16.16 once per (i,j))
+//
+// The loop order rewrite (j innermost vs. k innermost vs. (j,k) interleaved)
+// does not affect byte-identity because integer addition is associative and
+// commutative — the set of Q32.32 partial products at each (i,j) position is
+// identical regardless of the order in which they are accumulated, and the
+// single final right-shift is the same.  This is the same guarantee used by
+// the score-path AVX2 dot (task #57).
+//
+// The accumulator per output row is at most K * (Q16.16_max)^2 ≈ 1536 * 2^30
+// ≈ 2^40 for unit-normalised inputs — far below the i64 overflow threshold.
+// For pathological Q16.16 values approaching int32 range the accumulator can
+// reach 1536 * 2^62 ≈ 2^73, which would overflow i64.  The same risk exists
+// in the original tail-recursive scalar path; the encode path's practical
+// value range (float32 quantised weights) never triggers it.
+//
+// The 1536-element per-row Q32.32 accumulator (12 KB) lives on the heap for
+// N > 512 to stay within the stack frame budget; for N <= 512 it uses a
+// fixed-size stack buffer.
+#define MIND_NERVE_BLAS_GEMM_STACK_N 512
+
+#if MIND_NERVE_BLAS_X86_64
+// AVX2 inner kernel: for fixed i and k, accumulate a_k * B[k,0..N-1] into acc[0..N-1].
+// a_k:   Q16.16 value as i64 (low 32 bits carry the value; high 32 = sign extension)
+// b_row: pointer to B[k,0], ..., B[k,N-1] (contiguous i64 row-major slice)
+// acc:   i64 accumulator array of length N (must be initialised to 0 by caller)
+// N:     length of the row (number of output columns)
+//
+// Uses _mm256_mul_epi32 widening multiply: takes the low 32 bits of each
+// i64 lane in a and b, returns 4 × i64 products.  The low 32 bits of each
+// i64 slot in the i64-stride-8 MIND buffer carry the Q16.16 value, so the
+// cast (int32_t)x recovers the value with correct sign extension.
+//
+// The accumulation order is j ascending (matches scalar), so the result is
+// byte-identical to the scalar path at every (i,j) position.
+__attribute__((target("avx2,fma")))
+static void mind_nerve_blas_gemm_accrow_avx2(
+    int64_t a_k, const int64_t *b_row, int64_t *acc, int64_t N
+) {
+    // Broadcast a_k into all four i64 lanes of a 256-bit register.
+    // _mm256_mul_epi32 reads the low 32 bits of each i64 lane; since
+    // a_k is already sign-extended into i64, the low 32 bits hold (int32_t)a_k.
+    __m256i va = _mm256_set1_epi64x(a_k);
+    int64_t j = 0;
+    for (; j + 4 <= N; j += 4) {
+        // Load 4 × i64 from B row (contiguous i64-stride-8 buffer).
+        __m256i vb = _mm256_loadu_si256((const __m256i *)(b_row + j));
+        // Load current accumulator values.
+        __m256i vacc = _mm256_loadu_si256((const __m256i *)(acc + j));
+        // Widening signed multiply on the low 32-bit lanes: yields 4 × i64.
+        // _mm256_mul_epi32 sign-extends the 32-bit values to i64 — exactly
+        // what we want since Q16.16 values are stored sign-extended in i64.
+        __m256i prod = _mm256_mul_epi32(va, vb);
+        // Accumulate: vacc[l] += prod[l] (i64 add, no shift here).
+        vacc = _mm256_add_epi64(vacc, prod);
+        _mm256_storeu_si256((__m256i *)(acc + j), vacc);
+    }
+    // Scalar tail for N not divisible by 4.
+    for (; j < N; ++j) {
+        int64_t a32 = (int64_t)(int32_t)a_k;
+        int64_t b32 = (int64_t)(int32_t)b_row[j];
+        acc[j] += a32 * b32;
+    }
+}
+#endif /* MIND_NERVE_BLAS_X86_64 */
+
+// Scalar inner kernel: same contract as the AVX2 variant above.
+static void mind_nerve_blas_gemm_accrow_scalar(
+    int64_t a_k, const int64_t *b_row, int64_t *acc, int64_t N
+) {
+    int64_t a32 = (int64_t)(int32_t)a_k;
+    for (int64_t j = 0; j < N; ++j) {
+        int64_t b32 = (int64_t)(int32_t)b_row[j];
+        acc[j] += a32 * b32;
+    }
+}
+
+int64_t __mind_nerve_blas_matmul_q16_i64(
+    int64_t a_addr, int64_t b_addr, int64_t c_addr,
+    int64_t M, int64_t K, int64_t N
+) {
+    if (a_addr == 0 || b_addr == 0 || c_addr == 0) return -1;
+    if (M <= 0 || K <= 0 || N <= 0) return 0;
+
+    const int64_t *A = (const int64_t *)(uintptr_t)a_addr;
+    const int64_t *B = (const int64_t *)(uintptr_t)b_addr;
+    int64_t       *C = (int64_t       *)(uintptr_t)c_addr;
+
+    // Per-row Q32.32 accumulator: stack for N <= MIND_NERVE_BLAS_GEMM_STACK_N,
+    // heap otherwise (the FFN expansion output dimension is N=1536 > 512).
+    int64_t  acc_stack[MIND_NERVE_BLAS_GEMM_STACK_N];
+    int64_t *acc      = acc_stack;
+    int      acc_heap = 0;
+
+    if (N > MIND_NERVE_BLAS_GEMM_STACK_N) {
+        acc = (int64_t *)malloc((size_t)N * sizeof(int64_t));
+        if (acc == NULL) return -1;
+        acc_heap = 1;
+    }
+
+    for (int64_t i = 0; i < M; ++i) {
+        // Zero the accumulator for this output row.
+        memset(acc, 0, (size_t)N * sizeof(int64_t));
+
+        const int64_t *A_row = A + (size_t)i * (size_t)K;
+
+        // k-outer loop: for each contraction index k, update all N outputs.
+        // B[k,:] is a contiguous row of the B matrix (row-major layout).
+        for (int64_t k = 0; k < K; ++k) {
+            int64_t a_k = A_row[k];   // Q16.16 value, sign-extended in i64
+            const int64_t *B_row = B + (size_t)k * (size_t)N;
+#if MIND_NERVE_BLAS_X86_64
+            if (mind_nerve_blas_use_avx2) {
+                mind_nerve_blas_gemm_accrow_avx2(a_k, B_row, acc, N);
+            } else {
+                mind_nerve_blas_gemm_accrow_scalar(a_k, B_row, acc, N);
+            }
+#else
+            mind_nerve_blas_gemm_accrow_scalar(a_k, B_row, acc, N);
+#endif
+        }
+
+        // Narrow each Q32.32 accumulator to Q16.16 and write to C row.
+        int64_t *C_row = C + (size_t)i * (size_t)N;
+        for (int64_t j = 0; j < N; ++j) {
+            C_row[j] = (int64_t)(int32_t)(acc[j] >> 16);
+        }
+    }
+
+    if (acc_heap) free(acc);
+    return 0;
+}

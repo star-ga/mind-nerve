@@ -114,11 +114,11 @@ jobs:
       - name: Build mindc
         working-directory: mind-compiler
         run: cargo build --release --features "std-surface cross-module-imports" --bin mindc
-      - name: Parse every .mind file in mind/luts/ and mind/kernels/
+      - name: Parse every .mind file in mind/luts/, mind/kernels/, and mind/exports/
         run: |
           MINDC=$(pwd)/mind-compiler/target/release/mindc
           fail=0
-          for f in mind/luts/*.mind mind/kernels/*.mind; do
+          for f in mind/luts/*.mind mind/kernels/*.mind mind/exports/*.mind; do
             [ -f "$f" ] || continue
             echo "::group::Parsing $f"
             if "$MINDC" "$f" --emit-ir > /dev/null 2>&1; then

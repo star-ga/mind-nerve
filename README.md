@@ -52,10 +52,18 @@ for r in result.routes:
 | | |
 | :--- | :--- |
 | **96.06% top-5 accuracy** | against 11,922 routing candidates (v1.1-oss catalog) |
-| **23 ms p95 latency** | UNIX-socket daemon, warm, on GPU — Phase 1 PyTorch (warm daemon on 4-core CPU is ~90 ms; native MIND target is ≤30 ms on 4-core CPU) |
+| **Phase 1 latency (shipped)** | warm-daemon p95 ~23 ms on GPU and ~90 ms on a 4-core CPU (PyTorch SentenceTransformers backend) |
+| **Phase 2 latency (target)** | ≤30 ms p95 on a 4-core CPU via the native MIND Q16.16 encoder — not yet end-to-end; see Phase 2 status below |
 | **~95% token reduction** | on a 440-skill Claude Code catalog per turn |
 | **One-line install** | `mind-nerve-install install --cli claude-code --with-preselect` |
-| **Six target CLIs today** | Claude Code, Claude Desktop, Cursor, Codex, Claude Code hooks, MCP — 13 more on the roadmap |
+| **Public integrations today** | Claude Code, Claude Desktop, Cursor, Codex, Gemini CLI, plus a stdio MCP server for any MCP-aware client — see [Integrations](#integrations) |
+
+> **Dual-license note.** The repo source, the Python wheel surface, and the
+> Phase-1 weights are Apache-2.0. The wheel additionally bundles
+> `libmindnerve.so`, a compiled native runtime component under a separate
+> STARGA license. The Phase-1 PyTorch inference path runs entirely under
+> Apache-2.0 and does not require that binary. See [License](#license) and
+> [`LICENSE.md`](LICENSE.md) for the full split.
 
 ## The problem
 
@@ -69,7 +77,8 @@ constraint on library growth.
 | Load the whole library | strong        | fast              | O(N) skills, every turn |
 | Vector-only retrieval  | weak on intent | fast              | low |
 | LLM-as-router          | strong        | a full LLM call   | a full LLM call |
-| **mind-nerve**         | 96.06% top-5  | 23 ms p95 (warm daemon) | a few hundred tokens |
+| **mind-nerve (Phase 1, GPU daemon)** | 96.06% top-5 | ~23 ms p95 (warm daemon, GPU) | a few hundred tokens |
+| **mind-nerve (Phase 1, 4-core CPU)** | 96.06% top-5 | ~90 ms p95 (warm daemon, CPU) | a few hundred tokens |
 
 ## Quickstart
 
@@ -153,14 +162,15 @@ Together they bracket the prompt path.
 
 ## Integrations
 
-| Host                        | Mechanism                       | Status |
-| --------------------------- | ------------------------------- | ------ |
-| Claude Code                 | MCP + optional hooks            | shipping |
-| Claude Desktop              | MCP                             | shipping |
-| Cursor                      | MCP (`~/.cursor/mcp.json`)      | shipping |
-| Codex                       | MCP (`~/.codex/config.toml`)    | shipping |
-| Any MCP-aware client        | stdio MCP server                | shipping |
-| Aider, Gemini CLI, Windsurf | shim integrations               | v0.1.1 roadmap |
+| Host                        | Mechanism                                          | Status |
+| --------------------------- | -------------------------------------------------- | ------ |
+| Claude Code                 | MCP + optional `UserPromptSubmit`/`SessionStart` hooks | shipping |
+| Claude Desktop              | MCP (`claude_desktop_config.json`)                 | shipping |
+| Cursor                      | MCP (`~/.cursor/mcp.json`)                         | shipping |
+| Codex                       | MCP (`~/.codex/config.toml`)                       | shipping |
+| Gemini CLI                  | extension manifest (`~/.gemini/extensions/`)       | shipping |
+| Any MCP-aware client        | stdio MCP server                                   | shipping |
+| Aider, Windsurf             | shim integrations                                  | roadmap |
 
 The CLI matrix is opt-in:
 
@@ -199,19 +209,59 @@ mind-nerve-install install --cli all
 
 ## How it works
 
-**Current architecture (Phase 1 — shipped):** Encoder + direct scoring head.
-The encoder is a sliding-window self-attention model (window 256 tokens,
-stride 192); the decoder is dropped entirely ("drop-the-decoder" design per
-[`spec/architecture.md`](spec/architecture.md)). The direct scoring head
-dot-products the encoded query against the precomputed catalog embeddings
-and returns the top-K routes. Top-K extraction is deterministic: ties break
-by ascending SHA-256(route_id) so the same input on x86, ARM, and CUDA
-returns the same ranking every time. Full spec in
-[`spec/architecture.md`](spec/architecture.md).
+The frozen design is **drop-the-decoder + sliding-window encoder + direct
+scoring head**. The decoder is dropped entirely; the encoder uses
+sliding-window self-attention (window 256 tokens, stride 192) and writes a
+pooled query vector that is dot-producted against the precomputed catalog
+embedding table to produce the top-K routes. Top-K extraction is
+deterministic: ties break by ascending SHA-256(route_id), so the same input
+on x86, ARM, and CUDA returns the same ranking every time. The authoritative
+design is [`spec/architecture.md`](spec/architecture.md).
 
-**Target architecture (Phase 2 — in progress):** The same encoder design
-compiled to native MIND Q16.16 fixed-point, removing the PyTorch dependency
-and closing the CPU latency budget (≤30 ms p95 on 4-core CPU).
+That single design has two backends. Phase 1 is the one users install today.
+Phase 2 is being brought up incrementally and is not yet end-to-end.
+
+### Phase 1 backend — shipped today
+
+- **Implementation:** PyTorch + `sentence-transformers` (`BAAI/bge-small-en-v1.5`
+  fine-tuned on the v1.1-oss catalog), loaded once into the
+  `mind-nerve-routed` UNIX-socket daemon.
+- **Routing path:** encoder forward → L2-normalised pooled query vector →
+  dense dot product against the precomputed `route_table.npy` →
+  deterministic top-K with SHA-256 tie-break and `top_k ∈ [1, 64]` bounds.
+- **Weights:** auto-downloaded on first use from
+  [`star-ga/mind-nerve-phase1`](https://huggingface.co/star-ga/mind-nerve-phase1)
+  at the pinned revision recorded in the wheel (override via
+  `MIND_NERVE_HF_REVISION`).
+- **Latency:** warm-daemon p95 ~23 ms on GPU, ~90 ms on a 4-core CPU. The
+  ≤30 ms-on-CPU target is the **Phase 2** target, not the Phase 1 result.
+- **License:** Apache-2.0 end-to-end. Phase 1 does not load
+  `libmindnerve.so`; it runs entirely on the Python wheel surface.
+
+### Phase 2 backend — in progress (A1.5 PARTIAL)
+
+The same drop-the-decoder + sliding-window encoder design, compiled to a
+native MIND Q16.16 fixed-point `cdylib` that the wheel loads through a
+C-ABI shim. Goals: remove the PyTorch dependency, close the ≤30 ms-on-CPU
+budget, and prove cross-architecture bit-identity across x86, ARM, CUDA,
+and WebGPU.
+
+Status, as of commit
+[`b9b6401`](https://github.com/star-ga/mind-nerve/commit/b9b6401)
+(A1.5 PARTIAL):
+
+- ✅ A1.1–A1.4 — Q16.16 corpus, encoder kernels, C-ABI export surface, and
+  the SHA-256 bit-identity harness scaffold all landed.
+- ✅ A1.5 — pure-MIND encoder `cdylib` builds. The native **score path**
+  (matmul against the 11,922-row route table) measures
+  **p50 14.4 ms / p95 15.1 ms** on a 4-core CPU at commit `b9b6401` —
+  already inside the Phase 2 budget for that stage of the pipeline.
+- 🚧 Blocked on **mindc Phase 6.2** quantizer + SIMD lowering for the
+  full encoder forward; until that lands, the wheel still routes through
+  the Phase 1 PyTorch backend by default.
+- 🚧 Cross-architecture bit-identity hardware validation across x86, ARM,
+  CUDA, and WebGPU is the gating step before Phase 2 becomes the
+  default backend.
 
 ## Design constraints
 
@@ -277,17 +327,36 @@ mind-nerve/
 
 ## License
 
-The repository source, the Python wheel surface, and the Phase-1 trained
-weights on Hugging Face are all **Apache-2.0**. The wheel additionally
-bundles `libmindnerve.so` — a compiled native runtime component whose
-source is not part of this repository and is not distributed under Apache
-2.0; that component carries a separate STARGA license documented in
-[`LICENSE.md`](LICENSE.md). The Phase-1 PyTorch inference path does not
-depend on `libmindnerve.so`; users running `MIND_NERVE_BACKEND=pytorch`
-operate entirely under Apache-2.0.
+mind-nerve ships under a **dual license**:
 
-For commercial enquiries, contact
-[`license@star.ga`](mailto:license@star.ga).
+- **Apache-2.0** — the repository source (`python/`, `src/`, `spec/`,
+  `cli/`, `integrations/`, `tests/`), the Python wheel surface, and the
+  Phase-1 trained weights at
+  [`star-ga/mind-nerve-phase1`](https://huggingface.co/star-ga/mind-nerve-phase1)
+  are Apache-2.0. Phase-1 PyTorch inference runs entirely under Apache-2.0
+  and does **not** load any STARGA-licensed binary.
+- **STARGA Commercial** — the wheel additionally bundles
+  `libmindnerve.so`, a compiled native runtime component whose source is
+  not part of this repository. That binary carries a separate STARGA
+  license. Redistribution outside the published wheel is not granted by
+  the Apache-2.0 file.
+
+Full split is documented in [`LICENSE.md`](LICENSE.md). For commercial
+enquiries, contact [`license@star.ga`](mailto:license@star.ga).
+
+## Governance and support
+
+- **Contributing:** [`CONTRIBUTING.md`](CONTRIBUTING.md) — build, test, and PR flow.
+- **Security disclosures:** [`SECURITY.md`](SECURITY.md) — please do not file
+  public issues for vulnerabilities; report to
+  [`info@star.ga`](mailto:info@star.ga).
+- **Privacy:** [`docs/privacy.md`](docs/privacy.md) — local-only routing,
+  opt-in logging, no telemetry by default.
+- **Model card:** [`docs/model_card.md`](docs/model_card.md) — Phase-1 base
+  model, training data, intended use, and known limitations.
+- **Dataset and governance:** [`docs/dataset.md`](docs/dataset.md) and
+  [`docs/data_governance.md`](docs/data_governance.md) — corpus schema,
+  provenance, retention, and license posture.
 
 ## Citation
 

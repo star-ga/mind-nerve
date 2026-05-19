@@ -1,0 +1,75 @@
+name: Feature request
+description: Suggest an enhancement or new capability for mind-nerve.
+title: "feat: <summary>"
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for proposing a feature. The frozen architecture for
+        mind-nerve is documented in
+        [`spec/architecture.md`](../../spec/architecture.md) — material
+        changes to that surface require an RFC under
+        [`RFCs/`](../../RFCs); please open an issue here to discuss
+        first.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user-visible problem does this feature solve?
+      placeholder: "Today, X is hard because ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed surface
+      description: What would the API / CLI / config look like? Code samples welcome.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds, other libraries, or design variants you considered.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - Python API
+        - CLI / console scripts
+        - Daemon / socket protocol
+        - MCP server / tool surface
+        - Installer / integrations
+        - Training pipeline
+        - Spec change (requires RFC)
+        - Docs only
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Use-case details, scale, performance constraints, links to upstream issues, etc.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Confirmation
+      options:
+        - label: I have searched existing issues and discussions for similar proposals.
+          required: true
+        - label: I understand spec-level changes require an RFC and maintainer sign-off.
+          required: true

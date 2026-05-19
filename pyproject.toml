@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mind-nerve"
 dynamic = ["version"]
-description = "Intent-classification preselector for agent runtimes — open the library, hide the cost"
+description = "Intent-classification preselector for agent runtimes — open the library, hide the cost. Apache-2.0 source and Phase-1 weights; wheel bundles a separately licensed native runtime component (see LICENSE.md). Full documentation lives in README.md on the project homepage."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }

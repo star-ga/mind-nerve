@@ -1,0 +1,32 @@
+# mind-nerve CODEOWNERS
+#
+# These owners will be the default owners for everything in the repository.
+# Unless a later match takes precedence, they will be requested for review
+# when someone opens a pull request.
+#
+# Reference:
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-configuration/customizing-your-repository/about-code-owners
+
+* @cputer
+
+# Spec changes touch the frozen architecture contract; cputer owns these
+# explicitly even though the catch-all already covers them.
+/spec/                 @cputer
+/RFCs/                 @cputer
+
+# Governance and release surfaces.
+/.github/              @cputer
+/CONTRIBUTING.md       @cputer
+/SECURITY.md           @cputer
+/LICENSE               @cputer
+/LICENSE.md            @cputer
+/pyproject.toml        @cputer
+
+# Public Python surface — anything that goes out on PyPI.
+/python/mind_nerve/    @cputer
+
+# Public docs published from the repo root.
+/README.md             @cputer
+/ROADMAP.md            @cputer
+/CHANGELOG.md          @cputer
+/docs/                 @cputer

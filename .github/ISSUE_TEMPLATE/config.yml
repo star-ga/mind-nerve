@@ -1,0 +1,18 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security disclosure
+    url: https://github.com/star-ga/mind-nerve/security/policy
+    about: |
+      Report a security vulnerability privately. Do not file public
+      issues for security problems. See SECURITY.md for the disclosure
+      channel and SLAs.
+  - name: Commercial licensing
+    url: mailto:license@star.ga
+    about: |
+      Questions about the bundled native runtime, redistribution of
+      the wheel, or commercial use beyond the Apache-2.0 source surface.
+  - name: General inquiries
+    url: mailto:info@star.ga
+    about: |
+      Partnerships, press, or anything that is not a bug, feature, or
+      security disclosure.

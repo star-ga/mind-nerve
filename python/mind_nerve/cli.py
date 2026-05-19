@@ -266,8 +266,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--runtime-dir",
         default=None,
-        help="Override the runtime directory (default: $MIND_NERVE_RUNTIME_DIR or "
-        "/data/datasets/mind-nerve-catalog/phase1/v1.1-oss)",
+        help="Override the runtime directory (default: $MIND_NERVE_RUNTIME_DIR, "
+        "or ~/.local/share/mind-nerve/runtime/ which is auto-seeded from "
+        "Hugging Face on first use).",
     )
 
     sub = ap.add_subparsers(dest="cmd", required=True)

@@ -1,0 +1,105 @@
+name: Bug report
+description: Report a defect in mind-nerve routing, packaging, installer, daemon, MCP server, or docs.
+title: "bug: <summary>"
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report. Please fill in
+        as much detail as you can — reproducible reports are the fastest
+        to fix.
+
+        **Do not file security vulnerabilities here.** See
+        [`SECURITY.md`](../../SECURITY.md) for the private disclosure
+        channel.
+
+  - type: input
+    id: version
+    attributes:
+      label: mind-nerve version
+      description: Output of `mind-nerve --version`
+      placeholder: "0.3.0b5"
+    validations:
+      required: true
+
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      description: Output of `python --version`
+      placeholder: "3.12.4"
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: Platform / OS / arch
+      placeholder: "Ubuntu 24.04, x86_64"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Surface affected
+      multiple: true
+      options:
+        - mind-nerve CLI (`mind-nerve route`)
+        - Daemon (`mind-nerve-routed`)
+        - MCP server (`mind-nerve-mcp`)
+        - Installer (`mind-nerve-install`)
+        - Preselect hook (`mind-nerve-preselect`)
+        - Python API (`from mind_nerve import route`)
+        - Docs / README / spec
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction steps
+      description: Minimal commands or code that reproduces the issue.
+      render: shell
+      placeholder: |
+        $ pip install mind-nerve==0.3.0b5
+        $ mind-nerve route "deploy the staging build" --top-k 5
+        ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+      description: Include full tracebacks, JSON error envelopes, or stderr output.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Additional context
+      description: Catalog size, runtime dir contents, custom HF revision, anything else relevant.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Confirmation
+      options:
+        - label: I have searched existing issues and this is not a duplicate.
+          required: true
+        - label: I am not reporting a security vulnerability through this channel.
+          required: true

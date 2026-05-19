@@ -98,3 +98,40 @@ jobs:
         run: pip install -e ".[dev]"
       - name: Run pytest
         run: pytest tests/python -v
+
+  mindc-parse:
+    name: mindc-parse (Phase 2 Q16.16 kernels)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Checkout mind compiler at v0.4.4
+        uses: actions/checkout@v4
+        with:
+          repository: star-ga/mind
+          ref: v0.4.4
+          path: mind-compiler
+      - name: Build mindc
+        working-directory: mind-compiler
+        run: cargo build --release --features "std-surface cross-module-imports" --bin mindc
+      - name: Parse every .mind file in mind/luts/ and mind/kernels/
+        run: |
+          MINDC=$(pwd)/mind-compiler/target/release/mindc
+          fail=0
+          for f in mind/luts/*.mind mind/kernels/*.mind; do
+            [ -f "$f" ] || continue
+            echo "::group::Parsing $f"
+            if "$MINDC" "$f" --emit-ir > /dev/null 2>&1; then
+              echo "  OK"
+            else
+              echo "  FAIL — re-running with output:"
+              "$MINDC" "$f" --emit-ir || true
+              fail=1
+            fi
+            echo "::endgroup::"
+          done
+          if [ $fail -ne 0 ]; then
+            echo "::error::One or more .mind files failed to parse under mindc v0.4.4"
+            exit 1
+          fi
+          echo "All .mind kernels + LUTs parse cleanly under mindc v0.4.4."

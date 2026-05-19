@@ -620,6 +620,55 @@ static void mind_nerve_blas_gemm_micro_mr4_avx2(
     out[0]=(int64_t)(int32_t)(s0>>16); out[1]=(int64_t)(int32_t)(s1>>16);
     out[2]=(int64_t)(int32_t)(s2>>16); out[3]=(int64_t)(int32_t)(s3>>16);
 }
+
+// MR=4 x NR=2 register tile: 4 A rows x 2 transposed-B rows. Each A-row
+// vector load is reused across BOTH Bt rows AND each Bt load across all 4
+// A rows (8 i64 accumulators). out[r*2+n] is the SAME contiguous i64
+// K-dot as gemm_dot_i32_avx2(a_r, bt_n) — byte-identical (even/odd
+// _mm256_mul_epi32, associative i64 sum, single final >>16).
+__attribute__((target("avx2,fma")))
+static void mind_nerve_blas_gemm_micro_mr4nr2_avx2(
+    const int32_t *a0, const int32_t *a1,
+    const int32_t *a2, const int32_t *a3,
+    const int32_t *bt0, const int32_t *bt1,
+    int64_t K, int64_t out[8]
+) {
+    __m256i c00=_mm256_setzero_si256(), c01=_mm256_setzero_si256();
+    __m256i c10=_mm256_setzero_si256(), c11=_mm256_setzero_si256();
+    __m256i c20=_mm256_setzero_si256(), c21=_mm256_setzero_si256();
+    __m256i c30=_mm256_setzero_si256(), c31=_mm256_setzero_si256();
+    int64_t k = 0;
+    for (; k + 8 <= K; k += 8) {
+        __m256i vb0=_mm256_loadu_si256((const __m256i *)(bt0+k));
+        __m256i vb1=_mm256_loadu_si256((const __m256i *)(bt1+k));
+        __m256i vb0o=_mm256_srli_epi64(vb0,32);
+        __m256i vb1o=_mm256_srli_epi64(vb1,32);
+        #define MIND_T2(VA, C_0, C_1) do {                                 \
+            __m256i va =_mm256_loadu_si256((const __m256i *)((VA)+k));      \
+            __m256i vao=_mm256_srli_epi64(va,32);                          \
+            C_0=_mm256_add_epi64(C_0,_mm256_mul_epi32(va, vb0));           \
+            C_0=_mm256_add_epi64(C_0,_mm256_mul_epi32(vao,vb0o));          \
+            C_1=_mm256_add_epi64(C_1,_mm256_mul_epi32(va, vb1));           \
+            C_1=_mm256_add_epi64(C_1,_mm256_mul_epi32(vao,vb1o));          \
+        } while (0)
+        MIND_T2(a0,c00,c01); MIND_T2(a1,c10,c11);
+        MIND_T2(a2,c20,c21); MIND_T2(a3,c30,c31);
+        #undef MIND_T2
+    }
+    int64_t hb[8][4] __attribute__((aligned(32)));
+    _mm256_storeu_si256((__m256i*)hb[0],c00);_mm256_storeu_si256((__m256i*)hb[1],c01);
+    _mm256_storeu_si256((__m256i*)hb[2],c10);_mm256_storeu_si256((__m256i*)hb[3],c11);
+    _mm256_storeu_si256((__m256i*)hb[4],c20);_mm256_storeu_si256((__m256i*)hb[5],c21);
+    _mm256_storeu_si256((__m256i*)hb[6],c30);_mm256_storeu_si256((__m256i*)hb[7],c31);
+    int64_t s[8];
+    for (int t=0;t<8;++t) s[t]=hb[t][0]+hb[t][1]+hb[t][2]+hb[t][3];
+    const int32_t *AR[4]={a0,a1,a2,a3};
+    const int32_t *BR[2]={bt0,bt1};
+    for (; k < K; ++k)
+        for (int r=0;r<4;++r) for (int n=0;n<2;++n)
+            s[r*2+n] += (int64_t)AR[r][k]*(int64_t)BR[n][k];
+    for (int t=0;t<8;++t) out[t]=(int64_t)(int32_t)(s[t]>>16);
+}
 #endif
 
 int64_t __mind_nerve_blas_matmul_q16_i64(
@@ -655,7 +704,17 @@ int64_t __mind_nerve_blas_matmul_q16_i64(
                     int64_t *C1 = C + (size_t)(i+1)*(size_t)N;
                     int64_t *C2 = C + (size_t)(i+2)*(size_t)N;
                     int64_t *C3 = C + (size_t)(i+3)*(size_t)N;
-                    for (int64_t j = 0; j < N; ++j) {
+                    int64_t j = 0;
+                    for (; j + 2 <= N; j += 2) {  // MR=4 x NR=2 tile
+                        const int32_t *bt0 = Btp + (size_t)(j+0)*(size_t)K;
+                        const int32_t *bt1 = Btp + (size_t)(j+1)*(size_t)K;
+                        int64_t o[8];
+                        mind_nerve_blas_gemm_micro_mr4nr2_avx2(
+                            a0,a1,a2,a3,bt0,bt1,K,o);
+                        C0[j]=o[0];C0[j+1]=o[1]; C1[j]=o[2];C1[j+1]=o[3];
+                        C2[j]=o[4];C2[j+1]=o[5]; C3[j]=o[6];C3[j+1]=o[7];
+                    }
+                    for (; j < N; ++j) {  // N % 2 tail (proven mr4)
                         const int32_t *btrow = Btp + (size_t)j * (size_t)K;
                         int64_t o[4];
                         mind_nerve_blas_gemm_micro_mr4_avx2(a0,a1,a2,a3,btrow,K,o);

@@ -301,21 +301,37 @@ class _NativeEncoderRuntime:
         # Load HF tokenizer for WordPiece tokenization (stays Python-side).
         self._tokenizer = self._load_tokenizer(runtime_dir)
 
-        # Weight blob: loaded from route_table.q16.bin when present.
-        # For A1.3 we initialise the handle with a placeholder zero-length
-        # blob so that mn_encoder_init allocates scratch buffers; the weight
-        # blob is null until the offline quantizer ships in Phase 6.2.
+        # Encoder-weights blob: the Q16.16 weight tables consumed by
+        # mn_encoder_encode (NOT the catalog — that is route_table.q16.bin).
+        # Produced offline by tools/quantize_encoder_to_q16.py. Resolution:
+        #   1. $MIND_NERVE_ENCODER_WEIGHTS (explicit override)
+        #   2. <runtime_dir>/encoder_weights.q16.bin (default)
+        # When absent, the handle is initialised with a zero-length blob so
+        # mn_encoder_init still allocates scratch buffers; encode then yields
+        # an all-zero embedding (caller can detect via the missing blob).
         self._handle: int = 0
-        q16_blob_path = runtime_dir / "route_table.q16.bin"
+        env_blob = os.environ.get("MIND_NERVE_ENCODER_WEIGHTS")
+        if env_blob:
+            q16_blob_path = Path(env_blob).expanduser()
+        else:
+            q16_blob_path = runtime_dir / "encoder_weights.q16.bin"
+        self._encoder_weights_path = q16_blob_path
+        self._encoder_weights_loaded = q16_blob_path.exists()
         if q16_blob_path.exists():
+            import ctypes as _ct
+
+            # Pin the blob for the lifetime of the handle; the native side
+            # stores the raw address and reads it on every encode call.
             self._weights = np.fromfile(str(q16_blob_path), dtype=np.int64)
-            self._weights_pinned = np.ascontiguousarray(self._weights)
-            blob_addr = int(
-                self._weights_pinned.ctypes.data_as(
-                    __import__("ctypes").POINTER(__import__("ctypes").c_int64)
-                ).__int__()
+            self._weights_pinned = np.ascontiguousarray(self._weights, dtype=np.int64)
+            blob_addr = (
+                _ct.cast(
+                    self._weights_pinned.ctypes.data_as(_ct.POINTER(_ct.c_int64)),
+                    _ct.c_void_p,
+                ).value
+                or 0
             )
-            self._handle = self._native.init(blob_addr, self._weights.nbytes)
+            self._handle = self._native.init(blob_addr, self._weights_pinned.nbytes)
         else:
             # Placeholder handle: no valid weights yet.
             self._handle = self._native.init(0, 0)

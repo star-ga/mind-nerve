@@ -26,10 +26,10 @@ In scope:
 - `route_table.q16.bin` — concatenated Q16.16 per-row catalog
   embeddings, row-major, i64 LE per element.
 - `route_table.q16.meta.json` — reproducibility metadata.
-- (Optional) `encoder_weights.q16.bin` — when a checkpoint exposes a
-  separable Q16.16-quantizable encoder head. Phase 1 does NOT emit
-  this; reserved for Phase 6.x once `mn_encoder_init` consumes a real
-  weights blob.
+- `encoder_weights.q16.bin` — the full Q16.16 encoder-weights blob
+  consumed by the native `mn_encoder_encode` kernel. Produced by
+  `tools/quantize_encoder_to_q16.py` from the checkpoint
+  `model.safetensors`. Layout and gates: §3.4.
 
 Out of scope:
 - Online quantization on the inference path. The inference path
@@ -212,6 +212,61 @@ chain (see `spec/architecture.md §"Model-hash discipline"`). The
 inference path independently rehashes the catalog at load time; the
 meta SHA-256 is for human/CI verification of the quantizer output.
 
+### 3.4 `encoder_weights.q16.bin`
+
+The Q16.16 weight blob consumed by the native `mn_encoder_encode`
+kernel. Produced offline by `tools/quantize_encoder_to_q16.py` from a
+safetensors-format SentenceTransformer checkpoint
+(`<checkpoint>/model.safetensors`, a 12-layer BGE-small-en-v1.5 / BERT
+encoder). Same Q16.16 scheme as §2 (the quantizer imports the catalog
+quantizer's `quantize_array` verbatim — one implementation in the tree).
+
+Flat binary, **no header**. The byte layout is dictated by the
+*compiled* kernel's fixed pointer arithmetic in
+`mind/kernels/encode.mind` (`emb_block_bytes`, `layer_stride_bytes`,
+and the per-layer / embedding `off_*` functions) — NOT by the true
+tensor shapes:
+
+```
++-------------------------------------------------------------------+
+|  Embedding block (emb_block_bytes = 95_380_480 B from wb + 0)     |
+|    word_table   wb + 0           30522 rows + 3968 pad i64 slots  |
+|    pos_table    wb + 93_795_328  512 × 384                        |
+|    type_table   wb + 95_368_192  2 × 384                          |
+|    emb_ln_g     wb + 95_374_336  384                              |
+|    emb_ln_b     wb + 95_377_408  384                              |
+|  12 × layer block (layer_stride_bytes = 14_195_712 B each)        |
+|    Wq Wk Wv Wo (384×384), Wf1 (384×1536), Wf2 (1536×384),         |
+|    biases, ln1_g/b, ln2_g/b — at the encode.mind off_* offsets    |
++-------------------------------------------------------------------+
+Total = 95_380_480 + 12 × 14_195_712 = 265_729_024 bytes.
+```
+
+Critical layout facts:
+
+- The kernel's `pos_table_ptr` is the hard-coded byte offset
+  `93_795_328` (= `11_724_416` i64 slots). The true word table is
+  `30522 × 384 = 11_720_448` slots, leaving exactly `3_968` zero i64
+  pad slots before the position table. The pad is **not** a whole
+  number of 384-wide rows; the kernel never indexes past word row
+  30521 (token IDs are vocabulary-bounded) so the trailing slots stay
+  zero and are never read.
+- The MIND matmul kernel computes `c[i,j] = sum_k a[i,k] · b[k,j]`
+  with `b` row-major `(K, N)`. A PyTorch `nn.Linear` stores its weight
+  `(out, in)` and computes `x @ Wᵀ`. Every 2-D weight matrix is
+  therefore **transposed** to `(in, out)` in the blob.
+
+`encoder_weights.q16.meta.json` carries the same reproducibility
+metadata shape as §3.2 plus `n_layers`, `word_table_rows`,
+`word_table_pad_slots`, `emb_block_bytes`, `layer_stride_bytes`. The
+bit-identity gate (§5) applies identically: same checkpoint →
+byte-identical blob. Tested by `tests/python/test_quantize_encoder.py`.
+
+The native runtime locates the blob via
+`$MIND_NERVE_ENCODER_WEIGHTS` (explicit override) then
+`<runtime_dir>/encoder_weights.q16.bin`. Absent ⇒ `mn_encoder_init`
+gets a zero-length blob and `encode` yields an all-zero embedding.
+
 ## Section 4 — Round-trip semantics
 
 The pure-Python helpers `f32_to_q16(f)` and `q16_to_f32(q)` in
@@ -295,6 +350,26 @@ Behaviour:
 
 Exit codes: `0` on success, `1` on runtime error (missing input, bad
 shape), `2` on argument error.
+
+`mind-nerve quantize-encoder` is the encoder-weights entry point
+(§3.4):
+
+```
+mind-nerve quantize-encoder \
+    --checkpoint <dir containing model.safetensors> \
+    [--output <output-dir>] \
+    [--dry-run]
+```
+
+- `--checkpoint` is required and must contain `model.safetensors`.
+- `--output` defaults to `$MIND_NERVE_RUNTIME_DIR` if set, else the
+  user runtime dir (`~/.local/share/mind-nerve/runtime`), so the
+  native runtime finds `encoder_weights.q16.bin` next to
+  `route_table.npy`.
+- `--dry-run` prints the meta JSON without writing.
+
+Exit codes: `0` success, `1` missing checkpoint/safetensors, `2`
+shape/key mismatch.
 
 ## Section 7 — Versioning
 

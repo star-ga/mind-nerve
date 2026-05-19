@@ -171,6 +171,34 @@ def cmd_quantize(args) -> int:
     return module.main(argv)
 
 
+def cmd_quantize_encoder(args) -> int:
+    """Phase 6.x offline encoder-weights quantizer.
+
+    Wraps ``tools/quantize_encoder_to_q16.py``: loads a safetensors
+    checkpoint and emits ``encoder_weights.q16.bin`` for ``mn_encoder_encode``.
+    """
+    import importlib.util as _ilu
+    from pathlib import Path as _Path
+
+    tool_path = _Path(__file__).resolve().parents[2] / "tools" / "quantize_encoder_to_q16.py"
+    spec = _ilu.spec_from_file_location("quantize_encoder_to_q16", tool_path)
+    if spec is None or spec.loader is None:
+        print(
+            json.dumps({"error": f"encoder quantizer tool not found at {tool_path}"}),
+            file=sys.stderr,
+        )
+        return 1
+    module = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    argv = ["--checkpoint", args.checkpoint]
+    if args.output is not None:
+        argv.extend(["--output", args.output])
+    if args.dry_run:
+        argv.append("--dry-run")
+    return module.main(argv)
+
+
 def cmd_attest_sign(args) -> int:
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
     from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
@@ -441,6 +469,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print the meta JSON without writing any file.",
     )
     p_quant.set_defaults(func=cmd_quantize)
+
+    p_quant_enc = sub.add_parser(
+        "quantize-encoder",
+        help="Offline FP32 → Q16.16 encoder-weights quantizer (encoder_weights.q16.bin)",
+    )
+    p_quant_enc.add_argument(
+        "--checkpoint",
+        required=True,
+        help="Path to the checkpoint directory containing model.safetensors.",
+    )
+    p_quant_enc.add_argument(
+        "--output",
+        default=None,
+        help=(
+            "Output directory. Default: $MIND_NERVE_RUNTIME_DIR or the user "
+            "runtime dir (~/.local/share/mind-nerve/runtime)."
+        ),
+    )
+    p_quant_enc.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the meta JSON without writing any file.",
+    )
+    p_quant_enc.set_defaults(func=cmd_quantize_encoder)
 
     p_attest = sub.add_parser(
         "attest", help="MindLLM cross-binding handshake (sign/verify BindingRecords)"

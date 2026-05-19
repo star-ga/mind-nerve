@@ -19,7 +19,6 @@ from __future__ import annotations
 import ctypes
 import os
 from pathlib import Path
-from typing import Sequence
 
 import numpy as np
 
@@ -62,6 +61,7 @@ def _find_so() -> Path:
 # Q16.16 conversion helpers
 # ---------------------------------------------------------------------------
 
+
 def _f32_to_q16(arr: np.ndarray) -> np.ndarray:
     """Convert float32 ndarray to Q16.16 int64 ndarray (element-wise, saturating)."""
     scaled = np.round(arr.astype(np.float64) * _Q16_ONE).astype(np.int64)
@@ -81,6 +81,7 @@ def _token_ids_to_i64(token_ids: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 # NativeRuntime
 # ---------------------------------------------------------------------------
+
 
 class _NativeRuntime:
     """ctypes wrapper for the six mn_encoder_* C-ABI entry points.
@@ -125,7 +126,10 @@ class _NativeRuntime:
         #                           int64_t n_tokens, int64_t out_vec)
         lib.mn_encoder_encode.restype = ctypes.c_int64
         lib.mn_encoder_encode.argtypes = [
-            ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
         ]
 
         # int64_t mn_encoder_score(int64_t handle, int64_t qv,
@@ -133,16 +137,22 @@ class _NativeRuntime:
         #                          int64_t out_scores)
         lib.mn_encoder_score.restype = ctypes.c_int64
         lib.mn_encoder_score.argtypes = [
-            ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
-            ctypes.c_int64, ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
         ]
 
         # int64_t mn_encoder_topk(int64_t scores, int64_t n, int64_t k,
         #                         int64_t out_idx, int64_t out_scores)
         lib.mn_encoder_topk.restype = ctypes.c_int64
         lib.mn_encoder_topk.argtypes = [
-            ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
-            ctypes.c_int64, ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
         ]
 
         # int64_t mn_encoder_free(int64_t handle)
@@ -183,10 +193,12 @@ class _NativeRuntime:
         Returns:
             Opaque i64 handle. Returns 0 on allocation failure.
         """
-        return int(self._lib.mn_encoder_init(
-            ctypes.c_int64(weights_blob_addr),
-            ctypes.c_int64(blob_len_bytes),
-        ))
+        return int(
+            self._lib.mn_encoder_init(
+                ctypes.c_int64(weights_blob_addr),
+                ctypes.c_int64(blob_len_bytes),
+            )
+        )
 
     def encode(
         self,

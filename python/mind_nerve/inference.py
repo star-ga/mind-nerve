@@ -63,6 +63,7 @@ def _load_runtime() -> "_Runtime | _NativeEncoderRuntime":
         return _NativeEncoderRuntime(rdir)
     return _Runtime(rdir)
 
+
 _HF_REPO_ID = "star-ga/mind-nerve-phase1"
 _USER_RUNTIME_DIR = Path.home() / ".local" / "share" / "mind-nerve" / "runtime"
 
@@ -258,6 +259,7 @@ def _load_cached_pytorch(runtime_dir_str: str) -> "_Runtime":
 # Native encoder runtime (MIND_NERVE_BACKEND=native)
 # ---------------------------------------------------------------------------
 
+
 class _NativeEncoderRuntime:
     """Native Q16.16 encoder runtime backed by libmind_nerve_encoder.so.
 
@@ -275,7 +277,7 @@ class _NativeEncoderRuntime:
 
         # Load the native encoder binding. If the .so is not present the
         # import will raise FileNotFoundError with a build instruction.
-        from ._native import _NativeRuntime, _f32_to_q16, _q16_to_f32
+        from ._native import _f32_to_q16, _NativeRuntime, _q16_to_f32
 
         self._native = _NativeRuntime()
         self._f32_to_q16 = _f32_to_q16
@@ -296,8 +298,7 @@ class _NativeEncoderRuntime:
             blob_addr = int(
                 self._weights_pinned.ctypes.data_as(
                     __import__("ctypes").POINTER(__import__("ctypes").c_int64)
-                )
-                .__int__()
+                ).__int__()
             )
             self._handle = self._native.init(blob_addr, self._weights.nbytes)
         else:
@@ -323,13 +324,9 @@ class _NativeEncoderRuntime:
             embeddings_f32 = (embeddings_f32 * freq_scale[:, None]).astype(np.float32)
 
         # Store as Q16.16 int64 for native scoring path.
-        self._catalog_q16: np.ndarray = np.ascontiguousarray(
-            self._f32_to_q16(embeddings_f32)
-        )
+        self._catalog_q16: np.ndarray = np.ascontiguousarray(self._f32_to_q16(embeddings_f32))
 
-        self.routes: list[dict] = [
-            json.loads(ln) for ln in meta_path.open("r")
-        ]
+        self.routes: list[dict] = [json.loads(ln) for ln in meta_path.open("r")]
         if self._catalog_q16.shape[0] != len(self.routes):
             raise RuntimeError("Native catalog embeddings/meta length mismatch")
 
@@ -337,9 +334,7 @@ class _NativeEncoderRuntime:
         prior_path = runtime_dir / "route_table_prior.npy"
         if prior_path.exists():
             lp = np.load(prior_path).astype(np.float32)
-            self._log_prior_q16: np.ndarray | None = np.ascontiguousarray(
-                self._f32_to_q16(lp)
-            )
+            self._log_prior_q16: np.ndarray | None = np.ascontiguousarray(self._f32_to_q16(lp))
         else:
             self._log_prior_q16 = None
 
@@ -348,9 +343,7 @@ class _NativeEncoderRuntime:
         try:
             from transformers import AutoTokenizer  # type: ignore[import]
 
-            return AutoTokenizer.from_pretrained(
-                str(runtime_dir / "checkpoint"), use_fast=True
-            )
+            return AutoTokenizer.from_pretrained(str(runtime_dir / "checkpoint"), use_fast=True)
         except ImportError:
             # transformers not installed; tokenizer unavailable.
             # route() will raise a clear error if encode is called.
@@ -402,6 +395,7 @@ class _NativeEncoderRuntime:
 # ---------------------------------------------------------------------------
 # Backend-aware cached loader
 # ---------------------------------------------------------------------------
+
 
 @functools.lru_cache(maxsize=4)
 def _load_cached(runtime_dir_str: str, backend: str) -> "_Runtime | _NativeEncoderRuntime":

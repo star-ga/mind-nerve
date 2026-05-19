@@ -37,8 +37,8 @@ N_EVAL = 600
 N_LONG = 200
 N_ADVERSARIAL = 200
 
-SLIDING_WINDOW = 256   # encoder max tokens per window
-STRIDE = 192           # window stride (later-window-wins per §3.3)
+SLIDING_WINDOW = 256  # encoder max tokens per window
+STRIDE = 192  # window stride (later-window-wins per §3.3)
 
 THIS_DIR = Path(__file__).parent
 CORPUS_PATH = THIS_DIR / "corpus.json"
@@ -83,6 +83,7 @@ class _Xorshift64:
 # Route table loader
 # ---------------------------------------------------------------------------
 
+
 def _route_names(runtime_dir: Path) -> list[str]:
     """Return all route names from route_table.jsonl."""
     jsonl = runtime_dir / "route_table.jsonl"
@@ -115,123 +116,221 @@ def _resolve_runtime_dir() -> Path | None:
 # ---------------------------------------------------------------------------
 
 _HARDCODED_EVAL_SEED: list[str] = [
-    "git status", "git diff HEAD", "git log --oneline -20",
-    "git commit -m 'feat: add user auth'", "git push origin main",
-    "git pull --rebase", "git stash", "git stash pop",
-    "git checkout -b feature/new-api", "git merge main",
-    "npm install", "npm run build", "npm test", "npm run dev",
-    "pip install -r requirements.txt", "pip install -e '.[dev]'",
-    "python -m pytest tests/ -v", "python -m pytest --cov",
-    "docker build -t myapp .", "docker run -p 8080:80 myapp",
-    "docker-compose up -d", "docker-compose down",
-    "kubectl apply -f deployment.yaml", "kubectl get pods",
-    "kubectl logs -f pod-name", "kubectl exec -it pod bash",
-    "terraform plan", "terraform apply", "terraform destroy",
-    "cargo build --release", "cargo test", "cargo clippy",
-    "make build", "make test", "make clean",
-    "ls -la", "find . -name '*.py' -type f",
-    "grep -r 'TODO' src/", "grep -rn 'import' .",
-    "cat README.md", "less CHANGELOG.md",
+    "git status",
+    "git diff HEAD",
+    "git log --oneline -20",
+    "git commit -m 'feat: add user auth'",
+    "git push origin main",
+    "git pull --rebase",
+    "git stash",
+    "git stash pop",
+    "git checkout -b feature/new-api",
+    "git merge main",
+    "npm install",
+    "npm run build",
+    "npm test",
+    "npm run dev",
+    "pip install -r requirements.txt",
+    "pip install -e '.[dev]'",
+    "python -m pytest tests/ -v",
+    "python -m pytest --cov",
+    "docker build -t myapp .",
+    "docker run -p 8080:80 myapp",
+    "docker-compose up -d",
+    "docker-compose down",
+    "kubectl apply -f deployment.yaml",
+    "kubectl get pods",
+    "kubectl logs -f pod-name",
+    "kubectl exec -it pod bash",
+    "terraform plan",
+    "terraform apply",
+    "terraform destroy",
+    "cargo build --release",
+    "cargo test",
+    "cargo clippy",
+    "make build",
+    "make test",
+    "make clean",
+    "ls -la",
+    "find . -name '*.py' -type f",
+    "grep -r 'TODO' src/",
+    "grep -rn 'import' .",
+    "cat README.md",
+    "less CHANGELOG.md",
     "curl -X POST https://api.example.com/users -H 'Content-Type: application/json'",
     "curl -s https://api.example.com/health | jq .",
-    "ssh user@host", "scp file.txt user@host:/tmp/",
-    "chmod +x script.sh", "chown -R user:group /path",
-    "top", "htop", "ps aux", "kill -9 1234",
-    "systemctl status nginx", "systemctl restart nginx",
-    "journalctl -f -u nginx", "tail -f /var/log/app.log",
-    "ping google.com", "traceroute google.com",
-    "netstat -tulpn", "ss -tlnp",
-    "df -h", "du -sh *", "free -h",
-    "tar -czf archive.tar.gz dir/", "tar -xzf archive.tar.gz",
-    "zip -r archive.zip dir/", "unzip archive.zip",
+    "ssh user@host",
+    "scp file.txt user@host:/tmp/",
+    "chmod +x script.sh",
+    "chown -R user:group /path",
+    "top",
+    "htop",
+    "ps aux",
+    "kill -9 1234",
+    "systemctl status nginx",
+    "systemctl restart nginx",
+    "journalctl -f -u nginx",
+    "tail -f /var/log/app.log",
+    "ping google.com",
+    "traceroute google.com",
+    "netstat -tulpn",
+    "ss -tlnp",
+    "df -h",
+    "du -sh *",
+    "free -h",
+    "tar -czf archive.tar.gz dir/",
+    "tar -xzf archive.tar.gz",
+    "zip -r archive.zip dir/",
+    "unzip archive.zip",
     "openssl req -new -x509 -days 365 -keyout key.pem -out cert.pem",
     "export DATABASE_URL=postgres://localhost/mydb",
-    "env | grep MIND", "printenv PATH",
-    "which python3", "type git",
-    "nmap -sV localhost", "tracepath example.com",
-    "aws s3 ls s3://my-bucket", "aws ec2 describe-instances",
-    "gcloud compute instances list", "gcloud auth login",
-    "az vm list", "az group create --name mygroup --location eastus",
-    "heroku logs --tail", "heroku config:set KEY=value",
-    "flyctl deploy", "flyctl status",
-    "pytest -x -v --tb=short", "pytest -k test_encoder",
-    "ruff check src/", "ruff format --check src/",
-    "mypy src/ --strict", "black src/ --check",
-    "isort --check-only src/", "bandit -r src/",
-    "eslint src/ --ext .ts", "tsc --noEmit",
-    "vitest run", "jest --coverage",
+    "env | grep MIND",
+    "printenv PATH",
+    "which python3",
+    "type git",
+    "nmap -sV localhost",
+    "tracepath example.com",
+    "aws s3 ls s3://my-bucket",
+    "aws ec2 describe-instances",
+    "gcloud compute instances list",
+    "gcloud auth login",
+    "az vm list",
+    "az group create --name mygroup --location eastus",
+    "heroku logs --tail",
+    "heroku config:set KEY=value",
+    "flyctl deploy",
+    "flyctl status",
+    "pytest -x -v --tb=short",
+    "pytest -k test_encoder",
+    "ruff check src/",
+    "ruff format --check src/",
+    "mypy src/ --strict",
+    "black src/ --check",
+    "isort --check-only src/",
+    "bandit -r src/",
+    "eslint src/ --ext .ts",
+    "tsc --noEmit",
+    "vitest run",
+    "jest --coverage",
     "gh pr create --title 'feat: encoder port'",
-    "gh issue list", "gh repo clone org/repo",
+    "gh issue list",
+    "gh repo clone org/repo",
     "jq '.data[] | .name' response.json",
     "yq '.spec.containers[0].image' pod.yaml",
     "sed -i 's/old/new/g' file.txt",
     "awk '{print $1, $3}' access.log",
-    "sort -u names.txt", "uniq -c words.txt | sort -rn",
-    "wc -l *.py", "head -100 large.log",
-    "diff file1.txt file2.txt", "patch < changes.patch",
-    "strace -p 1234", "ltrace ./binary",
+    "sort -u names.txt",
+    "uniq -c words.txt | sort -rn",
+    "wc -l *.py",
+    "head -100 large.log",
+    "diff file1.txt file2.txt",
+    "patch < changes.patch",
+    "strace -p 1234",
+    "ltrace ./binary",
     "valgrind --leak-check=full ./app",
-    "gdb ./app core", "lldb ./app",
-    "perf stat ./benchmark", "perf record -g ./app",
+    "gdb ./app core",
+    "lldb ./app",
+    "perf stat ./benchmark",
+    "perf record -g ./app",
     "ab -n 1000 -c 10 http://localhost:8080/",
     "wrk -t4 -c100 -d30s http://localhost:8080/api/v1/",
     "siege -c 50 -r 100 http://localhost/",
     "locust -f locustfile.py --headless -u 100 -r 10",
-    "k6 run script.js", "artillery run load.yml",
-    "redis-cli ping", "redis-cli SET key value",
-    "psql -U postgres -d mydb", "pg_dump mydb > backup.sql",
-    "mysql -u root -p mydb", "mysqldump mydb > backup.sql",
+    "k6 run script.js",
+    "artillery run load.yml",
+    "redis-cli ping",
+    "redis-cli SET key value",
+    "psql -U postgres -d mydb",
+    "pg_dump mydb > backup.sql",
+    "mysql -u root -p mydb",
+    "mysqldump mydb > backup.sql",
     "mongosh --eval 'db.stats()'",
     "sqlite3 mydb.db '.tables'",
-    "celery worker -A app.celery", "celery beat -A app.celery",
-    "rabbitmq-server start", "kafka-topics --list",
+    "celery worker -A app.celery",
+    "celery beat -A app.celery",
+    "rabbitmq-server start",
+    "kafka-topics --list",
     "ffmpeg -i input.mp4 -c:v h264 output.mp4",
     "convert image.jpg -resize 50% thumbnail.jpg",
-    "optipng *.png", "jpegoptim *.jpg",
+    "optipng *.png",
+    "jpegoptim *.jpg",
     "pandoc README.md -o README.pdf",
-    "latex document.tex", "bibtex document",
-    "node server.js", "node -e 'console.log(process.version)'",
-    "deno run main.ts", "bun run start",
-    "go build ./...", "go test ./...", "go mod tidy",
-    "rustc main.rs", "rustup update",
-    "mvn clean install", "mvn test",
-    "gradle build", "gradle test",
-    "dotnet build", "dotnet test",
-    "php artisan serve", "php artisan migrate",
-    "rails server", "rails db:migrate",
-    "flask run --debug", "uvicorn main:app --reload",
-    "gunicorn -w 4 main:app", "nginx -t",
-    "apache2ctl configtest", "apache2ctl restart",
-    "certbot renew", "certbot certonly --standalone",
-    "fail2ban-client status", "ufw status numbered",
-    "iptables -L -n", "nft list ruleset",
-    "crontab -e", "at 2:00 AM tomorrow",
+    "latex document.tex",
+    "bibtex document",
+    "node server.js",
+    "node -e 'console.log(process.version)'",
+    "deno run main.ts",
+    "bun run start",
+    "go build ./...",
+    "go test ./...",
+    "go mod tidy",
+    "rustc main.rs",
+    "rustup update",
+    "mvn clean install",
+    "mvn test",
+    "gradle build",
+    "gradle test",
+    "dotnet build",
+    "dotnet test",
+    "php artisan serve",
+    "php artisan migrate",
+    "rails server",
+    "rails db:migrate",
+    "flask run --debug",
+    "uvicorn main:app --reload",
+    "gunicorn -w 4 main:app",
+    "nginx -t",
+    "apache2ctl configtest",
+    "apache2ctl restart",
+    "certbot renew",
+    "certbot certonly --standalone",
+    "fail2ban-client status",
+    "ufw status numbered",
+    "iptables -L -n",
+    "nft list ruleset",
+    "crontab -e",
+    "at 2:00 AM tomorrow",
     "ansible-playbook site.yml -i inventory",
-    "ansible all -m ping", "chef-client --local-mode",
-    "puppet apply site.pp", "salt '*' test.ping",
-    "vagrant up", "vagrant ssh", "packer build template.json",
-    "helm install myapp ./chart", "helm upgrade myapp ./chart",
-    "istioctl analyze", "kubectl rollout status deployment/myapp",
-    "argocd app sync myapp", "flux reconcile source git flux-system",
+    "ansible all -m ping",
+    "chef-client --local-mode",
+    "puppet apply site.pp",
+    "salt '*' test.ping",
+    "vagrant up",
+    "vagrant ssh",
+    "packer build template.json",
+    "helm install myapp ./chart",
+    "helm upgrade myapp ./chart",
+    "istioctl analyze",
+    "kubectl rollout status deployment/myapp",
+    "argocd app sync myapp",
+    "flux reconcile source git flux-system",
     "prometheus --config.file=prometheus.yml",
     "grafana-server --config /etc/grafana/grafana.ini",
-    "jaeger-all-in-one", "zipkin",
+    "jaeger-all-in-one",
+    "zipkin",
     "sentry-cli releases new 1.0.0",
     "datadog-agent status",
     "newrelic-admin run-program gunicorn main:app",
-    "logstash -f logstash.conf", "kibana",
+    "logstash -f logstash.conf",
+    "kibana",
     "elasticsearch --daemon",
-    "solr start -p 8983", "zookeeper-server-start.sh config/zookeeper.properties",
+    "solr start -p 8983",
+    "zookeeper-server-start.sh config/zookeeper.properties",
     "spark-submit --master local[4] job.py",
     "hadoop jar wordcount.jar WordCount input output",
     "hive -e 'SELECT COUNT(*) FROM my_table'",
     "pig -x local script.pig",
-    "airflow dags list", "airflow tasks test my_dag task_id 2024-01-01",
-    "dbt run", "dbt test", "dbt docs generate",
-    "mlflow ui", "mlflow run . -P alpha=0.5",
+    "airflow dags list",
+    "airflow tasks test my_dag task_id 2024-01-01",
+    "dbt run",
+    "dbt test",
+    "dbt docs generate",
+    "mlflow ui",
+    "mlflow run . -P alpha=0.5",
     "bentoml serve service.py:svc",
     "triton-server --model-repository=/models",
-    "ollama run llama2", "ollama pull mistral",
+    "ollama run llama2",
+    "ollama pull mistral",
     "llamafile -m model.gguf --server",
     "litellm --model gpt-4 --port 8000",
     "openai api chat.completions.create -m gpt-4",
@@ -241,37 +340,53 @@ _HARDCODED_EVAL_SEED: list[str] = [
     "optimum-cli export onnx --model bert-base-uncased bert_onnx",
     "onnxruntime --help",
     "tensorrt --help",
-    "nvcc --version", "nvidia-smi", "nvtop",
+    "nvcc --version",
+    "nvidia-smi",
+    "nvtop",
     "python -c 'import torch; print(torch.cuda.is_available())'",
     "accelerate launch train.py",
     "deepspeed --num_gpus=4 train.py",
     "torchrun --nproc_per_node=4 train.py",
-    "ray start --head", "ray up cluster.yaml",
-    "dask-scheduler", "dask-worker scheduler:8786",
-    "jupyter notebook", "jupyter lab",
-    "voila notebook.ipynb", "nbconvert --to html notebook.ipynb",
+    "ray start --head",
+    "ray up cluster.yaml",
+    "dask-scheduler",
+    "dask-worker scheduler:8786",
+    "jupyter notebook",
+    "jupyter lab",
+    "voila notebook.ipynb",
+    "nbconvert --to html notebook.ipynb",
     "papermill input.ipynb output.ipynb -p alpha 0.1",
-    "snakemake --cores 4", "nextflow run pipeline.nf",
+    "snakemake --cores 4",
+    "nextflow run pipeline.nf",
     "cwltool workflow.cwl input.yml",
     "cromwell run workflow.wdl inputs.json",
     "singularity exec myimage.sif python train.py",
     "apptainer build myimage.sif def.def",
     "lxc launch ubuntu:22.04 mycontainer",
     "qemu-system-x86_64 -m 4G -hda disk.img",
-    "virsh start myvm", "virt-install --name myvm",
+    "virsh start myvm",
+    "virt-install --name myvm",
     "multipass launch 22.04 --name myvm",
     "lima start default.yaml",
     "nix-shell -p python3 numpy",
-    "nix build .#myapp", "guix build python",
+    "nix build .#myapp",
+    "guix build python",
     "conda create -n myenv python=3.11",
-    "conda activate myenv", "mamba install numpy",
-    "poetry add requests", "poetry run python main.py",
-    "pipx install black", "uv pip install requests",
-    "pdm add requests", "flit build",
-    "twine upload dist/*", "python -m build",
-    "bump2version patch", "semantic-release version",
+    "conda activate myenv",
+    "mamba install numpy",
+    "poetry add requests",
+    "poetry run python main.py",
+    "pipx install black",
+    "uv pip install requests",
+    "pdm add requests",
+    "flit build",
+    "twine upload dist/*",
+    "python -m build",
+    "bump2version patch",
+    "semantic-release version",
     "pre-commit run --all-files",
-    "commitizen bump", "git-crypt unlock",
+    "commitizen bump",
+    "git-crypt unlock",
     "sops --decrypt secrets.enc.yaml",
     "vault kv get secret/myapp",
     "aws secretsmanager get-secret-value --secret-id myapp",
@@ -282,20 +397,24 @@ _HARDCODED_EVAL_SEED: list[str] = [
     "age -r recipient.pub plaintext.txt > encrypted.txt",
     "openssl enc -aes-256-cbc -in file -out file.enc",
     "checksec --file=./binary",
-    "pwndbg ./vulnerable", "radare2 ./binary",
-    "ghidra", "ida64",
+    "pwndbg ./vulnerable",
+    "radare2 ./binary",
+    "ghidra",
+    "ida64",
     "objdump -d ./binary | head -50",
     "strings ./binary | grep -i password",
     "strace -e trace=network ./app",
     "tcpdump -i eth0 -w capture.pcap",
     "wireshark capture.pcap",
-    "burpsuite", "zap-cli quick-scan http://localhost",
+    "burpsuite",
+    "zap-cli quick-scan http://localhost",
     "nikto -h http://localhost",
     "sqlmap -u 'http://localhost/user?id=1'",
     "nmap -sS -O localhost",
     "masscan --rate=1000 -p1-65535 192.168.1.0/24",
     "shodan search 'apache'",
-    "metasploit", "msfconsole",
+    "metasploit",
+    "msfconsole",
     "hydra -l admin -P passwords.txt http-get://localhost",
     "john --wordlist=rockyou.txt hashes.txt",
     "hashcat -a 0 -m 0 hashes.txt wordlist.txt",
@@ -303,9 +422,11 @@ _HARDCODED_EVAL_SEED: list[str] = [
     "steghide extract -sf image.jpg",
     "binwalk -e firmware.bin",
     "volatility -f memory.dmp --profile=Win7SP1x64 pslist",
-    "autopsy", "sleuthkit fls -r image.dd",
+    "autopsy",
+    "sleuthkit fls -r image.dd",
     "foremost -i image.dd -o output/",
-    "exiftool image.jpg", "exifprobe image.jpg",
+    "exiftool image.jpg",
+    "exifprobe image.jpg",
     "mat2 --inplace document.pdf",
     "tshark -r capture.pcap -T fields -e http.request.uri",
     "suricata -c suricata.yaml -i eth0",
@@ -313,24 +434,34 @@ _HARDCODED_EVAL_SEED: list[str] = [
     "zeek -r capture.pcap",
     "yara rules.yar suspicious.exe",
     "clamav --scan-dir=/tmp",
-    "rkhunter --check", "chkrootkit",
-    "lynis audit system", "openscap xccdf eval --profile xccdf_org",
-    "trivy image myapp:latest", "grype myapp:latest",
+    "rkhunter --check",
+    "chkrootkit",
+    "lynis audit system",
+    "openscap xccdf eval --profile xccdf_org",
+    "trivy image myapp:latest",
+    "grype myapp:latest",
     "syft myapp:latest -o spdx-json",
-    "snyk test", "dependabot",
+    "snyk test",
+    "dependabot",
     "semgrep --config=p/python .",
-    "sonarqube-scanner", "fortify sca -b myapp -scan",
-    "checkmarx scan create", "veracode-api-signing",
+    "sonarqube-scanner",
+    "fortify sca -b myapp -scan",
+    "checkmarx scan create",
+    "veracode-api-signing",
     "prowler -g check11,check12 -r us-east-1",
     "steampipe query 'select * from aws_iam_user'",
     "cloudsplaining generate --input-file policy.json",
-    "pacu modules list", "cloudmapper collect --account my-account",
+    "pacu modules list",
+    "cloudmapper collect --account my-account",
     "trufflehog git --repo https://github.com/org/repo",
-    "gitleaks detect --source .", "detect-secrets scan",
-    "dockle myapp:latest", "hadolint Dockerfile",
+    "gitleaks detect --source .",
+    "detect-secrets scan",
+    "dockle myapp:latest",
+    "hadolint Dockerfile",
     "kube-score score deployment.yaml",
     "polaris audit --config polaris.yaml --audit-path .",
-    "kubeaudit all", "conftest test deployment.yaml",
+    "kubeaudit all",
+    "conftest test deployment.yaml",
     "opa eval --data policy.rego --input input.json",
     "terrascan scan -t aws -d .",
     "checkov -d .",
@@ -338,18 +469,29 @@ _HARDCODED_EVAL_SEED: list[str] = [
     "regula run .",
     "cloud-custodian run -s out/ policy.yml",
     "falco --config /etc/falco/falco.yaml",
-    "cilium status", "calico node status",
-    "istio analyze", "linkerd check",
+    "cilium status",
+    "calico node status",
+    "istio analyze",
+    "linkerd check",
     "envoy --config-path envoy.yaml",
-    "consul agent -dev", "nomad agent -dev",
-    "vault server -dev", "boundary dev",
-    "waypoint up", "packer init .",
-    "pulumi up", "pulumi stack select dev",
-    "cdk deploy", "cdk synth",
-    "sam build", "sam deploy",
-    "serverless deploy", "serverless invoke local",
-    "netlify deploy --prod", "vercel --prod",
-    "wrangler deploy", "pages-functions-build",
+    "consul agent -dev",
+    "nomad agent -dev",
+    "vault server -dev",
+    "boundary dev",
+    "waypoint up",
+    "packer init .",
+    "pulumi up",
+    "pulumi stack select dev",
+    "cdk deploy",
+    "cdk synth",
+    "sam build",
+    "sam deploy",
+    "serverless deploy",
+    "serverless invoke local",
+    "netlify deploy --prod",
+    "vercel --prod",
+    "wrangler deploy",
+    "pages-functions-build",
 ]
 
 
@@ -389,13 +531,44 @@ def _synthetic_eval_queries(rng: _Xorshift64, n: int, seen: set[str]) -> list[st
         "export {tool} data",
     ]
     tools = [
-        "terraform", "ansible", "kubernetes", "docker", "helm", "vault",
-        "consul", "nomad", "packer", "vagrant", "jenkins", "gitlab",
-        "github-actions", "circleci", "travisci", "drone", "argocd",
-        "flux", "tekton", "knative", "istio", "linkerd", "envoy",
-        "prometheus", "grafana", "alertmanager", "loki", "tempo",
-        "jaeger", "zipkin", "opentelemetry", "datadog", "newrelic",
-        "splunk", "elasticsearch", "kibana", "logstash", "fluentd",
+        "terraform",
+        "ansible",
+        "kubernetes",
+        "docker",
+        "helm",
+        "vault",
+        "consul",
+        "nomad",
+        "packer",
+        "vagrant",
+        "jenkins",
+        "gitlab",
+        "github-actions",
+        "circleci",
+        "travisci",
+        "drone",
+        "argocd",
+        "flux",
+        "tekton",
+        "knative",
+        "istio",
+        "linkerd",
+        "envoy",
+        "prometheus",
+        "grafana",
+        "alertmanager",
+        "loki",
+        "tempo",
+        "jaeger",
+        "zipkin",
+        "opentelemetry",
+        "datadog",
+        "newrelic",
+        "splunk",
+        "elasticsearch",
+        "kibana",
+        "logstash",
+        "fluentd",
     ]
     results: list[str] = []
     while len(results) < n:
@@ -419,7 +592,7 @@ _LONG_QUERY_TEMPLATES: list[str] = [
         "def process_batch(items: list[dict], batch_size: int = 32, "
         "timeout: float = 30.0, retry_count: int = 3, "
         "backoff_factor: float = 1.5) -> list[dict]: "
-        "\"\"\"Process a batch of items with retry logic and exponential backoff. "
+        '"""Process a batch of items with retry logic and exponential backoff. '
         "Each item is validated, transformed, and persisted to the database. "
         "Failed items are retried up to retry_count times with exponential backoff. "
         "Items that fail all retries are logged and returned in the error list. "
@@ -429,7 +602,7 @@ _LONG_QUERY_TEMPLATES: list[str] = [
         "timeout (float) — per-item timeout in seconds; "
         "retry_count (int) — maximum retries per item; "
         "backoff_factor (float) — exponential backoff multiplier. "
-        "Returns: list of successfully processed items.\"\"\" "
+        'Returns: list of successfully processed items.""" '
         "results = [] "
         "errors = [] "
         "for i in range(0, len(items), batch_size): "
@@ -452,7 +625,7 @@ _LONG_QUERY_TEMPLATES: list[str] = [
     ),
     (
         "class DistributedEmbeddingCache: "
-        "\"\"\"Thread-safe distributed embedding cache backed by Redis with "
+        '"""Thread-safe distributed embedding cache backed by Redis with '
         "LRU eviction, TTL support, and automatic serialization of "
         "numpy float32 arrays to Q16.16 fixed-point representation. "
         "The cache key is SHA-256(model_hash + tokenizer_hash + query_text). "
@@ -461,7 +634,7 @@ _LONG_QUERY_TEMPLATES: list[str] = [
         "(maxsize=1024) and L2 is the shared Redis cluster. "
         "Write-back from L1 to L2 is asynchronous via a background thread. "
         "The serialize method converts float32[384] to Q16.16 i32[384] bytes "
-        "with deterministic rounding for cross-arch reproducibility.\"\"\" "
+        'with deterministic rounding for cross-arch reproducibility.""" '
         "def __init__(self, redis_url: str, ttl_seconds: int = 3600, "
         "             l1_maxsize: int = 1024) -> None: "
         "    self._redis = redis.Redis.from_url(redis_url) "
@@ -863,43 +1036,43 @@ _LONG_QUERY_TEMPLATES: list[str] = [
         "IFS=$'\\n\\t' "
         "# Automated deployment script for mind-nerve v0.4.0 "
         "# Performs: build, test, security scan, docker build, push, deploy "
-        "SCRIPT_DIR=\"$(cd \"$(dirname \"${BASH_SOURCE[0]}\")\" && pwd)\" "
-        "REPO_ROOT=\"$(cd \"${SCRIPT_DIR}/..\" && pwd)\" "
-        "VERSION=\"${1:-}\" "
-        "ENVIRONMENT=\"${2:-staging}\" "
-        "REGISTRY=\"ghcr.io/star-ga\" "
-        "IMAGE=\"${REGISTRY}/mind-nerve\" "
-        "if [[ -z \"${VERSION}\" ]]; then "
+        'SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" '
+        'REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)" '
+        'VERSION="${1:-}" '
+        'ENVIRONMENT="${2:-staging}" '
+        'REGISTRY="ghcr.io/star-ga" '
+        'IMAGE="${REGISTRY}/mind-nerve" '
+        'if [[ -z "${VERSION}" ]]; then '
         "    echo 'ERROR: VERSION argument required' >&2 "
         "    echo 'Usage: deploy.sh <version> [environment]' >&2 "
         "    exit 1 "
         "fi "
-        "echo \"==> Deploying mind-nerve ${VERSION} to ${ENVIRONMENT}\" "
-        "cd \"${REPO_ROOT}\" "
+        'echo "==> Deploying mind-nerve ${VERSION} to ${ENVIRONMENT}" '
+        'cd "${REPO_ROOT}" '
         "echo '==> Running tests...' "
         "python -m pytest tests/ -x -q --tb=short "
         "echo '==> Running security scan...' "
         "bandit -r python/mind_nerve -ll "
         "echo '==> Building Docker image...' "
-        "docker build --build-arg VERSION=\"${VERSION}\" "
-        "             --build-arg BUILD_DATE=\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" "
-        "             --build-arg VCS_REF=\"$(git rev-parse HEAD)\" "
-        "             -t \"${IMAGE}:${VERSION}\" "
-        "             -t \"${IMAGE}:latest\" "
+        'docker build --build-arg VERSION="${VERSION}" '
+        '             --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+        '             --build-arg VCS_REF="$(git rev-parse HEAD)" '
+        '             -t "${IMAGE}:${VERSION}" '
+        '             -t "${IMAGE}:latest" '
         "             . "
         "echo '==> Scanning image for vulnerabilities...' "
-        "trivy image --exit-code 1 --severity HIGH,CRITICAL \"${IMAGE}:${VERSION}\" "
+        'trivy image --exit-code 1 --severity HIGH,CRITICAL "${IMAGE}:${VERSION}" '
         "echo '==> Pushing image...' "
-        "docker push \"${IMAGE}:${VERSION}\" "
-        "docker push \"${IMAGE}:latest\" "
+        'docker push "${IMAGE}:${VERSION}" '
+        'docker push "${IMAGE}:latest" '
         "echo '==> Deploying to Kubernetes...' "
         "kubectl set image deployment/mind-nerve-encoder "
-        "        encoder=\"${IMAGE}:${VERSION}\" "
-        "        --namespace=\"${ENVIRONMENT}\" "
+        '        encoder="${IMAGE}:${VERSION}" '
+        '        --namespace="${ENVIRONMENT}" '
         "kubectl rollout status deployment/mind-nerve-encoder "
-        "        --namespace=\"${ENVIRONMENT}\" "
+        '        --namespace="${ENVIRONMENT}" '
         "        --timeout=300s "
-        "echo \"==> Deployment complete: ${IMAGE}:${VERSION} -> ${ENVIRONMENT}\" "
+        'echo "==> Deployment complete: ${IMAGE}:${VERSION} -> ${ENVIRONMENT}" '
     ),
     # Data pipeline
     (
@@ -1103,6 +1276,7 @@ _LONG_QUERY_TEMPLATES: list[str] = [
 # Adversarial corpus
 # ---------------------------------------------------------------------------
 
+
 def _build_adversarial(rng: _Xorshift64) -> list[str]:
     """200 adversarial cases covering edge conditions in the encoder."""
     cases: list[str] = []
@@ -1172,15 +1346,15 @@ def _build_adversarial(rng: _Xorshift64) -> list[str]:
 
     # 6. Unicode edge cases (10 cases)
     unicode_cases = [
-        "\x01",        # control character SOH
-        "�",          # replacement character
-        "​",          # zero-width space
-        "‌",          # zero-width non-joiner
-        "‍",          # zero-width joiner
-        "﻿",          # BOM
-        "é",          # é
-        "中文",   # Chinese characters
-        "ال",   # Arabic
+        "\x01",  # control character SOH
+        "�",  # replacement character
+        "​",  # zero-width space
+        "‌",  # zero-width non-joiner
+        "‍",  # zero-width joiner
+        "﻿",  # BOM
+        "é",  # é
+        "中文",  # Chinese characters
+        "ال",  # Arabic
         "αβγ",  # Greek α β γ
     ]
     cases.extend(unicode_cases)
@@ -1242,10 +1416,26 @@ def _build_adversarial(rng: _Xorshift64) -> list[str]:
 
     # 12. Pad to exactly 200 cases with synthetic variations
     base_queries = [
-        "what is", "how to", "find all", "list", "get", "show me",
-        "explain", "help with", "configure", "deploy", "run", "stop",
-        "start", "restart", "check", "validate", "test", "build",
-        "install", "update",
+        "what is",
+        "how to",
+        "find all",
+        "list",
+        "get",
+        "show me",
+        "explain",
+        "help with",
+        "configure",
+        "deploy",
+        "run",
+        "stop",
+        "start",
+        "restart",
+        "check",
+        "validate",
+        "test",
+        "build",
+        "install",
+        "update",
     ]
     while len(cases) < N_ADVERSARIAL:
         b = base_queries[rng.next_bounded(len(base_queries))]
@@ -1260,31 +1450,30 @@ def _build_adversarial(rng: _Xorshift64) -> list[str]:
 # Corpus assembly
 # ---------------------------------------------------------------------------
 
+
 def _build_eval_segment(runtime_dir: Path | None, rng: _Xorshift64) -> list[str]:
     """
-    Build 600 eval-distribution queries.
+    Build 600 eval-distribution queries from the hardcoded seed list.
 
-    Priority:
-    1. Route names from route_table.jsonl (real eval distribution).
-    2. Fall back to _HARDCODED_EVAL_SEED if runtime is absent.
+    Historical note: an earlier version of this function preferred a live
+    `route_table.jsonl` (the installed runtime's actual catalog) when
+    present, and only fell back to `_HARDCODED_EVAL_SEED` if absent. That
+    introduced a determinism failure under CI: machines with the runtime
+    installed produced one corpus, the CI runner produced a different one,
+    and the committed `corpus.json` could only match one of them.
+
+    Phase A1.4 closes that gap by sourcing the eval segment exclusively
+    from the in-repo `_HARDCODED_EVAL_SEED`. The committed `corpus.json`
+    is now reproducible on any machine — CI, dev box, fresh clone — from
+    nothing but the contents of this file plus the seed constants.
     """
-    if runtime_dir is not None:
-        names = _route_names(runtime_dir)
-        if names:
-            # Shuffle deterministically, then take first 600.
-            rng.shuffle(names)
-            names = names[:N_EVAL]
-            # Pad if fewer than 600 routes exist.
-            seen = set(names)
-            names = list(names)
-            if len(names) < N_EVAL:
-                names.extend(
-                    _synthetic_eval_queries(rng, N_EVAL - len(names), seen)
-                )
-            return names
-
-    # Fallback: hardcoded seed list.
+    # `runtime_dir` is accepted for API stability but intentionally ignored.
+    _ = runtime_dir
     base = _ensure_600(list(_HARDCODED_EVAL_SEED))
+    # Apply the corpus seed's permutation so ordering still benefits from
+    # the deterministic shuffle (matters for any downstream consumer that
+    # walks `eval_segment` in order).
+    rng.shuffle(base)
     return base
 
 

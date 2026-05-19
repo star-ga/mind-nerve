@@ -36,6 +36,7 @@
 // No f32. No while. Depends on: std.vec (callers), luts.* (not needed here).
 
 use std.vec;
+use kernels.matmul_blas;
 
 // ---------------------------------------------------------------------------
 // Per-head element accessors
@@ -100,11 +101,14 @@ pub fn qkt_heads(q: i64, k_buf: i64, attn: i64, H: i64,
     qkt_heads(q, k_buf, attn, H, T, D, h + 1)
 }
 
-// Public: Q·Kᵀ batched over H heads.
+// Public: Q·Kt batched over H heads.
 // q: (H,T,D) Q16.16, k_buf: (H,T,D) Q16.16,
-// attn: (H,T,T) output — written with /sqrt(D) scale applied.
+// attn: (H,T,T) output -- written with /sqrt(D) scale applied.
+// Phase A1.5 Step 2: delegated to BLAS SIMD path (byte-identical to scalar).
+// Scalar primitives (qkt_dot_k, qkt_row_j, qkt_rows_i, qkt_heads) are kept
+// intact as the oracle reference; they are not reachable from this entry point.
 pub fn qkt_matmul(q: i64, k_buf: i64, attn: i64, H: i64, T: i64, D: i64) -> i64 {
-    qkt_heads(q, k_buf, attn, H, T, D, 0)
+    qkt_blas(q, k_buf, attn, H, T, D)
 }
 
 // ---------------------------------------------------------------------------
@@ -148,6 +152,9 @@ pub fn attnv_heads(attn: i64, v: i64, out: i64, H: i64,
 // Public: attn·V batched over H heads.
 // attn: (H,T,T) Q16.16, v: (H,T,D) Q16.16,
 // out: (H,T,D) Q16.16 output.
+// Phase A1.5 Step 2: delegated to BLAS SIMD path (byte-identical to scalar).
+// Scalar primitives (attnv_dot_k, attnv_row_j, attnv_rows_i, attnv_heads)
+// are kept intact as the oracle reference.
 pub fn attnv_matmul(attn: i64, v: i64, out: i64, H: i64, T: i64, D: i64) -> i64 {
-    attnv_heads(attn, v, out, H, T, D, 0)
+    attnv_blas(attn, v, out, H, T, D)
 }

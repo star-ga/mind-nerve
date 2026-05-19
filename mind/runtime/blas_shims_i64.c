@@ -550,3 +550,261 @@ int64_t __mind_nerve_blas_matmul_q16_i64(
     if (acc_heap) free(acc);
     return 0;
 }
+
+// ---------------------------------------------------------------------------
+// Attention SIMD kernels (Phase A1.5 Step 2)
+//
+// Two contractions in the multi-head attention block:
+//
+//   qkt_matmul  — Q·Kᵀ per head: for each (h,i,j), sum_k Q[h,i,k]*K[h,j,k]
+//   attnv_matmul — attn·V per head: for each (h,i), k-outer over V rows
+//
+// Buffer layout (from batched_matmul_q16.mind, comment block):
+//   Q, K, V:  (H, T, D) head-major row-major i64 buffers
+//             element [h, t, d] at offset (h*T*D + t*D + d)*8
+//   attn:     (H, T, T) head-major row-major i64 buffer
+//             element [h, i, j] at offset (h*T*T + i*T + j)*8
+//   out/ctx:  (H, T, D) same layout as Q
+//
+// Stride analysis:
+//
+//   qkt inner dot: Q[h,i,0..D-1] is a contiguous D-element row (stride 1).
+//   K[h,j,0..D-1] is a contiguous D-element row (stride 1).
+//   => simple contiguous dot of length D=32.  Both rows are SIMD-ready.
+//
+//   attnv inner loop: for fixed (h,i) we compute
+//       out[h,i,j] = sum_k attn[h,i,k] * V[h,k,j]  j=0..D-1
+//   Rewriting as k-outer (same pattern as the Step 1 GEMM):
+//       scalar = attn[h,i,k];  V[h,k,0..D-1] is contiguous (D=32).
+//   => accrow(scalar, V_row, acc[D], D) — identical to gemm_accrow above.
+//
+// Accumulation contract (must match canonical scalar in batched_matmul_q16.mind):
+//
+//   qkt_dot_k: acc = sum_{k=0}^{D-1} Q[k]*K[k]  (Q32.32, NO intermediate >>16)
+//     then caller writes  attn[h,i,j] = (acc >> 16) * scale >> 16
+//
+//   attnv accrow: acc[j] += attn_ik * V[h,k,j]  for all k (Q32.32, no shift)
+//     then caller writes  out[h,i,j] = (int32_t)(acc[j] >> 16)
+//
+// Byte-identity argument:
+//   Both paths accumulate a fixed set of Q16.16*Q16.16 products in i64
+//   without any intermediate right-shift during the reduction loop.  Integer
+//   addition is associative and commutative; the final >>16 is applied once
+//   per output element after the full reduction.  The set of products is
+//   identical whether the inner loop is scalar-sequential or 4-wide AVX2
+//   (the loop body computes the same values in the same j-ascending order;
+//   the AVX2 kernel is a register-width unrolling of the scalar loop, not
+//   a reassociation).  This is the same argument as the Step 1 GEMM (task #57).
+//
+//   Overflow:
+//     qkt: D=32 products each at most 2^30 -> sum <= 32*2^30 = 2^35.  Fine.
+//     attnv: T<=256 products each at most 2^30 -> sum <= 256*2^30 = 2^38. Fine.
+//
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// dot_q32_accum — contiguous Q16.16 dot returning Q32.32 (no intermediate >>16)
+//
+// Returns sum_{k=0}^{len-1} (int32_t)a[k] * (int32_t)b[k]  as i64.
+// Both a and b are i64 stride-8 buffers; low 32 bits carry the Q16.16 value.
+// ---------------------------------------------------------------------------
+
+static int64_t mind_nerve_blas_dot_q32_accum_scalar(
+    const int64_t *a, const int64_t *b, int64_t len
+) {
+    int64_t acc = 0;
+    for (int64_t k = 0; k < len; ++k) {
+        int64_t av = (int64_t)(int32_t)a[k];
+        int64_t bv = (int64_t)(int32_t)b[k];
+        acc += av * bv;
+    }
+    return acc;
+}
+
+#if MIND_NERVE_BLAS_X86_64
+// AVX2 Q32.32 dot: accumulate 4 x i64 products per iteration, no >>16.
+// _mm256_mul_epi32 sign-extends the low 32 bits of each i64 lane and
+// produces 4 x i64 products (same widening as the GEMM accrow kernel).
+// Horizontal sum at end; scalar tail for len not divisible by 4.
+__attribute__((target("avx2,fma")))
+static int64_t mind_nerve_blas_dot_q32_accum_avx2(
+    const int64_t *a, const int64_t *b, int64_t len
+) {
+    __m256i vacc = _mm256_setzero_si256();
+    int64_t k = 0;
+    for (; k + 4 <= len; k += 4) {
+        __m256i va = _mm256_loadu_si256((const __m256i *)(a + k));
+        __m256i vb = _mm256_loadu_si256((const __m256i *)(b + k));
+        // Widening signed 32x32->64 multiply on the low 32-bit lane of each i64.
+        __m256i prod = _mm256_mul_epi32(va, vb);
+        vacc = _mm256_add_epi64(vacc, prod);
+    }
+    int64_t buf[4] __attribute__((aligned(32)));
+    _mm256_store_si256((__m256i *)buf, vacc);
+    int64_t sum = buf[0] + buf[1] + buf[2] + buf[3];
+    for (; k < len; ++k) {
+        int64_t av = (int64_t)(int32_t)a[k];
+        int64_t bv = (int64_t)(int32_t)b[k];
+        sum += av * bv;
+    }
+    return sum;
+}
+#endif /* MIND_NERVE_BLAS_X86_64 */
+
+// ---------------------------------------------------------------------------
+// __mind_nerve_blas_qkt_q16_i64 — batched Q·Kᵀ attention contraction.
+//
+// Computes attn[h,i,j] = (sum_k Q[h,i,k]*K[h,j,k] >> 16) * scale >> 16
+// where scale = attn_scale_q16() = 11585 (Q16.16 encoding of 1/sqrt(32)).
+//
+// Arguments (all i64):
+//   q_addr:    base address of Q  buffer, shape (H, T, D), i64 stride-8
+//   k_addr:    base address of K  buffer, shape (H, T, D), i64 stride-8
+//   attn_addr: base address of attn output, shape (H, T, T), i64 stride-8
+//   H, T, D:   head count, sequence length, per-head dimension
+//
+// Returns 0 on success, -1 if any pointer is null or a dimension is zero.
+//
+// Accumulation matches canonical batched_matmul_q16.mind::qkt_dot_k:
+//   q32 = dot_q32_accum(Q[h,i,:], K[h,j,:], D)
+//   raw_q16 = q32 >> 16
+//   attn[h,i,j] = (raw_q16 * 11585) >> 16
+// Both steps use integer arithmetic with no FP; byte-identical to scalar.
+//
+// The three outer loops (h, i, j) are C for-loops (no recursion overhead).
+// The inner dot is delegated to dot_q32_accum_{scalar,avx2}.
+// ---------------------------------------------------------------------------
+int64_t __mind_nerve_blas_qkt_q16_i64(
+    int64_t q_addr, int64_t k_addr, int64_t attn_addr,
+    int64_t H, int64_t T, int64_t D
+) {
+    if (q_addr == 0 || k_addr == 0 || attn_addr == 0) return -1;
+    if (H <= 0 || T <= 0 || D <= 0) return 0;
+
+    const int64_t *Q    = (const int64_t *)(uintptr_t)q_addr;
+    const int64_t *K    = (const int64_t *)(uintptr_t)k_addr;
+    int64_t       *ATTN = (int64_t       *)(uintptr_t)attn_addr;
+
+    // Attention scale: 1/sqrt(D) in Q16.16.
+    // D=32 always for this model; constant matches attn_scale_q16() in MIND.
+    const int64_t scale = 11585;
+
+    for (int64_t h = 0; h < H; ++h) {
+        // Base pointers for head h.
+        // Q[h, :, :] starts at Q + h*T*D; row i at + i*D.
+        // K[h, :, :] starts at K + h*T*D; row j at + j*D.
+        // attn[h, :, :] starts at ATTN + h*T*T; element [i,j] at + i*T+j.
+        const int64_t *Q_head    = Q    + (size_t)h * (size_t)(T * D);
+        const int64_t *K_head    = K    + (size_t)h * (size_t)(T * D);
+        int64_t       *attn_head = ATTN + (size_t)h * (size_t)(T * T);
+
+        for (int64_t i = 0; i < T; ++i) {
+            const int64_t *Q_row = Q_head + (size_t)i * (size_t)D;
+
+            for (int64_t j = 0; j < T; ++j) {
+                const int64_t *K_row = K_head + (size_t)j * (size_t)D;
+
+                // Q32.32 dot product of two contiguous D-element rows.
+                int64_t q32;
+#if MIND_NERVE_BLAS_X86_64
+                if (mind_nerve_blas_use_avx2) {
+                    q32 = mind_nerve_blas_dot_q32_accum_avx2(Q_row, K_row, D);
+                } else {
+                    q32 = mind_nerve_blas_dot_q32_accum_scalar(Q_row, K_row, D);
+                }
+#else
+                q32 = mind_nerve_blas_dot_q32_accum_scalar(Q_row, K_row, D);
+#endif
+                // Narrow Q32.32 -> Q16.16, then apply 1/sqrt(D) scale.
+                int64_t raw_q16    = q32 >> 16;
+                int64_t scaled_q16 = (raw_q16 * scale) >> 16;
+                attn_head[(size_t)i * (size_t)T + (size_t)j] =
+                    (int64_t)(int32_t)scaled_q16;
+            }
+        }
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// __mind_nerve_blas_attnv_q16_i64 — batched attn·V attention contraction.
+//
+// Computes out[h,i,j] = sum_k attn[h,i,k] * V[h,k,j]  >> 16
+//
+// Arguments (all i64):
+//   attn_addr: (H, T, T) i64 stride-8 — softmax weights
+//   v_addr:    (H, T, D) i64 stride-8 — value projections
+//   out_addr:  (H, T, D) i64 stride-8 — output (overwritten)
+//   H, T, D:   dimensions
+//
+// Returns 0 on success, -1 if any pointer is null or a dimension is zero.
+//
+// k-outer accumulation pattern:
+//   For each (h, i):
+//     zero D-element i64 accumulator
+//     for k = 0..T-1:
+//       attn_ik = attn[h, i, k]                  (scalar, sign-extended i32)
+//       V[h, k, :] is a contiguous D-element row (same layout as the GEMM)
+//       acc[j] += attn_ik * V[h,k,j]  for j=0..D-1  (via gemm_accrow)
+//     out[h,i,j] = (int32_t)(acc[j] >> 16)
+//
+// This is the same k-outer / j-inner pattern as __mind_nerve_blas_matmul_q16_i64;
+// the gemm_accrow_{scalar,avx2} functions are reused directly.  D=32 fits
+// entirely in a fixed-size stack accumulator (no heap allocation needed).
+// ---------------------------------------------------------------------------
+int64_t __mind_nerve_blas_attnv_q16_i64(
+    int64_t attn_addr, int64_t v_addr, int64_t out_addr,
+    int64_t H, int64_t T, int64_t D
+) {
+    if (attn_addr == 0 || v_addr == 0 || out_addr == 0) return -1;
+    if (H <= 0 || T <= 0 || D <= 0) return 0;
+
+    const int64_t *ATTN = (const int64_t *)(uintptr_t)attn_addr;
+    const int64_t *V    = (const int64_t *)(uintptr_t)v_addr;
+    int64_t       *OUT  = (int64_t       *)(uintptr_t)out_addr;
+
+    // D=32 for this model; stack accumulator is 32*8 = 256 bytes.
+    // Use MIND_NERVE_BLAS_GEMM_STACK_N guard for generality.
+    int64_t acc_stack[MIND_NERVE_BLAS_GEMM_STACK_N];
+    if (D > MIND_NERVE_BLAS_GEMM_STACK_N) {
+        // Defensive: D is always 32 in practice; this path is unreachable.
+        return -1;
+    }
+
+    for (int64_t h = 0; h < H; ++h) {
+        const int64_t *attn_head = ATTN + (size_t)h * (size_t)(T * T);
+        const int64_t *V_head    = V    + (size_t)h * (size_t)(T * D);
+        int64_t       *out_head  = OUT  + (size_t)h * (size_t)(T * D);
+
+        for (int64_t i = 0; i < T; ++i) {
+            // attn[h, i, :] row: contiguous T-element slice.
+            const int64_t *attn_row = attn_head + (size_t)i * (size_t)T;
+
+            // Zero the D-element Q32.32 accumulator.
+            memset(acc_stack, 0, (size_t)D * sizeof(int64_t));
+
+            // k-outer: for each attention weight k, accumulate into acc[0..D-1].
+            // V[h, k, :] is a contiguous D-element row.
+            for (int64_t k = 0; k < T; ++k) {
+                int64_t attn_ik = attn_row[k];   // Q16.16, sign-extended in i64
+                const int64_t *V_row = V_head + (size_t)k * (size_t)D;
+#if MIND_NERVE_BLAS_X86_64
+                if (mind_nerve_blas_use_avx2) {
+                    mind_nerve_blas_gemm_accrow_avx2(attn_ik, V_row, acc_stack, D);
+                } else {
+                    mind_nerve_blas_gemm_accrow_scalar(attn_ik, V_row, acc_stack, D);
+                }
+#else
+                mind_nerve_blas_gemm_accrow_scalar(attn_ik, V_row, acc_stack, D);
+#endif
+            }
+
+            // Narrow Q32.32 -> Q16.16 and write output row.
+            int64_t *out_row = out_head + (size_t)i * (size_t)D;
+            for (int64_t j = 0; j < D; ++j) {
+                out_row[j] = (int64_t)(int32_t)(acc_stack[j] >> 16);
+            }
+        }
+    }
+    return 0;
+}

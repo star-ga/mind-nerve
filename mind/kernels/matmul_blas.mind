@@ -84,9 +84,39 @@ pub fn dot_q16_blas(a: i64, b: i64, len: i64) -> i64 {
 // The C shim preserves the canonical (i,k,j) accumulation order from
 // matmul_q16.mind and produces byte-identical output to the scalar
 // tail-recursive path (integer accumulation is associative; the single
-// Q32.32→Q16.16 right-shift happens once per output element).
+// Q32.32->Q16.16 right-shift happens once per output element).
 // AVX2 dispatch: controlled by MIND_NERVE_BLAS env-var at .so load time,
 // same flag as the score path (task #57 invariant).
 pub fn matmul_q16_blas(a: i64, b: i64, c: i64, M: i64, K: i64, N: i64) -> i64 {
     __mind_nerve_blas_matmul_q16_i64(a, b, c, M, K, N)
+}
+
+// qkt_blas — batched Q·Kt attention contraction (Phase A1.5 Step 2).
+//
+// Replaces qkt_matmul in batched_matmul_q16.mind.
+// q:    (H, T, D) i64 head-major row-major Q16.16 buffer.
+// k:    (H, T, D) i64 head-major row-major Q16.16 buffer.
+// attn: (H, T, T) i64 output buffer (overwritten with scaled QKt scores).
+// H, T, D: dimensions (H=12, D=32 for this model; T varies by sequence).
+//
+// Delegated to __mind_nerve_blas_qkt_q16_i64 in blas_shims_i64.c.
+// Accumulation: dot_q32_accum (no intermediate >>16), then >>16 * scale >>16.
+// Byte-identical to qkt_dot_k by the integer-associativity argument.
+pub fn qkt_blas(q: i64, k: i64, attn: i64, H: i64, T: i64, D: i64) -> i64 {
+    __mind_nerve_blas_qkt_q16_i64(q, k, attn, H, T, D)
+}
+
+// attnv_blas — batched attn·V attention contraction (Phase A1.5 Step 2).
+//
+// Replaces attnv_matmul in batched_matmul_q16.mind.
+// attn: (H, T, T) i64 head-major row-major Q16.16 buffer (softmax weights).
+// v:    (H, T, D) i64 head-major row-major Q16.16 buffer (value projections).
+// out:  (H, T, D) i64 output buffer (overwritten).
+// H, T, D: dimensions.
+//
+// Delegated to __mind_nerve_blas_attnv_q16_i64 in blas_shims_i64.c.
+// k-outer loop; per-head D-element Q32.32 accumulator narrowed once.
+// Byte-identical to attnv_dot_k by integer-associativity.
+pub fn attnv_blas(attn: i64, v: i64, out: i64, H: i64, T: i64, D: i64) -> i64 {
+    __mind_nerve_blas_attnv_q16_i64(attn, v, out, H, T, D)
 }

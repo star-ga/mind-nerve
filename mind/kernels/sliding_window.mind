@@ -147,7 +147,7 @@ pub fn copy_slice_j(src: i64, dst: i64, H: i64, t: i64, j: i64) -> i64 {
 pub fn merge_window_t(win_out: i64, global_out: i64, H: i64,
                       t_start: i64, t_end: i64, t: i64) -> i64 {
     if t >= t_end { return 0; }
-    merge_window_j(win_out, global_out, H, t_start, t);
+    merge_window_j(win_out, global_out, H, t_start, t, 0);
     merge_window_t(win_out, global_out, H, t_start, t_end, t + 1)
 }
 

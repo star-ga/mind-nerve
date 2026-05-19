@@ -1,10 +1,19 @@
 #!/usr/bin/env bash
 # mind-nerve/tools/build_native_encoder.sh
 #
+# DEPRECATED: this shell script uses incorrect mindc CLI flags (--output,
+# --features) that were never valid mindc options. It was superseded by
+# tools/build_encoder_cdylib.py for the A1.5 build.
+#
+# Use the Python driver instead:
+#   python3 tools/build_encoder_cdylib.py [--mind-checkout /path/to/mind]
+#
+# This file is kept for historical reference only.
+#
 # Build libmind_nerve_encoder.so from the mind/exports/c_abi.mind surface.
 #
 # Prerequisites:
-#   - mindc v0.4.4+ (from star-ga/mind, checked out at MIND_CHECKOUT or
+#   - mindc v0.6.0+ (from star-ga/mind, checked out at MIND_CHECKOUT or
 #     cloned automatically to /tmp/mind-build/mind).
 #   - Rust toolchain (stable, with x86_64-unknown-linux-gnu target).
 #   - mindc compiled with features: std-surface cross-module-imports mlir-build

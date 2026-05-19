@@ -1,0 +1,60 @@
+# Version control + tooling
+.git
+.gitignore
+.githooks
+.github
+
+# Python build artefacts
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.egg-info
+*.egg
+.eggs
+build
+dist
+target
+.tox
+.nox
+
+# Caches
+.cache
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.benchmarks
+.[a-z]*-cache
+
+# Local environments
+.env
+.venv
+venv
+env
+
+# Tests and large data (kept out of the runtime image; CI runs them separately)
+tests
+research
+audits
+catalog-builder
+autoresearch_results*.tsv
+run.log
+
+# Documentation source (the image only needs runtime behaviour)
+docs
+RFCs
+spec
+ROADMAP.md
+CHANGELOG.md
+program.md
+
+# Editor / OS
+.idea
+.vscode
+*.swp
+.DS_Store
+
+# Native build outputs that may exist locally but must not bleed in
+*.so
+*.dylib
+*.dll

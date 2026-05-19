@@ -1,0 +1,40 @@
+# mind-nerve local-dev / smoke deployment.
+#
+# Brings up a single long-running daemon backed by host-mounted runtime +
+# cache directories so model artefacts persist across container restarts.
+# Healthcheck uses the same UNIX-socket probe as the production
+# SessionStart hook, so readiness here matches readiness inside Claude
+# Code / Cursor / Codex / Gemini / Vibe.
+
+services:
+  mind-nerve-daemon:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mind-nerve:local
+    container_name: mind-nerve-daemon
+    restart: unless-stopped
+    environment:
+      MIND_NERVE_RUNTIME_DIR: /var/lib/mind-nerve/runtime
+      MIND_NERVE_SOCKET: /var/run/mind-nerve/mind-nerve.sock
+      XDG_CACHE_HOME: /var/cache/mind-nerve
+      HF_HOME: /var/cache/mind-nerve/huggingface
+    volumes:
+      - mind-nerve-runtime:/var/lib/mind-nerve/runtime
+      - mind-nerve-cache:/var/cache/mind-nerve
+      - mind-nerve-socket:/var/run/mind-nerve
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - >-
+          test -S /var/run/mind-nerve/mind-nerve.sock &&
+          mind-nerve --version
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+volumes:
+  mind-nerve-runtime:
+  mind-nerve-cache:
+  mind-nerve-socket:

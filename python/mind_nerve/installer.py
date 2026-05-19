@@ -71,6 +71,95 @@ def safe_write(path: Path, content: str) -> None:
     os.replace(tmp_name, path)
 
 
+# ---------------------------------------------------------------------------
+# Rollback: restore previously written user config files from their .bak
+# ---------------------------------------------------------------------------
+
+
+def _target_config_paths(target: str) -> list[Path]:
+    """Return the list of user config files a given install target writes.
+
+    The list mirrors what each ``install_<target>`` function in this
+    module touches via :func:`safe_write`. Used by :func:`rollback_last`
+    to know which ``<path>.bak`` files to consider.
+    """
+    claude_desktop_candidates = [
+        HOME / ".config" / "Claude" / "claude_desktop_config.json",
+        HOME / "Library" / "Application Support" / "Claude" / "claude_desktop_config.json",
+    ]
+    return {
+        "claude": [HOME / ".claude.json", HOME / ".claude" / "settings.json"],
+        "claude-code": [HOME / ".claude.json", HOME / ".claude" / "settings.json"],
+        "claude-code-hook": [HOME / ".claude" / "settings.json"],
+        "claude-desktop": claude_desktop_candidates,
+        "cursor": [HOME / ".cursor" / "mcp.json"],
+        "codex": [HOME / ".codex" / "config.toml"],
+        "gemini": [HOME / ".gemini" / "extensions" / "mind-nerve" / "extension.json"],
+        "vibe": [HOME / ".vibe" / "mcp.json"],
+    }.get(target, [])
+
+
+def rollback_last(target: str) -> dict:
+    """Restore each known config file for *target* from its sibling ``.bak``.
+
+    For every path returned by :func:`_target_config_paths`, if a
+    ``<path>.bak`` exists the current ``<path>`` is replaced (atomically)
+    with the backup's contents. Originals that were never written by
+    ``mind-nerve`` simply have no ``.bak`` and are skipped.
+
+    Args:
+        target: One of ``claude``, ``codex``, ``gemini``, ``vibe``, ...
+
+    Returns:
+        A JSON-serialisable dict summarising which files were restored,
+        which had no backup, and which failed.
+    """
+    if target not in {
+        "claude",
+        "claude-code",
+        "claude-code-hook",
+        "claude-desktop",
+        "cursor",
+        "codex",
+        "gemini",
+        "vibe",
+    }:
+        return {
+            "restored": [],
+            "missing": [],
+            "errors": [{"target": target, "error": "unknown target"}],
+        }
+
+    restored: list[str] = []
+    missing: list[str] = []
+    errors: list[dict] = []
+
+    for path in _target_config_paths(target):
+        bak = path.with_suffix(path.suffix + ".bak")
+        if not bak.exists():
+            missing.append(str(path))
+            continue
+        try:
+            # Atomic restore: write the backup bytes to a temp file in the
+            # same directory and rename over the target. Keeps the same
+            # crash-safety contract as safe_write itself.
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile("wb", dir=path.parent, delete=False) as tmp:
+                tmp.write(bak.read_bytes())
+                tmp_name = tmp.name
+            os.replace(tmp_name, path)
+            restored.append(str(path))
+        except OSError as exc:
+            errors.append({"path": str(path), "error": str(exc)})
+
+    return {
+        "target": target,
+        "restored": restored,
+        "missing": missing,
+        "errors": errors,
+    }
+
+
 # CLIs grouped by install mechanism.
 MCP_CAPABLE = {
     "claude-code": {"detect": HOME / ".claude" / "settings.json", "method": "claude_cli"},
@@ -843,6 +932,15 @@ def install_systemd_user_unit() -> dict:
     }
 
 
+def cmd_rollback(args) -> int:
+    """CLI handler for ``mind-nerve-install rollback --target <name>``."""
+    result = rollback_last(args.target)
+    print(json.dumps(result, indent=2))
+    if result.get("errors"):
+        return 1
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="mind-nerve-install")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -852,6 +950,18 @@ def main(argv: list[str] | None = None) -> int:
 
     p_det = sub.add_parser("detect", help="Detect which supported CLIs are present on this host")
     p_det.set_defaults(func=cmd_detect)
+
+    p_rb = sub.add_parser(
+        "rollback",
+        help="Restore the previous version of a target CLI's config files from .bak",
+    )
+    p_rb.add_argument(
+        "--target",
+        required=True,
+        help="Target name: claude, claude-code, claude-code-hook, claude-desktop, "
+        "cursor, codex, gemini, vibe",
+    )
+    p_rb.set_defaults(func=cmd_rollback)
 
     p_ins = sub.add_parser("install", help="Install the mind-nerve hook for a CLI")
     p_ins.add_argument(

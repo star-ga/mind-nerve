@@ -234,6 +234,20 @@ def cmd_attest_verify(args) -> int:
     return 0 if result == "ok" else 1
 
 
+def cmd_rollback(args) -> int:
+    """Restore a target CLI's config files from their last ``.bak`` snapshots.
+
+    Thin wrapper over :func:`mind_nerve.installer.rollback_last` so users
+    can call either ``mind-nerve rollback --target claude`` or
+    ``mind-nerve-install rollback --target claude``.
+    """
+    from .installer import rollback_last
+
+    result = rollback_last(args.target)
+    print(json.dumps(result, indent=2))
+    return 1 if result.get("errors") else 0
+
+
 def cmd_watch(args) -> int:
     dirs = [(d, args.source or "local") for d in args.dirs]
     w = Watcher(
@@ -389,6 +403,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_verify.add_argument("--indent", action="store_true", help="Pretty-print JSON output")
     p_verify.set_defaults(func=cmd_attest_verify)
+
+    p_rb = sub.add_parser(
+        "rollback",
+        help="Restore a target CLI's config files from their .bak snapshots "
+        "written by mind-nerve-install.",
+    )
+    p_rb.add_argument(
+        "--target",
+        required=True,
+        help="Target name: claude, claude-code, claude-code-hook, claude-desktop, "
+        "cursor, codex, gemini, vibe",
+    )
+    p_rb.set_defaults(func=cmd_rollback)
 
     p_watch = sub.add_parser(
         "watch", help="Daemon: poll one or more dirs for new skills (no inotify dep)"

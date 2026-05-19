@@ -138,6 +138,39 @@ def cmd_train(args) -> int:
     return 0
 
 
+def cmd_quantize(args) -> int:
+    """Phase 6.2 offline Q16.16 quantizer — wraps ``tools/quantize_phase1_to_q16.py``.
+
+    Imports the tool module lazily so the rest of the CLI surface stays
+    free of the dependency. The tool's ``main`` accepts the same argv
+    surface, so this handler simply forwards.
+    """
+    import importlib.util as _ilu
+    from pathlib import Path as _Path
+
+    tool_path = _Path(__file__).resolve().parents[2] / "tools" / "quantize_phase1_to_q16.py"
+    spec = _ilu.spec_from_file_location("quantize_phase1_to_q16", tool_path)
+    if spec is None or spec.loader is None:
+        print(
+            json.dumps({"error": f"quantizer tool not found at {tool_path}"}),
+            file=sys.stderr,
+        )
+        return 1
+    module = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    argv = ["--catalog", args.catalog]
+    if args.input is not None:
+        argv.extend(["--input", args.input])
+    if args.output is not None:
+        argv.extend(["--output", args.output])
+    if args.hidden_dim is not None:
+        argv.extend(["--hidden-dim", str(args.hidden_dim)])
+    if args.dry_run:
+        argv.append("--dry-run")
+    return module.main(argv)
+
+
 def cmd_attest_sign(args) -> int:
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
     from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
@@ -373,6 +406,41 @@ def build_parser() -> argparse.ArgumentParser:
         help="500 pairs, 1 epoch — ~1 min run to validate the pipeline.",
     )
     p_train.set_defaults(func=cmd_train)
+
+    p_quant = sub.add_parser(
+        "quantize",
+        help="Phase 6.2 offline FP32 → Q16.16 quantizer (produces route_table.q16.bin)",
+    )
+    p_quant.add_argument(
+        "--catalog",
+        required=True,
+        help="Path to route_table.npy (float32, shape (N_rows, hidden_dim))",
+    )
+    p_quant.add_argument(
+        "--input",
+        default=None,
+        help=(
+            "Optional PyTorch checkpoint dir or file; hashed into the meta "
+            "JSON only. Pass ``:none:`` or omit to skip."
+        ),
+    )
+    p_quant.add_argument(
+        "--output",
+        default=None,
+        help=("Output directory. Default: $MIND_NERVE_RUNTIME_DIR or ~/.cache/mind-nerve/q16/"),
+    )
+    p_quant.add_argument(
+        "--hidden-dim",
+        type=int,
+        default=None,
+        help="Expected hidden dimension (default: catalog's column count).",
+    )
+    p_quant.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the meta JSON without writing any file.",
+    )
+    p_quant.set_defaults(func=cmd_quantize)
 
     p_attest = sub.add_parser(
         "attest", help="MindLLM cross-binding handshake (sign/verify BindingRecords)"

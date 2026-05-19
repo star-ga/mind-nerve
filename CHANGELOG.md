@@ -4,6 +4,43 @@ All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](htt
 
 ## [Unreleased] — v0.3.0 preparation
 
+### Phase 6.2 — offline Q16.16 quantizer
+
+- `tools/quantize_phase1_to_q16.py` (new): offline FP32 → Q16.16
+  quantizer. Reads a precomputed catalog `route_table.npy` (float32,
+  shape `(N_rows, hidden_dim)`) and emits the runtime artifact
+  `route_table.q16.bin` (row-major Q16.16, `int64` LE per element to
+  match the MIND heap ABI's i64-only loads in
+  `mind/kernels/encode.mind`) plus `route_table.q16.meta.json` with
+  the spec-mandated reproducibility metadata (quantizer version,
+  catalog SHA-256, optional checkpoint SHA-256, blob SHA-256,
+  saturation count).
+- `spec/quantization.md` (new): normative spec. Scale = `2^16`,
+  rounding = round-half-to-even, saturation = clamp to `[INT32_MIN,
+  INT32_MAX]`, on-disk encoding = `int64` LE. Determinism is
+  achieved by `float64` intermediate × explicit `numpy.round` ×
+  `int64` cast — no platform-specific FP ordering.
+- `tests/python/test_quantize_phase1.py` (new): round-trip
+  (`< 2 * 2^-16` ≈ 3.05e-5 max abs error over 1000 random
+  floats), bit-identity gate (same input → byte-identical `.bin`
+  across two runs), saturation, dtype, meta key order, CLI smoke,
+  cross-check against `mind_nerve._native._f32_to_q16`.
+- `python/mind_nerve/cli.py`: new `mind-nerve quantize` subcommand.
+  `mind-nerve quantize --catalog <route_table.npy> --output <dir>`
+  defaults `--output` to `$MIND_NERVE_RUNTIME_DIR` or
+  `~/.cache/mind-nerve/q16/`.
+
+The full-catalog (~4400 routes × 384 dim ≈ 13 MB) blob is produced
+on demand by the user. The `.bin` is never committed to git
+(matches the existing `*.bin` gitignore rule). Full-catalog
+quantization is gated on the Phase 1 PyTorch checkpoint being
+present locally; the quantizer + tests run against a synthetic
+NumPy fixture in the absence of a real checkpoint.
+
+This unblocks the A1.5 `mn_encoder_encode` end-to-end measurement
+path: the native encoder kernel now has a real Q16.16 weight blob
+to consume.
+
 ## [0.3.0-beta.6] — 2026-05-19
 
 Audit-response wave responding to the second external deep-research

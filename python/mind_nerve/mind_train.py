@@ -35,11 +35,16 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import platform
 import random
+import socket
+import subprocess
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal
+
+from .eval_metrics import expected_calibration_error, mrr, ndcg_at_k
 
 DEFAULT_BASE_MODEL = "BAAI/bge-small-en-v1.5"
 DEFAULT_EPOCHS = 3
@@ -48,6 +53,7 @@ DEFAULT_LR = 2e-5
 DEFAULT_MAX_LEN = 256
 DEFAULT_SEED = 1337
 DEFAULT_EVAL_FRAC = 0.1
+DEFAULT_DETERMINISTIC = True
 
 Backend = Literal["python", "native"]
 
@@ -67,6 +73,7 @@ class TrainConfig:
     eval_frac: float = DEFAULT_EVAL_FRAC
     smoke_test: bool = False
     backend: Backend = "python"
+    deterministic: bool = DEFAULT_DETERMINISTIC
 
 
 @dataclass(frozen=True)
@@ -140,11 +147,22 @@ def _evaluate_top_k(
     device: str,
     k_list: tuple[int, ...] = (1, 5, 10),
 ) -> dict[str, float]:
-    """Top-k accuracy of held-out queries against the full positives pool.
+    """Retrieval metrics for held-out queries against the full positives pool.
 
-    `all_positives` MUST be ordered so the first `len(eval_pairs)` entries
-    are the eval positives (so column ``i`` is the correct answer for
-    query ``i``).
+    `all_positives` MUST be ordered so the first ``len(eval_pairs)`` entries
+    are the eval positives (so column ``i`` is the correct answer for query
+    ``i``).
+
+    Emits, in addition to historical top-k accuracy:
+
+      * ``mrr``                  — mean reciprocal rank over the full pool
+      * ``ndcg@1``/``ndcg@5``/``ndcg@10`` — mean nDCG@k with binary
+        relevance
+      * ``ece``                  — expected calibration error using the
+        top-1 softmax-normalized similarity score as a confidence proxy
+
+    The accuracy fields ``top1``/``top5``/``top10`` and ``candidate_pool``
+    remain present and unchanged so downstream consumers do not regress.
     """
     import torch
     import torch.nn.functional as F
@@ -163,13 +181,196 @@ def _evaluate_top_k(
     q_emb = F.normalize(q_emb, dim=-1)
     p_emb = F.normalize(p_emb, dim=-1)
     sims = q_emb @ p_emb.T  # (Q, |corpus|)
-    correct = torch.arange(len(eval_pairs), device=device)
+    n_eval = len(eval_pairs)
+    correct = torch.arange(n_eval, device=device)
     metrics: dict[str, float] = {"candidate_pool": float(len(all_positives))}
+    max_k = min(max(k_list + (10,)), sims.size(1))
+    full_topk = sims.topk(max_k, dim=-1).indices  # (Q, max_k)
+
+    # Classic top-k hit-rate (preserved verbatim).
     for k in k_list:
-        topk = sims.topk(min(k, sims.size(1)), dim=-1).indices
+        kk = min(k, sims.size(1))
+        topk = full_topk[:, :kk]
         hit = (topk == correct.unsqueeze(1)).any(dim=-1).float().mean().item()
         metrics[f"top{k}"] = round(hit, 4)
+
+    # MRR + nDCG@k via the pure-Python reference implementations.
+    ranked_lists = full_topk.detach().cpu().tolist()
+    ground_truth = list(range(n_eval))
+    metrics["mrr"] = round(mrr(ranked_lists, ground_truth), 6)
+    for k in k_list:
+        metrics[f"ndcg@{k}"] = round(ndcg_at_k(ranked_lists, ground_truth, k=k), 6)
+
+    # ECE on the top-1 softmax confidence vs whether the top-1 row index
+    # matches the ground-truth column. Cosine similarities live in
+    # [-1, 1]; softmax normalizes them into a confidence distribution and
+    # we keep only the max per query.
+    probs = torch.softmax(sims.float(), dim=-1)
+    top1_conf, top1_idx = probs.max(dim=-1)
+    scores_np = top1_conf.detach().cpu().numpy()
+    correct_np = (top1_idx == correct).detach().cpu().numpy().astype("int64")
+    metrics["ece"] = round(expected_calibration_error(scores_np, correct_np, n_bins=10), 6)
     return metrics
+
+
+def _git_sha(repo_root: Path | None = None) -> str | None:
+    """Return ``HEAD`` git SHA for ``repo_root`` (cwd by default) or None."""
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(repo_root) if repo_root is not None else None,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    sha = proc.stdout.strip()
+    return sha or None
+
+
+def _sha256_file(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _find_requirements_lock(start: Path) -> Path | None:
+    """Walk upward from ``start`` looking for a ``requirements.lock`` sibling."""
+    cur = start.resolve()
+    for parent in (cur, *cur.parents):
+        candidate = parent / "requirements.lock"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _cpu_info_line() -> str:
+    """Best-effort one-line CPU descriptor (`platform.processor()` fallback)."""
+    info = platform.processor() or ""
+    try:
+        if Path("/proc/cpuinfo").is_file():
+            with Path("/proc/cpuinfo").open("r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    if line.lower().startswith("model name"):
+                        _, _, value = line.partition(":")
+                        info = value.strip() or info
+                        break
+    except OSError:
+        pass
+    return info or "unknown"
+
+
+def _runtime_environment_facts() -> dict[str, Any]:
+    """Collect host-level facts useful for reproducing a training run."""
+    import torch  # local import to keep this module importable without torch
+
+    cuda_version: str | None = None
+    try:
+        cuda_version = torch.version.cuda  # type: ignore[attr-defined]
+    except Exception:
+        cuda_version = None
+
+    return {
+        "hostname": socket.gethostname(),
+        "platform": platform.platform(),
+        "python_version": platform.python_version(),
+        "torch_version": torch.__version__,
+        "cuda_available": bool(torch.cuda.is_available()),
+        "cuda_version": cuda_version,
+        "cpu_info": _cpu_info_line(),
+    }
+
+
+def _apply_deterministic_flags(seed: int) -> None:
+    """Seed every RNG mind-nerve depends on and pin deterministic algorithms.
+
+    Documented cost: ``torch.use_deterministic_algorithms(True, warn_only=True)``
+    plus disabling cuDNN autotuning typically slows GPU training by 10-25% on
+    the BGE-small recipe; the CPU path is unaffected. Set
+    ``TrainConfig(deterministic=False)`` to opt out (and lose run-to-run
+    bit-equality).
+    """
+    import numpy as np
+    import torch
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    except (AttributeError, RuntimeError):
+        # Older Torch builds may not expose the flag.
+        pass
+    try:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    except AttributeError:
+        pass
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
+
+def _emit_run_json(
+    output_dir: Path,
+    config: TrainConfig,
+    dataset_manifest_sha256: str | None,
+    manifest_payload: dict[str, Any],
+    started_at_iso: str,
+    finished_at_iso: str,
+) -> Path:
+    """Write ``run.json`` next to the training artifact.
+
+    ``run.json`` is the single reproducibility manifest required by the
+    public audit gate. It captures the source commit, the dependency lock
+    hash, the dataset hash, the runtime model revision, every hyper-
+    parameter, and the host/CPU/CUDA fingerprint of the producer.
+    """
+    runtime = _runtime_environment_facts()
+    lock_path = _find_requirements_lock(Path(__file__).parent)
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "kind": "mind_nerve.train.run",
+        # Source identity
+        "git_sha": _git_sha(),
+        "requirements_lock_sha256": _sha256_file(lock_path) if lock_path else None,
+        "dataset_manifest_sha256": dataset_manifest_sha256,
+        "hf_revision": os.environ.get("MIND_NERVE_HF_REVISION") or None,
+        # Hyper-parameters
+        "seed": config.seed,
+        "epochs": manifest_payload.get("epochs", config.epochs),
+        "batch_size": config.batch_size,
+        "lr": config.lr,
+        "max_length": config.max_len,
+        "eval_fraction": config.eval_frac,
+        "deterministic": config.deterministic,
+        "backend": manifest_payload.get("backend", config.backend),
+        "base_model": config.base_model,
+        # Host facts
+        "hostname": runtime["hostname"],
+        "platform": runtime["platform"],
+        "python_version": runtime["python_version"],
+        "torch_version": runtime["torch_version"],
+        "cuda_available": runtime["cuda_available"],
+        "cuda_version": runtime["cuda_version"],
+        "cpu_info": runtime["cpu_info"],
+        # Time
+        "started_at": started_at_iso,
+        "finished_at": finished_at_iso,
+        # Augmentation of manifest.json (existing fields preserved verbatim)
+        "manifest": manifest_payload,
+    }
+    run_path = output_dir / "run.json"
+    run_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    return run_path
 
 
 def _train_python_backend(config: TrainConfig) -> TrainResult:
@@ -183,12 +384,18 @@ def _train_python_backend(config: TrainConfig) -> TrainResult:
     from sentence_transformers import InputExample, SentenceTransformer, losses
     from torch.utils.data import DataLoader
 
-    random.seed(config.seed)
+    started_at_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     os.environ["PYTHONHASHSEED"] = str(config.seed)
-    torch.manual_seed(config.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(config.seed)
+    if config.deterministic:
+        _apply_deterministic_flags(config.seed)
+    else:
+        random.seed(config.seed)
+        torch.manual_seed(config.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(config.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    dataset_manifest_sha256 = _sha256_file(config.catalog_path)
 
     pairs = _load_pairs(config.catalog_path)
     if not pairs:
@@ -234,6 +441,7 @@ def _train_python_backend(config: TrainConfig) -> TrainResult:
     final = _evaluate_top_k(model, eval_set, all_positives, device)
     model_hash = _compute_checkpoint_hash(checkpoint_dir)
 
+    finished_at_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     manifest = {
         "schema_version": 2,
         "phase": "0.3.0-beta.1",
@@ -245,19 +453,31 @@ def _train_python_backend(config: TrainConfig) -> TrainResult:
         "max_len": config.max_len,
         "seed": config.seed,
         "eval_frac": config.eval_frac,
+        "deterministic": config.deterministic,
         "train_pairs": len(train_set),
         "eval_pairs": len(eval_set),
         "baseline_metrics": baseline,
         "final_metrics": final,
         "elapsed_seconds": round(elapsed, 2),
         "model_hash": model_hash,
-        "trained_at_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "trained_at_iso": finished_at_iso,
+        "started_at": started_at_iso,
+        "finished_at": finished_at_iso,
         "device": device,
         "torch_version": torch.__version__,
+        "dataset_manifest_sha256": dataset_manifest_sha256,
     }
     manifest_path = config.output_dir / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-    (config.output_dir / "eval.json").write_text(json.dumps(final, indent=2) + "\n")
+    (config.output_dir / "eval.json").write_text(json.dumps(final, indent=2, sort_keys=True) + "\n")
+    _emit_run_json(
+        output_dir=config.output_dir,
+        config=config,
+        dataset_manifest_sha256=dataset_manifest_sha256,
+        manifest_payload=manifest,
+        started_at_iso=started_at_iso,
+        finished_at_iso=finished_at_iso,
+    )
 
     return TrainResult(
         checkpoint_dir=checkpoint_dir,

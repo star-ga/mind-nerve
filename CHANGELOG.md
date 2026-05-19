@@ -4,6 +4,113 @@ All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](htt
 
 ## [Unreleased] — v0.3.0 preparation
 
+## [0.3.0-beta.6] — 2026-05-19
+
+Audit-response wave responding to the second external deep-research
+audit (10 scopes, baseline 4.8/10 → target 8+/10). Four parallel
+work-streams landed independently with disjoint file-sets and no merge
+conflicts.
+
+### Repository structure & documentation (Stream A — `6ed923c`)
+
+- Added `CONTRIBUTING.md`, `SECURITY.md`, `CODEOWNERS`,
+  `.github/ISSUE_TEMPLATE/{bug_report,feature_request,config}.yml`,
+  `.github/pull_request_template.md`.
+- New `docs/dataset.md`, `docs/privacy.md`, `docs/model_card.md`,
+  `docs/data_governance.md` covering the public dataset contract,
+  privacy posture, model card with headline metrics, and
+  responsible-use governance.
+- README: reconciled architecture description to the frozen
+  drop-the-decoder + sliding-window encoder design; separated Phase-1
+  shipped (PyTorch SentenceTransformer, ~90 ms 4-core CPU p95) from
+  Phase-2 native (mind-nerve A1.5 partial measurement: 14.4 ms p50 /
+  15.1 ms p95 score path); honest perf framing in Highlights and
+  comparison table; dual-license callout pulled into Highlights;
+  Governance section linking new docs.
+- `pyproject.toml` long-description now states the Apache-2.0 +
+  separately-licensed-runtime split.
+- `python/mind_nerve/cli.py` stale `/data/datasets/...` help text
+  replaced with `$MIND_NERVE_RUNTIME_DIR` + auto-seeded HF cache.
+
+### Tests, CI, and dependency hardening (Stream B — `f3c79ba`)
+
+- `requirements.in` + `requirements.lock` (hash-locked via
+  `uv pip compile --generate-hashes`, 1359 lines covering full
+  dev + mcp closure).
+- `.github/dependabot.yml` (pip + github-actions, weekly grouped).
+- `.github/workflows/dependency-audit.yml` (pip-audit + Bandit +
+  Semgrep p/ci+p/python + CycloneDX SBOM, weekly + on-PR).
+- `.github/workflows/ci.yml` extended with `qa-gates` and
+  `perf-budget` jobs (existing 6 jobs preserved).
+- New integration tests at `tests/integration/`:
+  - `test_route_determinism.py` (100× byte-identical
+    `route_id` + score list assertions).
+  - `test_installer_roundtrip.py` (6 tests covering `.bak`
+    preservation when `os.replace` fails).
+  - `test_daemon_socket.py` (spawns the daemon, probes the
+    UNIX socket).
+- `tests/perf/test_route_latency_budget.py` (warm p50/p95/p99 over
+  100 queries, honest budget vs README/spec, 200 ms regression
+  ceiling, `MIND_NERVE_PERF_SKIP=1` opt-out).
+- `pyproject.toml` dev extras (`pytest-cov`, `mypy`, `bandit`,
+  `pip-audit`) + `[tool.coverage]` + `[tool.mypy]` with strict mode
+  on `inference.py`, `installer.py`, `_runtime_dir.py` (49 errors
+  surfaced; path-by-path expansion plan documented in
+  `pyproject.toml`).
+- Coverage 42% on `tests/python + tests/integration` with ratchet
+  plan to 55% → 70% → 85% documented in workflow.
+
+### Trainer determinism, MRR/nDCG/ECE, run.json (Stream C — `a6d6ede`)
+
+- New `python/mind_nerve/eval_metrics.py` (pure-NumPy MRR, nDCG@k,
+  ECE, 168 LOC).
+- `python/mind_nerve/mind_train.py`: `TrainConfig.deterministic`
+  (default true), `_apply_deterministic_flags`
+  (`torch.use_deterministic_algorithms`, cuDNN deterministic,
+  `CUBLAS_WORKSPACE_CONFIG=:4096:8`), `_emit_run_json` with
+  `git_sha`, `dataset_manifest_sha256`,
+  `requirements_lock_sha256`, `hf_revision`, host facts;
+  extended `_evaluate_top_k` to emit MRR + nDCG@{1,5,10} + ECE
+  alongside existing top-1/5/10.
+- `tests/python/test_eval_metrics.py` (18 unit tests, hand-computed
+  fixtures + edge cases).
+- `tests/python/test_trainer_determinism.py` (2 integration tests
+  under `@pytest.mark.slow`, runs trainer twice with same seed,
+  asserts identical metrics within 1e-9).
+- `docs/reproducibility.md` documents the `run.json` schema,
+  deterministic-mode guarantees and non-guarantees, and a
+  reproduce-a-published-run recipe.
+
+### Deployment, packaging, release provenance (Stream D — `ab2aa43`)
+
+- `installer.py`: `_target_config_paths` helper, `rollback_last`,
+  `cmd_rollback` + new `rollback` subparser in
+  `mind-nerve-install`; CLI surface
+  `mind-nerve rollback --target <name>` also added in `cli.py`.
+- `tests/python/test_installer_atomic_writes.py` (17 tests covering
+  per-target `safe_write` coverage, `rollback_last` round-trips,
+  idempotency, and a source-level invariant test that fails if any
+  installer regresses).
+- New `Dockerfile` (multi-stage `python:3.12-slim`, non-root user,
+  real socket-probe `HEALTHCHECK`), `docker-compose.yml`
+  (single `mind-nerve-daemon` service with persistent volumes),
+  `.dockerignore`.
+- `docs/deployment.md` (Docker quickstart, daemon mode, MCP mode,
+  health/readiness, logging, rollback procedure,
+  supply-chain provenance pointer).
+- `.github/workflows/release.yml` switches PyPI publishing to
+  OIDC trusted-publishing + `actions/attest-build-provenance@v2`
+  + `SHA256SUMS` attached to the GitHub Release.
+
+### Verified
+
+- 324 passing tests (83 unit + 240 integration + 1 daemon socket).
+- Coverage 42% (strongly covered modules: `_runtime_dir.py` 88%,
+  `eval_metrics.py` 98%, `mind_train.py` 90%, `daemon.py` 86%).
+- All 13 installer writes use `safe_write`; source-level invariant
+  test prevents regression.
+- All four stream commits compose cleanly with no merge conflicts.
+
 ## [0.3.0-beta.5] - 2026-05-18
 
 Independent-audit hygiene pass: removed public references to internal

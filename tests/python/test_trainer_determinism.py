@@ -135,6 +135,9 @@ def test_two_runs_same_seed_produce_identical_metrics(
         pytest.skip(
             "base model download requires network; set MIND_NERVE_TEST_OFFLINE_OK to override"
         )
+    # The fine-tune path pulls `datasets`; it is a heavy optional dep not in
+    # the base test env. Skip rather than fail when it is absent.
+    pytest.importorskip("datasets")
 
     run_a = _run_once(synthetic_catalog, tmp_path / "run-a", seed=4242)
     run_b = _run_once(synthetic_catalog, tmp_path / "run-b", seed=4242)
@@ -167,6 +170,9 @@ def test_run_json_schema_fields_present(
         pytest.skip(
             "base model download requires network; set MIND_NERVE_TEST_OFFLINE_OK to override"
         )
+    # The fine-tune path pulls `datasets`; it is a heavy optional dep not in
+    # the base test env. Skip rather than fail when it is absent.
+    pytest.importorskip("datasets")
 
     run = _run_once(synthetic_catalog, tmp_path / "run", seed=99)
     payload = run["run"]

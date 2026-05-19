@@ -52,7 +52,12 @@ _Q16_ONE = 65536
 
 @pytest.fixture(scope="module")
 def lib() -> ctypes.CDLL:
-    rt = _NativeRuntime()
+    # The native encoder .so is built on demand and absent in a fresh CI
+    # checkout — skip rather than error when it is not present.
+    try:
+        rt = _NativeRuntime()
+    except FileNotFoundError as exc:
+        pytest.skip(f"native encoder .so not built: {exc}")
     lib = rt._lib
 
     lib.__mind_alloc.restype = ctypes.c_int64

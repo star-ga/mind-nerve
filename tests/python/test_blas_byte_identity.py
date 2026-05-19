@@ -71,8 +71,13 @@ def _make_queries(rng: np.random.Generator) -> list[np.ndarray]:
 
 @pytest.fixture(scope="module")
 def native_runtime() -> _NativeRuntime:
-    rt = _NativeRuntime()
-    return rt
+    # The native encoder .so is built on demand (tools/build_native_encoder.sh)
+    # and is not present in a fresh CI checkout. Skip — not fail — when it is
+    # absent; this gate is meaningful only against a built runtime.
+    try:
+        return _NativeRuntime()
+    except FileNotFoundError as exc:
+        pytest.skip(f"native encoder .so not built: {exc}")
 
 
 @pytest.fixture(scope="module")

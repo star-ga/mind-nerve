@@ -76,3 +76,9 @@ python/*.egg-info/
 audits/*-audit.md
 audits/*-review.md
 audits/*-independent-audit.md
+
+# pytest-cov runtime artifact
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml

@@ -4,6 +4,19 @@ All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](htt
 
 ## [Unreleased] — v0.3.0 preparation
 
+### Perf — MR=4 × NR=2 register tile on the dense GEMM (#236 inc 3)
+
+- `mind/runtime/blas_shims_i64.c`: each A-row vector load is now reused
+  across 2 Bt rows AND each Bt across 4 A rows (8 i64 accumulators, safe
+  AVX2 register budget). Each output is the same i64 K-dot as inc 1/2
+  (even/odd `_mm256_mul_epi32`, associative i64 sum, single final
+  `>>16`) → byte-identical; N%2 tail uses the proven mr4 microkernel.
+  Native encode p95 vs main: **T=64 441→225 ms, T=128 898→405 ms,
+  T=256 1928→854 ms (~1.96–2.26× cumulative, ~1.2× over inc 2)**,
+  monotone, no regression. A1.5 cosine 0.999996 / top-5 0.9975
+  byte-for-byte unchanged (re-verified, fresh rebuild); LUT 3/3; no
+  quantizer/blob change. vs MIND's own prior path. `mind@e520a9b`.
+
 ### Perf — MR=4 register microkernel on the dense GEMM (#236 inc 2)
 
 - `mind/runtime/blas_shims_i64.c`: 4 contiguous A rows are now computed

@@ -4,6 +4,32 @@ All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](htt
 
 ## [Unreleased] — v0.3.0 preparation
 
+### Perf — attention GEMMs vectorised through byte-identical SIMD Q16.16 (#230 Step 2)
+
+- `mind/runtime/blas_shims_i64.c` (new `__mind_nerve_blas_qkt_q16_i64`,
+  `__mind_nerve_blas_attnv_q16_i64`, `dot_q32_accum_{scalar,avx2}`):
+  byte-identical AVX2 Q16.16 kernels for the per-head attention
+  contractions. Critical correctness detail preserved: `qkt` accumulates
+  Q32.32 with **no intermediate `>> 16`** (unlike the linear-GEMM
+  `dot_q16` which shifts per product) — a dedicated `dot_q32_accum`
+  helper keeps that distinction. `qkt_matmul`/`attnv_matmul` re-pointed
+  to the SIMD path (`qkt_blas`/`attnv_blas` in `matmul_blas.mind`);
+  scalar `qkt_dot_k`/`attnv_dot_k` retained as the byte-identity oracle.
+  `mind@14f1444`.
+- Native encode latency (i7-5930K, on top of Step 1): **T=64 551→441 ms
+  p95 (1.28×), T=128 1377→898 ms (1.55×), T=256 3718→1928 ms (1.96×)** —
+  speedup grows with T as the O(T²·D) attention block becomes dominant
+  and the per-element MIND recursion-frame overhead is eliminated.
+  Correctness gate **byte-for-byte unchanged** (cosine 0.999996 /
+  top-5 0.9975), independently re-verified on the mindc-v0.6.7 encoder
+  rebuild; LUT bit-identity 3/3 hashes untouched; 415 pytest pass; no
+  quantizer/blob/layout change. `add_bias_row` measured a non-bottleneck
+  (sub-10 ms at T=256) and left scalar. Combined with Step 1 the encode
+  GEMM path is fully byte-identical SIMD; the remaining thesis-purity
+  item (replace the Track-A C shim with Track-B `dot_q16_v`, needs an
+  (N,K) weight layout) is tracked separately — it is an architectural
+  purity follow-on, not a latency need.
+
 ### Perf — native encode GEMMs routed through byte-identical SIMD Q16.16 matmul (#230 Step 1)
 
 - `mind/runtime/blas_shims_i64.c` (new symbol `__mind_nerve_blas_matmul_q16_i64`):

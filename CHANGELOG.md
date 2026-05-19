@@ -4,6 +4,24 @@ All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](htt
 
 ## [Unreleased] — v0.3.0 preparation
 
+### Perf — dense-int32 transposed-B Q16.16 GEMM (#236 inc 1)
+
+- `mind/runtime/blas_shims_i64.c`: the linear-GEMM path now repacks A
+  (M×K) to dense `int32` and B (K×N) to dense **transposed** `int32`
+  (N×K) once per call, so every `C[i,j]` is a contiguous length-K dot
+  using the proven 8-wide even/odd `_mm256_mul_epi32` technique (exact
+  full-range i32×i32→i64; single final `>>16`). Kills the i64-stride-8
+  2× memory / half-SIMD penalty and the strided `B[:,j]` access. The
+  i64-stride reference is retained as the byte-identity oracle +
+  malloc-fail fallback.
+- Native encode p95: **T=64 441→338 ms, T=128 898→680 ms,
+  T=256 1928→1295 ms (~1.30–1.49×)**, monotone, no regression at any
+  shape. Correctness byte-for-byte unchanged (A1.5 cosine 0.999996 /
+  top-5 0.9975, independently re-verified on a fresh encoder rebuild;
+  LUT bit-identity 3/3; no quantizer/blob change). Speedup is vs MIND's
+  own prior path. `mind@30c3fd9`. Increment 2 (BLIS panel packing + 6×8
+  register microkernel; qkt/attnv same treatment) is the follow-on.
+
 ### Perf — attention GEMMs vectorised through byte-identical SIMD Q16.16 (#230 Step 2)
 
 - `mind/runtime/blas_shims_i64.c` (new `__mind_nerve_blas_qkt_q16_i64`,

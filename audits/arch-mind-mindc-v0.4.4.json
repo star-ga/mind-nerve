@@ -1,0 +1,14 @@
+{
+  "_fixture": "/tmp/arch-mind-mind-nerve-v0.4.4.json",
+  "acyclicity_q16": 655360000,
+  "depth_q16": 655360000,
+  "equality_q16": 349495202,
+  "evidence_chain_density": 0,
+  "governance_kernel_coverage": 0,
+  "mcp_tool_isolation": 655360000,
+  "modularity_q16": 655360000,
+  "q16_determinism_purity": 451972413,
+  "redundancy_q16": 649003008,
+  "_mindc_tag": "v0.4.4",
+  "_note": "Phase D2a (Named-struct param names in error diagnostics) shipped in mindc v0.4.4; mind-nerve side surface unchanged - same Phase 1 inference path, only the compiler error message fidelity moves. Baseline preserved for next-tag delta tracking."
+}

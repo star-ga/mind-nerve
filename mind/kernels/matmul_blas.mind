@@ -1,0 +1,73 @@
+// mind-nerve/mind/kernels/matmul_blas.mind
+//
+// Phase A1.5 — BLAS-backed Q16.16 score path.
+//
+// The default scoring kernel in kernels/matmul_q16.mind (matmul_score)
+// is a tail-recursive scalar reduction. On the 11,922-route catalog at
+// dim=384 it saturates around 15 ms p95 — bounded by 1 op/cycle scalar
+// FMA throughput. The substrate-honest comparison is AVX2 FMA at 16
+// ops/cycle on a single core.
+//
+// This module exposes a SIMD-backed alternative that calls into the
+// runtime-support shim mind/runtime/blas_shims_i64.c. The shim provides
+// scalar + AVX2 paths that are byte-identical on Q16.16 (integer-domain
+// SIMD reduction with explicit i64 widening per lane is associative —
+// the result depends only on the value sequence, not the reduction tree).
+//
+// The C-side dispatcher reads MIND_NERVE_BLAS at .so load time:
+//   unset / "1" / "avx2"  -> auto-detect AVX2 (host falls back to scalar)
+//   "0" / "scalar"        -> force scalar oracle (used by byte-identity test)
+//
+// Buffer layout matches kernels/matmul_q16.mind: all Q16.16 operands are
+// i64 buffers stride-8 with the low 32 bits of each slot carrying the
+// Q16.16 value (sign-extended in the high 32 bits). This is the layout
+// the Python wrapper produces via np.ascontiguousarray(..., dtype=int64).
+//
+// No f32. No new heap allocations. Single extern call per outer iteration.
+
+use std.vec;
+
+// ---------------------------------------------------------------------------
+// C-ABI calls into mind/runtime/blas_shims_i64.c (statically linked into
+// libmind_nerve_encoder.so at build time).
+//
+// The shims expose two symbols:
+//   __mind_nerve_blas_dot_q16_i64(a_addr, b_addr, len) -> q16_score (i64)
+//     Q16.16 dot product over two i64 buffers of length `len`. Low 32 bits
+//     of the i64 result carry the Q16.16 sum; high 32 bits are sign
+//     extension. Scalar-vs-AVX2 byte-identical at every length.
+//
+//   __mind_nerve_blas_matmul_score_q16_i64(catalog, qv, out, n_rows, cols)
+//     Row-by-row Q16.16 score: out[r] = dot(catalog[r,:], qv).
+//     Returns 0 on success, -1 if any pointer is null.
+//
+// Per the MIND link contract (same pattern as kernels.gelu_q16 -> tanh_q16
+// in lut_shims.c), C symbols are referenced by their bare name from MIND
+// and resolved at .so link time — no `extern fn` declaration is needed.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// matmul_score_blas — drop-in replacement for matmul_score in matmul_q16.mind
+// for the mn_encoder_score path. Computes (n_rows × 384) · (384,) → (n_rows,)
+// Q16.16 scores.
+//
+// catalog: i64 address of an n_rows×384 row-major Q16.16 buffer (stride 8).
+// qv:      i64 address of a 384-element Q16.16 query vector.
+// out:     i64 address of an n_rows-element output buffer.
+// n_rows:  number of catalog rows N.
+//
+// Returns 0 on success.
+//
+// The reduction is delegated to the runtime-support C shim; this MIND
+// surface is a thin extern wrapper that lets c_abi.mind switch over by
+// changing a single call site.
+// ---------------------------------------------------------------------------
+pub fn matmul_score_blas(catalog: i64, qv: i64, out: i64, n_rows: i64) -> i64 {
+    __mind_nerve_blas_matmul_score_q16_i64(catalog, qv, out, n_rows, 384)
+}
+
+// dot_q16_blas — single-row Q16.16 dot for callers that want to hand-roll
+// the outer loop in MIND (kept for future use; not currently wired).
+pub fn dot_q16_blas(a: i64, b: i64, len: i64) -> i64 {
+    __mind_nerve_blas_dot_q16_i64(a, b, len)
+}

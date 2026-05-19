@@ -4,6 +4,37 @@ All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](htt
 
 ## [Unreleased] — v0.3.0 preparation
 
+### A1.5 — score-path rewire to mind-blas SIMD
+
+- `mind/kernels/matmul_blas.mind` (new) + `mind/runtime/blas_shims_i64.c`
+  (new): the `mn_encoder_score` path now routes through a SIMD-backed
+  i64-layout Q16.16 dot/matmul shim instead of the tail-recursive scalar
+  reduction in `mind/kernels/matmul_q16.mind`. The shim exposes scalar +
+  AVX2 paths with a `.so`-load-time dispatcher honouring
+  `MIND_NERVE_BLAS` (`1`/`avx2` = auto-detect AVX2, `0`/`scalar` = force
+  the byte-identical oracle). `mind/exports/c_abi.mind` calls
+  `matmul_score_blas`; `tools/build_encoder_cdylib.py` compiles the shim
+  with `-mavx2 -mfma` and links it into the encoder cdylib.
+- Q16.16 SIMD reduction with explicit per-lane i64 widening is
+  associative, so the AVX2 path is **byte-identical to scalar** — the
+  cross-arch determinism gate (task #57) is preserved. A reference
+  SHA-256 of the top-5 `(idx, score)` stream over 100 deterministic
+  queries is pinned in `tests/python/test_blas_byte_identity.py` for
+  future ARM / CUDA / photonic comparison.
+- Measured on i7-5930K, synthetic 11,922-route × 384-dim catalog,
+  1000 queries, single thread, score-only:
+  `p50 = 1.44 ms · p95 = 1.60 ms · p99 = 1.73 ms` — **9.3× faster**
+  than the 15 ms pre-A1.5 scalar baseline. Memory-bandwidth-limited
+  (the i64 stride-8 catalog is ~36 MB and saturates single-channel
+  DDR4); a future i32 stride-4 repack would approach the ~0.4 ms
+  compute floor.
+- New gates: `tests/python/test_blas_byte_identity.py` (scalar vs AVX2
+  byte-identity + cross-arch reference hash) and
+  `tests/perf/test_score_latency.py` (p95 < 2 ms hard gate,
+  `MIND_NERVE_PERF_SKIP=1` opt-out).
+- A1.5 verdict: **score path PASS**. Encode path remains tracked
+  separately (depends on the Phase 6.2 quantizer artifact, below).
+
 ### Phase 6.2 — offline Q16.16 quantizer
 
 - `tools/quantize_phase1_to_q16.py` (new): offline FP32 → Q16.16

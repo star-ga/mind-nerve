@@ -37,6 +37,7 @@ def _source_list(nerve_root: Path) -> list[Path]:
         nerve_root / "mind/luts/tanh_q16.mind",
         nerve_root / "mind/luts/softmax_q16.mind",
         nerve_root / "mind/kernels/matmul_q16.mind",
+        nerve_root / "mind/kernels/matmul_blas.mind",
         nerve_root / "mind/kernels/batched_matmul_q16.mind",
         nerve_root / "mind/kernels/layernorm_q16.mind",
         nerve_root / "mind/kernels/gelu_q16.mind",
@@ -258,6 +259,26 @@ def _compile_runtime_support(
         temp_objects.append(tmp_shim_o.name)
         print("[build] Compiled A1.5 LUT shims (tanh_q16, rsqrt_q16, softmax_q16)")
 
+    # A1.5 BLAS shim: i64-layout Q16.16 dot + score matmul with AVX2
+    # dispatcher. Closes the 40x gap on the score path.
+    blas_shim = nerve_root / "mind/runtime/blas_shims_i64.c"
+    if blas_shim.exists():
+        tmp_blas_o = tempfile.NamedTemporaryFile(suffix=".o", delete=False)
+        tmp_blas_o.close()
+        result = subprocess.run(
+            [
+                clang, "-c", "-fPIC", "-O2", "-mavx2", "-mfma",
+                str(blas_shim), "-o", tmp_blas_o.name,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"Compiling blas_shims_i64.c failed:\n{result.stderr}")
+        temp_objects.append(tmp_blas_o.name)
+        print("[build] Compiled A1.5 BLAS shim (i64 Q16.16 dot + score matmul)")
+
     return temp_objects
 
 
@@ -431,6 +452,7 @@ def build(
             "malloc", "free", "calloc", "realloc", "memcpy",
             "read", "write", "pread", "pwrite",
             "exp", "sqrt", "tanh",
+            "getenv", "strcmp",
         }
         unexpected_undef = [
             u for u in undefined

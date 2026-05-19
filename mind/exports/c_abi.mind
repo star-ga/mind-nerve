@@ -58,6 +58,7 @@
 use std.vec;
 use kernels.encode;
 use kernels.matmul_q16;
+use kernels.matmul_blas;
 use kernels.topk_q16;
 
 // ---------------------------------------------------------------------------
@@ -267,9 +268,12 @@ pub fn mn_encoder_encode(handle: i64, token_ids: i64,
 pub fn mn_encoder_score(handle: i64, qv: i64, catalog: i64,
                         n_rows: i64, out_scores: i64) -> i64 {
     if handle == 0 { return -1; }
-    // matmul_score computes (N,384) · (384,1) → (N,) dot products.
-    // qv is a (384,) column vector; treated as (384,1) for matmul purposes.
-    matmul_score(catalog, qv, out_scores, n_rows)
+    // Phase A1.5: route through the BLAS-backed score kernel. The C-side
+    // dispatcher in mind/runtime/blas_shims_i64.c picks scalar vs AVX2 at
+    // .so load time honouring MIND_NERVE_BLAS (1/avx2 = auto-detect AVX2,
+    // 0/scalar = force the byte-identical oracle path). The Q16.16 SIMD
+    // path is byte-identical to scalar by construction — task #57 gate.
+    matmul_score_blas(catalog, qv, out_scores, n_rows)
 }
 
 // ---------------------------------------------------------------------------

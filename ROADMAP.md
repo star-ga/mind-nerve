@@ -262,6 +262,25 @@ Q16.16 in flight, INT8 weights, cross-arch bit-identity, 30 ms p95).
    change; landing depends on Phase 2 native-MIND training reaching
    stability first.
 
+6. **L1-substrate encoder window similarity** (experimental, added
+   2026-05-18). Today the sliding-window encoder's window-ranking
+   similarity is L2-cosine (`(a·b) / (‖a‖₂‖b‖₂)`). For Q16.16
+   in-flight ranking the L2 step costs a fixed-point `sqrt` that
+   becomes a cross-substrate approximation contract under the bit-
+   identity gate. An L1-cosine variant (`(a·b) / (‖a‖₁‖b‖₁)`) or
+   raw L1 ranking (`−‖a − b‖₁`) is exact in Q16.16 by construction,
+   eliminating the `sqrt` and any fixed-point approximation contract
+   on the ranking path. Gate: leave-one-out top-K overlap and rank
+   correlation vs the L2 baseline on the held-out intent corpus
+   must clear `Kendall τ ≥ 0.85` and `top-5 overlap ≥ 90%` before
+   adoption. Throughput win (~5–15% on CPU encode, larger on
+   accelerators without native `sqrt`) is secondary to the
+   cross-substrate determinism win on Q16.16. Landing depends on
+   Phase 2 native-MIND inference path reaching stability first
+   (see [`spec/architecture.md`](spec/architecture.md) §
+   "Backwards-soft architecture switches" — this would be wired in
+   as one more off-by-default compile-time switch).
+
 ## Phase 3 — Ecosystem (target: Q3 2027)
 
 **Exit criteria**:

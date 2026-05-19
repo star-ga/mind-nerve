@@ -1,0 +1,425 @@
+// mind-nerve/mind/exports/c_abi.mind
+//
+// Phase A1.3 — C-ABI export surface for the native MIND Q16.16 encoder.
+//
+// ABI version: 1 (mn_encoder_version returns build-id string addr).
+//
+// All six pub fn symbols map directly to C-callable exports when compiled
+// with `mindc --emit-shared`. The mindc cdylib seam (RFC 0003, D2–D5 of
+// RFC 0002 from mindc 0.2.6) lowers `pub fn` to a C symbol with identical
+// name, no name-mangling.
+//
+// Parameter convention (i64 throughout):
+//   - All buffer parameters are i64 values holding a flat heap address.
+//   - Lengths are i64 counts of i64 elements (each i64 holds one Q16.16
+//     or one int32 token ID depending on context).
+//   - No f32 crosses the FFI boundary. Q16.16 fixed-point inside the buffers.
+//
+// Handle semantics:
+//   mn_encoder_init returns an i64 handle. The handle is an opaque
+//   heap-allocated record whose first field is the weight blob base address
+//   and whose second field is the blob length. All scratch buffers are
+//   allocated inside init and stored in the handle record so that encode
+//   calls are allocation-free after init.
+//
+// Weight blob:
+//   The weights_blob parameter is an i64 address pointing to a flat byte
+//   buffer of Q16.16-quantised weights in the layout defined by encode.mind
+//   (emb_block_bytes + 12 * layer_stride_bytes = ~142 MB). The blob is
+//   produced offline by the quantize_phase1_to_q16.py converter.
+//
+//   For A1.3, mn_encoder_init allocates a placeholder handle and stores the
+//   blob addr + len without parsing the weight block structure. Full weight
+//   validation and scratch-buffer sizing are deferred to the Phase-6.2
+//   const-blob support cycle when the offline quantizer ships.
+//
+// Build:
+//   cd /home/n/mind
+//   cargo run --features "std-surface cross-module-imports mlir-build" \
+//       --bin mindc -- /home/n/mind-nerve/mind/exports/c_abi.mind \
+//       --emit-shared /home/n/mind-nerve/python/mind_nerve/_native/libmind_nerve_encoder.so \
+//       --target=x86_64-unknown-linux-gnu \
+//       --features "std-surface cross-module-imports"
+//
+// C header surface (for ctypes / CFFI consumers):
+//   int64_t mn_encoder_init(int64_t weights_blob, int64_t len);
+//   int64_t mn_encoder_encode(int64_t handle, int64_t token_ids,
+//                             int64_t n_tokens, int64_t out_vec);
+//   int64_t mn_encoder_score(int64_t handle, int64_t qv,
+//                            int64_t catalog, int64_t n_rows,
+//                            int64_t out_scores);
+//   int64_t mn_encoder_topk(int64_t scores, int64_t n, int64_t k,
+//                           int64_t out_idx, int64_t out_scores);
+//   int64_t mn_encoder_free(int64_t handle);
+//   int64_t mn_encoder_version(void);
+//
+// No f32. No while. Cross-module imports resolved at --emit-shared link time.
+
+use std.vec;
+use kernels.encode;
+use kernels.matmul_q16;
+use kernels.topk_q16;
+
+// ---------------------------------------------------------------------------
+// Handle record layout (flat heap blob, 8 bytes per field):
+//   slot 0: weight blob base address (i64)
+//   slot 1: weight blob length in bytes (i64)
+//   slot 2: scratch x         — (max_seq, H) = (256, 384) Q16.16 buffer addr
+//   slot 3: scratch layer_out — (256, 384)
+//   slot 4: scratch q_proj    — (256, 384)
+//   slot 5: scratch k_proj    — (256, 384)
+//   slot 6: scratch v_proj    — (256, 384)
+//   slot 7: scratch q_heads   — (12, 256, 32)
+//   slot 8: scratch k_heads   — (12, 256, 32)
+//   slot 9: scratch v_heads   — (12, 256, 32)
+//   slot 10: scratch attn_raw — (12, 256, 256)
+//   slot 11: scratch ctx_heads — (12, 256, 32)
+//   slot 12: scratch ctx_cat  — (256, 384)
+//   slot 13: scratch ffn_buf  — (256, 1536)
+//   slot 14: scratch tmp      — (256, 384)
+//   slot 15: scratch tmp_word — (256, 384)
+//   slot 16: scratch tmp_pos  — (256, 384)
+//   slot 17: scratch tmp_type — (256, 384)
+//   slot 18: scratch cls_buf  — (384,)
+//   slot 19: scratch embed_out — (384,)
+//   slot 20: scratch win_tok  — (256,)  sliding-window token ID scratch
+//   slot 21: scratch win_typ  — (256,)  sliding-window type ID scratch
+//   slot 22: scratch type_ids — (max_seq,) all-zeros type ID buffer
+// Total: 23 slots × 8 bytes = 184 bytes for the handle record itself.
+// ---------------------------------------------------------------------------
+
+// Handle field offsets (byte offsets from handle base).
+pub fn hf_wb()        -> i64 { 0   }   // weight blob addr
+pub fn hf_len()       -> i64 { 8   }   // weight blob len
+pub fn hf_x()         -> i64 { 16  }
+pub fn hf_lo()        -> i64 { 24  }   // layer_out
+pub fn hf_qp()        -> i64 { 32  }   // q_proj
+pub fn hf_kp()        -> i64 { 40  }   // k_proj
+pub fn hf_vp()        -> i64 { 48  }   // v_proj
+pub fn hf_qh()        -> i64 { 56  }   // q_heads
+pub fn hf_kh()        -> i64 { 64  }   // k_heads
+pub fn hf_vh()        -> i64 { 72  }   // v_heads
+pub fn hf_ar()        -> i64 { 80  }   // attn_raw
+pub fn hf_ch()        -> i64 { 88  }   // ctx_heads
+pub fn hf_cc()        -> i64 { 96  }   // ctx_cat
+pub fn hf_fb()        -> i64 { 104 }   // ffn_buf
+pub fn hf_tmp()       -> i64 { 112 }
+pub fn hf_tw()        -> i64 { 120 }   // tmp_word
+pub fn hf_tp()        -> i64 { 128 }   // tmp_pos
+pub fn hf_tt()        -> i64 { 136 }   // tmp_type
+pub fn hf_cls()       -> i64 { 144 }
+pub fn hf_emb()       -> i64 { 152 }   // embed_out
+pub fn hf_wt()        -> i64 { 160 }   // win_tok
+pub fn hf_wty()       -> i64 { 168 }   // win_typ
+pub fn hf_tid()       -> i64 { 176 }   // type_ids (all-zero)
+
+// ---------------------------------------------------------------------------
+// Scratch buffer sizes (in bytes, each i64 element = 8 bytes):
+//   (T,H)        = 256*384*8 = 786432
+//   (nh,T,D)     = 12*256*32*8 = 786432
+//   (nh,T,T)     = 12*256*256*8 = 6291456
+//   (T,F)        = 256*1536*8 = 3145728
+//   (H,)         = 384*8 = 3072
+//   (T,)         = 256*8 = 2048
+// ---------------------------------------------------------------------------
+pub fn sz_TH()   -> i64 { 786432  }   // (256, 384)
+pub fn sz_nhTD() -> i64 { 786432  }   // (12, 256, 32)
+pub fn sz_nhTT() -> i64 { 6291456 }   // (12, 256, 256) attn_raw
+pub fn sz_TF()   -> i64 { 3145728 }   // (256, 1536)
+pub fn sz_H()    -> i64 { 3072    }   // (384,)
+pub fn sz_T()    -> i64 { 2048    }   // (256,)
+pub fn sz_handle() -> i64 { 184   }   // 23 × 8
+
+// ---------------------------------------------------------------------------
+// Handle field accessors.
+// ---------------------------------------------------------------------------
+pub fn hget(h: i64, off: i64) -> i64 {
+    __mind_load_i64(h + off)
+}
+pub fn hset(h: i64, off: i64, v: i64) -> i64 {
+    __mind_store_i64(h + off, v)
+}
+
+// ---------------------------------------------------------------------------
+// Zero-fill type_ids buffer (all tokens are segment 0 for single-segment input).
+// Tail-recursive over i = 0..n-1.
+// ---------------------------------------------------------------------------
+pub fn zero_fill(buf: i64, n: i64, i: i64) -> i64 {
+    if i >= n { return 0; }
+    __mind_store_i64(buf + i * 8, 0);
+    zero_fill(buf, n, i + 1)
+}
+
+// ---------------------------------------------------------------------------
+// mn_encoder_init — allocate handle + scratch buffers.
+//
+// weights_blob: i64 address of pre-quantised Q16.16 weight flat buffer.
+// len:          length of the blob in bytes.
+// Returns:      i64 handle (opaque record), or 0 on failure.
+//
+// For A1.3, the handle stores the blob addr + len and pre-allocates all
+// scratch buffers for max_seq=256. Full weight-structure validation is
+// deferred to Phase 6.2.
+// ---------------------------------------------------------------------------
+pub fn mn_encoder_init(weights_blob: i64, len: i64) -> i64 {
+    let h: i64 = __mind_alloc(sz_handle());
+    if h == 0 { return 0; }
+
+    // Store weight blob reference.
+    hset(h, hf_wb(), weights_blob);
+    hset(h, hf_len(), len);
+
+    // Allocate scratch buffers and store addresses in the handle.
+    hset(h, hf_x(),   __mind_alloc(sz_TH()));
+    hset(h, hf_lo(),  __mind_alloc(sz_TH()));
+    hset(h, hf_qp(),  __mind_alloc(sz_TH()));
+    hset(h, hf_kp(),  __mind_alloc(sz_TH()));
+    hset(h, hf_vp(),  __mind_alloc(sz_TH()));
+    hset(h, hf_qh(),  __mind_alloc(sz_nhTD()));
+    hset(h, hf_kh(),  __mind_alloc(sz_nhTD()));
+    hset(h, hf_vh(),  __mind_alloc(sz_nhTD()));
+    hset(h, hf_ar(),  __mind_alloc(sz_nhTT()));
+    hset(h, hf_ch(),  __mind_alloc(sz_nhTD()));
+    hset(h, hf_cc(),  __mind_alloc(sz_TH()));
+    hset(h, hf_fb(),  __mind_alloc(sz_TF()));
+    hset(h, hf_tmp(), __mind_alloc(sz_TH()));
+    hset(h, hf_tw(),  __mind_alloc(sz_TH()));
+    hset(h, hf_tp(),  __mind_alloc(sz_TH()));
+    hset(h, hf_tt(),  __mind_alloc(sz_TH()));
+    hset(h, hf_cls(), __mind_alloc(sz_H()));
+    hset(h, hf_emb(), __mind_alloc(sz_H()));
+    hset(h, hf_wt(),  __mind_alloc(sz_T()));
+    hset(h, hf_wty(), __mind_alloc(sz_T()));
+
+    // type_ids: (max_seq,) all-zero i64 buffer.
+    let tid_buf: i64 = __mind_alloc(sz_T());
+    zero_fill(tid_buf, 256, 0);
+    hset(h, hf_tid(), tid_buf);
+
+    h
+}
+
+// ---------------------------------------------------------------------------
+// mn_encoder_encode — run the full BERT encoder for a token ID sequence.
+//
+// handle:    opaque handle from mn_encoder_init.
+// token_ids: i64 buffer of n_tokens token IDs (Python int32 → widened i64).
+// n_tokens:  sequence length T (1 ≤ T ≤ 512).
+// out_vec:   i64 buffer of 384 elements to receive the Q16.16 L2-normalised
+//            embedding (written by encode()).
+//
+// Returns 0 on success, -1 on null handle.
+// ---------------------------------------------------------------------------
+pub fn mn_encoder_encode(handle: i64, token_ids: i64,
+                         n_tokens: i64, out_vec: i64) -> i64 {
+    if handle == 0 { return -1; }
+
+    let wb:  i64 = hget(handle, hf_wb());
+    let x:   i64 = hget(handle, hf_x());
+    let lo:  i64 = hget(handle, hf_lo());
+    let qp:  i64 = hget(handle, hf_qp());
+    let kp:  i64 = hget(handle, hf_kp());
+    let vp:  i64 = hget(handle, hf_vp());
+    let qh:  i64 = hget(handle, hf_qh());
+    let kh:  i64 = hget(handle, hf_kh());
+    let vh:  i64 = hget(handle, hf_vh());
+    let ar:  i64 = hget(handle, hf_ar());
+    let ch:  i64 = hget(handle, hf_ch());
+    let cc:  i64 = hget(handle, hf_cc());
+    let fb:  i64 = hget(handle, hf_fb());
+    let tmp: i64 = hget(handle, hf_tmp());
+    let tw:  i64 = hget(handle, hf_tw());
+    let tp:  i64 = hget(handle, hf_tp());
+    let tt:  i64 = hget(handle, hf_tt());
+    let cls: i64 = hget(handle, hf_cls());
+    let emb: i64 = hget(handle, hf_emb());
+    let wt:  i64 = hget(handle, hf_wt());
+    let wty: i64 = hget(handle, hf_wty());
+    let tid: i64 = hget(handle, hf_tid());
+
+    // Call the encode() driver from kernels.encode (routes single/sliding).
+    encode(token_ids, tid, wb,
+           x, lo,
+           qp, kp, vp,
+           qh, kh, vh,
+           ar, ch, cc,
+           fb, tmp,
+           tw, tp, tt,
+           cls, emb,
+           wt, wty,
+           n_tokens);
+
+    // Copy embed_out into caller-provided out_vec.
+    copy_vec(emb, out_vec, 384, 0)
+}
+
+// ---------------------------------------------------------------------------
+// mn_encoder_score — dot-product scoring of a query vector against a catalog.
+//
+// handle:     opaque handle (unused for scoring, kept for API symmetry).
+// qv:         i64 buffer of 384 Q16.16 elements (query embedding).
+// catalog:    i64 buffer of n_rows×384 Q16.16 elements (pre-L2-normalised).
+// n_rows:     number of catalog entries N.
+// out_scores: i64 buffer of N elements to receive Q16.16 dot products.
+//
+// Returns 0 on success, -1 on null handle.
+// ---------------------------------------------------------------------------
+pub fn mn_encoder_score(handle: i64, qv: i64, catalog: i64,
+                        n_rows: i64, out_scores: i64) -> i64 {
+    if handle == 0 { return -1; }
+    // matmul_score computes (N,384) · (384,1) → (N,) dot products.
+    // qv is a (384,) column vector; treated as (384,1) for matmul purposes.
+    matmul_score(catalog, qv, out_scores, n_rows)
+}
+
+// ---------------------------------------------------------------------------
+// mn_encoder_topk — select top-K candidates from a score array.
+//
+// scores:     i64 buffer of N Q16.16 scores.
+// n:          number of scores N.
+// k:          number of top results to return (K ≤ 32).
+// out_idx:    i64 buffer of K elements receiving sorted indices (desc score).
+// out_scores: i64 buffer of K elements receiving sorted scores (desc).
+//
+// Returns 0 on success.
+// Uses an inline K-min-heap (see kernels.topk_q16). Scratch heap and idx
+// are allocated transiently (K ≤ 32 → 512 bytes each, negligible).
+// ---------------------------------------------------------------------------
+pub fn mn_encoder_topk(scores: i64, n: i64, k: i64,
+                       out_idx: i64, out_scores: i64) -> i64 {
+    let heap_s: i64 = __mind_alloc(k * 8);
+    let heap_i: i64 = __mind_alloc(k * 8);
+    topk_q16(scores, n, k, heap_s, heap_i, out_scores, out_idx)
+}
+
+// ---------------------------------------------------------------------------
+// mn_encoder_free — release the handle and all scratch buffers.
+//
+// handle: opaque handle from mn_encoder_init.
+// Returns 0 always.
+//
+// Note: __mind_free is the mirror of __mind_alloc. If the runtime does not
+// expose a dealloc intrinsic, this is a no-op (GC or arena-collect).
+// ---------------------------------------------------------------------------
+pub fn mn_encoder_free(handle: i64) -> i64 {
+    if handle == 0 { return 0; }
+    // Free scratch buffers in reverse allocation order.
+    __mind_free(hget(handle, hf_tid()));
+    __mind_free(hget(handle, hf_wty()));
+    __mind_free(hget(handle, hf_wt()));
+    __mind_free(hget(handle, hf_emb()));
+    __mind_free(hget(handle, hf_cls()));
+    __mind_free(hget(handle, hf_tt()));
+    __mind_free(hget(handle, hf_tp()));
+    __mind_free(hget(handle, hf_tw()));
+    __mind_free(hget(handle, hf_tmp()));
+    __mind_free(hget(handle, hf_fb()));
+    __mind_free(hget(handle, hf_cc()));
+    __mind_free(hget(handle, hf_ch()));
+    __mind_free(hget(handle, hf_ar()));
+    __mind_free(hget(handle, hf_vh()));
+    __mind_free(hget(handle, hf_kh()));
+    __mind_free(hget(handle, hf_qh()));
+    __mind_free(hget(handle, hf_vp()));
+    __mind_free(hget(handle, hf_kp()));
+    __mind_free(hget(handle, hf_qp()));
+    __mind_free(hget(handle, hf_lo()));
+    __mind_free(hget(handle, hf_x()));
+    __mind_free(handle)
+}
+
+// ---------------------------------------------------------------------------
+// mn_encoder_version — return i64 address of a null-terminated build-id string.
+//
+// The string is a compile-time constant embedded in the .so via a literal
+// heap allocation at the start of execution. Format:
+//   "mind-nerve-encoder/1;mindc/0.4.4;abi/1;q16.16"
+//
+// The ABI version (third segment) matches the handle record layout version
+// documented above. Callers should compare the full string for forward-compat.
+//
+// Returns i64 address of the null-terminated ASCII bytes.
+// ---------------------------------------------------------------------------
+pub fn mn_encoder_version() -> i64 {
+    // Build-id string encoded as a sequence of ASCII bytes stored into a
+    // heap buffer. The string is:
+    //   "mind-nerve-encoder/1;mindc/0.4.4;abi/1;q16.16\0"
+    // Length: 47 bytes + 1 null = 48 bytes → allocate 48 bytes.
+    //
+    // ASCII codes (decimal):
+    // m=109 i=105 n=110 d=100 -=45 n=110 e=101 r=114 v=118 e=101 -=45
+    // e=101 n=110 c=99 o=111 d=100 e=101 r=114 /=47 1=49 ;=59
+    // m=109 i=105 n=110 d=100 c=99 /=47 0=48 .=46 4=52 .=46 4=52 ;=59
+    // a=97 b=98 i=105 /=47 1=49 ;=59
+    // q=113 1=49 6=54 .=46 1=49 6=54 \0=0
+    let buf: i64 = __mind_alloc(384);
+    write_version_bytes(buf);
+    buf
+}
+
+// Write build-id bytes one i64-per-byte into the version buffer.
+// Each byte occupies a full i64 slot (8 bytes) per the MIND heap layout.
+// Python ctypes reads the string as consecutive bytes starting at buf.
+// Because __mind_store_i64 writes 8 bytes at stride 8, each character
+// is stored with 7 trailing zero bytes. The ctypes c_char_p reader
+// must stride by 8 (see _NativeRuntime.version()).
+pub fn write_version_bytes(buf: i64) -> i64 {
+    // "mind-nerve-encoder/1;mindc/0.4.4;abi/1;q16.16\0"
+    // Stored as i64 per slot (stride 8). NUL terminates at slot 47.
+    __mind_store_i64(buf + 0,   109); // m
+    __mind_store_i64(buf + 8,   105); // i
+    __mind_store_i64(buf + 16,  110); // n
+    __mind_store_i64(buf + 24,  100); // d
+    __mind_store_i64(buf + 32,  45);  // -
+    __mind_store_i64(buf + 40,  110); // n
+    __mind_store_i64(buf + 48,  101); // e
+    __mind_store_i64(buf + 56,  114); // r
+    __mind_store_i64(buf + 64,  118); // v
+    __mind_store_i64(buf + 72,  101); // e
+    __mind_store_i64(buf + 80,  45);  // -
+    __mind_store_i64(buf + 88,  101); // e
+    __mind_store_i64(buf + 96,  110); // n
+    __mind_store_i64(buf + 104, 99);  // c
+    __mind_store_i64(buf + 112, 111); // o
+    __mind_store_i64(buf + 120, 100); // d
+    __mind_store_i64(buf + 128, 101); // e
+    __mind_store_i64(buf + 136, 114); // r
+    __mind_store_i64(buf + 144, 47);  // /
+    __mind_store_i64(buf + 152, 49);  // 1
+    __mind_store_i64(buf + 160, 59);  // ;
+    __mind_store_i64(buf + 168, 109); // m
+    __mind_store_i64(buf + 176, 105); // i
+    __mind_store_i64(buf + 184, 110); // n
+    __mind_store_i64(buf + 192, 100); // d
+    __mind_store_i64(buf + 200, 99);  // c
+    __mind_store_i64(buf + 208, 47);  // /
+    __mind_store_i64(buf + 216, 48);  // 0
+    __mind_store_i64(buf + 224, 46);  // .
+    __mind_store_i64(buf + 232, 52);  // 4
+    __mind_store_i64(buf + 240, 46);  // .
+    __mind_store_i64(buf + 248, 52);  // 4
+    __mind_store_i64(buf + 256, 59);  // ;
+    __mind_store_i64(buf + 264, 97);  // a
+    __mind_store_i64(buf + 272, 98);  // b
+    __mind_store_i64(buf + 280, 105); // i
+    __mind_store_i64(buf + 288, 47);  // /
+    __mind_store_i64(buf + 296, 49);  // 1
+    __mind_store_i64(buf + 304, 59);  // ;
+    __mind_store_i64(buf + 312, 113); // q
+    __mind_store_i64(buf + 320, 49);  // 1
+    __mind_store_i64(buf + 328, 54);  // 6
+    __mind_store_i64(buf + 336, 46);  // .
+    __mind_store_i64(buf + 344, 49);  // 1
+    __mind_store_i64(buf + 352, 54);  // 6
+    __mind_store_i64(buf + 360, 0);   // NUL terminator
+    0
+}
+
+// ---------------------------------------------------------------------------
+// Utility: copy n i64 elements from src to dst. Tail-recursive.
+// ---------------------------------------------------------------------------
+pub fn copy_vec(src: i64, dst: i64, n: i64, i: i64) -> i64 {
+    if i >= n { return 0; }
+    __mind_store_i64(dst + i * 8, __mind_load_i64(src + i * 8));
+    copy_vec(src, dst, n, i + 1)
+}

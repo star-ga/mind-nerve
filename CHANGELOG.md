@@ -4,6 +4,21 @@ All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](htt
 
 ## [Unreleased] — v0.3.0 preparation
 
+### Fix — native tokenize truncates to model max_seq_length (#228)
+
+- `python/mind_nerve/inference.py` `_tokenize` used `max_length=512`
+  while the reference SentenceTransformer truncates to
+  `sentence_bert_config.json` `max_seq_length=256` then CLS-pools. Any
+  input >256 tokens therefore reached the native encoder's
+  sliding-window ("later-window-wins") path and **silently produced a
+  different embedding than pytorch** — the A1.5 gate never caught it (its
+  harness tokenizes at 256). Now `max_length=256`: native route()/encode
+  is pytorch-SentenceTransformer-identical for all inputs; the
+  sliding-window kernel stays for explicit long-document use, never
+  silently on the contract path. New skip-guarded regression
+  `tests/python/test_tokenize_maxseq.py`. Python-only; no encoder
+  rebuild / no quantizer/blob/A1.5 change. `mind@d87c4c1`.
+
 ### Perf — MR=4 × NR=2 register tile on the dense GEMM (#236 inc 3)
 
 - `mind/runtime/blas_shims_i64.c`: each A-row vector load is now reused

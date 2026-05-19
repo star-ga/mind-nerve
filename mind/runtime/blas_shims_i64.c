@@ -546,7 +546,46 @@ static int64_t mind_nerve_blas_gemm_dot_i32_scalar(
     return (int64_t)(int32_t)(acc >> 16);
 }
 
+// Raw Q32.32 i64 sum, dense int32, NO final narrow — the caller applies
+// its own >>16 / scale (qkt: raw>>16 then *11585>>16). Byte-identical to
+// dot_q32_accum_scalar on the same values (same i32 products, same
+// ascending-k associative i64 sum). Scalar = AVX2 byte-identity oracle.
+static int64_t mind_nerve_blas_gemm_dot_i32_accum_scalar(
+    const int32_t *a, const int32_t *bt, int64_t K
+) {
+    int64_t acc = 0;
+    for (int64_t k = 0; k < K; ++k) acc += (int64_t)a[k] * (int64_t)bt[k];
+    return acc;
+}
+
 #if MIND_NERVE_BLAS_X86_64
+// Raw Q32.32 i64 sum, dense int32, 8-wide even/odd — no final narrow.
+// Same exact-i32*i32->i64 products as the scalar oracle; 4 i64 lanes +
+// horizontal recombine + scalar tail (two's-complement add is
+// associative -> byte-identical to the scalar accum).
+__attribute__((target("avx2,fma")))
+static int64_t mind_nerve_blas_gemm_dot_i32_accum_avx2(
+    const int32_t *a, const int32_t *bt, int64_t K
+) {
+    __m256i acc = _mm256_setzero_si256();
+    int64_t k = 0;
+    for (; k + 8 <= K; k += 8) {
+        __m256i va = _mm256_loadu_si256((const __m256i *)(a + k));
+        __m256i vb = _mm256_loadu_si256((const __m256i *)(bt + k));
+        __m256i pe = _mm256_mul_epi32(va, vb);
+        __m256i ao = _mm256_srli_epi64(va, 32);
+        __m256i bo = _mm256_srli_epi64(vb, 32);
+        __m256i po = _mm256_mul_epi32(ao, bo);
+        acc = _mm256_add_epi64(acc, pe);
+        acc = _mm256_add_epi64(acc, po);
+    }
+    int64_t buf[4] __attribute__((aligned(32)));
+    _mm256_store_si256((__m256i *)buf, acc);
+    int64_t sum = buf[0] + buf[1] + buf[2] + buf[3];
+    for (; k < K; ++k) sum += (int64_t)a[k] * (int64_t)bt[k];
+    return sum;   // raw Q32.32, caller narrows
+}
+
 __attribute__((target("avx2,fma")))
 static int64_t mind_nerve_blas_gemm_dot_i32_avx2(
     const int32_t *a, const int32_t *bt, int64_t K
@@ -931,6 +970,52 @@ int64_t __mind_nerve_blas_qkt_q16_i64(
     // D=32 always for this model; constant matches attn_scale_q16() in MIND.
     const int64_t scale = 11585;
 
+    // --- task #236: dense-int32 path (byte-identical) ---
+    // Q_row and K_row are both contiguous D-element rows; the i64-stride-8
+    // dot is repeated H*T*T times (the dominant O(T^2 D) attention cost).
+    // Pack each head's Q/K to dense int32 (kills the 2x-memory / half-SIMD
+    // i64-stride penalty) and dot 8-wide. raw Q32.32 sum is byte-identical
+    // to dot_q32_accum; qkt then applies its own >>16 and *scale>>16.
+    {
+        size_t head_n = (size_t)T * (size_t)D;
+        int32_t *Qp = (int32_t *)malloc(head_n * sizeof(int32_t));
+        int32_t *Kp = (int32_t *)malloc(head_n * sizeof(int32_t));
+        if (Qp != NULL && Kp != NULL) {
+            for (int64_t h = 0; h < H; ++h) {
+                const int64_t *Q_head = Q + (size_t)h * head_n;
+                const int64_t *K_head = K + (size_t)h * head_n;
+                int64_t *attn_head = ATTN + (size_t)h * (size_t)(T * T);
+                mind_nerve_blas_pack_i32_rowmajor(Q_head, Qp, T, D);
+                mind_nerve_blas_pack_i32_rowmajor(K_head, Kp, T, D);
+                for (int64_t i = 0; i < T; ++i) {
+                    const int32_t *Qr = Qp + (size_t)i * (size_t)D;
+                    int64_t *arow = attn_head + (size_t)i * (size_t)T;
+                    for (int64_t j = 0; j < T; ++j) {
+                        const int32_t *Kr = Kp + (size_t)j * (size_t)D;
+                        int64_t q32;
+#if MIND_NERVE_BLAS_X86_64
+                        if (mind_nerve_blas_use_avx2)
+                            q32 = mind_nerve_blas_gemm_dot_i32_accum_avx2(Qr, Kr, D);
+                        else
+                            q32 = mind_nerve_blas_gemm_dot_i32_accum_scalar(Qr, Kr, D);
+#else
+                        q32 = mind_nerve_blas_gemm_dot_i32_accum_scalar(Qr, Kr, D);
+#endif
+                        int64_t raw_q16    = q32 >> 16;
+                        int64_t scaled_q16 = (raw_q16 * scale) >> 16;
+                        arow[(size_t)j] = (int64_t)(int32_t)scaled_q16;
+                    }
+                }
+            }
+            free(Qp);
+            free(Kp);
+            return 0;
+        }
+        if (Qp) free(Qp);
+        if (Kp) free(Kp);
+    }
+    // malloc failed → in-place i64-stride reference path (byte-identical).
+
     for (int64_t h = 0; h < H; ++h) {
         // Base pointers for head h.
         // Q[h, :, :] starts at Q + h*T*D; row i at + i*D.
@@ -1012,6 +1097,83 @@ int64_t __mind_nerve_blas_attnv_q16_i64(
         // Defensive: D is always 32 in practice; this path is unreachable.
         return -1;
     }
+
+    // --- task #236: dense-int32 matmul path (byte-identical) ---
+    // attn·V per head is C[i,j] = sum_k attn[h,i,k]·V[h,k,j], final >>16 —
+    // exactly the matmul_q16 shape M=T, K=T, N=D. attn[h,i,:] is a
+    // contiguous T-row (pack row-major); V[h,k,j] is K×N row-major (pack
+    // transposed). Reuse the proven dense MR4 microkernels: same i32
+    // products + ascending-k associative i64 sum + single final >>16 as
+    // the accrow path → byte-identical (the matmul_q16 invariant).
+    {
+        size_t attn_n = (size_t)T * (size_t)T;
+        size_t v_n    = (size_t)T * (size_t)D;
+        int32_t *Ap  = (int32_t *)malloc(attn_n * sizeof(int32_t));
+        int32_t *Vtp = (int32_t *)malloc(v_n * sizeof(int32_t));
+        if (Ap != NULL && Vtp != NULL) {
+            const int64_t Mm = T, Kk = T, Nn = D;
+            for (int64_t h = 0; h < H; ++h) {
+                const int64_t *attn_head = ATTN + (size_t)h * attn_n;
+                const int64_t *V_head    = V    + (size_t)h * v_n;
+                int64_t       *out_head  = OUT  + (size_t)h * v_n;
+                mind_nerve_blas_pack_i32_rowmajor(attn_head, Ap, Mm, Kk);
+                mind_nerve_blas_pack_i32_transpose(V_head, Vtp, Kk, Nn);
+                int64_t i = 0;
+#if MIND_NERVE_BLAS_X86_64
+                if (mind_nerve_blas_use_avx2) {
+                    for (; i + 4 <= Mm; i += 4) {
+                        const int32_t *a0 = Ap + (size_t)(i+0)*(size_t)Kk;
+                        const int32_t *a1 = Ap + (size_t)(i+1)*(size_t)Kk;
+                        const int32_t *a2 = Ap + (size_t)(i+2)*(size_t)Kk;
+                        const int32_t *a3 = Ap + (size_t)(i+3)*(size_t)Kk;
+                        int64_t *O0 = out_head + (size_t)(i+0)*(size_t)Nn;
+                        int64_t *O1 = out_head + (size_t)(i+1)*(size_t)Nn;
+                        int64_t *O2 = out_head + (size_t)(i+2)*(size_t)Nn;
+                        int64_t *O3 = out_head + (size_t)(i+3)*(size_t)Nn;
+                        int64_t j = 0;
+                        for (; j + 2 <= Nn; j += 2) {
+                            const int32_t *bt0 = Vtp + (size_t)(j+0)*(size_t)Kk;
+                            const int32_t *bt1 = Vtp + (size_t)(j+1)*(size_t)Kk;
+                            int64_t o[8];
+                            mind_nerve_blas_gemm_micro_mr4nr2_avx2(
+                                a0,a1,a2,a3,bt0,bt1,Kk,o);
+                            O0[j]=o[0];O0[j+1]=o[1]; O1[j]=o[2];O1[j+1]=o[3];
+                            O2[j]=o[4];O2[j+1]=o[5]; O3[j]=o[6];O3[j+1]=o[7];
+                        }
+                        for (; j < Nn; ++j) {
+                            const int32_t *btr = Vtp + (size_t)j*(size_t)Kk;
+                            int64_t o[4];
+                            mind_nerve_blas_gemm_micro_mr4_avx2(a0,a1,a2,a3,btr,Kk,o);
+                            O0[j]=o[0]; O1[j]=o[1]; O2[j]=o[2]; O3[j]=o[3];
+                        }
+                    }
+                    for (; i < Mm; ++i) {
+                        const int32_t *ar = Ap + (size_t)i*(size_t)Kk;
+                        int64_t *Or = out_head + (size_t)i*(size_t)Nn;
+                        for (int64_t j = 0; j < Nn; ++j)
+                            Or[j] = mind_nerve_blas_gemm_dot_i32_avx2(
+                                ar, Vtp + (size_t)j*(size_t)Kk, Kk);
+                    }
+                } else
+#endif
+                {
+                    for (; i < Mm; ++i) {
+                        const int32_t *ar = Ap + (size_t)i*(size_t)Kk;
+                        int64_t *Or = out_head + (size_t)i*(size_t)Nn;
+                        for (int64_t j = 0; j < Nn; ++j)
+                            Or[j] = mind_nerve_blas_gemm_dot_i32_scalar(
+                                ar, Vtp + (size_t)j*(size_t)Kk, Kk);
+                    }
+                }
+            }
+            free(Ap);
+            free(Vtp);
+            return 0;
+        }
+        if (Ap)  free(Ap);
+        if (Vtp) free(Vtp);
+    }
+    // malloc failed → in-place accrow reference path (byte-identical).
 
     for (int64_t h = 0; h < H; ++h) {
         const int64_t *attn_head = ATTN + (size_t)h * (size_t)(T * T);

@@ -19,6 +19,28 @@ All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](htt
   `tests/python/test_tokenize_maxseq.py`. Python-only; no encoder
   rebuild / no quantizer/blob/A1.5 change. `mind@d87c4c1`.
 
+### Perf — attention GEMMs densified (qkt + attn·V) (#236 inc 4)
+
+- `mind/runtime/blas_shims_i64.c`: `__mind_nerve_blas_qkt_q16_i64` and
+  `__mind_nerve_blas_attnv_q16_i64` now take the dense-int32 path
+  instead of the i64-stride-8 `dot_q32_accum` / k-outer-accrow
+  reference. qkt packs each head's Q/K to dense int32 and dots 8-wide
+  via a raw Q32.32 `gemm_dot_i32_accum` (no narrow; qkt applies its own
+  `>>16` then `*scale>>16`). attn·V is exactly the `matmul_q16` shape
+  (M=T, K=T, N=D) — attn row-major, V transposed — so it reuses the
+  proven MR=4×NR=2 / mr4 / dot microkernels verbatim. Every output is
+  the same i32 products + ascending-k associative i64 sum + identical
+  narrow as the reference → **byte-identical**; the original i64-stride
+  paths are retained as the malloc-fail fallback. Controlled
+  before/after A/B (50 iters, native): p50 **−4.9% / −6.3% / −7.4%**,
+  p95 **−3.8% / −7.8% / −12.7%** at ~T 64 / 128 / 256 (gain grows with
+  T — attention is O(T²D)), monotone, no sign-flips. A1.5 cosine
+  0.999996 / top-5 0.9975 byte-for-byte unchanged across both A/B
+  builds (re-verified, fresh rebuild); blas/LUT/tokenize 8/8.
+  Profiling note: attention is ~10% of encode wall (linear GEMMs
+  ~59%), so the end-to-end effect is bounded; the next levers target
+  the linear GEMM. vs MIND's own prior path.
+
 ### Perf — MR=4 × NR=2 register tile on the dense GEMM (#236 inc 3)
 
 - `mind/runtime/blas_shims_i64.c`: each A-row vector load is now reused

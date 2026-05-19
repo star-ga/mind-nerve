@@ -55,14 +55,28 @@ pub fn softmax_exp_sum_step(exp_h: i64, buf: i64, n: i64, idx: i64, m: i64, acc_
     softmax_exp_sum_step(exp_h, buf, n, idx + 1, m, new_acc)
 }
 
-// ── Stage 5 helper: multiply each y_i by 1/D (Q16.16 × Q32.32 -> Q16.16) ────
+// ── Stage 5 helper: multiply each y_i by the precise reciprocal of the
+// fractional Q16.16 exp-sum D.
+//
+// A1.5 correctness: the original Stage 4 truncated the sum to an INTEGER
+// in [1, 256] (recip_q32_lookup of floor(sum)). For attention rows the
+// exp-sum is a small fractional value (e.g. 3.97), so flooring to 3 is a
+// ~24% denominator error that compounds across 12 layers — the second
+// dominant native-vs-pytorch error after rsqrt (ablation: softmax-precise
+// + finer rsqrt restores the encode path to cosine 1.000000 vs the f64
+// reference, top-5 overlap >= 0.92).
+//
+// `recip` is floor(2^48 / D) where D is the exact Q16.16 exp-sum. This is
+// a single i64 division on a fully deterministic integer operand — no
+// float, no FMA, fixed reduction order — so it stays cross-arch
+// bit-identical (task #57). out_i = (y_i * recip) >> 32 yields the
+// Q16.16 normalised probability:
+//   y_i/2^16 * (2^48 / D) >> 32  ==  (y_i / D) * 2^16  (Q16.16).
 
-pub fn softmax_scale_step(recip_h: i64, buf: i64, n: i64, idx: i64, d_int: i64) -> i64 {
+pub fn softmax_scale_step(recip: i64, buf: i64, n: i64, idx: i64) -> i64 {
     if idx >= n { return 0; }
     let yi: i64 = __mind_load_i64(buf + idx * 8);
-    let r: i64 = recip_q32_lookup(recip_h, d_int);
-    // yi (Q16.16) * r (Q32.32) -> shift right 32 to get Q16.16 result.
-    let prod: i64 = (yi * r) >> 32;
+    let prod: i64 = (yi * recip) >> 32;
     let q16_max: i64 = 2147483647;
     let q16_min: i64 = 0 - 2147483648;
     let clamped: i64 = if prod > q16_max {
@@ -71,7 +85,7 @@ pub fn softmax_scale_step(recip_h: i64, buf: i64, n: i64, idx: i64, d_int: i64) 
         if prod < q16_min { q16_min } else { prod }
     };
     __mind_store_i64(buf + idx * 8, clamped);
-    softmax_scale_step(recip_h, buf, n, idx + 1, d_int)
+    softmax_scale_step(recip, buf, n, idx + 1)
 }
 
 // ── Top-level softmax kernel ──────────────────────────────────────────────────
@@ -83,21 +97,23 @@ pub fn softmax_q16_run(exp_h: i64, recip_h: i64, buf: i64, n: i64) -> i64 {
     let first: i64 = __mind_load_i64(buf);
     let m: i64 = softmax_max_step(buf, n, 1, first);
 
-    // Stages 2 + 3: exp(x - m) and sum into Q32.32 accumulator.
+    // Stages 2 + 3: exp(x - m), write y_i back, accumulate the sum.
+    // softmax_exp_sum_step accumulates (y_i << 16); the low 16 bits are
+    // therefore always zero, so d_q16 = d_q32 >> 16 is the EXACT Q16.16
+    // sum (no precision lost in the narrowing).
     let d_q32: i64 = softmax_exp_sum_step(exp_h, buf, n, 0, m, 0);
+    let d_q16: i64 = d_q32 >> 16;
+    let d_safe: i64 = if d_q16 <= 0 { 1 } else { d_q16 };
 
-    // Stage 4: integer denominator for recip_q32 LUT.
-    // D is a Q32.32 integer; convert to integer units (>= 1).
-    // D_int = ceil(d_q32 / Q32_ONE) — use right shift 32 then clamp to [1, 256].
-    let d_shifted: i64 = d_q32 >> 32;
-    let d_int: i64 = if d_shifted < 1 {
-        1
-    } else {
-        if d_shifted > 256 { 256 } else { d_shifted }
-    };
+    // Stage 4: precise reciprocal of the fractional Q16.16 sum.
+    //   recip = floor(2^48 / D)   (D in Q16.16)
+    // recip_h is retained in the ABI for source compatibility but the
+    // pinned integer-truncated recip_q32 path is no longer used here.
+    let two_pow_48: i64 = 281474976710656;
+    let recip: i64 = two_pow_48 / d_safe;
 
-    // Stage 5: scale each y_i by 1/D.
-    softmax_scale_step(recip_h, buf, n, 0, d_int)
+    // Stage 5: scale each y_i by the precise reciprocal.
+    softmax_scale_step(recip, buf, n, 0)
 }
 
 // ── A1.5 multi-row convenience wrapper (pure MIND) ───────────────────────────

@@ -465,258 +465,258 @@ pub fn smoke_sqrt_q16() -> i64 {
     let sqdiff_0: i64 = sqx_0 - 165470;
     let sqadiff_0: i64 = if sqdiff_0 < 0 { 0 - sqdiff_0 } else { sqdiff_0 };
     if sqadiff_0 > 1 { return 417792; }
-    let rsqx_0: i64 = rsqrt_q16_lookup(rsh, 417792);
-    let rsqdiff_0: i64 = rsqx_0 - 25956;
-    let rsqadiff_0: i64 = if rsqdiff_0 < 0 { 0 - rsqdiff_0 } else { rsqdiff_0 };
-    if rsqadiff_0 > 1 { return 417792; }
     let sqx_1: i64 = sqrt_q16_lookup(sh, 999424);
     let sqdiff_1: i64 = sqx_1 - 255926;
     let sqadiff_1: i64 = if sqdiff_1 < 0 { 0 - sqdiff_1 } else { sqdiff_1 };
     if sqadiff_1 > 1 { return 999424; }
-    let rsqx_1: i64 = rsqrt_q16_lookup(rsh, 999424);
-    let rsqdiff_1: i64 = rsqx_1 - 16782;
-    let rsqadiff_1: i64 = if rsqdiff_1 < 0 { 0 - rsqdiff_1 } else { rsqdiff_1 };
-    if rsqadiff_1 > 1 { return 999424; }
     let sqx_2: i64 = sqrt_q16_lookup(sh, 13361152);
     let sqdiff_2: i64 = sqx_2 - 935754;
     let sqadiff_2: i64 = if sqdiff_2 < 0 { 0 - sqdiff_2 } else { sqdiff_2 };
     if sqadiff_2 > 1 { return 13361152; }
-    let rsqx_2: i64 = rsqrt_q16_lookup(rsh, 13361152);
-    let rsqdiff_2: i64 = rsqx_2 - 4589;
-    let rsqadiff_2: i64 = if rsqdiff_2 < 0 { 0 - rsqdiff_2 } else { rsqdiff_2 };
-    if rsqadiff_2 > 1 { return 13361152; }
     let sqx_3: i64 = sqrt_q16_lookup(sh, 1818624);
     let sqdiff_3: i64 = sqx_3 - 345232;
     let sqadiff_3: i64 = if sqdiff_3 < 0 { 0 - sqdiff_3 } else { sqdiff_3 };
     if sqadiff_3 > 1 { return 1818624; }
-    let rsqx_3: i64 = rsqrt_q16_lookup(rsh, 1818624);
-    let rsqdiff_3: i64 = rsqx_3 - 12440;
-    let rsqadiff_3: i64 = if rsqdiff_3 < 0 { 0 - rsqdiff_3 } else { rsqdiff_3 };
-    if rsqadiff_3 > 1 { return 1818624; }
     let sqx_4: i64 = sqrt_q16_lookup(sh, 1277952);
     let sqdiff_4: i64 = sqx_4 - 289399;
     let sqadiff_4: i64 = if sqdiff_4 < 0 { 0 - sqdiff_4 } else { sqdiff_4 };
     if sqadiff_4 > 1 { return 1277952; }
-    let rsqx_4: i64 = rsqrt_q16_lookup(rsh, 1277952);
-    let rsqdiff_4: i64 = rsqx_4 - 14840;
-    let rsqadiff_4: i64 = if rsqdiff_4 < 0 { 0 - rsqdiff_4 } else { rsqdiff_4 };
-    if rsqadiff_4 > 1 { return 1277952; }
     let sqx_5: i64 = sqrt_q16_lookup(sh, 16572416);
     let sqdiff_5: i64 = sqx_5 - 1042156;
     let sqadiff_5: i64 = if sqdiff_5 < 0 { 0 - sqdiff_5 } else { sqdiff_5 };
     if sqadiff_5 > 1 { return 16572416; }
-    let rsqx_5: i64 = rsqrt_q16_lookup(rsh, 16572416);
-    let rsqdiff_5: i64 = rsqx_5 - 4121;
-    let rsqadiff_5: i64 = if rsqdiff_5 < 0 { 0 - rsqdiff_5 } else { rsqdiff_5 };
-    if rsqadiff_5 > 1 { return 16572416; }
     let sqx_6: i64 = sqrt_q16_lookup(sh, 11264000);
     let sqdiff_6: i64 = sqx_6 - 859184;
     let sqadiff_6: i64 = if sqdiff_6 < 0 { 0 - sqdiff_6 } else { sqdiff_6 };
     if sqadiff_6 > 1 { return 11264000; }
-    let rsqx_6: i64 = rsqrt_q16_lookup(rsh, 11264000);
-    let rsqdiff_6: i64 = rsqx_6 - 4998;
-    let rsqadiff_6: i64 = if rsqdiff_6 < 0 { 0 - rsqdiff_6 } else { rsqdiff_6 };
-    if rsqadiff_6 > 1 { return 11264000; }
     let sqx_7: i64 = sqrt_q16_lookup(sh, 8642560);
     let sqdiff_7: i64 = sqx_7 - 752594;
     let sqadiff_7: i64 = if sqdiff_7 < 0 { 0 - sqdiff_7 } else { sqdiff_7 };
     if sqadiff_7 > 1 { return 8642560; }
-    let rsqx_7: i64 = rsqrt_q16_lookup(rsh, 8642560);
-    let rsqdiff_7: i64 = rsqx_7 - 5706;
-    let rsqadiff_7: i64 = if rsqdiff_7 < 0 { 0 - rsqdiff_7 } else { rsqdiff_7 };
-    if rsqadiff_7 > 1 { return 8642560; }
     let sqx_8: i64 = sqrt_q16_lookup(sh, 14991360);
     let sqdiff_8: i64 = sqx_8 - 991198;
     let sqadiff_8: i64 = if sqdiff_8 < 0 { 0 - sqdiff_8 } else { sqdiff_8 };
     if sqadiff_8 > 1 { return 14991360; }
-    let rsqx_8: i64 = rsqrt_q16_lookup(rsh, 14991360);
-    let rsqdiff_8: i64 = rsqx_8 - 4333;
-    let rsqadiff_8: i64 = if rsqdiff_8 < 0 { 0 - rsqdiff_8 } else { rsqdiff_8 };
-    if rsqadiff_8 > 1 { return 14991360; }
     let sqx_9: i64 = sqrt_q16_lookup(sh, 2367488);
     let sqdiff_9: i64 = sqx_9 - 393898;
     let sqadiff_9: i64 = if sqdiff_9 < 0 { 0 - sqdiff_9 } else { sqdiff_9 };
     if sqadiff_9 > 1 { return 2367488; }
-    let rsqx_9: i64 = rsqrt_q16_lookup(rsh, 2367488);
-    let rsqdiff_9: i64 = rsqx_9 - 10903;
-    let rsqadiff_9: i64 = if rsqdiff_9 < 0 { 0 - rsqdiff_9 } else { rsqdiff_9 };
-    if rsqadiff_9 > 1 { return 2367488; }
     let sqx_10: i64 = sqrt_q16_lookup(sh, 3997696);
     let sqdiff_10: i64 = sqx_10 - 511852;
     let sqadiff_10: i64 = if sqdiff_10 < 0 { 0 - sqdiff_10 } else { sqdiff_10 };
     if sqadiff_10 > 1 { return 3997696; }
-    let rsqx_10: i64 = rsqrt_q16_lookup(rsh, 3997696);
-    let rsqdiff_10: i64 = rsqx_10 - 8391;
-    let rsqadiff_10: i64 = if rsqdiff_10 < 0 { 0 - rsqdiff_10 } else { rsqdiff_10 };
-    if rsqadiff_10 > 1 { return 3997696; }
     let sqx_11: i64 = sqrt_q16_lookup(sh, 3489792);
     let sqdiff_11: i64 = sqx_11 - 478233;
     let sqadiff_11: i64 = if sqdiff_11 < 0 { 0 - sqdiff_11 } else { sqdiff_11 };
     if sqadiff_11 > 1 { return 3489792; }
-    let rsqx_11: i64 = rsqrt_q16_lookup(rsh, 3489792);
-    let rsqdiff_11: i64 = rsqx_11 - 8980;
-    let rsqadiff_11: i64 = if rsqdiff_11 < 0 { 0 - rsqdiff_11 } else { rsqdiff_11 };
-    if rsqadiff_11 > 1 { return 3489792; }
     let sqx_12: i64 = sqrt_q16_lookup(sh, 9486336);
     let sqdiff_12: i64 = sqx_12 - 788477;
     let sqadiff_12: i64 = if sqdiff_12 < 0 { 0 - sqdiff_12 } else { sqdiff_12 };
     if sqadiff_12 > 1 { return 9486336; }
-    let rsqx_12: i64 = rsqrt_q16_lookup(rsh, 9486336);
-    let rsqdiff_12: i64 = rsqx_12 - 5447;
-    let rsqadiff_12: i64 = if rsqdiff_12 < 0 { 0 - rsqdiff_12 } else { rsqdiff_12 };
-    if rsqadiff_12 > 1 { return 9486336; }
     let sqx_13: i64 = sqrt_q16_lookup(sh, 11141120);
     let sqdiff_13: i64 = sqx_13 - 854484;
     let sqadiff_13: i64 = if sqdiff_13 < 0 { 0 - sqdiff_13 } else { sqdiff_13 };
     if sqadiff_13 > 1 { return 11141120; }
-    let rsqx_13: i64 = rsqrt_q16_lookup(rsh, 11141120);
-    let rsqdiff_13: i64 = rsqx_13 - 5026;
-    let rsqadiff_13: i64 = if rsqdiff_13 < 0 { 0 - rsqdiff_13 } else { rsqdiff_13 };
-    if rsqadiff_13 > 1 { return 11141120; }
     let sqx_14: i64 = sqrt_q16_lookup(sh, 13058048);
     let sqdiff_14: i64 = sqx_14 - 925079;
     let sqadiff_14: i64 = if sqdiff_14 < 0 { 0 - sqdiff_14 } else { sqdiff_14 };
     if sqadiff_14 > 1 { return 13058048; }
-    let rsqx_14: i64 = rsqrt_q16_lookup(rsh, 13058048);
-    let rsqdiff_14: i64 = rsqx_14 - 4642;
-    let rsqadiff_14: i64 = if rsqdiff_14 < 0 { 0 - rsqdiff_14 } else { rsqdiff_14 };
-    if rsqadiff_14 > 1 { return 13058048; }
     let sqx_15: i64 = sqrt_q16_lookup(sh, 11624448);
     let sqdiff_15: i64 = sqx_15 - 872822;
     let sqadiff_15: i64 = if sqdiff_15 < 0 { 0 - sqdiff_15 } else { sqdiff_15 };
     if sqadiff_15 > 1 { return 11624448; }
-    let rsqx_15: i64 = rsqrt_q16_lookup(rsh, 11624448);
-    let rsqdiff_15: i64 = rsqx_15 - 4920;
-    let rsqadiff_15: i64 = if rsqdiff_15 < 0 { 0 - rsqdiff_15 } else { rsqdiff_15 };
-    if rsqadiff_15 > 1 { return 11624448; }
     let sqx_16: i64 = sqrt_q16_lookup(sh, 15138816);
     let sqdiff_16: i64 = sqx_16 - 996060;
     let sqadiff_16: i64 = if sqdiff_16 < 0 { 0 - sqdiff_16 } else { sqdiff_16 };
     if sqadiff_16 > 1 { return 15138816; }
-    let rsqx_16: i64 = rsqrt_q16_lookup(rsh, 15138816);
-    let rsqdiff_16: i64 = rsqx_16 - 4311;
-    let rsqadiff_16: i64 = if rsqdiff_16 < 0 { 0 - rsqdiff_16 } else { rsqdiff_16 };
-    if rsqadiff_16 > 1 { return 15138816; }
     let sqx_17: i64 = sqrt_q16_lookup(sh, 14098432);
     let sqdiff_17: i64 = sqx_17 - 961225;
     let sqadiff_17: i64 = if sqdiff_17 < 0 { 0 - sqdiff_17 } else { sqdiff_17 };
     if sqadiff_17 > 1 { return 14098432; }
-    let rsqx_17: i64 = rsqrt_q16_lookup(rsh, 14098432);
-    let rsqdiff_17: i64 = rsqx_17 - 4468;
-    let rsqadiff_17: i64 = if rsqdiff_17 < 0 { 0 - rsqdiff_17 } else { rsqdiff_17 };
-    if rsqadiff_17 > 1 { return 14098432; }
     let sqx_18: i64 = sqrt_q16_lookup(sh, 13221888);
     let sqdiff_18: i64 = sqx_18 - 930865;
     let sqadiff_18: i64 = if sqdiff_18 < 0 { 0 - sqdiff_18 } else { sqdiff_18 };
     if sqadiff_18 > 1 { return 13221888; }
-    let rsqx_18: i64 = rsqrt_q16_lookup(rsh, 13221888);
-    let rsqdiff_18: i64 = rsqx_18 - 4613;
-    let rsqadiff_18: i64 = if rsqdiff_18 < 0 { 0 - rsqdiff_18 } else { rsqdiff_18 };
-    if rsqadiff_18 > 1 { return 13221888; }
     let sqx_19: i64 = sqrt_q16_lookup(sh, 1966080);
     let sqdiff_19: i64 = sqx_19 - 358955;
     let sqadiff_19: i64 = if sqdiff_19 < 0 { 0 - sqdiff_19 } else { sqdiff_19 };
     if sqadiff_19 > 1 { return 1966080; }
-    let rsqx_19: i64 = rsqrt_q16_lookup(rsh, 1966080);
-    let rsqdiff_19: i64 = rsqx_19 - 11965;
-    let rsqadiff_19: i64 = if rsqdiff_19 < 0 { 0 - rsqdiff_19 } else { rsqdiff_19 };
-    if rsqadiff_19 > 1 { return 1966080; }
     let sqx_20: i64 = sqrt_q16_lookup(sh, 11542528);
     let sqdiff_20: i64 = sqx_20 - 869741;
     let sqadiff_20: i64 = if sqdiff_20 < 0 { 0 - sqdiff_20 } else { sqdiff_20 };
     if sqadiff_20 > 1 { return 11542528; }
-    let rsqx_20: i64 = rsqrt_q16_lookup(rsh, 11542528);
-    let rsqdiff_20: i64 = rsqx_20 - 4938;
-    let rsqadiff_20: i64 = if rsqdiff_20 < 0 { 0 - rsqdiff_20 } else { rsqdiff_20 };
-    if rsqadiff_20 > 1 { return 11542528; }
     let sqx_21: i64 = sqrt_q16_lookup(sh, 16629760);
     let sqdiff_21: i64 = sqx_21 - 1043957;
     let sqadiff_21: i64 = if sqdiff_21 < 0 { 0 - sqdiff_21 } else { sqdiff_21 };
     if sqadiff_21 > 1 { return 16629760; }
-    let rsqx_21: i64 = rsqrt_q16_lookup(rsh, 16629760);
-    let rsqdiff_21: i64 = rsqx_21 - 4114;
-    let rsqadiff_21: i64 = if rsqdiff_21 < 0 { 0 - rsqdiff_21 } else { rsqdiff_21 };
-    if rsqadiff_21 > 1 { return 16629760; }
     let sqx_22: i64 = sqrt_q16_lookup(sh, 12812288);
     let sqdiff_22: i64 = sqx_22 - 916332;
     let sqadiff_22: i64 = if sqdiff_22 < 0 { 0 - sqdiff_22 } else { sqdiff_22 };
     if sqadiff_22 > 1 { return 12812288; }
-    let rsqx_22: i64 = rsqrt_q16_lookup(rsh, 12812288);
-    let rsqdiff_22: i64 = rsqx_22 - 4687;
-    let rsqadiff_22: i64 = if rsqdiff_22 < 0 { 0 - rsqdiff_22 } else { rsqdiff_22 };
-    if rsqadiff_22 > 1 { return 12812288; }
     let sqx_23: i64 = sqrt_q16_lookup(sh, 2834432);
     let sqdiff_23: i64 = sqx_23 - 430995;
     let sqadiff_23: i64 = if sqdiff_23 < 0 { 0 - sqdiff_23 } else { sqdiff_23 };
     if sqadiff_23 > 1 { return 2834432; }
-    let rsqx_23: i64 = rsqrt_q16_lookup(rsh, 2834432);
-    let rsqdiff_23: i64 = rsqx_23 - 9965;
-    let rsqadiff_23: i64 = if rsqdiff_23 < 0 { 0 - rsqdiff_23 } else { rsqdiff_23 };
-    if rsqadiff_23 > 1 { return 2834432; }
     let sqx_24: i64 = sqrt_q16_lookup(sh, 12591104);
     let sqdiff_24: i64 = sqx_24 - 908389;
     let sqadiff_24: i64 = if sqdiff_24 < 0 { 0 - sqdiff_24 } else { sqdiff_24 };
     if sqadiff_24 > 1 { return 12591104; }
-    let rsqx_24: i64 = rsqrt_q16_lookup(rsh, 12591104);
-    let rsqdiff_24: i64 = rsqx_24 - 4728;
-    let rsqadiff_24: i64 = if rsqdiff_24 < 0 { 0 - rsqdiff_24 } else { rsqdiff_24 };
-    if rsqadiff_24 > 1 { return 12591104; }
     let sqx_25: i64 = sqrt_q16_lookup(sh, 4169728);
     let sqdiff_25: i64 = sqx_25 - 522749;
     let sqadiff_25: i64 = if sqdiff_25 < 0 { 0 - sqdiff_25 } else { sqdiff_25 };
     if sqadiff_25 > 1 { return 4169728; }
-    let rsqx_25: i64 = rsqrt_q16_lookup(rsh, 4169728);
-    let rsqdiff_25: i64 = rsqx_25 - 8216;
-    let rsqadiff_25: i64 = if rsqdiff_25 < 0 { 0 - rsqdiff_25 } else { rsqdiff_25 };
-    if rsqadiff_25 > 1 { return 4169728; }
     let sqx_26: i64 = sqrt_q16_lookup(sh, 1474560);
     let sqdiff_26: i64 = sqx_26 - 310864;
     let sqadiff_26: i64 = if sqdiff_26 < 0 { 0 - sqdiff_26 } else { sqdiff_26 };
     if sqadiff_26 > 1 { return 1474560; }
-    let rsqx_26: i64 = rsqrt_q16_lookup(rsh, 1474560);
-    let rsqdiff_26: i64 = rsqx_26 - 13816;
-    let rsqadiff_26: i64 = if rsqdiff_26 < 0 { 0 - rsqdiff_26 } else { rsqdiff_26 };
-    if rsqadiff_26 > 1 { return 1474560; }
     let sqx_27: i64 = sqrt_q16_lookup(sh, 3891200);
     let sqdiff_27: i64 = sqx_27 - 504988;
     let sqadiff_27: i64 = if sqdiff_27 < 0 { 0 - sqdiff_27 } else { sqdiff_27 };
     if sqadiff_27 > 1 { return 3891200; }
-    let rsqx_27: i64 = rsqrt_q16_lookup(rsh, 3891200);
-    let rsqdiff_27: i64 = rsqx_27 - 8505;
-    let rsqadiff_27: i64 = if rsqdiff_27 < 0 { 0 - rsqdiff_27 } else { rsqdiff_27 };
-    if rsqadiff_27 > 1 { return 3891200; }
     let sqx_28: i64 = sqrt_q16_lookup(sh, 4980736);
     let sqdiff_28: i64 = sqx_28 - 571329;
     let sqadiff_28: i64 = if sqdiff_28 < 0 { 0 - sqdiff_28 } else { sqdiff_28 };
     if sqadiff_28 > 1 { return 4980736; }
-    let rsqx_28: i64 = rsqrt_q16_lookup(rsh, 4980736);
-    let rsqdiff_28: i64 = rsqx_28 - 7517;
-    let rsqadiff_28: i64 = if rsqdiff_28 < 0 { 0 - rsqdiff_28 } else { rsqdiff_28 };
-    if rsqadiff_28 > 1 { return 4980736; }
     let sqx_29: i64 = sqrt_q16_lookup(sh, 4440064);
     let sqdiff_29: i64 = sqx_29 - 539429;
     let sqadiff_29: i64 = if sqdiff_29 < 0 { 0 - sqdiff_29 } else { sqdiff_29 };
     if sqadiff_29 > 1 { return 4440064; }
-    let rsqx_29: i64 = rsqrt_q16_lookup(rsh, 4440064);
-    let rsqdiff_29: i64 = rsqx_29 - 7962;
-    let rsqadiff_29: i64 = if rsqdiff_29 < 0 { 0 - rsqdiff_29 } else { rsqdiff_29 };
-    if rsqadiff_29 > 1 { return 4440064; }
     let sqx_30: i64 = sqrt_q16_lookup(sh, 11771904);
     let sqdiff_30: i64 = sqx_30 - 878341;
     let sqadiff_30: i64 = if sqdiff_30 < 0 { 0 - sqdiff_30 } else { sqdiff_30 };
     if sqadiff_30 > 1 { return 11771904; }
-    let rsqx_30: i64 = rsqrt_q16_lookup(rsh, 11771904);
-    let rsqdiff_30: i64 = rsqx_30 - 4889;
-    let rsqadiff_30: i64 = if rsqdiff_30 < 0 { 0 - rsqdiff_30 } else { rsqdiff_30 };
-    if rsqadiff_30 > 1 { return 11771904; }
     let sqx_31: i64 = sqrt_q16_lookup(sh, 4579328);
     let sqdiff_31: i64 = sqx_31 - 547823;
     let sqadiff_31: i64 = if sqdiff_31 < 0 { 0 - sqdiff_31 } else { sqdiff_31 };
     if sqadiff_31 > 1 { return 4579328; }
-    let rsqx_31: i64 = rsqrt_q16_lookup(rsh, 4579328);
-    let rsqdiff_31: i64 = rsqx_31 - 7840;
+    let rsqx_0: i64 = rsqrt_q16_lookup(rsh, 1169408);
+    let rsqdiff_0: i64 = rsqx_0 - 15514;
+    let rsqadiff_0: i64 = if rsqdiff_0 < 0 { 0 - rsqdiff_0 } else { rsqdiff_0 };
+    if rsqadiff_0 > 1 { return 1169408; }
+    let rsqx_1: i64 = rsqrt_q16_lookup(rsh, 2598912);
+    let rsqdiff_1: i64 = rsqx_1 - 10406;
+    let rsqadiff_1: i64 = if rsqdiff_1 < 0 { 0 - rsqdiff_1 } else { rsqdiff_1 };
+    if rsqadiff_1 > 1 { return 2598912; }
+    let rsqx_2: i64 = rsqrt_q16_lookup(rsh, 3637248);
+    let rsqdiff_2: i64 = rsqx_2 - 8796;
+    let rsqadiff_2: i64 = if rsqdiff_2 < 0 { 0 - rsqdiff_2 } else { rsqdiff_2 };
+    if rsqadiff_2 > 1 { return 3637248; }
+    let rsqx_3: i64 = rsqrt_q16_lookup(rsh, 6265856);
+    let rsqdiff_3: i64 = rsqx_3 - 6702;
+    let rsqadiff_3: i64 = if rsqdiff_3 < 0 { 0 - rsqdiff_3 } else { rsqdiff_3 };
+    if rsqadiff_3 > 1 { return 6265856; }
+    let rsqx_4: i64 = rsqrt_q16_lookup(rsh, 242688);
+    let rsqdiff_4: i64 = rsqx_4 - 34056;
+    let rsqadiff_4: i64 = if rsqdiff_4 < 0 { 0 - rsqdiff_4 } else { rsqdiff_4 };
+    if rsqadiff_4 > 1 { return 242688; }
+    let rsqx_5: i64 = rsqrt_q16_lookup(rsh, 14657536);
+    let rsqdiff_5: i64 = rsqx_5 - 4382;
+    let rsqadiff_5: i64 = if rsqdiff_5 < 0 { 0 - rsqdiff_5 } else { rsqdiff_5 };
+    if rsqadiff_5 > 1 { return 14657536; }
+    let rsqx_6: i64 = rsqrt_q16_lookup(rsh, 3124224);
+    let rsqdiff_6: i64 = rsqx_6 - 9491;
+    let rsqadiff_6: i64 = if rsqdiff_6 < 0 { 0 - rsqdiff_6 } else { rsqdiff_6 };
+    if rsqadiff_6 > 1 { return 3124224; }
+    let rsqx_7: i64 = rsqrt_q16_lookup(rsh, 15761408);
+    let rsqdiff_7: i64 = rsqx_7 - 4225;
+    let rsqadiff_7: i64 = if rsqdiff_7 < 0 { 0 - rsqdiff_7 } else { rsqdiff_7 };
+    if rsqadiff_7 > 1 { return 15761408; }
+    let rsqx_8: i64 = rsqrt_q16_lookup(rsh, 10584064);
+    let rsqdiff_8: i64 = rsqx_8 - 5156;
+    let rsqadiff_8: i64 = if rsqdiff_8 < 0 { 0 - rsqdiff_8 } else { rsqdiff_8 };
+    if rsqadiff_8 > 1 { return 10584064; }
+    let rsqx_9: i64 = rsqrt_q16_lookup(rsh, 9017344);
+    let rsqdiff_9: i64 = rsqx_9 - 5587;
+    let rsqadiff_9: i64 = if rsqdiff_9 < 0 { 0 - rsqdiff_9 } else { rsqdiff_9 };
+    if rsqadiff_9 > 1 { return 9017344; }
+    let rsqx_10: i64 = rsqrt_q16_lookup(rsh, 13370368);
+    let rsqdiff_10: i64 = rsqx_10 - 4588;
+    let rsqadiff_10: i64 = if rsqdiff_10 < 0 { 0 - rsqdiff_10 } else { rsqdiff_10 };
+    if rsqadiff_10 > 1 { return 13370368; }
+    let rsqx_11: i64 = rsqrt_q16_lookup(rsh, 15233024);
+    let rsqdiff_11: i64 = rsqx_11 - 4298;
+    let rsqadiff_11: i64 = if rsqdiff_11 < 0 { 0 - rsqdiff_11 } else { rsqdiff_11 };
+    if rsqadiff_11 > 1 { return 15233024; }
+    let rsqx_12: i64 = rsqrt_q16_lookup(rsh, 3245056);
+    let rsqdiff_12: i64 = rsqx_12 - 9313;
+    let rsqadiff_12: i64 = if rsqdiff_12 < 0 { 0 - rsqdiff_12 } else { rsqdiff_12 };
+    if rsqadiff_12 > 1 { return 3245056; }
+    let rsqx_13: i64 = rsqrt_q16_lookup(rsh, 11051008);
+    let rsqdiff_13: i64 = rsqx_13 - 5046;
+    let rsqadiff_13: i64 = if rsqdiff_13 < 0 { 0 - rsqdiff_13 } else { rsqdiff_13 };
+    if rsqadiff_13 > 1 { return 11051008; }
+    let rsqx_14: i64 = rsqrt_q16_lookup(rsh, 8572928);
+    let rsqdiff_14: i64 = rsqx_14 - 5730;
+    let rsqadiff_14: i64 = if rsqdiff_14 < 0 { 0 - rsqdiff_14 } else { rsqdiff_14 };
+    if rsqadiff_14 > 1 { return 8572928; }
+    let rsqx_15: i64 = rsqrt_q16_lookup(rsh, 12457984);
+    let rsqdiff_15: i64 = rsqx_15 - 4753;
+    let rsqadiff_15: i64 = if rsqdiff_15 < 0 { 0 - rsqdiff_15 } else { rsqdiff_15 };
+    if rsqadiff_15 > 1 { return 12457984; }
+    let rsqx_16: i64 = rsqrt_q16_lookup(rsh, 2659328);
+    let rsqdiff_16: i64 = rsqx_16 - 10288;
+    let rsqadiff_16: i64 = if rsqdiff_16 < 0 { 0 - rsqdiff_16 } else { rsqdiff_16 };
+    if rsqadiff_16 > 1 { return 2659328; }
+    let rsqx_17: i64 = rsqrt_q16_lookup(rsh, 5872640);
+    let rsqdiff_17: i64 = rsqx_17 - 6923;
+    let rsqadiff_17: i64 = if rsqdiff_17 < 0 { 0 - rsqdiff_17 } else { rsqdiff_17 };
+    if rsqadiff_17 > 1 { return 5872640; }
+    let rsqx_18: i64 = rsqrt_q16_lookup(rsh, 12988416);
+    let rsqdiff_18: i64 = rsqx_18 - 4655;
+    let rsqadiff_18: i64 = if rsqdiff_18 < 0 { 0 - rsqdiff_18 } else { rsqdiff_18 };
+    if rsqadiff_18 > 1 { return 12988416; }
+    let rsqx_19: i64 = rsqrt_q16_lookup(rsh, 9853952);
+    let rsqdiff_19: i64 = rsqx_19 - 5344;
+    let rsqadiff_19: i64 = if rsqdiff_19 < 0 { 0 - rsqdiff_19 } else { rsqdiff_19 };
+    if rsqadiff_19 > 1 { return 9853952; }
+    let rsqx_20: i64 = rsqrt_q16_lookup(rsh, 4446208);
+    let rsqdiff_20: i64 = rsqx_20 - 7956;
+    let rsqadiff_20: i64 = if rsqdiff_20 < 0 { 0 - rsqdiff_20 } else { rsqdiff_20 };
+    if rsqadiff_20 > 1 { return 4446208; }
+    let rsqx_21: i64 = rsqrt_q16_lookup(rsh, 718848);
+    let rsqdiff_21: i64 = rsqx_21 - 19787;
+    let rsqadiff_21: i64 = if rsqdiff_21 < 0 { 0 - rsqdiff_21 } else { rsqdiff_21 };
+    if rsqadiff_21 > 1 { return 718848; }
+    let rsqx_22: i64 = rsqrt_q16_lookup(rsh, 6895616);
+    let rsqdiff_22: i64 = rsqx_22 - 6389;
+    let rsqadiff_22: i64 = if rsqdiff_22 < 0 { 0 - rsqdiff_22 } else { rsqdiff_22 };
+    if rsqadiff_22 > 1 { return 6895616; }
+    let rsqx_23: i64 = rsqrt_q16_lookup(rsh, 12328960);
+    let rsqdiff_23: i64 = rsqx_23 - 4778;
+    let rsqadiff_23: i64 = if rsqdiff_23 < 0 { 0 - rsqdiff_23 } else { rsqdiff_23 };
+    if rsqadiff_23 > 1 { return 12328960; }
+    let rsqx_24: i64 = rsqrt_q16_lookup(rsh, 13335552);
+    let rsqdiff_24: i64 = rsqx_24 - 4594;
+    let rsqadiff_24: i64 = if rsqdiff_24 < 0 { 0 - rsqdiff_24 } else { rsqdiff_24 };
+    if rsqadiff_24 > 1 { return 13335552; }
+    let rsqx_25: i64 = rsqrt_q16_lookup(rsh, 16488448);
+    let rsqdiff_25: i64 = rsqx_25 - 4131;
+    let rsqadiff_25: i64 = if rsqdiff_25 < 0 { 0 - rsqdiff_25 } else { rsqdiff_25 };
+    if rsqadiff_25 > 1 { return 16488448; }
+    let rsqx_26: i64 = rsqrt_q16_lookup(rsh, 5620736);
+    let rsqdiff_26: i64 = rsqx_26 - 7076;
+    let rsqadiff_26: i64 = if rsqdiff_26 < 0 { 0 - rsqdiff_26 } else { rsqdiff_26 };
+    if rsqadiff_26 > 1 { return 5620736; }
+    let rsqx_27: i64 = rsqrt_q16_lookup(rsh, 2059264);
+    let rsqdiff_27: i64 = rsqx_27 - 11691;
+    let rsqadiff_27: i64 = if rsqdiff_27 < 0 { 0 - rsqdiff_27 } else { rsqdiff_27 };
+    if rsqadiff_27 > 1 { return 2059264; }
+    let rsqx_28: i64 = rsqrt_q16_lookup(rsh, 6620160);
+    let rsqdiff_28: i64 = rsqx_28 - 6520;
+    let rsqadiff_28: i64 = if rsqdiff_28 < 0 { 0 - rsqdiff_28 } else { rsqdiff_28 };
+    if rsqadiff_28 > 1 { return 6620160; }
+    let rsqx_29: i64 = rsqrt_q16_lookup(rsh, 6674432);
+    let rsqdiff_29: i64 = rsqx_29 - 6494;
+    let rsqadiff_29: i64 = if rsqdiff_29 < 0 { 0 - rsqdiff_29 } else { rsqdiff_29 };
+    if rsqadiff_29 > 1 { return 6674432; }
+    let rsqx_30: i64 = rsqrt_q16_lookup(rsh, 270336);
+    let rsqdiff_30: i64 = rsqx_30 - 32267;
+    let rsqadiff_30: i64 = if rsqdiff_30 < 0 { 0 - rsqdiff_30 } else { rsqdiff_30 };
+    if rsqadiff_30 > 1 { return 270336; }
+    let rsqx_31: i64 = rsqrt_q16_lookup(rsh, 10103808);
+    let rsqdiff_31: i64 = rsqx_31 - 5278;
     let rsqadiff_31: i64 = if rsqdiff_31 < 0 { 0 - rsqdiff_31 } else { rsqdiff_31 };
-    if rsqadiff_31 > 1 { return 4579328; }
+    if rsqadiff_31 > 1 { return 10103808; }
     sqrt_q16_free(sh);
     rsqrt_q16_free(rsh);
     0

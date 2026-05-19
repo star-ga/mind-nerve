@@ -43,9 +43,20 @@ from mind_nerve._native import _NativeRuntime
 
 # Cross-arch reference hashes (task #57). Generated on i7-5930K,
 # x86_64-Linux, pure-MIND integer Q16.16 path.
+#
+# A1.5 (encode-path precision): the rsqrt LUT was widened 2048 -> 16384
+# entries and the Newton refinement raised 1 -> 3 steps; the softmax
+# normaliser was changed from the integer-truncated denominator (floor of
+# the sum, clamped to [1,256]) to a precise reciprocal of the exact
+# Q16.16 exp-sum. Both changes legitimately shift the rsqrt/softmax
+# oracle — the OLD hashes encoded the too-coarse values that caused the
+# native-vs-pytorch top-5 overlap to fail at 0.37. The values remain
+# deterministic and byte-identical scalar-vs-SIMD (the load-bearing
+# task #57 invariant); these are the re-pinned correct hashes. tanh and
+# the BLAS score-path hash are unchanged (untouched by A1.5).
 REFERENCE_HASH_TANH = "190e488bd5a0f67fcc7a2ca60df688d98b53fe1643b9cbe485e8859740bf4bb8"
-REFERENCE_HASH_RSQRT = "c7e2791a73ad234187c00f0d2a918c86826ea509346c37b448ade18379b06a2d"
-REFERENCE_HASH_SOFTMAX = "e39ad4ec913ae5b0a77add0c0d1ec1526f00f4c729fc3c8fbc4b04525a2621ae"
+REFERENCE_HASH_RSQRT = "d27d4c03020abeaee13a65de3963910cace68a1c77b2b0c1a14d708b965170b3"
+REFERENCE_HASH_SOFTMAX = "15a43da770b3b63bcd6d74d6f452d960c619a1ce792d840435ce2bdbfe64808f"
 
 _Q16_ONE = 65536
 
@@ -140,21 +151,25 @@ def test_tanh_q16_deterministic_and_reference(lib: ctypes.CDLL) -> None:
 
 
 # ---------------------------------------------------------------------------
-# rsqrt_q16  (1/sqrt(x) Q16.16; sqrt_q16.mind 2048-entry table + 1 Newton)
+# rsqrt_q16  (1/sqrt(x) Q16.16; sqrt_q16.mind 16384-entry table + 3 Newton)
 # ---------------------------------------------------------------------------
 #
-# Representable domain: x_real in [0.125, 256.0] (table bucket stride
-# 256/2048 = 0.125). The wrapper composes the rsqrt table seed with one
-# Newton step; inputs below the first bucket (x_real < 0.125) clamp to
-# table[0] and are out of the accuracy contract (the encoder defensively
-# clamps LayerNorm variance / L2 sum-of-squares before calling).
+# Representable domain: x_real in [256/16384, 256.0] = [0.015625, 256.0]
+# (A1.5 widened the table 2048 -> 16384 entries; bucket stride 256/16384 =
+# 0.015625). The wrapper composes the rsqrt table seed with THREE Newton
+# steps; inputs below the first bucket clamp to table[0] and are out of
+# the accuracy contract (the encoder defensively clamps LayerNorm variance
+# / L2 sum-of-squares before calling). The finer seed + 3 Newton steps is
+# what restores the native-vs-pytorch top-5 route overlap to >= 0.92.
+
+_RSQRT_ENTRIES = 16384
 
 
 def test_rsqrt_q16_deterministic_and_reference(lib: ctypes.CDLL) -> None:
-    # Sweep: non-positive sentinel + every table bucket midpoint.
+    # Sweep: non-positive sentinel + every table bucket midpoint (16384).
     sweep: list[int] = [-_Q16_ONE, -1, 0]
-    for i in range(2048):
-        x_real = (i + 1) * (256.0 / 2048)
+    for i in range(_RSQRT_ENTRIES):
+        x_real = (i + 1) * (256.0 / _RSQRT_ENTRIES)
         sweep.append(int(round(x_real * _Q16_ONE)))
 
     out_a = [lib.rsqrt_q16(x) for x in sweep]
@@ -182,12 +197,25 @@ def test_rsqrt_q16_deterministic_and_reference(lib: ctypes.CDLL) -> None:
         e = abs(y / _Q16_ONE - ref)
         max_abs = max(max_abs, e)
         max_rel = max(max_rel, e / ref)
-    print(f"  rsqrt_q16 max abs error (table+1 Newton, [0.125,256]): {max_abs:.6e}")
-    print(f"  rsqrt_q16 max rel error (table+1 Newton, [0.125,256]): {max_rel:.6e}")
-    # One Newton step on the 2048-entry seed: <= 1.2e-4 abs / <= 2.0e-3 rel
-    # across the entire representable domain.
-    assert max_abs < 2.0e-4
+    print(f"  rsqrt_q16 max abs error (16384 table+3 Newton): {max_abs:.6e}")
+    print(f"  rsqrt_q16 max rel error (16384 table+3 Newton): {max_rel:.6e}")
+    # Three Newton steps on the 16384-entry seed. The worst absolute error
+    # sits at large x where 1/sqrt(x) is small (~0.06) and bounded by the
+    # Q16.16 quantum of the *output*, not by seed/Newton convergence — the
+    # RELATIVE error (what Newton controls, and what the stacked-LayerNorm
+    # encode path is sensitive to) is held below 2e-3 across the domain.
+    # Interior region (x < 100, where LayerNorm variance / L2 sums live)
+    # is < 8e-5 abs. This is what lifts native-vs-pytorch top-5 overlap
+    # from 0.37 to >= 0.92 (the old 2048/1-Newton table was far coarser).
+    assert max_abs < 1.5e-4
     assert max_rel < 2.0e-3
+    # Interior accuracy contract (the encode path's operating range).
+    interior = [
+        abs(y / _Q16_ONE - 1.0 / math.sqrt(x / _Q16_ONE))
+        for x, y in zip(sweep, out_a, strict=True)
+        if 0 < x < 100 * _Q16_ONE
+    ]
+    assert max(interior) < 8.0e-5
 
     if REFERENCE_HASH_RSQRT != "<recorded-on-first-run>":
         assert digest == REFERENCE_HASH_RSQRT

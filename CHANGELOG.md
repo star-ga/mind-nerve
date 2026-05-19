@@ -4,6 +4,44 @@ All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](htt
 
 ## [Unreleased] — v0.3.0 preparation
 
+### Bench — criterion speed + efficiency harness
+
+- `tests/perf/bench_criterion.py` (new): score-only speed bench over the
+  seeded synthetic 11,922 × 384 Q16.16 catalog (1000 queries, 64 distinct,
+  single thread, warm), matrixing MIND + mind-blas-A (AVX2), MIND + scalar
+  oracle, numpy + BLAS reference, and pytorch CPU. Emits
+  `bench_criterion.json` + a human table. Measured on i7-5930K:
+  mind-blas-A `p50 = 1.42 ms · p95 = 1.61 ms · p99 = 1.73 ms` (~696 QPS),
+  scalar oracle `p50 = 1.69 ms · p95 = 1.94 ms`, numpy+BLAS `p50 = 0.24 ms`,
+  pytorch CPU `p50 = 1.03 ms · p95 = 1.24 ms`; peak RSS ≈460–475 MiB.
+  mind-blas-A is ≈1/6 the idealised numpy+BLAS p50 path and 9.3× faster
+  than the pre-A1.5 scalar baseline, while preserving cross-arch Q16.16
+  bit-identity (a property BLAS does not offer). Encode-only + end-to-end
+  are explicitly `PENDING` (blocked on the Phase 6.2 full-catalog run with
+  the real Phase 1 checkpoint). Pytest entry point hard-fails iff
+  mind-blas-A p95 > 2.0 ms (regression detector).
+- `tests/perf/bench_efficiency.py` (new): the substrate bench. (1) Cross-arch
+  Q16.16 bit-identity (task #57) — SHA-256 of the top-5 `(idx, score)`
+  stream over the 100-query corpus on BOTH dispatch paths; AVX2 == scalar
+  == the pinned x86 reference
+  `f4524bd56fd74e9dfbfb17b5b1f56fafda0e7e99321ef75ebce777219cda45fc`, the
+  cross-arch oracle for future ARM / CUDA / photonic backends. (2) L1/L2/L∞
+  metric matrix on the same catalog — L1-vs-L2 top-5 rank-overlap 37.4%
+  (Jaccard 0.24), L∞-vs-L2 2.4% (Jaccard 0.01): L1/L∞ are distinct metrics,
+  not cosine approximations, on synthetic data. (3) Joules/query via Intel
+  RAPL — `null` (`rapl_unreadable`, root-only sysfs on this host); GPU path
+  `PENDING` (no GPU score path). Emits `bench_efficiency.json` + a table.
+- `tests/perf/_bench_common.py` (new): single source of truth for the seeded
+  synthetic catalog/query builders, percentile helper, native-runtime
+  resolver, and BLAS dispatch binding shared by the two benches.
+- `docs/benchmarks.md` (new): publication writeup with honest framing —
+  mind-blas-A reaches a fraction of idealised BLAS while preserving
+  cross-arch Q16.16 bit-identity, memory-bandwidth-limited regime stated
+  explicitly, encode path marked PENDING.
+- Both benches are runnable standalone (`python tests/perf/bench_*.py`) and
+  under pytest (gated, self-skip under `MIND_NERVE_PERF_SKIP=1`). Bench JSON
+  artefacts are git-ignored (machine-specific timings).
+
 ### A1.5 — score-path rewire to mind-blas SIMD
 
 - `mind/kernels/matmul_blas.mind` (new) + `mind/runtime/blas_shims_i64.c`

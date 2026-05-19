@@ -1,0 +1,549 @@
+// mind-nerve/mind/kernels/encode.mind
+//
+// Phase A1.2 — Top-level encoder driver: 12-layer BERT forward pass.
+//
+// Architecture (BGE-small-en-v1.5, per spec §1 model params):
+//   hidden_size H = 384
+//   num_heads   n_heads = 12
+//   head_dim    D = 32  (H / n_heads)
+//   ffn_size    F = 1536
+//   num_layers  L = 12
+//   max_seq_len T ≤ 256 (dense), T > 256 uses sliding-window framing.
+//
+// Forward pass per token sequence of length T:
+//   1. embedding_lookup → x: (T, H)
+//   2. layernorm (post-embedding) → x: (T, H)
+//   For each layer l = 0..11:
+//   3a. Q = matmul_384_384(x, Wq[l], bq[l])
+//   3b. K = matmul_384_384(x, Wk[l], bk[l])
+//   3c. V = matmul_384_384(x, Wv[l], bv[l])
+//   3d. head-split Q/K/V: (T,384) → (12,T,32) — no copy, stride calc
+//   3e. attn_raw = qkt_matmul(Q, K) → (12,T,T) with /sqrt(32) applied
+//   3f. softmax_q16(attn_raw) → attn: (12,T,T)    [A1.1 dependency]
+//   3g. ctx = attnv_matmul(attn, V) → (12,T,32)
+//   3h. ctx_cat: (T,384) — head concat, no copy (stride reverse)
+//   3i. out_proj = matmul_384_384(ctx_cat, Wo[l], bo[l]) → (T,384)
+//   3j. residual: x_attn = x + out_proj  (elementwise Q16.16 add)
+//   3k. layernorm(x_attn) → x: (T,H)
+//   3l. ffn1 = matmul_384_1536(x, Wf1[l], bf1[l]) → (T,1536)
+//   3m. gelu(ffn1) in-place
+//   3n. ffn2 = matmul_1536_384(ffn1, Wf2[l], bf2[l]) → (T,384)
+//   3o. residual: x_ffn = x + ffn2
+//   3p. layernorm(x_ffn) → x: (T,H)
+//   4.  CLS slice: cls = x[0,:] → (H,)
+//   5.  L2-norm: embed = l2_norm(cls) → (H,)
+//
+// Softmax is handled by the A1.1 softmax_q16 kernel (imported via use).
+//
+// Weight layout convention (WeightBank struct via heap record):
+//   All weights are pre-quantized FP32 → Q16.16 offline and packed into
+//   a single contiguous heap blob. The WeightBank struct encodes i64
+//   base-address offsets for each weight matrix. The C ABI entry point
+//   mn_encoder_encode receives the WeightBank handle from mn_encoder_init.
+//
+// Head-split / head-concat implementation:
+//   Q, K, V each have shape (T, 384). After projection, treating them as
+//   (T, 12, 32) allows per-head indexing via:
+//     q[h, t, d] = Q[(t * 12 + h) * 32 + d]   — interleaved head layout.
+//   This is a zero-copy reinterpretation. The batched matmul kernels
+//   accept a head-stride parameter to handle this.
+//
+//   Because the BERT checkpoint stores QKV projections in "T*H" row-major
+//   (not head-interleaved) order, we must transpose into head-major layout
+//   for the batched matmul. A lightweight T×H → H/D × T × D
+//   repack is done in-place using a scratch buffer.
+//
+// Sliding-window: for T > 256 the outer loop dispatches windows;
+//   for T ≤ 256 the single-window path skips framing entirely.
+//
+// All activation buffers are pre-allocated by the caller (mn_encoder_init
+//   sizes them to the maximum sequence length).
+//
+// Reduction order is inherited from each called kernel (documented in
+// their respective files). The driver itself only sequences kernel calls.
+//
+// No f32. No while. LUT imports: luts.softmax_q16 (via A1.1).
+
+use std.vec;
+use luts.softmax_q16;
+
+// ---------------------------------------------------------------------------
+// Architectural constants
+// ---------------------------------------------------------------------------
+pub fn n_hidden()  -> i64 { 384  }
+pub fn n_heads()   -> i64 { 12   }
+pub fn head_dim()  -> i64 { 32   }
+pub fn n_ffn()     -> i64 { 1536 }
+pub fn n_layers()  -> i64 { 12   }
+pub fn max_seq()   -> i64 { 256  }
+
+// ---------------------------------------------------------------------------
+// WeightBank layout — flat i64 offsets from a single weight blob base addr.
+//
+// For 12 layers, each layer has 8 weight matrices + 8 bias vectors:
+//   Wq[l]: (384,384) → 384*384*8 bytes = 1,179,648 bytes
+//   Wk[l], Wv[l], Wo[l]: same
+//   Wf1[l]: (384,1536) → 4,718,592 bytes
+//   Wf2[l]: (1536,384) → 4,718,592 bytes
+//   bq[l], bk[l], bv[l], bo[l]: (384,) → 3,072 bytes each
+//   bf1[l]: (1536,) → 12,288 bytes
+//   bf2[l]: (384,) → 3,072 bytes
+//   ln1_g[l], ln1_b[l]: (384,) → 3,072 each
+//   ln2_g[l], ln2_b[l]: (384,) → 3,072 each
+//
+// Embedding tables (at fixed offsets before layer weights):
+//   word_table: (30522,384) → 30522*384*8 = 93,795,328 bytes
+//   pos_table:  (512,384)   → 1,572,864 bytes
+//   type_table: (2,384)     → 6,144 bytes
+//   emb_ln_g, emb_ln_b: (384,) → 3,072 bytes each
+//
+// All base addresses are i64 (heap pointer from __mind_alloc).
+// The weight_offset function computes the byte offset for a given weight.
+// ---------------------------------------------------------------------------
+
+// Layer stride in bytes for the weight blob.
+// Layout within one layer (all in bytes):
+//   Wq=1179648, Wk=1179648, Wv=1179648, Wo=1179648  → 4,718,592
+//   Wf1=4718592, Wf2=4718592                          → 9,437,184
+//   bq=3072, bk=3072, bv=3072, bo=3072                → 12,288
+//   bf1=12288, bf2=3072                               → 15,360
+//   ln1_g=3072, ln1_b=3072, ln2_g=3072, ln2_b=3072   → 12,288
+// Total per layer: 4718592 + 9437184 + 12288 + 15360 + 12288 = 14,195,712
+pub fn layer_stride_bytes() -> i64 { 14195712 }
+
+// Embedding block size (bytes before layer 0):
+//   word=93795328, pos=1572864, type=6144, emb_ln_g=3072, emb_ln_b=3072
+pub fn emb_block_bytes() -> i64 { 95380480 }
+
+// Offsets within a single layer block.
+pub fn off_wq()   -> i64 { 0 }
+pub fn off_wk()   -> i64 { 1179648 }
+pub fn off_wv()   -> i64 { 2359296 }
+pub fn off_wo()   -> i64 { 3538944 }
+pub fn off_wf1()  -> i64 { 4718592 }
+pub fn off_wf2()  -> i64 { 9437184 }
+pub fn off_bq()   -> i64 { 14155776 }
+pub fn off_bk()   -> i64 { 14158848 }
+pub fn off_bv()   -> i64 { 14161920 }
+pub fn off_bo()   -> i64 { 14164992 }
+pub fn off_bf1()  -> i64 { 14168064 }
+pub fn off_bf2()  -> i64 { 14180352 }
+pub fn off_ln1g() -> i64 { 14183424 }
+pub fn off_ln1b() -> i64 { 14186496 }
+pub fn off_ln2g() -> i64 { 14189568 }
+pub fn off_ln2b() -> i64 { 14192640 }
+
+// ---------------------------------------------------------------------------
+// Weight pointer helpers: base = weight_blob + emb_block + l*layer_stride
+// ---------------------------------------------------------------------------
+pub fn layer_base(wb: i64, l: i64) -> i64 {
+    wb + emb_block_bytes() + l * layer_stride_bytes()
+}
+
+pub fn wq_ptr(wb: i64, l: i64)   -> i64 { layer_base(wb, l) + off_wq() }
+pub fn wk_ptr(wb: i64, l: i64)   -> i64 { layer_base(wb, l) + off_wk() }
+pub fn wv_ptr(wb: i64, l: i64)   -> i64 { layer_base(wb, l) + off_wv() }
+pub fn wo_ptr(wb: i64, l: i64)   -> i64 { layer_base(wb, l) + off_wo() }
+pub fn wf1_ptr(wb: i64, l: i64)  -> i64 { layer_base(wb, l) + off_wf1() }
+pub fn wf2_ptr(wb: i64, l: i64)  -> i64 { layer_base(wb, l) + off_wf2() }
+pub fn bq_ptr(wb: i64, l: i64)   -> i64 { layer_base(wb, l) + off_bq() }
+pub fn bk_ptr(wb: i64, l: i64)   -> i64 { layer_base(wb, l) + off_bk() }
+pub fn bv_ptr(wb: i64, l: i64)   -> i64 { layer_base(wb, l) + off_bv() }
+pub fn bo_ptr(wb: i64, l: i64)   -> i64 { layer_base(wb, l) + off_bo() }
+pub fn bf1_ptr(wb: i64, l: i64)  -> i64 { layer_base(wb, l) + off_bf1() }
+pub fn bf2_ptr(wb: i64, l: i64)  -> i64 { layer_base(wb, l) + off_bf2() }
+pub fn ln1g_ptr(wb: i64, l: i64) -> i64 { layer_base(wb, l) + off_ln1g() }
+pub fn ln1b_ptr(wb: i64, l: i64) -> i64 { layer_base(wb, l) + off_ln1b() }
+pub fn ln2g_ptr(wb: i64, l: i64) -> i64 { layer_base(wb, l) + off_ln2g() }
+pub fn ln2b_ptr(wb: i64, l: i64) -> i64 { layer_base(wb, l) + off_ln2b() }
+
+// Embedding weight pointers (before any layer block).
+pub fn word_table_ptr(wb: i64) -> i64 { wb }
+pub fn pos_table_ptr(wb: i64)  -> i64 { wb + 93795328 }
+pub fn type_table_ptr(wb: i64) -> i64 { wb + 95368192 }
+pub fn emb_lng_ptr(wb: i64)    -> i64 { wb + 95374336 }
+pub fn emb_lnb_ptr(wb: i64)    -> i64 { wb + 95377408 }
+
+// ---------------------------------------------------------------------------
+// Elementwise add of two (T, H) Q16.16 tensors: c = a + b.
+// Tail-recursive over flat index idx = 0 .. T*H - 1.
+// ---------------------------------------------------------------------------
+pub fn add_tensors(a: i64, b: i64, c: i64, len: i64, idx: i64) -> i64 {
+    if idx >= len { return 0; }
+    let av: i64 = __mind_load_i64(a + idx * 8);
+    let bv: i64 = __mind_load_i64(b + idx * 8);
+    __mind_store_i64(c + idx * 8, av + bv);
+    add_tensors(a, b, c, len, idx + 1)
+}
+
+// ---------------------------------------------------------------------------
+// Head-split: (T, H) → (n_heads, T, head_dim)
+// Input layout:  x[t * H + h * D + d]  (after Q/K/V projection, H=384)
+// Output layout: out[h * T * D + t * D + d]
+// T*H elements total.
+// Tail-recursive over t, then h, then d.
+// ---------------------------------------------------------------------------
+pub fn head_split_t(src: i64, dst: i64, T: i64, H: i64, nh: i64, D: i64,
+                    t: i64) -> i64 {
+    if t >= T { return 0; }
+    head_split_h(src, dst, T, H, nh, D, t, 0);
+    head_split_t(src, dst, T, H, nh, D, t + 1)
+}
+
+pub fn head_split_h(src: i64, dst: i64, T: i64, H: i64, nh: i64, D: i64,
+                    t: i64, h: i64) -> i64 {
+    if h >= nh { return 0; }
+    head_split_d(src, dst, T, H, nh, D, t, h, 0);
+    head_split_h(src, dst, T, H, nh, D, t, h + 1)
+}
+
+pub fn head_split_d(src: i64, dst: i64, T: i64, H: i64, nh: i64, D: i64,
+                    t: i64, h: i64, d: i64) -> i64 {
+    if d >= D { return 0; }
+    let src_idx: i64 = t * H + h * D + d;
+    let dst_idx: i64 = h * T * D + t * D + d;
+    let v: i64 = __mind_load_i64(src + src_idx * 8);
+    __mind_store_i64(dst + dst_idx * 8, v);
+    head_split_d(src, dst, T, H, nh, D, t, h, d + 1)
+}
+
+// ---------------------------------------------------------------------------
+// Head-concat: (n_heads, T, head_dim) → (T, H)
+// Inverse of head_split.
+// ---------------------------------------------------------------------------
+pub fn head_concat_t(src: i64, dst: i64, T: i64, H: i64, nh: i64, D: i64,
+                     t: i64) -> i64 {
+    if t >= T { return 0; }
+    head_concat_h(src, dst, T, H, nh, D, t, 0);
+    head_concat_t(src, dst, T, H, nh, D, t + 1)
+}
+
+pub fn head_concat_h(src: i64, dst: i64, T: i64, H: i64, nh: i64, D: i64,
+                     t: i64, h: i64) -> i64 {
+    if h >= nh { return 0; }
+    head_concat_d(src, dst, T, H, nh, D, t, h, 0);
+    head_concat_h(src, dst, T, H, nh, D, t, h + 1)
+}
+
+pub fn head_concat_d(src: i64, dst: i64, T: i64, H: i64, nh: i64, D: i64,
+                     t: i64, h: i64, d: i64) -> i64 {
+    if d >= D { return 0; }
+    let src_idx: i64 = h * T * D + t * D + d;
+    let dst_idx: i64 = t * H + h * D + d;
+    let v: i64 = __mind_load_i64(src + src_idx * 8);
+    __mind_store_i64(dst + dst_idx * 8, v);
+    head_concat_d(src, dst, T, H, nh, D, t, h, d + 1)
+}
+
+// ---------------------------------------------------------------------------
+// CLS-token slice: copy row 0 of (T, H) tensor into a (H,) buffer.
+// Tail-recursive over j = 0..H-1.
+// ---------------------------------------------------------------------------
+pub fn cls_slice(x: i64, cls: i64, H: i64, j: i64) -> i64 {
+    if j >= H { return 0; }
+    let v: i64 = __mind_load_i64(x + j * 8);
+    __mind_store_i64(cls + j * 8, v);
+    cls_slice(x, cls, H, j + 1)
+}
+
+// ---------------------------------------------------------------------------
+// Single encoder layer forward pass.
+//
+// x:     (T, H) Q16.16 input activations (modified in-place via residuals).
+// out:   (T, H) Q16.16 output (written in-place over scratch buffers).
+// Scratch buffers (all caller-allocated):
+//   q_proj, k_proj, v_proj: (T, H)
+//   q_heads, k_heads, v_heads: (n_heads, T, head_dim)
+//   attn_raw: (n_heads, T, T)
+//   ctx_heads: (n_heads, T, head_dim)
+//   ctx_cat: (T, H)
+//   ffn_buf: (T, n_ffn)
+//   tmp: (T, H) general scratch
+// wb: weight blob base address.
+// l:  layer index 0..11.
+// T:  sequence length.
+// ---------------------------------------------------------------------------
+pub fn encoder_layer(x: i64, out: i64,
+                     q_proj: i64, k_proj: i64, v_proj: i64,
+                     q_heads: i64, k_heads: i64, v_heads: i64,
+                     attn_raw: i64, ctx_heads: i64, ctx_cat: i64,
+                     ffn_buf: i64, tmp: i64,
+                     wb: i64, l: i64, T: i64) -> i64 {
+    let H: i64  = n_hidden();
+    let nh: i64 = n_heads();
+    let D: i64  = head_dim();
+    let F: i64  = n_ffn();
+
+    // --- Attention sub-layer ---
+    // Q, K, V projections
+    matmul_384_384(x, wq_ptr(wb, l), bq_ptr(wb, l), q_proj, T);
+    matmul_384_384(x, wk_ptr(wb, l), bk_ptr(wb, l), k_proj, T);
+    matmul_384_384(x, wv_ptr(wb, l), bv_ptr(wb, l), v_proj, T);
+
+    // Head-split Q, K, V into head-major layout
+    head_split_t(q_proj, q_heads, T, H, nh, D, 0);
+    head_split_t(k_proj, k_heads, T, H, nh, D, 0);
+    head_split_t(v_proj, v_heads, T, H, nh, D, 0);
+
+    // Q·Kᵀ with scale (head-batched); result in attn_raw (H,T,T)
+    qkt_matmul(q_heads, k_heads, attn_raw, nh, T, D);
+
+    // Softmax in-place (A1.1 kernel; row-wise over last dim T)
+    softmax_q16(attn_raw, nh * T, T);
+
+    // attn·V (head-batched); result in ctx_heads (H,T,D)
+    attnv_matmul(attn_raw, v_heads, ctx_heads, nh, T, D);
+
+    // Head-concat
+    head_concat_t(ctx_heads, ctx_cat, T, H, nh, D, 0);
+
+    // Output projection
+    matmul_384_384(ctx_cat, wo_ptr(wb, l), bo_ptr(wb, l), tmp, T);
+
+    // Residual + post-attn LayerNorm
+    add_tensors(x, tmp, out, T * H, 0);
+    layernorm_q16(out, out, ln1g_ptr(wb, l), ln1b_ptr(wb, l), T, H);
+
+    // --- FFN sub-layer ---
+    // FFN expansion + GELU
+    matmul_384_1536(out, wf1_ptr(wb, l), bf1_ptr(wb, l), ffn_buf, T);
+    gelu_q16_ffn(ffn_buf, ffn_buf, T);
+
+    // FFN contraction
+    matmul_1536_384(ffn_buf, wf2_ptr(wb, l), bf2_ptr(wb, l), tmp, T);
+
+    // Residual + post-FFN LayerNorm
+    add_tensors(out, tmp, out, T * H, 0);
+    layernorm_q16(out, out, ln2g_ptr(wb, l), ln2b_ptr(wb, l), T, H);
+
+    // Copy out → x for next layer (out is used as x in subsequent call).
+    // Since encode_layers passes out as x in the next iteration,
+    // we just return 0; the caller threads out → x.
+    0
+}
+
+// ---------------------------------------------------------------------------
+// 12-layer loop: tail-recursive over l = 0..11.
+// x is updated in-place by each layer (out aliases a double-buffered pair).
+// ---------------------------------------------------------------------------
+pub fn encode_layers(x: i64, layer_out: i64,
+                     q_proj: i64, k_proj: i64, v_proj: i64,
+                     q_heads: i64, k_heads: i64, v_heads: i64,
+                     attn_raw: i64, ctx_heads: i64, ctx_cat: i64,
+                     ffn_buf: i64, tmp: i64,
+                     wb: i64, T: i64, l: i64) -> i64 {
+    if l >= n_layers() { return 0; }
+    encoder_layer(x, layer_out,
+                  q_proj, k_proj, v_proj,
+                  q_heads, k_heads, v_heads,
+                  attn_raw, ctx_heads, ctx_cat,
+                  ffn_buf, tmp,
+                  wb, l, T);
+    // Thread layer_out → x for next layer.
+    encode_layers(layer_out, x,
+                  q_proj, k_proj, v_proj,
+                  q_heads, k_heads, v_heads,
+                  attn_raw, ctx_heads, ctx_cat,
+                  ffn_buf, tmp,
+                  wb, T, l + 1)
+}
+
+// ---------------------------------------------------------------------------
+// Single-window encode: runs embedding + 12 layers + CLS + L2-norm.
+//
+// token_ids:  (T,) i64 buffer.
+// type_ids:   (T,) i64 buffer (all zeros for single-segment).
+// wb:         weight blob base.
+// Scratch buffers (sized for max_seq = 256):
+//   x, layer_out:      (T, 384)
+//   q_proj..v_proj:    (T, 384)
+//   q_heads..v_heads:  (12, T, 32)
+//   attn_raw:          (12, T, T)
+//   ctx_heads:         (12, T, 32)
+//   ctx_cat:           (T, 384)
+//   ffn_buf:           (T, 1536)
+//   tmp:               (T, 384)
+//   tmp_word..tmp_type:(T, 384) embedding scratch
+//   cls_buf:           (384,)
+//   embed_out:         (384,) — L2-normalised encoder output
+// T: sequence length for this window.
+// Returns 0; embed_out holds the result.
+// ---------------------------------------------------------------------------
+pub fn encode_window(token_ids: i64, type_ids: i64, wb: i64,
+                     x: i64, layer_out: i64,
+                     q_proj: i64, k_proj: i64, v_proj: i64,
+                     q_heads: i64, k_heads: i64, v_heads: i64,
+                     attn_raw: i64, ctx_heads: i64, ctx_cat: i64,
+                     ffn_buf: i64, tmp: i64,
+                     tmp_word: i64, tmp_pos: i64, tmp_type: i64,
+                     cls_buf: i64, embed_out: i64,
+                     T: i64) -> i64 {
+    let H: i64 = n_hidden();
+
+    // Embedding lookup + 3-way sum + post-embedding LayerNorm
+    embedding_lookup(token_ids, type_ids,
+                     word_table_ptr(wb), pos_table_ptr(wb), type_table_ptr(wb),
+                     tmp_word, tmp_pos, tmp_type,
+                     x, T);
+    layernorm_q16(x, x, emb_lng_ptr(wb), emb_lnb_ptr(wb), T, H);
+
+    // 12 BERT layers (alternating x ↔ layer_out as ping-pong buffers)
+    encode_layers(x, layer_out,
+                  q_proj, k_proj, v_proj,
+                  q_heads, k_heads, v_heads,
+                  attn_raw, ctx_heads, ctx_cat,
+                  ffn_buf, tmp,
+                  wb, T, 0);
+
+    // After encode_layers: final activations are in x (even L=12 iterations
+    // means we end up back at x after ping-pong). CLS slice from x row 0.
+    cls_slice(x, cls_buf, H, 0);
+
+    // L2-norm → embed_out
+    l2_norm_q16(cls_buf, embed_out, H)
+}
+
+// ---------------------------------------------------------------------------
+// Sliding-window encode for T > max_seq (later-window-wins).
+// Dispatches each window in ascending order; later windows overwrite
+// earlier results for overlap tokens.
+//
+// For T ≤ max_seq: single window, degenerates to encode_window.
+//
+// The sliding-window version encodes *each window independently*:
+//   - Copies the token subsequence [start, end) into a local token_ids
+//     slice (caller provides a win_tok scratch buffer of size max_seq).
+//   - Runs encode_window on that slice to get per-window context.
+//   - Merges the window's layer activations into the global output buffer
+//     for tokens [start, end), overwriting previous results for any
+//     overlapping tokens.
+//
+// IMPORTANT: because each window runs a complete 12-layer forward pass on
+// its own (start..end) context, the "later-window-wins" rule applies to
+// the *attention context*, not just the output values. Tokens in the
+// overlap see different K/V contexts between windows — this is intentional
+// and documented in spec §3.3.
+//
+// win_tok: (max_seq,) i64 scratch for per-window token IDs.
+// win_typ: (max_seq,) i64 scratch for per-window type IDs.
+// win_out: (max_seq, H) scratch for per-window activations.
+// global_out: (T, H) final output buffer.
+// ---------------------------------------------------------------------------
+pub fn encode_sliding(token_ids: i64, type_ids: i64, wb: i64,
+                      x: i64, layer_out: i64,
+                      q_proj: i64, k_proj: i64, v_proj: i64,
+                      q_heads: i64, k_heads: i64, v_heads: i64,
+                      attn_raw: i64, ctx_heads: i64, ctx_cat: i64,
+                      ffn_buf: i64, tmp: i64,
+                      tmp_word: i64, tmp_pos: i64, tmp_type: i64,
+                      cls_buf: i64, embed_out: i64,
+                      win_tok: i64, win_typ: i64,
+                      T: i64) -> i64 {
+    encode_sliding_n(token_ids, type_ids, wb,
+                     x, layer_out,
+                     q_proj, k_proj, v_proj,
+                     q_heads, k_heads, v_heads,
+                     attn_raw, ctx_heads, ctx_cat,
+                     ffn_buf, tmp,
+                     tmp_word, tmp_pos, tmp_type,
+                     cls_buf, embed_out,
+                     win_tok, win_typ,
+                     T, 0)
+}
+
+pub fn encode_sliding_n(token_ids: i64, type_ids: i64, wb: i64,
+                        x: i64, layer_out: i64,
+                        q_proj: i64, k_proj: i64, v_proj: i64,
+                        q_heads: i64, k_heads: i64, v_heads: i64,
+                        attn_raw: i64, ctx_heads: i64, ctx_cat: i64,
+                        ffn_buf: i64, tmp: i64,
+                        tmp_word: i64, tmp_pos: i64, tmp_type: i64,
+                        cls_buf: i64, embed_out: i64,
+                        win_tok: i64, win_typ: i64,
+                        T: i64, n: i64) -> i64 {
+    let start: i64 = win_start(n);
+    if start >= T { return 0; }
+    let end: i64   = win_end(n, T);
+    let wlen: i64  = end - start;
+
+    // Copy token/type IDs for this window into scratch.
+    copy_ids(token_ids, win_tok, start, end, 0);
+    copy_ids(type_ids, win_typ, start, end, 0);
+
+    // Run full encode for this window (result goes to x/layer_out).
+    encode_window(win_tok, win_typ, wb,
+                  x, layer_out,
+                  q_proj, k_proj, v_proj,
+                  q_heads, k_heads, v_heads,
+                  attn_raw, ctx_heads, ctx_cat,
+                  ffn_buf, tmp,
+                  tmp_word, tmp_pos, tmp_type,
+                  cls_buf, embed_out,
+                  wlen);
+
+    // Merge this window's layer activations (in x, post-encode) into
+    // global_out. x holds the final layer output for tokens 0..wlen-1
+    // of the window; global_out maps these to absolute positions start..end.
+    // CLS token for the FINAL window (last n before start >= T) is
+    // used as the overall embedding — that final encode_window already
+    // wrote cls_buf and l2_norm into embed_out.
+    merge_window_t(x, layer_out, n_hidden(), start, end, start);
+
+    encode_sliding_n(token_ids, type_ids, wb,
+                     layer_out, x,
+                     q_proj, k_proj, v_proj,
+                     q_heads, k_heads, v_heads,
+                     attn_raw, ctx_heads, ctx_cat,
+                     ffn_buf, tmp,
+                     tmp_word, tmp_pos, tmp_type,
+                     cls_buf, embed_out,
+                     win_tok, win_typ,
+                     T, n + 1)
+}
+
+// Copy IDs for window [t_start, t_end) into dst[0..wlen).
+pub fn copy_ids(src: i64, dst: i64, t_start: i64, t_end: i64, j: i64) -> i64 {
+    if t_start + j >= t_end { return 0; }
+    let v: i64 = __mind_load_i64(src + (t_start + j) * 8);
+    __mind_store_i64(dst + j * 8, v);
+    copy_ids(src, dst, t_start, t_end, j + 1)
+}
+
+// ---------------------------------------------------------------------------
+// Public top-level entry: encode(token_ids, T, type_ids, wb, ...) → embed_out
+//
+// Routes to single-window (T ≤ 256) or sliding-window (T > 256).
+// embed_out: (384,) Q16.16 L2-normalised embedding.
+// ---------------------------------------------------------------------------
+pub fn encode(token_ids: i64, type_ids: i64, wb: i64,
+              x: i64, layer_out: i64,
+              q_proj: i64, k_proj: i64, v_proj: i64,
+              q_heads: i64, k_heads: i64, v_heads: i64,
+              attn_raw: i64, ctx_heads: i64, ctx_cat: i64,
+              ffn_buf: i64, tmp: i64,
+              tmp_word: i64, tmp_pos: i64, tmp_type: i64,
+              cls_buf: i64, embed_out: i64,
+              win_tok: i64, win_typ: i64,
+              T: i64) -> i64 {
+    if T <= max_seq() {
+        return encode_window(token_ids, type_ids, wb,
+                             x, layer_out,
+                             q_proj, k_proj, v_proj,
+                             q_heads, k_heads, v_heads,
+                             attn_raw, ctx_heads, ctx_cat,
+                             ffn_buf, tmp,
+                             tmp_word, tmp_pos, tmp_type,
+                             cls_buf, embed_out,
+                             T);
+    }
+    encode_sliding(token_ids, type_ids, wb,
+                   x, layer_out,
+                   q_proj, k_proj, v_proj,
+                   q_heads, k_heads, v_heads,
+                   attn_raw, ctx_heads, ctx_cat,
+                   ffn_buf, tmp,
+                   tmp_word, tmp_pos, tmp_type,
+                   cls_buf, embed_out,
+                   win_tok, win_typ,
+                   T)
+}

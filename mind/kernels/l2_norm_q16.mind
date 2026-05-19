@@ -1,0 +1,59 @@
+// mind-nerve/mind/kernels/l2_norm_q16.mind
+//
+// Phase A1.2 — Q16.16 L2-normalization (single vector).
+//
+// Applied after CLS-token extraction (spec §op-27):
+//   out[j] = x[j] / sqrt( sum_j(x[j]^2) )   for j = 0..383
+//
+// Q16.16 strategy:
+//   1. Accumulate sum of squares in Q32.32: ss += x[j]*x[j].
+//   2. Narrow Q32.32 → Q16.16 by >> 16 to get ss_q16.
+//   3. Clamp ss_q16 to 1 if zero (defensive).
+//   4. rsqrt = rsqrt_q16(ss_q16) from A1.1 LUT.
+//   5. out[j] = (x[j] * rsqrt) >> 16  for each j.
+//
+// Reduction order: j = 0..n-1 ascending (canonical, deterministic).
+//
+// No f32. No while. LUT import: luts.sqrt_q16 (rsqrt_q16).
+
+use luts.sqrt_q16;
+
+// ---------------------------------------------------------------------------
+// Step 1: Sum of squares in Q32.32, tail-recursive over j.
+// ---------------------------------------------------------------------------
+pub fn ss_sum_j(x: i64, n: i64, j: i64, acc: i64) -> i64 {
+    if j >= n { return acc; }
+    let xv: i64 = __mind_load_i64(x + j * 8);
+    ss_sum_j(x, n, j + 1, acc + xv * xv)
+}
+
+// ---------------------------------------------------------------------------
+// Step 2: Write normalised output, tail-recursive over j.
+// ---------------------------------------------------------------------------
+pub fn l2_write_j(x: i64, out: i64, n: i64, rsqrt_val: i64, j: i64) -> i64 {
+    if j >= n { return 0; }
+    let xv: i64  = __mind_load_i64(x + j * 8);
+    let yv: i64  = (xv * rsqrt_val) >> 16;
+    __mind_store_i64(out + j * 8, yv);
+    l2_write_j(x, out, n, rsqrt_val, j + 1)
+}
+
+// Defensive clamp: if ss_q16 == 0 return 1 to avoid rsqrt(0).
+pub fn clamp_ss(ss_q16: i64) -> i64 {
+    if ss_q16 == 0 { return 1; }
+    ss_q16
+}
+
+// ---------------------------------------------------------------------------
+// Public: L2-norm of a Q16.16 vector of length n.
+// x:   Q16.16 input vector (length n).
+// out: Q16.16 output (may alias x).
+// n:   vector length (384 for encoder output, but generic).
+// ---------------------------------------------------------------------------
+pub fn l2_norm_q16(x: i64, out: i64, n: i64) -> i64 {
+    let ss_q32: i64    = ss_sum_j(x, n, 0, 0);
+    let ss_q16: i64    = ss_q32 >> 16;
+    let ss_safe: i64   = clamp_ss(ss_q16);
+    let rsqrt_val: i64 = rsqrt_q16(ss_safe);
+    l2_write_j(x, out, n, rsqrt_val, 0)
+}

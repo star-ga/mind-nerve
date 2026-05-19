@@ -1,0 +1,95 @@
+// mind-nerve/mind/kernels/gelu_q16.mind
+//
+// Phase A1.2 — Q16.16 GELU activation (Hendrycks/Gimpel tanh approximation).
+//
+// Formula (spec §op-22):
+//   GELU(x) ≈ 0.5 · x · (1 + tanh( sqrt(2/π) · (x + 0.044715 · x³) ))
+//
+// Q16.16 encoding of constants:
+//   0.5           → Q16.16: 32768     (= 0.5 * 65536)
+//   Q16.16 ONE    → 65536
+//   sqrt(2/π)     ≈ 0.7978845608…
+//                 → Q16.16: 52274     (= round(0.7978845608 * 65536))
+//   0.044715      → Q16.16: 2931      (= round(0.044715 * 65536))
+//
+// Computation sequence (all Q16.16 except where noted):
+//   1. cube = (x * x >> 16) * x >> 16           — x³ in Q16.16
+//   2. inner = x + (0.044715_q16 * cube >> 16)  — x + 0.044715·x³
+//   3. arg   = sqrt2_over_pi_q16 * inner >> 16  — scale by sqrt(2/π)
+//   4. th    = tanh_q16(arg)                     — from A1.1 LUT
+//   5. one_plus_th = q16_one + th               — 1 + tanh(...)
+//   6. half_x  = x * half_q16 >> 16             — 0.5·x
+//   7. out     = half_x * one_plus_th >> 16      — final GELU value
+//
+// Precision note: erf→tanh substitution introduces ≤0.001 max-abs error
+// before quantization. After Q16.16 rounding, cross-substrate identity is
+// guaranteed by the single tanh_q16 LUT (bit-identical lookup).
+//
+// Applied pointwise to each element of a (T, 1536) tensor (FFN expansion
+// output). The function also accepts arbitrary lengths via the generic
+// gelu_q16_vec entry point.
+//
+// No f32. No while. LUT import: luts.tanh_q16 (resolved at link via A1.1).
+
+use luts.tanh_q16;
+
+// ---------------------------------------------------------------------------
+// Q16.16 constants
+// ---------------------------------------------------------------------------
+
+pub fn q16_one() -> i64    { 65536 }
+pub fn half_q16() -> i64   { 32768 }
+pub fn c044715_q16() -> i64 { 2931 }
+pub fn sqrt2pi_q16() -> i64 { 52274 }
+
+// ---------------------------------------------------------------------------
+// Pointwise GELU on a single Q16.16 value.
+// ---------------------------------------------------------------------------
+pub fn gelu_scalar(x: i64) -> i64 {
+    // x² in Q16.16
+    let x2: i64 = (x * x) >> 16;
+    // x³ = x² * x in Q16.16
+    let x3: i64 = (x2 * x) >> 16;
+    // 0.044715 * x³
+    let coeff_x3: i64 = (c044715_q16() * x3) >> 16;
+    // inner = x + 0.044715*x³
+    let inner: i64 = x + coeff_x3;
+    // arg = sqrt(2/π) * inner
+    let arg: i64 = (sqrt2pi_q16() * inner) >> 16;
+    // tanh from A1.1 LUT
+    let th: i64 = tanh_q16(arg);
+    // 1 + tanh(arg)
+    let one_plus_th: i64 = q16_one() + th;
+    // 0.5 * x
+    let half_x: i64 = (x * half_q16()) >> 16;
+    // 0.5 * x * (1 + tanh(arg))
+    (half_x * one_plus_th) >> 16
+}
+
+// ---------------------------------------------------------------------------
+// Pointwise GELU over a flat buffer of length `n`.
+// Tail-recursive over index idx = 0..n-1. In-place (out may alias buf).
+// ---------------------------------------------------------------------------
+pub fn gelu_vec_loop(buf: i64, out: i64, n: i64, idx: i64) -> i64 {
+    if idx >= n { return 0; }
+    let xv: i64  = __mind_load_i64(buf + idx * 8);
+    let yv: i64  = gelu_scalar(xv);
+    __mind_store_i64(out + idx * 8, yv);
+    gelu_vec_loop(buf, out, n, idx + 1)
+}
+
+// ---------------------------------------------------------------------------
+// Public: GELU over generic flat buffer.
+// buf: Q16.16 input, out: Q16.16 output (may alias buf), n: element count.
+// ---------------------------------------------------------------------------
+pub fn gelu_q16_vec(buf: i64, out: i64, n: i64) -> i64 {
+    gelu_vec_loop(buf, out, n, 0)
+}
+
+// ---------------------------------------------------------------------------
+// Convenience: GELU over a (T, 1536) matrix (FFN activation surface).
+// buf: (T*1536) flat Q16.16 buffer. In-place.
+// ---------------------------------------------------------------------------
+pub fn gelu_q16_ffn(buf: i64, out: i64, T: i64) -> i64 {
+    gelu_q16_vec(buf, out, T * 1536)
+}

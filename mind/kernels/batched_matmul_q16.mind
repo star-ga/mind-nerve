@@ -1,0 +1,153 @@
+// mind-nerve/mind/kernels/batched_matmul_q16.mind
+//
+// Phase A1.2 — Batched Q16.16 matmul for multi-head attention.
+//
+// Two operations:
+//   qkt_matmul  — Q·Kᵀ: (H, T, D) × (H, D, T) → (H, T, T)
+//   attnv_matmul — attn·V: (H, T, T) × (H, T, D) → (H, T, D)
+//
+// Model dimensions (BGE-small-en-v1.5):
+//   H = 12  attention heads
+//   T ≤ 256 sequence length
+//   D = 32  per-head dimension (hidden_size / num_heads = 384 / 12)
+//
+// ABI: Each "batch" of head matrices is stored as a contiguous heap
+// buffer in head-major row-major order:
+//   Q[h,t,d] at offset (h * T * D + t * D + d) * 8
+//   K[h,t,d] — same layout; Kᵀ is indexed as K[h,d,t] = K[h,t,d]
+//   attn[h,t,t2] at offset (h * T * T + t * T + t2) * 8
+//   V[h,t,d] at offset (h * T * D + t * D + d) * 8
+//   out[h,t,d] — same layout as Q
+//
+// Reduction order (canonical, deterministic):
+//   qkt:    h=0..H-1; i=0..T-1; k=0..D-1; j=0..T-1
+//   attnv:  h=0..H-1; i=0..T-1; k=0..T-1; j=0..D-1
+//
+// Q32.32 accumulator inside each head's reduction loop.
+// No FMA reassociation. Cross-substrate identity guaranteed by
+// ascending-index accumulation order.
+//
+// Scale factor 1/sqrt(32) applied to qkt output:
+//   1/sqrt(32) = 0.17677669...
+//   Q16.16 encoding: round(0.17677669 * 65536) = 11585
+//   Applied as a pointwise Q16.16 multiply after qkt is written.
+//   No runtime sqrt — precomputed constant per spec §op-12.
+//
+// No f32. No while. Depends on: std.vec (callers), luts.* (not needed here).
+
+use std.vec;
+
+// ---------------------------------------------------------------------------
+// Per-head element accessors
+// ---------------------------------------------------------------------------
+
+// Head-major 3-D buffer: [H, rows, cols] packed row-major.
+pub fn hbuf_get(buf: i64, h: i64, row: i64, col: i64,
+                rows: i64, cols: i64) -> i64 {
+    __mind_load_i64(buf + (h * rows * cols + row * cols + col) * 8)
+}
+
+pub fn hbuf_set(buf: i64, h: i64, row: i64, col: i64,
+                rows: i64, cols: i64, val: i64) -> i64 {
+    __mind_store_i64(buf + (h * rows * cols + row * cols + col) * 8, val)
+}
+
+// ---------------------------------------------------------------------------
+// Q16.16 scale constant for attention: round(1/sqrt(32) * 65536) = 11585
+// ---------------------------------------------------------------------------
+pub fn attn_scale_q16() -> i64 { 11585 }
+
+// ---------------------------------------------------------------------------
+// Q·Kᵀ — inner reduction over D (k dimension)
+// ---------------------------------------------------------------------------
+
+// Accumulate Q[h,i,k] * K[h,j,k] for k = 0..D-1 (K-transposed read).
+// Returns Q32.32 accumulated product.
+pub fn qkt_dot_k(q: i64, k_buf: i64, h: i64, i: i64, j: i64,
+                 T: i64, D: i64, k: i64, acc: i64) -> i64 {
+    if k >= D { return acc; }
+    let qv: i64 = hbuf_get(q, h, i, k, T, D);
+    let kv: i64 = hbuf_get(k_buf, h, j, k, T, D);  // Kᵀ[h,k,j] = K[h,j,k]
+    qkt_dot_k(q, k_buf, h, i, j, T, D, k + 1, acc + qv * kv)
+}
+
+// Write one row of attn[h,i,:] scaled by 1/sqrt(D).
+// Tail-recursive over j = 0..T-1.
+pub fn qkt_row_j(q: i64, k_buf: i64, attn: i64, h: i64, i: i64,
+                 T: i64, D: i64, j: i64) -> i64 {
+    if j >= T { return 0; }
+    let acc_q32: i64 = qkt_dot_k(q, k_buf, h, i, j, T, D, 0, 0);
+    let raw_q16: i64 = acc_q32 >> 16;
+    // Apply 1/sqrt(D) scale: multiply Q16.16 * Q16.16 → Q32.32, narrow.
+    let scaled_q16: i64 = (raw_q16 * attn_scale_q16()) >> 16;
+    hbuf_set(attn, h, i, j, T, T, scaled_q16);
+    qkt_row_j(q, k_buf, attn, h, i, T, D, j + 1)
+}
+
+// Sweep rows i = 0..T-1 for head h.
+pub fn qkt_rows_i(q: i64, k_buf: i64, attn: i64, h: i64,
+                  T: i64, D: i64, i: i64) -> i64 {
+    if i >= T { return 0; }
+    qkt_row_j(q, k_buf, attn, h, i, T, D, 0);
+    qkt_rows_i(q, k_buf, attn, h, T, D, i + 1)
+}
+
+// Sweep heads h = 0..H-1.
+pub fn qkt_heads(q: i64, k_buf: i64, attn: i64, H: i64,
+                 T: i64, D: i64, h: i64) -> i64 {
+    if h >= H { return 0; }
+    qkt_rows_i(q, k_buf, attn, h, T, D, 0);
+    qkt_heads(q, k_buf, attn, H, T, D, h + 1)
+}
+
+// Public: Q·Kᵀ batched over H heads.
+// q: (H,T,D) Q16.16, k_buf: (H,T,D) Q16.16,
+// attn: (H,T,T) output — written with /sqrt(D) scale applied.
+pub fn qkt_matmul(q: i64, k_buf: i64, attn: i64, H: i64, T: i64, D: i64) -> i64 {
+    qkt_heads(q, k_buf, attn, H, T, D, 0)
+}
+
+// ---------------------------------------------------------------------------
+// attn·V — inner reduction over T (k dimension, attention weights)
+// ---------------------------------------------------------------------------
+
+// Accumulate attn[h,i,k] * V[h,k,j] for k = 0..T-1.
+// Returns Q32.32.
+pub fn attnv_dot_k(attn: i64, v: i64, h: i64, i: i64, j: i64,
+                   T: i64, D: i64, k: i64, acc: i64) -> i64 {
+    if k >= T { return acc; }
+    let av: i64 = hbuf_get(attn, h, i, k, T, T);
+    let vv: i64 = hbuf_get(v, h, k, j, T, D);
+    attnv_dot_k(attn, v, h, i, j, T, D, k + 1, acc + av * vv)
+}
+
+// Write one row of out[h,i,:].
+pub fn attnv_row_j(attn: i64, v: i64, out: i64, h: i64, i: i64,
+                   T: i64, D: i64, j: i64) -> i64 {
+    if j >= D { return 0; }
+    let acc_q32: i64 = attnv_dot_k(attn, v, h, i, j, T, D, 0, 0);
+    let val_q16: i64 = acc_q32 >> 16;
+    hbuf_set(out, h, i, j, T, D, val_q16);
+    attnv_row_j(attn, v, out, h, i, T, D, j + 1)
+}
+
+pub fn attnv_rows_i(attn: i64, v: i64, out: i64, h: i64,
+                    T: i64, D: i64, i: i64) -> i64 {
+    if i >= T { return 0; }
+    attnv_row_j(attn, v, out, h, i, T, D, 0);
+    attnv_rows_i(attn, v, out, h, T, D, i + 1)
+}
+
+pub fn attnv_heads(attn: i64, v: i64, out: i64, H: i64,
+                   T: i64, D: i64, h: i64) -> i64 {
+    if h >= H { return 0; }
+    attnv_rows_i(attn, v, out, h, T, D, 0);
+    attnv_heads(attn, v, out, H, T, D, h + 1)
+}
+
+// Public: attn·V batched over H heads.
+// attn: (H,T,T) Q16.16, v: (H,T,D) Q16.16,
+// out: (H,T,D) Q16.16 output.
+pub fn attnv_matmul(attn: i64, v: i64, out: i64, H: i64, T: i64, D: i64) -> i64 {
+    attnv_heads(attn, v, out, H, T, D, 0)
+}

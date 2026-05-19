@@ -1,0 +1,154 @@
+// mind-nerve/mind/kernels/layernorm_q16.mind
+//
+// Phase A1.2 — Q16.16 LayerNorm (post-embedding, post-attn, post-FFN).
+//
+// Implements:
+//   y[i,j] = gamma[j] * (x[i,j] - mean_i) / sqrt(var_i + eps) + beta[j]
+//
+// Q16.16 strategy per spec §3 op-6:
+//   - Mean computed with Q32.32 accumulator, narrowed after sum.
+//   - Variance computed with Q32.32 accumulator over squared deviations.
+//   - eps=1e-12 is below Q16.16 ULP (≈1.5e-5); treated as 0 in Q16.16.
+//     Defensive clamp: if Q16.16 variance == 0 → clamp to 1 (Q16.16).
+//   - rsqrt via luts.sqrt_q16 (A1.1 dependency); rsqrt = 1/sqrt(var).
+//   - gamma/beta are Q16.16 weight vectors (length = hidden_dim).
+//
+// Reduction order (canonical, deterministic):
+//   Per token i: mean accumulation j = 0..H-1 ascending.
+//   Per token i: variance accumulation j = 0..H-1 ascending.
+//   Per token i: normalize + affine j = 0..H-1 ascending.
+//
+// No f32. No while. LUT import: luts.sqrt_q16 (resolved at link time via A1.1).
+//
+// Cross-substrate identity: ascending-index accumulation, same clamp
+// at variance = 0. rsqrt from LUT is bit-identical across substrates.
+
+use std.vec;
+use luts.sqrt_q16;
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+// Q16.16 ONE = 65536
+pub fn q16_one() -> i64 { 65536 }
+
+// Q16.16 clamp-to-1 sentinel for zero variance.
+pub fn var_clamp_min() -> i64 { 1 }
+
+// ---------------------------------------------------------------------------
+// Element accessors
+// ---------------------------------------------------------------------------
+
+pub fn row_get(buf: i64, row: i64, col: i64, cols: i64) -> i64 {
+    __mind_load_i64(buf + (row * cols + col) * 8)
+}
+
+pub fn row_set(buf: i64, row: i64, col: i64, cols: i64, val: i64) -> i64 {
+    __mind_store_i64(buf + (row * cols + col) * 8, val)
+}
+
+pub fn vec_load(buf: i64, idx: i64) -> i64 {
+    __mind_load_i64(buf + idx * 8)
+}
+
+// ---------------------------------------------------------------------------
+// Step 1: Mean — Q32.32 sum over H elements, narrowed to Q16.16.
+// mean_sum_j accumulates sum of x[i, j] for j = 0..H-1.
+// ---------------------------------------------------------------------------
+pub fn mean_sum_j(x: i64, i: i64, H: i64, j: i64, acc: i64) -> i64 {
+    if j >= H { return acc; }
+    let xv: i64 = row_get(x, i, j, H);
+    mean_sum_j(x, i, H, j + 1, acc + xv)
+}
+
+// Compute Q16.16 mean for row i: sum / H.
+// Division by H in Q16.16: (sum_q32 << 0) / H, result stays Q16.16 units
+// because sum is over Q16.16 values (not widened by the Q32.32 factor).
+pub fn row_mean(x: i64, i: i64, H: i64) -> i64 {
+    let sum: i64 = mean_sum_j(x, i, H, 0, 0);
+    sum / H
+}
+
+// ---------------------------------------------------------------------------
+// Step 2: Variance — Q32.32 accumulator over (x[j] - mean)^2.
+// Each deviation squared: dev = x[j] - mean (Q16.16).
+//   dev^2 (Q32.32) = dev * dev.
+// Sum in Q32.32, narrow to Q16.16 after dividing by H.
+// ---------------------------------------------------------------------------
+pub fn var_sum_j(x: i64, i: i64, H: i64, mean: i64, j: i64, acc: i64) -> i64 {
+    if j >= H { return acc; }
+    let xv: i64  = row_get(x, i, j, H);
+    let dev: i64 = xv - mean;
+    let sq: i64  = dev * dev;   // Q32.32: (Q16.16)^2
+    var_sum_j(x, i, H, mean, j + 1, acc + sq)
+}
+
+// Q16.16 variance: sum_of_squares / H, narrowed from Q32.32.
+pub fn row_var(x: i64, i: i64, H: i64, mean: i64) -> i64 {
+    let sum_q32: i64 = var_sum_j(x, i, H, mean, 0, 0);
+    // narrow: sum_q32 / H gives units of Q32.32; >> 16 to Q16.16.
+    let var_q16: i64 = (sum_q32 / H) >> 16;
+    if var_q16 == 0 { return var_clamp_min(); }
+    var_q16
+}
+
+// ---------------------------------------------------------------------------
+// Step 3: Normalize + affine transform.
+// rsqrt_val = rsqrt_q16(var) from the A1.1 LUT.
+// y[i,j] = gamma[j] * (x[i,j] - mean) * rsqrt_val + beta[j]
+//   All multiplies in Q16.16: a*b >> 16.
+// ---------------------------------------------------------------------------
+pub fn norm_write_j(x: i64, out: i64, gamma: i64, beta: i64,
+                    i: i64, H: i64, mean: i64, rsqrt_val: i64,
+                    j: i64) -> i64 {
+    if j >= H { return 0; }
+    let xv: i64   = row_get(x, i, j, H);
+    let dev: i64  = xv - mean;
+    // (dev * rsqrt_val) >> 16: Q16.16 * Q16.16 -> Q32.32 -> Q16.16
+    let normed: i64  = (dev * rsqrt_val) >> 16;
+    let gv: i64   = vec_load(gamma, j);
+    let bv: i64   = vec_load(beta, j);
+    // gamma * normed >> 16
+    let scaled: i64  = (gv * normed) >> 16;
+    let result: i64  = scaled + bv;
+    row_set(out, i, j, H, result);
+    norm_write_j(x, out, gamma, beta, i, H, mean, rsqrt_val, j + 1)
+}
+
+// ---------------------------------------------------------------------------
+// Single-token LayerNorm (row i, hidden dim H).
+// ---------------------------------------------------------------------------
+pub fn layernorm_row(x: i64, out: i64, gamma: i64, beta: i64,
+                     i: i64, H: i64) -> i64 {
+    let mean: i64     = row_mean(x, i, H);
+    let var_q16: i64  = row_var(x, i, H, mean);
+    // rsqrt from A1.1 LUT: rsqrt_q16 takes Q16.16 variance, returns Q16.16.
+    let rsqrt_val: i64 = rsqrt_q16(var_q16);
+    norm_write_j(x, out, gamma, beta, i, H, mean, rsqrt_val, 0)
+}
+
+// ---------------------------------------------------------------------------
+// Batch LayerNorm over T tokens: tail-recursive i = 0..T-1.
+// ---------------------------------------------------------------------------
+pub fn layernorm_rows(x: i64, out: i64, gamma: i64, beta: i64,
+                      T: i64, H: i64, i: i64) -> i64 {
+    if i >= T { return 0; }
+    layernorm_row(x, out, gamma, beta, i, H);
+    layernorm_rows(x, out, gamma, beta, T, H, i + 1)
+}
+
+// ---------------------------------------------------------------------------
+// Public entry: LayerNorm over (T, H) tensor.
+// x:     (T, H) Q16.16 input.
+// out:   (T, H) Q16.16 output (may alias x for in-place).
+// gamma: (H,) Q16.16 scale weights.
+// beta:  (H,) Q16.16 shift weights.
+// T:     sequence length.
+// H:     hidden dimension (384 for BERT hidden; same function is called
+//         for all three LayerNorm sites in BERT).
+// ---------------------------------------------------------------------------
+pub fn layernorm_q16(x: i64, out: i64, gamma: i64, beta: i64,
+                     T: i64, H: i64) -> i64 {
+    layernorm_rows(x, out, gamma, beta, T, H, 0)
+}

@@ -1,0 +1,161 @@
+// mind-nerve/mind/kernels/sliding_window.mind
+//
+// Phase A1.2 — Sliding-window attention framing (later-window-wins).
+//
+// Spec §3.3 decision: "Later-window-wins."
+//
+// When T ≤ 256: one window covers all tokens. No framing needed.
+//   Degenerates to a single dense attention call.
+//
+// When T > 256:
+//   Window size W = 256, stride S = 192.
+//   Window n starts at: start_n = n * S.
+//   Window n covers tokens [start_n, min(start_n + W, T) - 1].
+//   Overlap region of consecutive windows: [start_{n+1}, start_n + W - 1].
+//   Each overlap token is assigned to the LATER window (higher n).
+//
+// Winning window assignment per token t:
+//   The latest window index n such that start_n <= t < start_n + W.
+//   Equivalently: win(t) = floor( max(0, t - W + S) / S )
+//                        = floor( max(0, t - 63) / 192 )
+//   (derived from: t is in window n iff n <= (t - start_n) / 1 ... simplest
+//    way is: last_win_start that covers t = floor((t - (W - 1)) / S) * S,
+//    but clamped to >= 0 and such that start <= t.)
+//
+// Simpler implementation: count windows, dispatch each window's forward
+// pass in order, write winning-window output by overwriting earlier results.
+// Because windows are dispatched ascending (n = 0, 1, 2, ...), each token's
+// output slot in the output buffer is overwritten if a later window covers
+// it — exactly "later-window-wins" without any per-token assignment map.
+//
+// Window dispatch loop (tail-recursive over n):
+//   start = n * S
+//   if start >= T: done.
+//   end = min(start + W, T)
+//   dispatch forward_window(hidden_state, start, end, layer_state, out)
+//   recurse with n + 1.
+//
+// forward_window is a callback pointer (i64 fn handle) — in this file
+// it is represented as a parameter whose actual value is the function
+// pointer provided by the encode() driver. Because mindc v0.4.4 does not
+// yet support first-class fn pointers as call targets, the dispatch is
+// inlined directly in encode.mind. This file exposes the framing
+// primitives (win_count, win_start, win_end, winning_window_index) that
+// encode.mind calls to drive the loop.
+//
+// Winning-window index (for the bit-identity harness A1.4):
+//   win_idx(t) = number of full windows before the one that covers t =
+//     floor( t / S ) clamped so the last window covers any remainder.
+//
+// No f32. No while. No luts.
+
+use std.vec;
+
+// ---------------------------------------------------------------------------
+// Constants: window size, stride.
+// ---------------------------------------------------------------------------
+pub fn win_size() -> i64   { 256 }
+pub fn win_stride() -> i64 { 192 }
+
+// ---------------------------------------------------------------------------
+// Number of windows needed to cover T tokens.
+// If T == 0: 0 windows.
+// If T <= W: 1 window.
+// Otherwise: ceil((T - W) / S) + 1.
+// Tail-recursive count: count_wins(start, T).
+// ---------------------------------------------------------------------------
+pub fn count_wins_loop(start: i64, T: i64, n: i64) -> i64 {
+    if start >= T { return n; }
+    count_wins_loop(start + win_stride(), T, n + 1)
+}
+
+pub fn win_count(T: i64) -> i64 {
+    if T == 0 { return 0; }
+    count_wins_loop(0, T, 0)
+}
+
+// ---------------------------------------------------------------------------
+// Start offset of window n.
+// ---------------------------------------------------------------------------
+pub fn win_start(n: i64) -> i64 {
+    n * win_stride()
+}
+
+// ---------------------------------------------------------------------------
+// End offset (exclusive) of window n, clamped to T.
+// ---------------------------------------------------------------------------
+pub fn win_end(n: i64, T: i64) -> i64 {
+    let e: i64 = win_start(n) + win_size();
+    if e > T { return T; }
+    e
+}
+
+// ---------------------------------------------------------------------------
+// Winning window index for token t.
+//
+// Definition: the largest n such that win_start(n) <= t AND win_end(n,T) > t.
+//   = floor(t / S) but capped so that win_start(n) < T.
+// Because later-window-wins dispatches ascending and overwrites, any
+// window whose [start, end) covers t will write t's slot. The last
+// such window is the winner.
+//
+// Closed form: n = t / S  (integer division, floor).
+// But if win_start(n) + win_size() <= t for the computed n (shouldn't
+// happen for valid t < T), we clamp to 0. In practice for the canonical
+// stride scheme:
+//   S = 192, W = 256, overlap = 64.
+//   t=0..191: only window 0 covers → win 0.
+//   t=192..255: both win 0 (covers [0,255]) and win 1 (covers [192,447]).
+//               Later wins → win 1.
+//   t=256..383: only win 1 (if T > 256) → win 1.
+//   etc.
+// floor(t / 192) gives: t=0..191 → 0, t=192..383 → 1 (✓ later-wins).
+// ---------------------------------------------------------------------------
+pub fn winning_window_index(t: i64) -> i64 {
+    t / win_stride()
+}
+
+// ---------------------------------------------------------------------------
+// Token stride helpers used by encode.mind to copy sub-sequences.
+// Copy token activations for the slice [t_start, t_end) from src to dst.
+// src and dst are (T, H) flat buffers; H = hidden_dim = 384.
+// Tail-recursive over t.
+// ---------------------------------------------------------------------------
+pub fn copy_slice_t(src: i64, dst: i64, H: i64,
+                    t_start: i64, t_end: i64, t: i64) -> i64 {
+    if t >= t_end { return 0; }
+    copy_slice_j(src, dst, H, t, 0);
+    copy_slice_t(src, dst, H, t_start, t_end, t + 1)
+}
+
+pub fn copy_slice_j(src: i64, dst: i64, H: i64, t: i64, j: i64) -> i64 {
+    if j >= H { return 0; }
+    let v: i64 = __mind_load_i64(src + (t * H + j) * 8);
+    __mind_store_i64(dst + (t * H + j) * 8, v);
+    copy_slice_j(src, dst, H, t, j + 1)
+}
+
+// ---------------------------------------------------------------------------
+// Merge window output back into the global output buffer.
+// Overwrites slots [t_start, t_end) — "later-window-wins" is achieved by
+// calling merge in ascending window order; the last write wins.
+// win_out: (win_len, H) flat buffer holding this window's attention output,
+//          where win_len = t_end - t_start.
+// global_out: (T, H) flat output buffer (token t's slot at global_out +
+//              t*H*8 corresponds to win_out offset (t - t_start)*H*8).
+// ---------------------------------------------------------------------------
+pub fn merge_window_t(win_out: i64, global_out: i64, H: i64,
+                      t_start: i64, t_end: i64, t: i64) -> i64 {
+    if t >= t_end { return 0; }
+    merge_window_j(win_out, global_out, H, t_start, t);
+    merge_window_t(win_out, global_out, H, t_start, t_end, t + 1)
+}
+
+pub fn merge_window_j(win_out: i64, global_out: i64, H: i64,
+                      t_start: i64, t: i64, j: i64) -> i64 {
+    if j >= H { return 0; }
+    let local_t: i64 = t - t_start;
+    let v: i64 = __mind_load_i64(win_out + (local_t * H + j) * 8);
+    __mind_store_i64(global_out + (t * H + j) * 8, v);
+    merge_window_j(win_out, global_out, H, t_start, t, j + 1)
+}

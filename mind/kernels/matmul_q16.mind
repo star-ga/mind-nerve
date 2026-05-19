@@ -1,0 +1,166 @@
+// mind-nerve/mind/kernels/matmul_q16.mind
+//
+// Phase A1.2 — Q16.16 dense matrix multiply
+//
+// ABI:  All matrix data is a flat i64 heap buffer (row-major).
+//       Weights and activations are Q16.16 fixed-point encoded inside i64.
+//       Q16.16: integer = raw >> 16; frac = raw & 0xFFFF.
+//       Q32.32 accumulator: i64 with 32 fractional bits (used only inside
+//       the inner reduction loop; narrowed to Q16.16 on store).
+//
+// Reduction order (canonical, deterministic):
+//   Outer  i: 0 .. M-1  (output rows)
+//   Middle k: 0 .. K-1  (contraction dim, ascending; accumulator order)
+//   Inner  j: 0 .. N-1  (output cols)
+//
+//   Written as (i, k, j) for cache locality on row-major A;
+//   accumulator is Q32.32 (i64 with 32 fractional bits) widened inside
+//   the k loop, narrowed to Q16.16 (>> 16) on write to C.
+//
+// Three shape regimes wired:
+//   matmul_384_384   (T,384)·(384,384)   → Q/K/V + output projections
+//   matmul_384_1536  (T,384)·(384,1536)  → FFN expansion
+//   matmul_1536_384  (T,1536)·(1536,384) → FFN contraction
+//   matmul_score     (N,384)·(384,1)     → scoring dot-products
+//
+// All loops use tail recursion (mindc v0.4.4 has no `while` statement).
+//
+// Cross-substrate identity: fixed (i,k,j) ordering, Q32.32 accumulator
+// with no FMA reassociation. Identical output on x86 and future CUDA
+// paths provided the mul/add sequence is lowered sequentially.
+//
+// No f32. No while. No external dependencies beyond std.vec (for callers
+// that pass heap buffers). luts.* imports are not required by this file.
+
+use std.vec;
+
+// ---------------------------------------------------------------------------
+// Q16.16 / Q32.32 constants
+// ---------------------------------------------------------------------------
+
+// Q16.16 ONE = 1 << 16 = 65536
+pub fn q16_one() -> i64 { 65536 }
+
+// Multiply two Q16.16 values, accumulate into Q32.32 (i64).
+// Result is Q32.32: (a * b) without narrowing.
+// Caller narrows via >> 16 to return to Q16.16.
+pub fn q16_mul_wide(a: i64, b: i64) -> i64 {
+    a * b
+}
+
+// Narrow Q32.32 -> Q16.16 (arithmetic right shift by 16).
+pub fn q32_to_q16(acc: i64) -> i64 {
+    acc >> 16
+}
+
+// ---------------------------------------------------------------------------
+// Raw element accessors (row-major flat buffers)
+// ---------------------------------------------------------------------------
+
+// Load element [row, col] from flat buffer, stride `cols`.
+pub fn mat_get(buf: i64, row: i64, col: i64, cols: i64) -> i64 {
+    __mind_load_i64(buf + (row * cols + col) * 8)
+}
+
+// Store element [row, col] into flat buffer, stride `cols`.
+pub fn mat_set(buf: i64, row: i64, col: i64, cols: i64, val: i64) -> i64 {
+    __mind_store_i64(buf + (row * cols + col) * 8, val)
+}
+
+// ---------------------------------------------------------------------------
+// Inner k-loop: accumulate one (i, j) dot product over contraction dim K.
+// Returns Q32.32 accumulated result (not yet narrowed).
+// Tail-recursive over k = 0..K-1.
+// ---------------------------------------------------------------------------
+pub fn dot_k(a: i64, b: i64, K: i64, N: i64, i: i64, j: i64,
+             k: i64, acc: i64) -> i64 {
+    if k >= K { return acc; }
+    let av: i64 = mat_get(a, i, k, K);
+    let bv: i64 = mat_get(b, k, j, N);
+    let prod: i64 = q16_mul_wide(av, bv);
+    dot_k(a, b, K, N, i, j, k + 1, acc + prod)
+}
+
+// ---------------------------------------------------------------------------
+// Inner j-loop: sweep output columns for fixed row i and write to C.
+// Tail-recursive over j = 0..N-1.
+// ---------------------------------------------------------------------------
+pub fn row_j(a: i64, b: i64, c: i64, K: i64, N: i64, i: i64,
+             j: i64) -> i64 {
+    if j >= N { return 0; }
+    let acc_q32: i64 = dot_k(a, b, K, N, i, j, 0, 0);
+    let val_q16: i64 = q32_to_q16(acc_q32);
+    mat_set(c, i, j, N, val_q16);
+    row_j(a, b, c, K, N, i, j + 1)
+}
+
+// ---------------------------------------------------------------------------
+// Outer i-loop: sweep output rows.
+// Tail-recursive over i = 0..M-1.
+// ---------------------------------------------------------------------------
+pub fn matmul_rows(a: i64, b: i64, c: i64, M: i64, K: i64, N: i64,
+                   i: i64) -> i64 {
+    if i >= M { return 0; }
+    row_j(a, b, c, K, N, i, 0);
+    matmul_rows(a, b, c, M, K, N, i + 1)
+}
+
+// ---------------------------------------------------------------------------
+// Generic matmul entry point.
+// a: M×K Q16.16 buffer, b: K×N Q16.16 buffer, c: M×N output buffer.
+// Returns 0 on completion.
+// ---------------------------------------------------------------------------
+pub fn matmul_q16(a: i64, b: i64, c: i64, M: i64, K: i64, N: i64) -> i64 {
+    matmul_rows(a, b, c, M, K, N, 0)
+}
+
+// ---------------------------------------------------------------------------
+// Shape-specialised wrappers (doc: spec §A1.2 regime table)
+// ---------------------------------------------------------------------------
+
+// (T, 384) · (384, 384) — Q/K/V projections and output projection.
+// bias_vec: length-384 Q16.16 buffer (or 0 = no bias).
+pub fn matmul_384_384(a: i64, b: i64, bias: i64, c: i64, T: i64) -> i64 {
+    matmul_q16(a, b, c, T, 384, 384);
+    if bias == 0 { return 0; }
+    add_bias_row(c, bias, T, 384, 0)
+}
+
+// (T, 384) · (384, 1536) — FFN expansion.
+pub fn matmul_384_1536(a: i64, b: i64, bias: i64, c: i64, T: i64) -> i64 {
+    matmul_q16(a, b, c, T, 384, 1536);
+    if bias == 0 { return 0; }
+    add_bias_row(c, bias, T, 1536, 0)
+}
+
+// (T, 1536) · (1536, 384) — FFN contraction.
+// Widest reduction in the network: k=1536, Q32.32 accumulator mandatory.
+pub fn matmul_1536_384(a: i64, b: i64, bias: i64, c: i64, T: i64) -> i64 {
+    matmul_q16(a, b, c, T, 1536, 384);
+    if bias == 0 { return 0; }
+    add_bias_row(c, bias, T, 384, 0)
+}
+
+// (N, 384) · (384, 1) — scoring: catalog embedding × query vector.
+// b points to a single 384-element column vector (N×1 result in out).
+pub fn matmul_score(a: i64, b: i64, out: i64, N: i64) -> i64 {
+    matmul_q16(a, b, out, N, 384, 1)
+}
+
+// ---------------------------------------------------------------------------
+// Bias addition helper: add bias_vec[j] to each row of mat[i,j].
+// Tail-recursive over i = 0..rows-1.
+// ---------------------------------------------------------------------------
+pub fn add_bias_row(mat: i64, bias: i64, rows: i64, cols: i64, i: i64) -> i64 {
+    if i >= rows { return 0; }
+    add_bias_col(mat, bias, cols, i, 0);
+    add_bias_row(mat, bias, rows, cols, i + 1)
+}
+
+pub fn add_bias_col(mat: i64, bias: i64, cols: i64, i: i64, j: i64) -> i64 {
+    if j >= cols { return 0; }
+    let old: i64 = mat_get(mat, i, j, cols);
+    let bv: i64  = __mind_load_i64(bias + j * 8);
+    mat_set(mat, i, j, cols, old + bv);
+    add_bias_col(mat, bias, cols, i, j + 1)
+}

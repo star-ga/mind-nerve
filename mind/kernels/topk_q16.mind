@@ -1,0 +1,227 @@
+// mind-nerve/mind/kernels/topk_q16.mind
+//
+// Phase A1.2 — Top-K selection via K-min-heap (K ≤ 32).
+//
+// Implements spec §op-30: argpartition + argsort equivalent.
+// Produces the K indices with the highest Q16.16 scores from a scores
+// array of length N, sorted descending by score.
+//
+// Algorithm: K-min-heap over (score, index) pairs.
+//   The heap always holds the K LARGEST seen so far.
+//   For each element e: if e > heap_min, replace heap_min with e and
+//   sift-down. After scanning all N, sort the heap descending.
+//
+// Tie-breaking: equal scores break ties by index ascending (smaller
+// index wins, consistent with deterministic canonical order).
+//
+// Heap storage: two flat i64 arrays heap_scores[K] and heap_idx[K]
+// passed by the caller. K ≤ 32 (per spec). Caller allocates on the
+// scratch heap; both arrays have stride 8 (one i64 per slot).
+//
+// Heap property: min-heap on score. Root = slot 0 = global minimum.
+// sift_down restores the min-heap invariant after root replacement.
+//
+// Final output: caller-provided out_scores[K] and out_idx[K] filled
+// sorted descending by score (insertion sort, K ≤ 32).
+//
+// Reduction order: i = 0..N-1 ascending. Tie-break on index ascending.
+// Cross-substrate identity: pure integer comparisons, no FP.
+//
+// No f32. No while. No luts.
+
+use std.vec;
+
+// ---------------------------------------------------------------------------
+// Heap slot accessors
+// ---------------------------------------------------------------------------
+pub fn heap_score_get(hs: i64, slot: i64) -> i64 {
+    __mind_load_i64(hs + slot * 8)
+}
+pub fn heap_score_set(hs: i64, slot: i64, v: i64) -> i64 {
+    __mind_store_i64(hs + slot * 8, v)
+}
+pub fn heap_idx_get(hi: i64, slot: i64) -> i64 {
+    __mind_load_i64(hi + slot * 8)
+}
+pub fn heap_idx_set(hi: i64, slot: i64, v: i64) -> i64 {
+    __mind_store_i64(hi + slot * 8, v)
+}
+
+// ---------------------------------------------------------------------------
+// Compare: does slot a "precede" slot b in the min-heap?
+// a precedes b if score_a < score_b, OR score_a == score_b AND idx_a > idx_b
+// (min-heap on score; equal scores: larger index is "smaller" in heap so
+// that when replaced, we keep the tie with the smaller index).
+// Returns 1 if slot a should be the root over slot b, 0 otherwise.
+// ---------------------------------------------------------------------------
+pub fn heap_lt(hs: i64, hi: i64, a: i64, b: i64) -> i64 {
+    let sa: i64 = heap_score_get(hs, a);
+    let sb: i64 = heap_score_get(hs, b);
+    if sa < sb { return 1; }
+    if sa > sb { return 0; }
+    // equal scores: larger index is "smaller" (will be evicted first)
+    if heap_idx_get(hi, a) > heap_idx_get(hi, b) { return 1; }
+    0
+}
+
+// ---------------------------------------------------------------------------
+// Swap two heap slots.
+// ---------------------------------------------------------------------------
+pub fn heap_swap(hs: i64, hi: i64, a: i64, b: i64) -> i64 {
+    let sa: i64 = heap_score_get(hs, a);
+    let sb: i64 = heap_score_get(hs, b);
+    let ia: i64 = heap_idx_get(hi, a);
+    let ib: i64 = heap_idx_get(hi, b);
+    heap_score_set(hs, a, sb);
+    heap_score_set(hs, b, sa);
+    heap_idx_set(hi, a, ib);
+    heap_idx_set(hi, b, ia);
+    0
+}
+
+// ---------------------------------------------------------------------------
+// sift_down: restore min-heap invariant from slot `pos` downward.
+// K: current heap size. Tail-recursive.
+// ---------------------------------------------------------------------------
+pub fn sift_down(hs: i64, hi: i64, K: i64, pos: i64) -> i64 {
+    let left: i64  = 2 * pos + 1;
+    let right: i64 = 2 * pos + 2;
+    let smallest: i64 = pick_smallest(hs, hi, K, pos, left, right);
+    if smallest == pos { return 0; }
+    heap_swap(hs, hi, pos, smallest);
+    sift_down(hs, hi, K, smallest)
+}
+
+// Find the smallest among pos, left, right (those that exist in [0,K)).
+pub fn pick_smallest(hs: i64, hi: i64, K: i64,
+                     pos: i64, left: i64, right: i64) -> i64 {
+    let best: i64 = check_left(hs, hi, K, pos, left);
+    check_right(hs, hi, K, best, right)
+}
+
+pub fn check_left(hs: i64, hi: i64, K: i64, pos: i64, left: i64) -> i64 {
+    if left >= K { return pos; }
+    if heap_lt(hs, hi, left, pos) == 1 { return left; }
+    pos
+}
+
+pub fn check_right(hs: i64, hi: i64, K: i64, best: i64, right: i64) -> i64 {
+    if right >= K { return best; }
+    if heap_lt(hs, hi, right, best) == 1 { return right; }
+    best
+}
+
+// ---------------------------------------------------------------------------
+// Build initial heap from the first K elements.
+// sift_down from K/2-1 down to 0 (heapify). Tail-recursive.
+// ---------------------------------------------------------------------------
+pub fn heapify_loop(hs: i64, hi: i64, K: i64, pos: i64) -> i64 {
+    if pos < 0 { return 0; }
+    sift_down(hs, hi, K, pos);
+    heapify_loop(hs, hi, K, pos - 1)
+}
+
+pub fn init_heap(scores: i64, hs: i64, hi: i64, K: i64, i: i64) -> i64 {
+    if i >= K { return 0; }
+    heap_score_set(hs, i, __mind_load_i64(scores + i * 8));
+    heap_idx_set(hi, i, i);
+    init_heap(scores, hs, hi, K, i + 1)
+}
+
+pub fn build_heap(scores: i64, hs: i64, hi: i64, K: i64) -> i64 {
+    init_heap(scores, hs, hi, K, 0);
+    heapify_loop(hs, hi, K, K / 2 - 1)
+}
+
+// ---------------------------------------------------------------------------
+// Scan remaining elements i = K..N-1, update heap if e > root.
+// ---------------------------------------------------------------------------
+pub fn scan_loop(scores: i64, hs: i64, hi: i64, K: i64, N: i64, i: i64) -> i64 {
+    if i >= N { return 0; }
+    let sv: i64   = __mind_load_i64(scores + i * 8);
+    let root_s: i64 = heap_score_get(hs, 0);
+    let root_i: i64 = heap_idx_get(hi, 0);
+    // Replace root if sv > root_s, or equal but index i < root_i (keep smaller idx).
+    let replace: i64 = should_replace(sv, i, root_s, root_i);
+    do_replace(hs, hi, K, sv, i, replace);
+    scan_loop(scores, hs, hi, K, N, i + 1)
+}
+
+pub fn should_replace(sv: i64, si: i64, root_s: i64, root_i: i64) -> i64 {
+    if sv > root_s { return 1; }
+    if sv < root_s { return 0; }
+    // equal scores: prefer smaller index
+    if si < root_i { return 1; }
+    0
+}
+
+pub fn do_replace(hs: i64, hi: i64, K: i64, sv: i64, si: i64, replace: i64) -> i64 {
+    if replace == 0 { return 0; }
+    heap_score_set(hs, 0, sv);
+    heap_idx_set(hi, 0, si);
+    sift_down(hs, hi, K, 0)
+}
+
+// ---------------------------------------------------------------------------
+// Sort heap descending by score (insertion sort, K ≤ 32).
+// Write sorted results into out_scores[K] and out_idx[K].
+// Strategy: extract min K times from heap (heap-sort descending),
+// then reverse. Implemented as: copy heap to out arrays, insertion-sort
+// descending.
+// ---------------------------------------------------------------------------
+pub fn copy_heap_to_out(hs: i64, hi: i64, out_s: i64, out_i: i64,
+                        K: i64, k: i64) -> i64 {
+    if k >= K { return 0; }
+    __mind_store_i64(out_s + k * 8, heap_score_get(hs, k));
+    __mind_store_i64(out_i + k * 8, heap_idx_get(hi, k));
+    copy_heap_to_out(hs, hi, out_s, out_i, K, k + 1)
+}
+
+// Insertion sort descending on out_s / out_i. Tail-recursive outer.
+pub fn isort_outer(out_s: i64, out_i: i64, K: i64, k: i64) -> i64 {
+    if k >= K { return 0; }
+    isort_inner(out_s, out_i, k, k - 1);
+    isort_outer(out_s, out_i, K, k + 1)
+}
+
+pub fn isort_inner(out_s: i64, out_i: i64, k: i64, j: i64) -> i64 {
+    if j < 0 { return 0; }
+    let sj: i64  = __mind_load_i64(out_s + j * 8);
+    let sk: i64  = __mind_load_i64(out_s + k * 8);
+    let ij: i64  = __mind_load_i64(out_i + j * 8);
+    let ik: i64  = __mind_load_i64(out_i + k * 8);
+    // Descending: if s[j] < s[k] (or equal and idx[j] > idx[k]), swap.
+    let do_swap: i64 = isort_should_swap(sj, ij, sk, ik);
+    if do_swap == 0 { return 0; }
+    __mind_store_i64(out_s + j * 8, sk);
+    __mind_store_i64(out_s + k * 8, sj);
+    __mind_store_i64(out_i + j * 8, ik);
+    __mind_store_i64(out_i + k * 8, ij);
+    isort_inner(out_s, out_i, j, j - 1)
+}
+
+pub fn isort_should_swap(sj: i64, ij: i64, sk: i64, ik: i64) -> i64 {
+    if sj < sk { return 1; }
+    if sj > sk { return 0; }
+    // equal scores: ascending index first
+    if ij > ik { return 1; }
+    0
+}
+
+// ---------------------------------------------------------------------------
+// Public: top-K selection.
+// scores:    (N,) Q16.16 score array.
+// N:         number of candidates.
+// K:         number of results to return (≤ 32).
+// heap_s, heap_i: (K,) scratch buffers for the heap.
+// out_scores, out_idx: (K,) output buffers, sorted descending.
+// Returns 0 on completion.
+// ---------------------------------------------------------------------------
+pub fn topk_q16(scores: i64, N: i64, K: i64,
+                heap_s: i64, heap_i: i64,
+                out_scores: i64, out_idx: i64) -> i64 {
+    build_heap(scores, heap_s, heap_i, K);
+    scan_loop(scores, heap_s, heap_i, K, N, K);
+    copy_heap_to_out(heap_s, heap_i, out_scores, out_idx, K, 0);
+    isort_outer(out_scores, out_idx, K, 1)
+}

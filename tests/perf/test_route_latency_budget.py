@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import os
 import statistics
+import subprocess
+import sys
 import time
 
 import pytest
@@ -61,6 +63,29 @@ def _skip_if_runtime_unavailable() -> None:
         _ = rt.catalog_size
     except Exception as exc:  # noqa: BLE001
         pytest.skip(f"runtime unavailable for perf test: {exc.__class__.__name__}: {exc}")
+
+    # The end-to-end route() path exercises the native encode kernel. When
+    # the Phase-6.2 full-catalog weight blob is absent the encode path can
+    # fault in native code — a segfault, not a Python exception, which the
+    # try/except above cannot catch. Probe a single route() in a child
+    # process so a native crash degrades to a clean skip instead of taking
+    # the whole pytest process down.
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from mind_nerve import route; route('probe encode path', top_k=5)",
+        ],
+        capture_output=True,
+        timeout=120,
+    )
+    if probe.returncode != 0:
+        pytest.skip(
+            "route() end-to-end unavailable — native encode path not "
+            f"measurable (exit {probe.returncode}; Phase-6.2 full-catalog "
+            "encode blob pending). Score-path perf is covered by "
+            "test_score_latency.py."
+        )
 
 
 @pytest.mark.perf

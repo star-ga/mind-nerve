@@ -4,6 +4,22 @@ All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](htt
 
 ## [Unreleased] — v0.3.0 preparation
 
+### Perf — MR=4 register microkernel on the dense GEMM (#236 inc 2)
+
+- `mind/runtime/blas_shims_i64.c`: 4 contiguous A rows are now computed
+  against one transposed-B row together, reusing each `Bt[k]` vector
+  load across all 4 rows (4× fewer B streams — the dominant Goto/BLIS
+  reuse). Each output is the same i64 K-dot as inc 1 (even/odd
+  `_mm256_mul_epi32`, associative i64 sum, single final `>>16`) →
+  byte-identical; the M%4 tail and scalar path keep the proven single
+  dot. Native encode p95 vs main: **T=64 441→266 ms, T=128 898→497 ms,
+  T=256 1928→1076 ms (~1.66–1.81× cumulative, ~1.25–1.3× over inc 1)**,
+  monotone, no regression. A1.5 cosine 0.999996 / top-5 0.9975
+  byte-for-byte unchanged (re-verified, fresh rebuild); LUT 3/3; no
+  quantizer/blob change. vs MIND's own prior path. `mind@be4c53d`.
+  Increment 3 (full 6×8 register tile + B-panel L1 packing + qkt/attnv
+  same treatment) is the remaining FBGEMM-class gap.
+
 ### Perf — dense-int32 transposed-B Q16.16 GEMM (#236 inc 1)
 
 - `mind/runtime/blas_shims_i64.c`: the linear-GEMM path now repacks A

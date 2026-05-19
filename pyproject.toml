@@ -38,7 +38,15 @@ dependencies = [
 
 [project.optional-dependencies]
 mcp = ["mcp>=0.9"]
-dev = ["pytest>=7", "ruff>=0.5", "build>=1.0"]
+dev = [
+    "pytest>=7",
+    "ruff>=0.5",
+    "build>=1.0",
+    "pytest-cov>=4.1",
+    "mypy>=1.8",
+    "bandit>=1.7",
+    "pip-audit>=2.7",
+]
 
 [project.scripts]
 mind-nerve              = "mind_nerve.cli:main"
@@ -71,4 +79,85 @@ target-version = "py310"
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B"]
 ignore = ["E501"]   # line-length handled by ruff format; help text + docstrings exceed
+
+# ---------------------------------------------------------------------------
+# Coverage configuration
+#
+# `qa-gates` runs pytest with --cov on tests/python + tests/integration.
+# tests/perf/ is intentionally excluded from coverage (perf jobs run as a
+# separate matrix step and would skew measurements with sleep/wall-clock
+# work).
+# ---------------------------------------------------------------------------
+[tool.coverage.run]
+branch = true
+source = ["python/mind_nerve"]
+omit = [
+    "python/mind_nerve/_native.py",      # ctypes shim — exercised only when .so present
+    "python/mind_nerve/templates/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]
+show_missing = true
+skip_covered = false
+
+# ---------------------------------------------------------------------------
+# mypy configuration
+#
+# Phase-1 of the audit response: strict mode is enabled only on the
+# three modules that already carry good type hints and are the highest
+# value to keep strict on every PR:
+#   - inference.py     (public routing entry point)
+#   - installer.py     (writes user config files atomically)
+#   - _runtime_dir.py  (socket-dir resolution; small, well-typed)
+#
+# The path-by-path expansion plan is:
+#   Phase 2: types.py, attestation.py, ensure.py
+#   Phase 3: daemon.py, mcp_server.py, cli.py
+#   Phase 4: discovery.py, federation.py, mind_train.py, marketplace.py
+# Each phase lands once the module reaches strict cleanliness without
+# regressing runtime behaviour.
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.10"
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+ignore_missing_imports = true
+exclude = [
+    "tests/",
+    "build/",
+    "dist/",
+    "catalog-builder/",
+    "integrations/",
+    "python/mind_nerve/_native.py",
+]
+
+# Public surface — strict per audit P0.
+[[tool.mypy.overrides]]
+module = [
+    "mind_nerve.inference",
+    "mind_nerve.installer",
+    "mind_nerve._runtime_dir",
+]
+strict = true
+
+# ---------------------------------------------------------------------------
+# pytest configuration
+#
+# `integration` and `perf` markers must be registered to avoid the
+# "Unknown pytest.mark" warning being escalated under `-W error`.
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+markers = [
+    "integration: end-to-end tests that touch the public Python surface (route, installer, daemon)",
+    "perf: latency/throughput tests; not run on every PR",
+    "stress: long-running stress tests (NIAH, leak soak); opt-in only",
+    "slow: tests that take more than ~10s; opt-in only",
+]
 

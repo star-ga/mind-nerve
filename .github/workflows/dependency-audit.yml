@@ -1,0 +1,172 @@
+name: dependency-audit
+
+# Weekly SCA + SAST + SBOM. Also runs on PRs that touch dependencies or
+# Python source so a vulnerable bump is caught before merge.
+#
+# Jobs:
+#   - pip-audit  — vulnerability scan against requirements.lock.
+#                  Fails on HIGH/CRITICAL findings.
+#   - bandit     — static security lint over python/mind_nerve.
+#   - semgrep    — semantic security scan (p/ci + p/python).
+#   - sbom       — CycloneDX SBOM from requirements.lock; uploaded as an
+#                  artifact and (on release) attached to the GitHub release.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "pyproject.toml"
+      - "requirements.in"
+      - "requirements.lock"
+      - "python/mind_nerve/**"
+      - ".github/workflows/dependency-audit.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "pyproject.toml"
+      - "requirements.in"
+      - "requirements.lock"
+      - "python/mind_nerve/**"
+      - ".github/workflows/dependency-audit.yml"
+  schedule:
+    # Mondays 07:00 UTC — one hour after Dependabot so the audit catches
+    # the freshly-opened bump PRs in the next manual rerun.
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  pip-audit:
+    name: pip-audit (vulnerability scan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pip-audit
+        run: pip install pip-audit==2.10.0
+      - name: Audit requirements.lock
+        run: |
+          # pip-audit's default exit code is non-zero on any finding.
+          # We want HIGH+CRITICAL only to gate; LOW/MEDIUM are emitted
+          # as warnings via the JSON output.
+          set +e
+          pip-audit -r requirements.lock \
+              --vulnerability-service osv \
+              --format json \
+              --output /tmp/pip-audit.json
+          rc=$?
+          set -e
+          python3 - <<'PY'
+          import json, sys
+          report = json.loads(open('/tmp/pip-audit.json').read())
+          deps = report.get('dependencies', [])
+          high_or_crit = []
+          all_vulns = []
+          for d in deps:
+              for v in d.get('vulns', []):
+                  severity = (v.get('severity') or '').upper()
+                  ident = v.get('id', '')
+                  pkg = d.get('name', '')
+                  ver = d.get('version', '')
+                  all_vulns.append((pkg, ver, ident, severity))
+                  if severity in ('HIGH', 'CRITICAL'):
+                      high_or_crit.append((pkg, ver, ident, severity))
+          for pkg, ver, ident, severity in all_vulns:
+              print(f'  {pkg}=={ver}  {ident}  severity={severity or "UNKNOWN"}')
+          if high_or_crit:
+              print(f'::error::pip-audit: {len(high_or_crit)} HIGH/CRITICAL vulnerabilities found')
+              sys.exit(1)
+          if all_vulns:
+              print(f'::warning::pip-audit: {len(all_vulns)} non-blocking vulnerabilities found')
+          else:
+              print('pip-audit: no vulnerabilities in requirements.lock')
+          PY
+      - name: Upload pip-audit JSON
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pip-audit-report
+          path: /tmp/pip-audit.json
+
+  bandit:
+    name: bandit (static security lint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install bandit
+        run: pip install bandit==1.7.9
+      - name: Run bandit
+        run: |
+          bandit -r python/mind_nerve -x tests \
+              --severity-level medium \
+              --confidence-level medium \
+              --format json --output /tmp/bandit.json || true
+          bandit -r python/mind_nerve -x tests \
+              --severity-level medium \
+              --confidence-level medium
+      - name: Upload bandit JSON
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bandit-report
+          path: /tmp/bandit.json
+
+  semgrep:
+    name: semgrep (p/ci + p/python)
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Semgrep
+        run: |
+          semgrep --config=p/ci --config=p/python \
+              --error \
+              --json --output /tmp/semgrep.json \
+              python/mind_nerve || true
+          semgrep --config=p/ci --config=p/python \
+              --error \
+              python/mind_nerve
+      - name: Upload semgrep JSON
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-report
+          path: /tmp/semgrep.json
+
+  sbom:
+    name: SBOM (CycloneDX from requirements.lock)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install cyclonedx-bom
+        run: pip install cyclonedx-bom==5.2.0
+      - name: Generate SBOM
+        run: |
+          cyclonedx-py requirements requirements.lock \
+              --output-format json \
+              --outfile sbom.cdx.json
+          python3 -c "
+          import json
+          sbom = json.loads(open('sbom.cdx.json').read())
+          n = len(sbom.get('components', []))
+          print(f'SBOM: {n} components recorded')
+          assert n > 0, 'empty SBOM'
+          "
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: sbom.cdx.json
+          retention-days: 90

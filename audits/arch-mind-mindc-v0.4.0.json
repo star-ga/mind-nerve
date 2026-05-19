@@ -1,0 +1,12 @@
+{
+  "_fixture": "/tmp/arch-mind-nerve.json",
+  "acyclicity_q16": 655360000,
+  "depth_q16": 655360000,
+  "equality_q16": 349495202,
+  "evidence_chain_density": 0,
+  "governance_kernel_coverage": 0,
+  "mcp_tool_isolation": 655360000,
+  "modularity_q16": 655360000,
+  "q16_determinism_purity": 451972413,
+  "redundancy_q16": 649003008
+}

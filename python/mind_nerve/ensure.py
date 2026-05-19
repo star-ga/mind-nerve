@@ -27,6 +27,8 @@ import sys
 import time
 from pathlib import Path
 
+from ._runtime_dir import runtime_socket_dir
+
 # Max time a "loser" of the flock race will wait for the winner's daemon
 # to come up before falling through fail-open. Sized at 4x the observed
 # cold-load (~5 s) to give comfortable headroom on slow disks / boxes.
@@ -34,11 +36,7 @@ WAIT_SECONDS = 20.0
 
 
 def default_socket_path() -> Path:
-    uid = os.getuid()
-    xdg = Path(f"/run/user/{uid}")
-    if xdg.is_dir() and os.access(xdg, os.W_OK):
-        return xdg / "mind-nerve.sock"
-    return Path(f"/tmp/mind-nerve-{uid}.sock")
+    return runtime_socket_dir() / "mind-nerve.sock"
 
 
 def _socket_responsive(sock_path: Path, timeout: float = 1.0) -> bool:

@@ -2,7 +2,7 @@
 
 Design document for the Phase 3 binding between mind-nerve route history and the
 mind-mem v4 cognitive memory kernel. This spec publishes the interface contract so
-external consumers (downstream orchestrators, arch-mind contract scoring) can validate
+external consumers (downstream contract scoring consumers) can validate
 the binding shape while Phase 2 completes.
 
 Status: **design-only** — functional ship is BLOCKED on mind-mem v4 cognitive kernel

@@ -37,11 +37,9 @@ Three blockers were raised 2026-05-14. Status after the Phase 1 alpha sprint:
    *inference* path is what must move to native MIND; the *training* path
    is allowed to remain external until Phase 2's native-MIND trainer
    (`mind-train`) is built.
-3. **Wire MIND with protected libs — DONE.** `libmindnerve.so` ships
-   bundled inside the wheel. The build pipeline and protection sources
-   live in a private sibling toolchain repo maintained by STARGA and
-   not part of this public surface; the public wheel passes an automated
-   leak-verifier before each release.
+3. **Wire MIND with protected libs — DONE.** `libmindnerve.so` is the
+   native runtime bundled inside the wheel. The Phase-1 PyTorch
+   inference path published in this repository works without it.
 
 **Release status (2026-05-18):** `v0.3.0-beta.2` is the current PyPI
 public — wheel + sdist live at
@@ -305,7 +303,7 @@ Q16.16 in flight, INT8 weights, cross-arch bit-identity, 30 ms p95).
 | Federated routing contract tests (`tests/integration/test_federation_reconcile.py`) | **DONE** (design-only) |
 | mind-mem v4 cognitive-kernel binding spec (`spec/mind_mem_v4_integration.md`) | **DONE** (design-only) |
 | Skill marketplace functional ship | **BLOCKED** — requires Phase 2 completion |
-| Federated routing functional ship | **BLOCKED** — requires Phase 2 + mind-flow typed-edges |
+| Federated routing functional ship | **BLOCKED** — requires Phase 2 + the typed-edges composition layer |
 | mind-mem v4 cognitive-kernel integration functional ship | **BLOCKED** — requires mind-mem v4 |
 
 ## Non-goals (now and ever)
@@ -324,4 +322,4 @@ Q16.16 in flight, INT8 weights, cross-arch bit-identity, 30 ms p95).
 | `mind-runtime` | Provides the 18-backend lowering matrix mind-nerve compiles against |
 | `mind-mem` | v4.1 §7 tool-routing preselector consumes mind-nerve at the MCP layer |
 | `MindLLM` | Per-neuron weight attestation discipline applies symmetrically to mind-nerve |
-| `rfn-mind` | v3.x deterministic FT path applies to mind-nerve training in Phase 2 |
+| native-MIND training pipeline | v3.x deterministic fine-tuning path applies to mind-nerve training in Phase 2 |

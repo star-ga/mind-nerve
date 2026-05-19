@@ -30,14 +30,12 @@ import sys
 import time
 from pathlib import Path
 
+from ._runtime_dir import runtime_socket_dir
+
 
 def default_socket_path() -> Path:
-    """XDG_RUNTIME_DIR if writable, else /tmp fallback."""
-    uid = os.getuid()
-    xdg = Path(f"/run/user/{uid}")
-    if xdg.is_dir() and os.access(xdg, os.W_OK):
-        return xdg / "mind-nerve.sock"
-    return Path(f"/tmp/mind-nerve-{uid}.sock")
+    """Return the preferred socket path using the shared runtime-dir helper."""
+    return runtime_socket_dir() / "mind-nerve.sock"
 
 
 def main() -> int:

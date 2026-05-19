@@ -8,8 +8,8 @@ Lives next to `ROADMAP.md` as the operational plan for the Phase 1 build.
 | Decision | Choice | Why |
 |---|---|---|
 | **Sequencing** | Catalog-first, training after | The catalog IS the moat. Training on STARGA's local 1,000 skills only would yield a parochial model. Real public agent ecosystem has 8-15k+ skills/tools/MCPs/agents. |
-| **Training path** | PyTorch (BF16/FP32) → `torch_to_bundle` Q16.16 export → native MIND inference | rfn-mind v3 (native MIND training) is a design doc gated on Phase 6 / Cerebras — 18-36mo out. Native MIND **inference** end-to-end is shippable today via the rfn-mind bundle toolchain. |
-| **Brand claim** | "Native MIND inference. Q16.16 deterministic. Sub-30ms p95." | All three are true with the practical path. We do NOT claim "native MIND training" until rfn-mind v3 ships. |
+| **Training path** | PyTorch (BF16/FP32) → `torch_to_bundle` Q16.16 export → native MIND inference | The future native-MIND training pipeline (gated on Phase 6 + dedicated training hardware) is 18-36mo out. Native MIND **inference** end-to-end is shippable today via the torch-to-bundle conversion path. |
+| **Brand claim** | "Native MIND inference. Q16.16 deterministic. Sub-30ms p95." | All three are true with the practical path. We do NOT claim "native MIND training" until the native-MIND training pipeline ships. |
 | **Tokenizer** | Custom BPE, 32k vocab, trained on the merged catalog + query corpus | Tool/skill names have unique vocabulary (`mcp__server__tool_name`, `RFC_NNN_NAME`, etc.) — generic BPE wastes tokens here. |
 | **Architecture (frozen)** | Encoder-only (drop-the-decoder), sliding-window self-attention (window=256, stride=192), direct scoring head over catalog | Scaffold landed 2026-05-13. Frozen per ROADMAP.md. |
 | **Quantization** | INT8 weights, Q16.16 activations, cross-arch bit-identity gate | Non-negotiable Phase 1 exit criterion. |
@@ -86,7 +86,7 @@ Single target: **≥92% top-5 accuracy** on held-out test set, **p95 ≤30ms** o
 4. ~50-100k steps to convergence
 5. Best checkpoint by validation top-5 accuracy
 6. INT8 quantization (per-channel symmetric)
-7. Q16.16 activation export via rfn-mind torch_to_bundle path
+7. Q16.16 activation export via the torch-to-bundle conversion path
 8. Cross-arch bit-identity verification gate (x86 vs CUDA)
 ```
 

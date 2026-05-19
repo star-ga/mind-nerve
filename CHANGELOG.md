@@ -4,6 +4,24 @@ All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](htt
 
 ## [Unreleased] — v0.3.0 preparation
 
+## [0.3.0-beta.5] - 2026-05-18
+
+Independent-audit hygiene pass: removed public references to internal
+build infrastructure and tightened the socket/lockfile path used by the
+daemon.
+
+### Security
+
+- Removed mentions of internal toolchain processes from README, ROADMAP,
+  CHANGELOG, LICENSE, spec/, and docs/.
+- Daemon and ensure() now prefer `$XDG_RUNTIME_DIR` (or
+  `~/.cache/mind-nerve/run/` at mode 0700) over a predictable
+  `/tmp/mind-nerve-<uid>` path, closing a local symlink-attack DoS
+  surface on shared systems.
+- New `python/mind_nerve/_runtime_dir.py` + `tests/python/test_runtime_dir.py`.
+
+No surface-API behaviour change.
+
 ## [0.3.0-beta.4] — 2026-05-18
 
 Audit response (deep-research 2026-05-18): deterministic SHA-256 tie-break
@@ -51,7 +69,7 @@ HF revision pin, README architecture+latency+license clarifications.
 - Phase-1 Python latency (~90 ms warm-daemon CPU) and Phase-2 native target
   (≤30 ms CPU) are now stated separately and clearly.
 - License section now has a single concise paragraph explaining the Apache-2.0
-  Python/weights surface and the separately licensed bundled FORTRESS binary.
+  Python/weights surface and the separately licensed bundled native runtime.
 - `MIND_NERVE_HF_REVISION` env var added to the Configuration table.
 
 ## [0.3.0-beta.3] — 2026-05-18
@@ -314,7 +332,7 @@ mind-mem v4 cognitive kernel, ARM CI runner) and remain deferred.
   Stub-only ship; functional ship awaits the rest of Phase 2.
 - **Federated cross-host routing** — typed-port design + stub for
   routing requests across mind-nerve instances on different hosts.
-  Stub-only ship; functional ship awaits mind-flow typed-edges.
+  Stub-only ship; functional ship awaits the future typed-edges composition layer.
 - **mind-mem v4 cognitive-kernel binding spec** — the published
   contract for plugging mind-nerve into mind-mem's cognitive kernel
   (route-history as memory class). Spec ships now; functional ship
@@ -590,12 +608,11 @@ First private alpha tag. Phase 1 (Python-side inference) is complete; Phase 2 (n
 - **MCP server façade** — stdio JSON-RPC, exposes `mind_nerve_route` tool to any MCP-capable client.
 - **17-CLI installer** — MCP-first (`claude-code`, `claude-desktop`, `cursor`, `codex`) + `claude-code-hook` fallback + 10 stub adapters for vendor CLIs that don't speak MCP yet.
 - **Discovery layer** — `scan()`, `Watcher`, `add_route()` with license-gated ingest (refuses `commercial_risk`, requires `--include-unknown` for unknown-license sources).
-- **Bundled runtime component** — `libmindnerve.so` ships inside the wheel. Source lives outside this repository under a separate STARGA agreement; the wheel goes through an automated leak-verifier before release.
+- **Bundled runtime component** — `libmindnerve.so` ships inside the wheel under a separate STARGA license; see `LICENSE.md`.
 
 ### Security
-- Public mind-nerve repo history scrubbed of non-public build artefacts via `git filter-repo` on 2026-05-16. The build pipeline and runtime-component sources live outside this tree.
-- `.gitignore` hardened to block re-introduction of `protected-build/`, `dist/`, `*.so`, `*.dylib`, `*.dll`.
-- Each release of the wheel passes an automated leak verifier covering: expected export surface, no developer-machine paths, no credential fingerprints, no embedded compiler-getter symbols, and the `.comment` section is the STARGA toolchain stamp only.
+
+Each release of the wheel ships only the documented public API surface.
 
 ### Known limitations
 - Inference path runs Python-side (PyTorch via the wheel). Native MIND Q16.16 inference is Phase 2.

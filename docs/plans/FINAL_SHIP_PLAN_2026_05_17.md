@@ -35,7 +35,7 @@ Authoritative scoping output for the FINAL mind-nerve ship — Phase 2 + Phase 3
 | Item | Status |
 |---|---|
 | Skill marketplace adapter | **SHIPPABLE NOW** as design + stub; functional ship awaits Phase 2 |
-| Federated routing | **SHIPPABLE NOW** as design + stub; functional ship awaits Phase 2 + mind-flow typed-edges |
+| Federated routing | **SHIPPABLE NOW** as design + stub; functional ship awaits Phase 2 + the typed-edges composition layer |
 | mind-mem v4 cognitive-kernel integration | **BLOCKED** — needs mind-mem v4 |
 
 ## Final ship version path
@@ -75,7 +75,7 @@ v1.0.0          — Native cdylib inference path (gated mindc 0.3.0)
 - **mindc 0.3.0** — `--lib` cdylib emit, AOT codegen, MIC profile-locked headers
 - **mind-mem v4 cognitive kernel** — Phase 3 route-history-as-memory-class binding
 - **ARM CI runner** — Apple Silicon or `macos-14-arm64` GitHub runner
-- **rfn-mind Phase 6** — only if `mind-train` defers to rfn-mind's trainer (decoupled by Tier 3 item #10)
+- **Phase-6 native training milestone** — only if `mind-train` defers to the native-MIND trainer (decoupled by Tier 3 item #10)
 - **Multilingual training corpus** — Tier-1 (12 languages) corpus
   mining + multi-pod GPU run. Tier-2 (~20 languages) staged but not
   gating any ship. Tier-3 script-floor CI gate ships independently

@@ -279,10 +279,10 @@ mind-nerve/
 
 The repository source, the Python wheel surface, and the Phase-1 trained
 weights on Hugging Face are all **Apache-2.0**. The wheel additionally
-bundles `libmindnerve.so` — a compiled FORTRESS runtime component whose
+bundles `libmindnerve.so` — a compiled native runtime component whose
 source is not part of this repository and is not distributed under Apache
-2.0; that component carries a separate STARGA commercial license documented
-in [`LICENSE.md`](LICENSE.md). The Phase-1 PyTorch inference path does not
+2.0; that component carries a separate STARGA license documented in
+[`LICENSE.md`](LICENSE.md). The Phase-1 PyTorch inference path does not
 depend on `libmindnerve.so`; users running `MIND_NERVE_BACKEND=pytorch`
 operate entirely under Apache-2.0.
 

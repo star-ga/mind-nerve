@@ -3,8 +3,8 @@
 Design: spec/federated_routing.md
 
 All public functions raise NotImplementedError until Phase 2 (native MIND
-inference, mind-flow typed-edge availability) completes and the functional
-implementation replaces this stub.
+inference) completes and the typed-edges composition layer is available;
+the functional implementation replaces this stub at that point.
 
 Consumers may import and type-check against these interfaces today.
 """

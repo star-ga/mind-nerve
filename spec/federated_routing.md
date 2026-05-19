@@ -5,8 +5,8 @@ multiple mind-nerve instances running on different hosts collaborate to share ro
 decisions, reconcile their attestation chains, and maintain a consistent evidence record
 across a cluster.
 
-Status: **design-only** — functional ship requires Phase 2 completion and mind-flow
-typed-edge availability.
+Status: **design-only** — functional ship requires Phase 2 completion and
+the future typed-edges composition layer.
 
 ---
 

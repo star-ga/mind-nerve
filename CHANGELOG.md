@@ -4,6 +4,30 @@ All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](htt
 
 ## [Unreleased] — v0.3.0 preparation
 
+### Perf — native encode GEMMs routed through byte-identical SIMD Q16.16 matmul (#230 Step 1)
+
+- `mind/runtime/blas_shims_i64.c` (new symbol `__mind_nerve_blas_matmul_q16_i64`):
+  a k-outer/j-inner AVX2 Q16.16 GEMM (`_mm256_mul_epi32` widening 32×32→64
+  on the low-32 of each i64 stride-8 slot, Q32.32 accumulate, single
+  `>> 16` narrow at write) + scalar fallback. **Byte-identical** to the
+  scalar `matmul_q16` oracle by construction (integer-domain reduction is
+  associative; same guarantee as the task-#57 score-path AVX2 dot) — and
+  empirically: the full 12-layer encode embedding cosine vs pytorch is
+  **unchanged at 0.999996 / top-5 0.9975** (a lane bug would have
+  collapsed it across the stacked GEMMs, as the prior precision
+  regression did). `matmul_blas.mind` exposes it as `matmul_q16_blas`;
+  `matmul_384_384` / `matmul_384_1536` / `matmul_1536_384` now route
+  through it instead of the tail-recursive scalar `matmul_q16` (scalar
+  primitives retained as the byte-identity oracle).
+- Native encode latency (i7-5930K, same blob): **T=10 1047→77 ms p95
+  (13.9×), T=64 7077→553 ms (11.9×), T=128 19632→1365 ms (10.6×)**.
+  Correctness gate unchanged (independently re-verified on the
+  mindc-v0.6.7 rebuild); LUT bit-identity 3/3, hashes untouched; no
+  quantizer/blob/layout change. Remaining cost is now bias-add /
+  layernorm / attention (qkt/attnv still scalar) — that is #230 Step 2
+  (incl. the thesis-pure Track-B `dot_q16_v` path, which needs an (N,K)
+  weight layout). `mind@4d25383`.
+
 ### Bench — criterion speed + efficiency harness
 
 - `tests/perf/bench_criterion.py` (new): score-only speed bench over the

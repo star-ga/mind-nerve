@@ -237,10 +237,11 @@ Toolchain prerequisites all shipped: `mindc` 0.2.6 (C-ABI export),
 [`mindc` 0.3.0](https://github.com/star-ga/mind/releases/tag/v0.3.0)
 (cdylib emit + Phase 0/1/1.5 std-surface intrinsics + RFC 0005 P0e/P0f
 struct + FieldAccess ABI), and
-[`mindc` 0.4.2](https://github.com/star-ga/mind/releases/tag/v0.4.2)
-(RFC 0005 Phase 2 + B + C — pure-MIND std.vec/string/map/io bundled
-into the binary).  Remaining work is the mind-nerve-side native
-encoder kernel that links against the toolchain.
+[`mindc` 0.4.3](https://github.com/star-ga/mind/releases/tag/v0.4.3)
+(RFC 0005 Phase 2 + B + C + D₁ — pure-MIND std.vec/string/map/io bundled
+into the binary, with a `$MIND_STDLIB_PATH` env-var fork-without-recompile
+escape hatch).  Remaining work is the mind-nerve-side native encoder
+kernel that links against the toolchain.
 
 **Phase 3** — Catalog v2: license-aware ingest at scale, evidence-chain
 proofs, per-tenant route tables.

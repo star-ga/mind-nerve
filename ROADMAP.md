@@ -122,6 +122,16 @@ dependency.  Phase C also lit a new gated-feature CI step (commit
 suites separately + combined, closing a real CI blind spot — 65+
 gated tests are now under cloud guard against silent regression.
 
+**`mindc` 0.4.3 landed 2026-05-18** — RFC 0005 **Phase D₁**
+(`$MIND_STDLIB_PATH` env-var override).  Lets downstream users fork
+the pure-MIND stdlib without rebuilding mindc — pointing the env
+var at a directory containing all four `.mind` files swaps the
+bundled blobs at project-load time.  Same fork-without-recompile
+escape hatch Rust's `RUSTC_BOOTSTRAP` provides; same module-level
+feature gate as Phase C so the default-build hot path stays
+branchless.  Bench gate clean (small +1.8% / medium -0.8% / large
++1.9%, all inside +5%).
+
 | Task | Blocker | mindc milestone | Status |
 |---|---|---|---|
 | Cross-arch bit-identity (x86-CPU vs CUDA) | `pub fn` → C symbol export so the native MIND inference kernel is callable as a `cdylib` | **0.2.6** — `pub fn`-to-C, `[exports]`, `--profile` flag | **mindc-side SHIPPED** (RFC 0002 D2–D5 in `0a408e3`, `_v1` ABI lock in `de6cf18`, RFC 0003 cdylib seam). mind-nerve-side validation (mindc CUDA build + bit-identical SHA) still pending hardware — task #57 stays open. |

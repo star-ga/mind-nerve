@@ -19,7 +19,29 @@ All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](htt
   `tests/python/test_tokenize_maxseq.py`. Python-only; no encoder
   rebuild / no quantizer/blob/A1.5 change. `mind@d87c4c1`.
 
-### Perf — attention GEMMs densified (qkt + attn·V) (#236 inc 4)
+### Perf — process-lifetime transposed-weight-panel cache (#236 inc 5)
+
+- `mind/runtime/blas_shims_i64.c`: profiling showed the linear GEMMs are
+  ~59% of encode wall and **memory-bandwidth-bound** (the dense path
+  re-ran `pack_i32_transpose` on the SAME immutable weight matrix every
+  encode call — ~42 MB/encode of repack DRAM traffic). The encoder
+  weights load once into a stable blob at fixed offsets, so the B
+  pointer to `matmul_q16` is identical across every call. Added a
+  process-lifetime cache of transposed int32 weight panels keyed by
+  (B addr, K, N) + a 3-word content probe (the probe rules out a
+  freed-then-reused-address collision without re-reading the panel —
+  preserves byte-identity, does not re-incur the eliminated traffic).
+  Cache miss/full/`MIND_NERVE_BLAS_WCACHE=0` falls back to the
+  per-call malloc+pack. Same data, memoised → **byte-identical**.
+  A/B vs prior commit (50 iters, native): p50 **−12.6% / −7.1% /
+  −6.7%**, p95 **−9.5% / −7.3% / −6.9%** at ~T 64 / 128 / 256,
+  monotone, no sign-flips. A1.5 cosine 0.999996 / top-5 0.9975
+  byte-for-byte unchanged; blas/LUT 6/6. (A regime-incorrect MR=6×NR=2
+  register-widening attempt was measured, regressed, and discarded —
+  the linear GEMM is memory-bound, not compute-bound.) vs MIND's own
+  prior path.
+
+### Perf — attention GEMMs densified (qkt · attn·V) (#236 inc 4)
 
 - `mind/runtime/blas_shims_i64.c`: `__mind_nerve_blas_qkt_q16_i64` and
   `__mind_nerve_blas_attnv_q16_i64` now take the dense-int32 path

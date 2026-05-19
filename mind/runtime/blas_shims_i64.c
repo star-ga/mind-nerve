@@ -710,6 +710,73 @@ static void mind_nerve_blas_gemm_micro_mr4nr2_avx2(
 }
 #endif
 
+// ---------------------------------------------------------------------------
+// Process-lifetime transposed-weight-panel cache (task #236).
+//
+// The encoder weight matrices are loaded once into a stable, immutable
+// blob at fixed offsets for the process lifetime (encode.mind WeightBank
+// / inference.py _weights_pinned). __mind_nerve_blas_matmul_q16_i64
+// otherwise re-runs pack_i32_transpose on the SAME weight B on every
+// encode call — the dominant memory-bound cost (profiled: ~42 MB/encode
+// repack reads). Memoise the transposed int32 panel keyed by (B addr,
+// K, N) + a 3-word content probe. The probe makes a
+// freed-then-reused-address collision astronomically unlikely WITHOUT
+// re-reading the whole panel, so it preserves byte-identity (the A1.5
+// gate empirically validates the full call pattern) without re-incurring
+// the traffic being eliminated.
+//
+// Single-threaded by construction: the native encode path runs
+// sequentially under the caller's GIL, exactly like the existing
+// load-time dispatch flag. Entries are never evicted/freed (weights
+// live for the process; ~85 MB int32 for the full bge-small set).
+// Opt out with MIND_NERVE_BLAS_WCACHE=0.
+// ---------------------------------------------------------------------------
+#define MIND_NERVE_WCACHE_CAP 256
+typedef struct {
+    const int64_t *key;          // B base address (stable weight slice)
+    int64_t        K, N;
+    int64_t        p0, p1, p2;   // content probe: first/mid/last i64 of B
+    int32_t       *btp;          // owned transposed panel (never freed)
+} mind_nerve_wcache_ent;
+
+static mind_nerve_wcache_ent mind_nerve_wcache[MIND_NERVE_WCACHE_CAP];
+static int mind_nerve_wcache_n   = 0;
+static int mind_nerve_wcache_off = -1;   // -1 = env not yet probed
+
+static int mind_nerve_wcache_enabled(void) {
+    if (mind_nerve_wcache_off < 0) {
+        const char *v = getenv("MIND_NERVE_BLAS_WCACHE");
+        mind_nerve_wcache_off = (v && v[0] == '0' && v[1] == '\0') ? 1 : 0;
+    }
+    return mind_nerve_wcache_off == 0;
+}
+
+// Cached transposed int32 panel for B (K x N -> N x K), packing +
+// inserting on miss. NULL if the cache is full or malloc fails (caller
+// then does a per-call malloc+pack — still correct, just not memoised).
+static const int32_t *mind_nerve_wcache_get(
+    const int64_t *B, int64_t K, int64_t N
+) {
+    size_t  bn = (size_t)K * (size_t)N;
+    int64_t p0 = B[0];
+    int64_t p1 = B[bn >> 1];
+    int64_t p2 = B[bn - 1];
+    for (int e = 0; e < mind_nerve_wcache_n; ++e) {
+        mind_nerve_wcache_ent *c = &mind_nerve_wcache[e];
+        if (c->key == B && c->K == K && c->N == N &&
+            c->p0 == p0 && c->p1 == p1 && c->p2 == p2)
+            return c->btp;
+    }
+    if (mind_nerve_wcache_n >= MIND_NERVE_WCACHE_CAP) return NULL;
+    int32_t *btp = (int32_t *)malloc(bn * sizeof(int32_t));
+    if (btp == NULL) return NULL;
+    mind_nerve_blas_pack_i32_transpose(B, btp, K, N);
+    mind_nerve_wcache_ent *c = &mind_nerve_wcache[mind_nerve_wcache_n++];
+    c->key = B; c->K = K; c->N = N;
+    c->p0 = p0; c->p1 = p1; c->p2 = p2; c->btp = btp;
+    return btp;
+}
+
 int64_t __mind_nerve_blas_matmul_q16_i64(
     int64_t a_addr, int64_t b_addr, int64_t c_addr,
     int64_t M, int64_t K, int64_t N
@@ -725,11 +792,24 @@ int64_t __mind_nerve_blas_matmul_q16_i64(
     {
         size_t a_n = (size_t)M * (size_t)K;
         size_t b_n = (size_t)K * (size_t)N;
-        int32_t *Ap  = (int32_t *)malloc(a_n * sizeof(int32_t));
-        int32_t *Btp = (int32_t *)malloc(b_n * sizeof(int32_t));
+        int32_t *Ap = (int32_t *)malloc(a_n * sizeof(int32_t));
+        // Btp: memoised transposed weight panel (process-lifetime, owned
+        // by the cache). On cache miss/full/disabled, fall back to a
+        // per-call malloc+pack (Btp_own, freed below). Both paths feed
+        // byte-identical data to the kernels.
+        const int32_t *Btp = NULL;
+        int32_t *Btp_own = NULL;
+        if (mind_nerve_wcache_enabled())
+            Btp = mind_nerve_wcache_get(B, K, N);
+        if (Btp == NULL) {
+            Btp_own = (int32_t *)malloc(b_n * sizeof(int32_t));
+            if (Btp_own != NULL) {
+                mind_nerve_blas_pack_i32_transpose(B, Btp_own, K, N);
+                Btp = Btp_own;
+            }
+        }
         if (Ap != NULL && Btp != NULL) {
             mind_nerve_blas_pack_i32_rowmajor(A, Ap, M, K);
-            mind_nerve_blas_pack_i32_transpose(B, Btp, K, N);
             int64_t i = 0;
 #if MIND_NERVE_BLAS_X86_64
             if (mind_nerve_blas_use_avx2) {
@@ -779,12 +859,12 @@ int64_t __mind_nerve_blas_matmul_q16_i64(
                 }
             }
             free(Ap);
-            free(Btp);
+            if (Btp_own) free(Btp_own);   // cached panel is never freed
             return 0;
         }
         // malloc failed → fall through to the in-place i64-stride reference.
-        if (Ap)  free(Ap);
-        if (Btp) free(Btp);
+        if (Ap)      free(Ap);
+        if (Btp_own) free(Btp_own);
     }
 
     // Per-row Q32.32 accumulator: stack for N <= MIND_NERVE_BLAS_GEMM_STACK_N,

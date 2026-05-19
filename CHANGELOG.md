@@ -73,6 +73,64 @@ All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](htt
 - A1.5 verdict: **score path PASS**. Encode path remains tracked
   separately (depends on the Phase 6.2 quantizer artifact, below).
 
+### A1.5 — pure-MIND tanh/rsqrt/softmax Q16.16 LUTs replace C shim (#218)
+
+- The encode path's activation LUTs are now **pure MIND**, not libm.
+  `mind/runtime/lut_shims.c` (libm `tanh`/`exp`/`sqrt` float math, NOT
+  cross-arch bit-identical, "MEASUREMENT ONLY") is **deleted** and
+  superseded by `mind/runtime/lut_cache.c` — a thin handle cache that
+  performs **zero arithmetic**: it lazily calls each pure-MIND `*_init()`
+  once and caches the i64 table handle (matching the prior shim's
+  implicit table-resident caching contract, so kernel call sites are
+  unchanged). Every numeric value — table entries and lookups — is now
+  produced by the deterministic integer Q16.16 sources in `mind/luts/`.
+- New single-arg pure-MIND wrappers, called by bare name (the
+  MIND↔C link convention used by `__mind_alloc` and the score-path
+  shim — no `extern fn` needed):
+  - `tanh_q16(x)` in `mind/luts/tanh_q16.mind` — 4096-entry table lookup.
+  - `softmax_q16(buf, n_rows, row_len)` in `mind/luts/softmax_q16.mind` —
+    row-loops the existing 5-stage pinned `softmax_q16_run` (exp + recip
+    LUTs); the pinned integer-D normalisation is unchanged (it is a
+    cross-arch-deterministic design, not an accuracy target).
+  - `rsqrt_q16(x)` in `mind/luts/rsqrt_q16.mind` (new) — composes the
+    `sqrt_q16.mind` 2048-entry rsqrt table seed with **one Newton step**
+    (`y1 = y0·(3 − x·y0²)/2`, pure integer Q16.16). Non-positive input
+    returns the `Q16_MAX` sentinel. Max error over the representable
+    domain `x∈[0.125, 256.0]`: **≤ 1.12e-4 abs / ≤ 1.74e-3 rel**.
+  - The wrappers are emitted by `tools/gen_luts.py` (the LUT source of
+    truth) so a regenerate keeps them; `rsqrt_q16.mind` is the only
+    hand-written LUT file.
+- Latent compiler-interaction bug surfaced + closed: `tools/gen_luts.py`
+  emitted bare negative integer literals (`let domain_lo: i64 = -524288;`
+  and `__mind_store_i64(buf+0, -65536)`) which the current mindc
+  front-end lowers to the constant `0` — this silently zeroed the tanh
+  table interior and the LUT domain offsets. It was masked by the C shim
+  (the pure MIND lookup path was never exercised end-to-end). The
+  generator now emits the subtraction form `(0 - N)` for all negative
+  constants and table entries (lowers to a correct `arith.subi`,
+  bit-identical, diff-stable for non-negatives); all 5 LUT sources
+  regenerated. Post-fix: `tanh_q16` max abs error ≤ 3.74e-3 vs libm over
+  `|x|≤8` (≈2e-5 in the GELU interior).
+- New gate `tests/python/test_lut_bit_identity.py`: for tanh / rsqrt /
+  softmax — determinism across calls, idempotent handle-cache (a freshly
+  built table reproduces lookups bit-for-bit), accuracy bounds, and a
+  pinned cross-arch SHA-256 reference per wrapper (task #57, same pattern
+  as `test_blas_byte_identity.py`). x86_64 references:
+  - tanh   `190e488bd5a0f67fcc7a2ca60df688d98b53fe1643b9cbe485e8859740bf4bb8`
+  - rsqrt  `c7e2791a73ad234187c00f0d2a918c86826ea509346c37b448ade18379b06a2d`
+  - softmax `e39ad4ec913ae5b0a77add0c0d1ec1526f00f4c729fc3c8fbc4b04525a2621ae`
+  (the integer-only path cannot drift across substrate / compiler / SIMD).
+- `tools/build_encoder_cdylib.py`: drops `lut_shims.c`, compiles
+  `lut_cache.c`, adds `mind/luts/rsqrt_q16.mind` to the source list. The
+  rebuilt cdylib resolves `tanh_q16` / `rsqrt_q16` / `softmax_q16` as
+  pure-MIND `T` symbols; libm `tanh`/`exp`/`sqrt` are no longer
+  referenced by the LUT path. Full suite green (356 passed); the
+  score-path byte-identity + p95<2ms gates are unchanged.
+- A1.5 verdict: encode-path LUT bit-identity prerequisite **CLOSED**.
+  The remaining encode-path blocker is unchanged (the end-to-end
+  `mn_encoder_encode` measurement still depends on the Phase 6.2
+  quantizer artifact, below).
+
 ### Phase 6.2 — offline Q16.16 quantizer
 
 - `tools/quantize_phase1_to_q16.py` (new): offline FP32 → Q16.16

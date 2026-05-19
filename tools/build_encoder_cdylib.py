@@ -34,6 +34,7 @@ def _source_list(nerve_root: Path) -> list[Path]:
         nerve_root / "mind/luts/exp_q16.mind",
         nerve_root / "mind/luts/recip_q32.mind",
         nerve_root / "mind/luts/sqrt_q16.mind",
+        nerve_root / "mind/luts/rsqrt_q16.mind",
         nerve_root / "mind/luts/tanh_q16.mind",
         nerve_root / "mind/luts/softmax_q16.mind",
         nerve_root / "mind/kernels/matmul_q16.mind",
@@ -243,21 +244,25 @@ def _compile_runtime_support(
         raise RuntimeError(f"Compiling runtime support failed:\n{result.stderr}")
     temp_objects.append(tmp_o.name)
 
-    # A1.5 LUT shims: tanh_q16, rsqrt_q16, softmax_q16 C implementations
-    lut_shim = nerve_root / "mind/runtime/lut_shims.c"
-    if lut_shim.exists():
-        tmp_shim_o = tempfile.NamedTemporaryFile(suffix=".o", delete=False)
-        tmp_shim_o.close()
+    # A1.5 LUT handle cache: lazily builds the pure-MIND tanh / rsqrt /
+    # exp / recip tables once and caches the i64 handles. NO arithmetic in
+    # C — every numeric value comes from the pure-MIND luts/*.mind sources
+    # (Q16.16 cross-arch bit-identical, task #57). Supersedes the former
+    # libm lut_shims.c (deleted).
+    lut_cache = nerve_root / "mind/runtime/lut_cache.c"
+    if lut_cache.exists():
+        tmp_cache_o = tempfile.NamedTemporaryFile(suffix=".o", delete=False)
+        tmp_cache_o.close()
         result = subprocess.run(
-            [clang, "-c", "-fPIC", "-O2", str(lut_shim), "-o", tmp_shim_o.name, "-lm"],
+            [clang, "-c", "-fPIC", "-O2", str(lut_cache), "-o", tmp_cache_o.name],
             capture_output=True,
             text=True,
             timeout=60,
         )
         if result.returncode != 0:
-            raise RuntimeError(f"Compiling lut_shims.c failed:\n{result.stderr}")
-        temp_objects.append(tmp_shim_o.name)
-        print("[build] Compiled A1.5 LUT shims (tanh_q16, rsqrt_q16, softmax_q16)")
+            raise RuntimeError(f"Compiling lut_cache.c failed:\n{result.stderr}")
+        temp_objects.append(tmp_cache_o.name)
+        print("[build] Compiled A1.5 LUT handle cache (pure-MIND tanh/rsqrt/softmax)")
 
     # A1.5 BLAS shim: i64-layout Q16.16 dot + score matmul with AVX2
     # dispatcher. Closes the 40x gap on the score path.

@@ -64,7 +64,7 @@ pub fn softmax_scale_step(recip_h: i64, buf: i64, n: i64, idx: i64, d_int: i64) 
     // yi (Q16.16) * r (Q32.32) -> shift right 32 to get Q16.16 result.
     let prod: i64 = (yi * r) >> 32;
     let q16_max: i64 = 2147483647;
-    let q16_min: i64 = -2147483648;
+    let q16_min: i64 = 0 - 2147483648;
     let clamped: i64 = if prod > q16_max {
         q16_max
     } else {
@@ -98,4 +98,39 @@ pub fn softmax_q16_run(exp_h: i64, recip_h: i64, buf: i64, n: i64) -> i64 {
 
     // Stage 5: scale each y_i by 1/D.
     softmax_scale_step(recip_h, buf, n, 0, d_int)
+}
+
+// ── A1.5 multi-row convenience wrapper (pure MIND) ───────────────────────────
+//
+// softmax_q16(buf, n_rows, row_len) -> 0
+//
+// Replaces the former libm/exp C shim. Applies the 5-stage pinned Q16.16
+// softmax pipeline in-place to `n_rows` contiguous rows of `row_len`
+// Q16.16 elements each (flat layout: row r starts at buf + r*row_len*8).
+//
+// Every stage is pure integer Q16.16 (exp / recip via the existing LUTs);
+// no float anywhere — cross-arch bit-identical (task #57). The 32 KiB exp
+// table and 2 KiB recip table are each built once by their pure-MIND
+// *_init() and cached on the C side (mind/runtime/lut_cache.c) so callers
+// do not rebuild them per call — matching the prior shim's implicit
+// caching contract so kernel call sites (encode.mind) need no change.
+//
+// __mind_nerve_lut_exp_h / __mind_nerve_lut_recip_h are resolved at .so
+// link time (same MIND<->C bare-name convention as __mind_alloc).
+
+pub fn softmax_q16_rows(exp_h: i64, recip_h: i64,
+                        buf: i64, n_rows: i64, row_len: i64, r: i64) -> i64 {
+    if r >= n_rows { return 0; }
+    let row: i64 = buf + r * row_len * 8;
+    softmax_q16_run(exp_h, recip_h, row, row_len);
+    softmax_q16_rows(exp_h, recip_h, buf, n_rows, row_len, r + 1)
+}
+
+pub fn softmax_q16(buf: i64, n_rows: i64, row_len: i64) -> i64 {
+    if buf == 0 { return 0; }
+    if n_rows <= 0 { return 0; }
+    if row_len <= 0 { return 0; }
+    let exp_h: i64   = __mind_nerve_lut_exp_h();
+    let recip_h: i64 = __mind_nerve_lut_recip_h();
+    softmax_q16_rows(exp_h, recip_h, buf, n_rows, row_len, 0)
 }

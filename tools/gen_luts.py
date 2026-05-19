@@ -148,11 +148,23 @@ def gen_rsqrt_q16() -> list[int]:
 
 # ── MIND source emitters ───────────────────────────────────────────────────────
 
+def q16(val: int) -> str:
+    """Render an integer as a mindc-safe i64 literal expression.
+
+    A bare negative literal (``-65536``) is mis-lowered to the constant 0
+    by the current mindc front-end (negative-literal-in-initializer and
+    negative-literal-as-call-arg). The subtraction form ``(0 - 65536)``
+    lowers to a correct ``arith.subi`` and is bit-identical. Non-negative
+    values are emitted verbatim so the generated tables stay diff-stable.
+    """
+    return str(val) if val >= 0 else f"(0 - {-val})"
+
+
 def emit_store_seq(table: list[int], buf_var: str, indent: str = "    ") -> str:
     """Emit a sequence of __mind_store_i64 calls to populate a buffer."""
     lines = []
     for i, val in enumerate(table):
-        lines.append(f"{indent}__mind_store_i64({buf_var} + {i * 8}, {val});")
+        lines.append(f"{indent}__mind_store_i64({buf_var} + {i * 8}, {q16(val)});")
     return "\n".join(lines)
 
 def write_recip_q32(table: list[int]) -> None:
@@ -237,7 +249,7 @@ def write_exp_q16(table: list[int]) -> None:
     # Offset second half by half*8
     stores_hi_lines = []
     for i, val in enumerate(table[half:]):
-        stores_hi_lines.append(f"    __mind_store_i64(buf + {(half + i) * 8}, {val});")
+        stores_hi_lines.append(f"    __mind_store_i64(buf + {(half + i) * 8}, {q16(val)});")
     stores_hi = "\n".join(stores_hi_lines)
 
     src = emit_header("exp_q16.mind") + f"""\
@@ -271,7 +283,7 @@ pub fn exp_q16_init() -> i64 {{
 
 pub fn exp_q16_lookup(handle: i64, x: i64) -> i64 {{
     let q16_one: i64 = 65536;
-    let domain_lo: i64 = -1048576;
+    let domain_lo: i64 = 0 - 1048576;
     let stride: i64 = 256;
     if x >= 0 {{ return q16_one; }}
     if x <= domain_lo {{ return __mind_load_i64(handle); }}
@@ -298,7 +310,7 @@ def write_tanh_q16(table: list[int]) -> None:
     stores_lo = emit_store_seq(table[:2048], "buf")
     stores_hi_lines = []
     for i, val in enumerate(table[2048:]):
-        stores_hi_lines.append(f"    __mind_store_i64(buf + {(2048 + i) * 8}, {val});")
+        stores_hi_lines.append(f"    __mind_store_i64(buf + {(2048 + i) * 8}, {q16(val)});")
     stores_hi = "\n".join(stores_hi_lines)
 
     src = emit_header("tanh_q16.mind") + f"""\
@@ -322,6 +334,7 @@ def write_tanh_q16(table: list[int]) -> None:
 // Public surface (i64 ABI):
 //   tanh_q16_init()  -> i64
 //   tanh_q16_lookup(handle: i64, x: i64) -> i64
+//   tanh_q16(x: i64) -> i64    A1.5 single-arg wrapper (cached handle)
 
 pub fn tanh_q16_init() -> i64 {{
     let buf: i64 = __mind_alloc({n * 8});
@@ -331,7 +344,7 @@ pub fn tanh_q16_init() -> i64 {{
 }}
 
 pub fn tanh_q16_lookup(handle: i64, x: i64) -> i64 {{
-    let domain_lo: i64 = -524288;
+    let domain_lo: i64 = 0 - 524288;
     let domain_hi: i64 = 524288;
     let stride: i64 = 256;
     if x <= domain_lo {{ return __mind_load_i64(handle); }}
@@ -352,6 +365,21 @@ pub fn tanh_q16_lookup(handle: i64, x: i64) -> i64 {{
 pub fn tanh_q16_free(handle: i64) -> i64 {{
     __mind_free(handle);
     0
+}}
+
+// ── A1.5 single-arg convenience wrapper (pure MIND) ──────────────────────────
+//
+// tanh_q16(x_q16) -> y_q16
+//
+// Replaces the former libm C shim. The 4096-entry table is built once by
+// the pure-MIND tanh_q16_init() and the i64 handle is cached on the C side
+// (mind/runtime/lut_cache.c) so callers do not rebuild it per call. The
+// table values AND this lookup are pure integer Q16.16 — bit-identical
+// across substrates (task #57). __mind_nerve_lut_tanh_h is resolved at .so
+// link time (same MIND<->C bare-name convention as __mind_alloc).
+pub fn tanh_q16(x: i64) -> i64 {{
+    let h: i64 = __mind_nerve_lut_tanh_h();
+    tanh_q16_lookup(h, x)
 }}
 """
     path = os.path.join(LUTS_DIR, "tanh_q16.mind")
@@ -422,7 +450,7 @@ pub fn softmax_scale_step(recip_h: i64, buf: i64, n: i64, idx: i64, d_int: i64) 
     // yi (Q16.16) * r (Q32.32) -> shift right 32 to get Q16.16 result.
     let prod: i64 = (yi * r) >> 32;
     let q16_max: i64 = 2147483647;
-    let q16_min: i64 = -2147483648;
+    let q16_min: i64 = 0 - 2147483648;
     let clamped: i64 = if prod > q16_max {
         q16_max
     } else {
@@ -457,6 +485,41 @@ pub fn softmax_q16_run(exp_h: i64, recip_h: i64, buf: i64, n: i64) -> i64 {
     // Stage 5: scale each y_i by 1/D.
     softmax_scale_step(recip_h, buf, n, 0, d_int)
 }
+
+// ── A1.5 multi-row convenience wrapper (pure MIND) ───────────────────────────
+//
+// softmax_q16(buf, n_rows, row_len) -> 0
+//
+// Replaces the former libm/exp C shim. Applies the 5-stage pinned Q16.16
+// softmax pipeline in-place to `n_rows` contiguous rows of `row_len`
+// Q16.16 elements each (flat layout: row r starts at buf + r*row_len*8).
+//
+// Every stage is pure integer Q16.16 (exp / recip via the existing LUTs);
+// no float anywhere — cross-arch bit-identical (task #57). The 32 KiB exp
+// table and 2 KiB recip table are each built once by their pure-MIND
+// *_init() and cached on the C side (mind/runtime/lut_cache.c) so callers
+// do not rebuild them per call — matching the prior shim's implicit
+// caching contract so kernel call sites (encode.mind) need no change.
+//
+// __mind_nerve_lut_exp_h / __mind_nerve_lut_recip_h are resolved at .so
+// link time (same MIND<->C bare-name convention as __mind_alloc).
+
+pub fn softmax_q16_rows(exp_h: i64, recip_h: i64,
+                        buf: i64, n_rows: i64, row_len: i64, r: i64) -> i64 {
+    if r >= n_rows { return 0; }
+    let row: i64 = buf + r * row_len * 8;
+    softmax_q16_run(exp_h, recip_h, row, row_len);
+    softmax_q16_rows(exp_h, recip_h, buf, n_rows, row_len, r + 1)
+}
+
+pub fn softmax_q16(buf: i64, n_rows: i64, row_len: i64) -> i64 {
+    if buf == 0 { return 0; }
+    if n_rows <= 0 { return 0; }
+    if row_len <= 0 { return 0; }
+    let exp_h: i64   = __mind_nerve_lut_exp_h();
+    let recip_h: i64 = __mind_nerve_lut_recip_h();
+    softmax_q16_rows(exp_h, recip_h, buf, n_rows, row_len, 0)
+}
 """
     path = os.path.join(LUTS_DIR, "softmax_q16.mind")
     with open(path, "w") as f:
@@ -471,13 +534,13 @@ def write_sqrt_q16(sqrt_table: list[int], rsqrt_table: list[int]) -> None:
     stores_sqrt_lo = emit_store_seq(sqrt_table[:1024], "sqrt_buf")
     stores_sqrt_hi_lines = []
     for i, val in enumerate(sqrt_table[1024:]):
-        stores_sqrt_hi_lines.append(f"    __mind_store_i64(sqrt_buf + {(1024 + i) * 8}, {val});")
+        stores_sqrt_hi_lines.append(f"    __mind_store_i64(sqrt_buf + {(1024 + i) * 8}, {q16(val)});")
     stores_sqrt_hi = "\n".join(stores_sqrt_hi_lines)
 
     stores_rsqrt_lo = emit_store_seq(rsqrt_table[:1024], "rsqrt_buf")
     stores_rsqrt_hi_lines = []
     for i, val in enumerate(rsqrt_table[1024:]):
-        stores_rsqrt_hi_lines.append(f"    __mind_store_i64(rsqrt_buf + {(1024 + i) * 8}, {val});")
+        stores_rsqrt_hi_lines.append(f"    __mind_store_i64(rsqrt_buf + {(1024 + i) * 8}, {q16(val)});")
     stores_rsqrt_hi = "\n".join(stores_rsqrt_hi_lines)
 
     src = emit_header("sqrt_q16.mind") + f"""\

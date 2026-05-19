@@ -4128,7 +4128,7 @@ pub fn exp_q16_init() -> i64 {
 
 pub fn exp_q16_lookup(handle: i64, x: i64) -> i64 {
     let q16_one: i64 = 65536;
-    let domain_lo: i64 = -1048576;
+    let domain_lo: i64 = 0 - 1048576;
     let stride: i64 = 256;
     if x >= 0 { return q16_one; }
     if x <= domain_lo { return __mind_load_i64(handle); }

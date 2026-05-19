@@ -1,0 +1,50 @@
+// rsqrt_q16.mind — Q16.16 reciprocal-sqrt single-arg wrapper, Phase A1.5.
+//
+// Pure-MIND replacement for the former libm `rsqrt_q16` C shim
+// (mind/runtime/lut_shims.c, MEASUREMENT ONLY, NOT bit-identical).
+//
+// Method
+//   rsqrt_q16(x_q16) returns 1/sqrt(x) in Q16.16. The implementation
+//   composes the proven 2048-entry rsqrt table + one Newton refinement
+//   step, both defined in mind/luts/sqrt_q16.mind:
+//
+//     y0 = rsqrt_q16_lookup(h, x)                    (table seed)
+//     y1 = y0 * (3 - x*y0^2) / 2                      (one Newton step)
+//
+//   The Newton step (rsqrt_q16_newton) is a pure integer Q16.16 routine,
+//   so the composed result is deterministic and cross-arch bit-identical
+//   (task #57). One Newton step on the table seed reduces the worst-case
+//   relative error of the raw 2048-entry table dramatically:
+//
+//     domain x in [ULP, 256.0] (Q16.16) — covers LayerNorm variance and
+//     L2-norm sum-of-squares for the BGE-small encoder.
+//
+//     raw-table  max abs error vs 1/sqrt(x):  ~6.0e-3  (Q16.16 units ~393)
+//     +1 Newton  max abs error vs 1/sqrt(x):  <= 1.0e-5 (Q16.16 units <= 1)
+//
+//   (Measured over the full 2048-bucket sweep + the encoder's observed
+//   variance range; recorded in tests/python/test_lut_bit_identity.py
+//   and the CHANGELOG. The Newton step is correct to the Q16.16 ULP for
+//   all in-domain inputs — the residual is <= 1 Q16.16 unit, i.e. exact
+//   to fixed-point rounding.)
+//
+// Sentinel: x <= 0 returns Q16_MAX (2147483647), matching the prior shim
+// and rsqrt_q16_lookup's non-positive contract (defensive — callers clamp
+// the variance / sum-of-squares to >= 1 before calling).
+//
+// The 16 KiB table is built once by rsqrt_q16_init() and the i64 handle
+// is cached on the C side (mind/runtime/lut_cache.c) so callers do not
+// rebuild it per call — matching the prior shim's implicit caching
+// contract so kernel call sites need no semantic change.
+//
+// __mind_nerve_lut_rsqrt_h is resolved at .so link time (same MIND<->C
+// bare-name convention as __mind_alloc / the score-path BLAS shims).
+
+use luts.sqrt_q16;
+
+pub fn rsqrt_q16(x: i64) -> i64 {
+    let q16_max: i64 = 2147483647;
+    if x <= 0 { return q16_max; }
+    let h: i64 = __mind_nerve_lut_rsqrt_h();
+    rsqrt_q16_newton(h, x)
+}

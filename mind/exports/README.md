@@ -138,7 +138,7 @@ MIND_CHECKOUT=/home/n/mind ./tools/build_native_encoder.sh
 ```
 
 The output `.so` is staged to `python/mind_nerve/_native/libmind_nerve_encoder.so`
-alongside the FORTRESS-protected `libmindnerve.so`. Both are bundled into the
+alongside the native runtime `libmindnerve.so`. Both are bundled into the
 wheel via `pyproject.toml` package-data.
 
 ## Status (A1.3)

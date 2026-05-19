@@ -118,9 +118,9 @@ None — the proposal respects all six non-negotiables:
 
 ## Validation gates run
 
-- arch-mind score before / after: pending (this RFC is a proposal,
+- structural-audit score before / after: pending (this RFC is a proposal,
   not yet implemented).
-- skill-improver mean before / after: pending.
+- lint score before / after: pending.
 - Latency / accuracy actual numbers: pending implementation.
 
 ## Decision
@@ -287,9 +287,9 @@ None — the proposal respects all six non-negotiables:
 
 ## Validation gates run
 
-- arch-mind score before / after: pending (this RFC is a proposal,
+- structural-audit score before / after: pending (this RFC is a proposal,
   not yet implemented).
-- skill-improver mean before / after: pending.
+- lint score before / after: pending.
 - Latency / accuracy actual numbers: pending implementation against a
   representative agent-skill catalog with non-trivial frequency skew.
 
@@ -479,9 +479,9 @@ None — the proposal respects all six non-negotiables:
 
 ## Validation gates run
 
-- arch-mind score before / after: pending (this RFC is a proposal, not
+- structural-audit score before / after: pending (this RFC is a proposal, not
   yet implemented).
-- skill-improver mean before / after: pending.
+- lint score before / after: pending.
 - Latency / accuracy actual numbers: pending implementation against the
   STARGA agent-CLI dev-set workload with measured length distribution.
 
@@ -692,9 +692,9 @@ None — the proposal respects all six non-negotiables:
 
 ## Validation gates run
 
-- arch-mind score before / after: pending (this RFC is a proposal,
+- structural-audit score before / after: pending (this RFC is a proposal,
   not yet implemented).
-- skill-improver mean before / after: pending.
+- lint score before / after: pending.
 - Latency / accuracy actual numbers: pending implementation against
   the held-out STARGA agent-skill catalog with measured long-tail
   frequency distribution.
@@ -903,9 +903,9 @@ None — the proposal respects all six non-negotiables:
 
 ## Validation gates run
 
-- arch-mind score before / after: pending (this RFC is a proposal,
+- structural-audit score before / after: pending (this RFC is a proposal,
   not yet implemented).
-- skill-improver mean before / after: pending.
+- lint score before / after: pending.
 - Latency / accuracy actual numbers: pending implementation against
   the STARGA agent-skill catalog with a saliency-calibrated bitmask.
 
@@ -1145,9 +1145,9 @@ None — the proposal respects all six non-negotiables:
 
 ## Validation gates run
 
-- arch-mind score before / after: pending (this RFC is a proposal,
+- structural-audit score before / after: pending (this RFC is a proposal,
   not yet implemented).
-- skill-improver mean before / after: pending.
+- lint score before / after: pending.
 - Latency / accuracy actual numbers: pending implementation against
   the STARGA agent-skill dev set with a catalog-builder-calibrated
   `MARGIN_FLOOR`.
@@ -1358,9 +1358,9 @@ None — the proposal respects all six non-negotiables:
 
 ## Validation gates run
 
-- arch-mind score before / after: pending (this RFC is a proposal,
+- structural-audit score before / after: pending (this RFC is a proposal,
   not yet implemented).
-- skill-improver mean before / after: pending.
+- lint score before / after: pending.
 - Latency / accuracy actual numbers: pending implementation against
   the STARGA agent-CLI dev set with the length distribution measured
   alongside RFC-003's stride calibration.
@@ -1629,9 +1629,9 @@ None — the proposal respects all six non-negotiables:
 
 ## Validation gates run
 
-- arch-mind score before / after: pending (this RFC is a proposal,
+- structural-audit score before / after: pending (this RFC is a proposal,
   not yet implemented).
-- skill-improver mean before / after: pending.
+- lint score before / after: pending.
 - Latency / accuracy actual numbers: pending implementation against
   the STARGA agent-skill catalog with an MRL-trained reference
   checkpoint.
@@ -1875,9 +1875,9 @@ None — the proposal respects all six non-negotiables:
 
 ## Validation gates run
 
-- arch-mind score before / after: pending (this RFC is a proposal,
+- structural-audit score before / after: pending (this RFC is a proposal,
   not yet implemented).
-- skill-improver mean before / after: pending.
+- lint score before / after: pending.
 - Latency / accuracy actual numbers: pending implementation against
   the STARGA agent-skill catalog with a reference checkpoint
   trained with the learned `pool_q_latent` parameter.
@@ -2169,9 +2169,9 @@ None — the proposal respects all six non-negotiables:
 
 ## Validation gates run
 
-- arch-mind score before / after: pending (this RFC is a proposal,
+- structural-audit score before / after: pending (this RFC is a proposal,
   not yet implemented).
-- skill-improver mean before / after: pending.
+- lint score before / after: pending.
 - Latency / accuracy actual numbers: pending implementation against
   the STARGA agent-skill catalog with a reference checkpoint trained
   against the cosine-similarity contrastive objective.
@@ -2516,9 +2516,9 @@ None — the proposal respects all six non-negotiables:
 
 ## Validation gates run
 
-- arch-mind score before / after: pending (this RFC is a proposal,
+- structural-audit score before / after: pending (this RFC is a proposal,
   not yet implemented).
-- skill-improver mean before / after: pending.
+- lint score before / after: pending.
 - Latency / accuracy actual numbers: pending implementation against
   the STARGA agent-CLI dev set with a reference checkpoint trained
   with the ALiBi-biased attention mask active during pre-training.
@@ -2863,9 +2863,9 @@ None — the proposal respects all six non-negotiables:
 
 ## Validation gates run
 
-- arch-mind score before / after: pending (this RFC is a proposal,
+- structural-audit score before / after: pending (this RFC is a proposal,
   not yet implemented).
-- skill-improver mean before / after: pending.
+- lint score before / after: pending.
 - Latency / accuracy actual numbers: pending implementation against
   the STARGA agent-CLI dev set with a reference checkpoint trained
   using the asymmetric `"query: "` / `"passage: "` prefix recipe.
@@ -3151,9 +3151,9 @@ None — the proposal respects all six non-negotiables:
 
 ## Validation gates run
 
-- arch-mind score before / after: pending (this RFC is a proposal,
+- structural-audit score before / after: pending (this RFC is a proposal,
   not yet implemented).
-- skill-improver mean before / after: pending.
+- lint score before / after: pending.
 - Latency / accuracy actual numbers: pending implementation
   against the STARGA agent-skill catalog with a reference
   checkpoint trained with RMSNorm in place of LayerNorm.
@@ -3481,9 +3481,9 @@ None — the proposal respects all six non-negotiables:
 
 ## Validation gates run
 
-- arch-mind score before / after: pending (this RFC is a
+- structural-audit score before / after: pending (this RFC is a
   proposal, not yet implemented).
-- skill-improver mean before / after: pending.
+- lint score before / after: pending.
 - Latency / accuracy actual numbers: pending implementation
   against the STARGA agent-skill catalog with a reference
   checkpoint trained against r=8 multi-query pooling and the
@@ -3787,9 +3787,9 @@ None — the proposal respects all six non-negotiables:
 
 ## Validation gates run
 
-- arch-mind score before / after: pending (this RFC is a proposal,
+- structural-audit score before / after: pending (this RFC is a proposal,
   not yet implemented).
-- skill-improver mean before / after: pending.
+- lint score before / after: pending.
 - Latency / accuracy actual numbers: pending implementation against
   the STARGA agent-skill catalog with a reference checkpoint
   retrained using positive-aware hard negative mining at α = 0.90
@@ -4116,9 +4116,9 @@ None — the proposal respects all six non-negotiables:
 
 ## Validation gates run
 
-- arch-mind score before / after: pending (this RFC is a proposal,
+- structural-audit score before / after: pending (this RFC is a proposal,
   not yet implemented).
-- skill-improver mean before / after: pending.
+- lint score before / after: pending.
 - Latency / accuracy actual numbers: pending implementation against
   the STARGA agent-skill catalog with a reference checkpoint
   retrained using bge-reranker-large as the listwise KL teacher at
@@ -4518,9 +4518,9 @@ None — the proposal respects all six non-negotiables:
 
 ## Validation gates run
 
-- arch-mind score before / after: pending (this RFC is a proposal,
+- structural-audit score before / after: pending (this RFC is a proposal,
   not yet implemented).
-- skill-improver mean before / after: pending.
+- lint score before / after: pending.
 - Latency / accuracy actual numbers: pending implementation against
   the STARGA agent-skill catalog with a reference catalog rebuilt
   using gpt-4o-mini (or Llama-3.1-8B-Instruct) for query generation
@@ -4911,9 +4911,9 @@ None — the proposal respects all six non-negotiables:
 
 ## Validation gates run
 
-- arch-mind score before / after: pending (this RFC is a proposal,
+- structural-audit score before / after: pending (this RFC is a proposal,
   not yet implemented).
-- skill-improver mean before / after: pending.
+- lint score before / after: pending.
 - Latency / accuracy actual numbers: pending implementation against
   the STARGA agent-skill catalog with a reference checkpoint
   retrained using the combined RFC-015 + RFC-016 + RFC-017 +
@@ -5316,9 +5316,9 @@ None — the proposal respects all six non-negotiables:
 
 ## Validation gates run
 
-- arch-mind score before / after: pending (this RFC is a proposal,
+- structural-audit score before / after: pending (this RFC is a proposal,
   not yet implemented).
-- skill-improver mean before / after: pending.
+- lint score before / after: pending.
 - Latency / accuracy actual numbers: pending implementation against
   the STARGA agent-skill catalog with a reference checkpoint
   retrained using the combined RFC-015 + RFC-016 + RFC-017 + RFC-018
@@ -5742,9 +5742,9 @@ None — the proposal respects all six non-negotiables:
 
 ## Validation gates run
 
-- arch-mind score before / after: pending (this RFC is a
+- structural-audit score before / after: pending (this RFC is a
   proposal, not yet implemented).
-- skill-improver mean before / after: pending.
+- lint score before / after: pending.
 - Latency / accuracy actual numbers: pending implementation
   against the STARGA agent-skill catalog with a reference
   checkpoint retrained using the combined RFC-015 + RFC-016 +
@@ -6199,9 +6199,9 @@ None — the proposal respects all six non-negotiables:
 
 ## Validation gates run
 
-- arch-mind score before / after: pending (this RFC is a
+- structural-audit score before / after: pending (this RFC is a
   proposal, not yet implemented).
-- skill-improver mean before / after: pending.
+- lint score before / after: pending.
 - Latency / accuracy actual numbers: pending implementation
   against the STARGA agent-skill catalog with a reference
   checkpoint trained using the full two-stage pipeline at the
@@ -6652,9 +6652,9 @@ None — the proposal respects all six non-negotiables:
 
 ## Validation gates run
 
-- arch-mind score before / after: pending (this RFC is a proposal,
+- structural-audit score before / after: pending (this RFC is a proposal,
   not yet implemented).
-- skill-improver mean before / after: pending.
+- lint score before / after: pending.
 - Latency / accuracy actual numbers: pending implementation against
   the STARGA agent-skill catalog with a reference checkpoint
   pretrained using the two-phase Stage-1 pipeline (RetroMAE Phase A
@@ -7193,9 +7193,9 @@ None — the proposal respects all six non-negotiables:
 
 ## Validation gates run
 
-- arch-mind score before / after: pending (this RFC is a
+- structural-audit score before / after: pending (this RFC is a
   proposal, not yet implemented).
-- skill-improver mean before / after: pending.
+- lint score before / after: pending.
 - Latency / accuracy actual numbers: pending implementation
   against the STARGA agent-skill catalog with a reference
   checkpoint retrained using the combined RFC-015 + RFC-016 +
@@ -7645,9 +7645,9 @@ None — the proposal respects all six non-negotiables:
 
 ## Validation gates run
 
-- arch-mind score before / after: pending (this RFC is a
+- structural-audit score before / after: pending (this RFC is a
   proposal, not yet implemented).
-- skill-improver mean before / after: pending.
+- lint score before / after: pending.
 - Latency / accuracy actual numbers: pending implementation
   against the STARGA agent-skill catalog with a reference
   checkpoint retrained using the combined RFC-015 + RFC-016 +
@@ -8202,9 +8202,9 @@ None — the proposal respects all six non-negotiables:
 
 ## Validation gates run
 
-- arch-mind score before / after: pending (this RFC is a
+- structural-audit score before / after: pending (this RFC is a
   proposal, not yet implemented).
-- skill-improver mean before / after: pending.
+- lint score before / after: pending.
 - Latency / accuracy actual numbers: pending implementation
   against the STARGA agent-CLI dev set with a reference
   checkpoint trained using the per-task instruction recipe and
@@ -8648,9 +8648,9 @@ None — the proposal respects all six non-negotiables:
 
 ## Validation gates run
 
-- arch-mind score before / after: pending (this RFC is a proposal,
+- structural-audit score before / after: pending (this RFC is a proposal,
   not yet implemented).
-- skill-improver mean before / after: pending.
+- lint score before / after: pending.
 - Latency / accuracy actual numbers: pending implementation
   against the STARGA agent-skill catalog with a reference
   checkpoint trained using the combined RFC-001 + RFC-015 +
@@ -9112,9 +9112,9 @@ None — the proposal respects all six non-negotiables:
 
 ## Validation gates run
 
-- arch-mind score before / after: pending (this RFC is a proposal,
+- structural-audit score before / after: pending (this RFC is a proposal,
   not yet implemented).
-- skill-improver mean before / after: pending.
+- lint score before / after: pending.
 - Latency / accuracy actual numbers: pending implementation against
   the STARGA agent-skill catalog with a reference checkpoint trained
   using the combined RFC-001 + RFC-015 + RFC-016 + RFC-017 + RFC-018
@@ -9548,9 +9548,9 @@ None — the proposal respects all six non-negotiables:
 
 ## Validation gates run
 
-- arch-mind score before / after: pending (this RFC is a proposal,
+- structural-audit score before / after: pending (this RFC is a proposal,
   not yet implemented).
-- skill-improver mean before / after: pending.
+- lint score before / after: pending.
 - Latency / accuracy actual numbers: pending implementation against
   the STARGA agent-skill catalog with a reference checkpoint
   trained using the combined RFC-001 + RFC-015 + RFC-016 + RFC-017
@@ -10007,9 +10007,9 @@ None — the proposal respects all six non-negotiables:
 
 ## Validation gates run
 
-- arch-mind score before / after: pending (this RFC is a
+- structural-audit score before / after: pending (this RFC is a
   proposal, not yet implemented).
-- skill-improver mean before / after: pending.
+- lint score before / after: pending.
 - Latency / accuracy actual numbers: pending implementation
   against the STARGA agent-skill catalog with a reference
   checkpoint trained using the combined RFC-001 + RFC-015 +
@@ -10504,9 +10504,9 @@ None — the proposal respects all six non-negotiables:
 
 ## Validation gates run
 
-- arch-mind score before / after: pending (this RFC is a
+- structural-audit score before / after: pending (this RFC is a
   proposal, not yet implemented).
-- skill-improver mean before / after: pending.
+- lint score before / after: pending.
 - Latency / accuracy actual numbers: pending implementation
   against the STARGA agent-skill catalog with a reference
   checkpoint trained using the combined RFC-001 + RFC-015 +
@@ -10998,9 +10998,9 @@ None — the proposal respects all six non-negotiables:
 
 ## Validation gates run
 
-- arch-mind score before / after: pending (this RFC is a
+- structural-audit score before / after: pending (this RFC is a
   proposal, not yet implemented).
-- skill-improver mean before / after: pending.
+- lint score before / after: pending.
 - Latency / accuracy actual numbers: pending implementation
   against the STARGA agent-skill catalog with a reference
   checkpoint trained using the combined RFC-001 + RFC-015 +
@@ -11497,9 +11497,9 @@ None — the proposal respects all six non-negotiables:
 
 ## Validation gates run
 
-- arch-mind score before / after: pending (this RFC is a
+- structural-audit score before / after: pending (this RFC is a
   proposal, not yet implemented).
-- skill-improver mean before / after: pending.
+- lint score before / after: pending.
 - Latency / accuracy actual numbers: pending implementation
   against the STARGA agent-skill catalog with a reference
   checkpoint trained using the combined RFC-001 + RFC-015 +
@@ -12049,9 +12049,9 @@ None — the proposal respects all six non-negotiables:
 
 ## Validation gates run
 
-- arch-mind score before / after: pending (this RFC is a proposal,
+- structural-audit score before / after: pending (this RFC is a proposal,
   not yet implemented).
-- skill-improver mean before / after: pending.
+- lint score before / after: pending.
 - Latency / accuracy actual numbers: pending implementation against
   the STARGA agent-skill catalog with a reference checkpoint
   trained using the combined RFC-001 + RFC-015 + RFC-016 + RFC-017
@@ -12597,9 +12597,9 @@ None — the proposal respects all six non-negotiables:
 
 ## Validation gates run
 
-- arch-mind score before / after: pending (this RFC is a
+- structural-audit score before / after: pending (this RFC is a
   proposal, not yet implemented).
-- skill-improver mean before / after: pending.
+- lint score before / after: pending.
 - Latency / accuracy actual numbers: pending implementation
   against the STARGA agent-skill catalog with a reference
   checkpoint trained using the combined RFC-001 + RFC-015
@@ -13019,9 +13019,9 @@ None — the proposal respects all six non-negotiables:
 
 ## Validation gates run
 
-- arch-mind score before / after: pending (this RFC is a proposal, not
+- structural-audit score before / after: pending (this RFC is a proposal, not
   yet implemented).
-- skill-improver mean before / after: pending.
+- lint score before / after: pending.
 - Latency / accuracy actual numbers: pending implementation against the
   STARGA agent-skill catalog with a reference checkpoint trained using
   the combined RFC-001 + RFC-015 through RFC-035 pipeline at

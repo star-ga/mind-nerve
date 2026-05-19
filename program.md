@@ -7,7 +7,7 @@ The DRAFT phase (iterations #1–#38) surfaced 34 RFCs in `RFCs/INDEX.md`.
 This file now drives the IMPLEMENT phase: each iteration picks one
 unprocessed RFC, lands the code change in `src/*.mind` (or marks it
 SKIPPED with a clear reason), adds or extends a test, and verifies
-that arch-mind + skill-improver gates don't regress.
+that structural-audit + lint gates gates don't regress.
 
 ## What mind-nerve is (recap)
 
@@ -100,8 +100,8 @@ those land sequentially.
       with the commit hash after the commit; for now the marker
       itself is what the metric counts).
    b. The `run_command` then runs:
-      - arch-mind structural scan (must not regress vs the anchor)
-      - skill-improver report (must not regress)
+      - structural-audit scan (must not regress vs the anchor)
+      - lint report (must not regress)
       - composite includes `+5000` per IMPLEMENTED RFC.
 
 ## Constraints any implementation MUST respect
@@ -147,7 +147,7 @@ mistral) rejects the iteration's diff, else 0. See "Consensus gate"
 below.
 
 Each shipped RFC is worth far more than any structural metric — that
-is the point. arch-mind + skill-improver act as guard rails (they
+is the point. structural-audit + lint gates act as guard rails (they
 gate against regressions) rather than as the main optimization
 target.
 

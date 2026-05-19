@@ -39,13 +39,13 @@ jobs:
         run: python -m build
       - name: twine check
         run: twine check dist/*
-      - name: Note about protected .so
+      - name: Note about native runtime
         run: |
-          # The FORTRESS-protected libmindnerve.so is NOT in the public repo —
-          # it's bundled into the wheel only at STARGA release time. CI here
-          # validates the OSS surface (Python code, tests, lint, build); the
-          # production wheel published to PyPI is built locally and re-uploaded.
-          echo "CI builds an OSS-surface wheel (no .so). Release wheels are built locally with the protected runtime bundled."
+          # The native runtime libmindnerve.so is not part of the public
+          # source tree. CI here validates the OSS surface (Python code,
+          # tests, lint, build); release wheels published to PyPI are
+          # built separately.
+          echo "CI builds an OSS-surface wheel. Release wheels are built separately."
       - uses: actions/upload-artifact@v4
         with:
           name: dist

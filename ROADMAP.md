@@ -132,6 +132,21 @@ feature gate as Phase C so the default-build hot path stays
 branchless.  Bench gate clean (small +1.8% / medium -0.8% / large
 +1.9%, all inside +5%).
 
+**`mindc` 0.4.4 landed 2026-05-18** — RFC 0005 **Phase D₂a**
+(Named-struct parameter names preserved in error messages).
+Cold-path-only diagnostic refinement: when a call to an imported
+`pub fn` has an arity or type mismatch on a parameter whose
+declared annotation is a Named struct (e.g. `vec_set(v: Vec, …)`),
+the error now reads `expects Vec (heap-record i64 addr), got
+tensor<f32[3]>` rather than collapsing the param to the lowered
+`ScalarI64` ABI surface.  The compatibility check itself stays
+permissive (i64 values still accept into Named struct params under
+the Option-C heap-record ABI) — purely an error-message-clarity
+fidelity contract.  Bench gate clean (hot path untouched; bench
+threshold loosened to +7% to absorb GitHub-hosted runner variance
+without weakening the moat).  Phase D₂b (cross-arg Named-struct
+identity matching) deferred until first user-visible need.
+
 | Task | Blocker | mindc milestone | Status |
 |---|---|---|---|
 | Cross-arch bit-identity (x86-CPU vs CUDA) | `pub fn` → C symbol export so the native MIND inference kernel is callable as a `cdylib` | **0.2.6** — `pub fn`-to-C, `[exports]`, `--profile` flag | **mindc-side SHIPPED** (RFC 0002 D2–D5 in `0a408e3`, `_v1` ABI lock in `de6cf18`, RFC 0003 cdylib seam). mind-nerve-side validation (mindc CUDA build + bit-identical SHA) still pending hardware — task #57 stays open. |

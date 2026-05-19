@@ -571,6 +571,55 @@ static int64_t mind_nerve_blas_gemm_dot_i32_avx2(
     for (; k < K; ++k) sum += (int64_t)a[k] * (int64_t)bt[k];
     return (int64_t)(int32_t)(sum >> 16);   // single final narrow
 }
+
+// MR=4 register microkernel: 4 contiguous A rows x 1 transposed-B row.
+// Each Bt[k] vector load is reused across all 4 A rows -> 4x fewer B
+// streams (the dominant Goto/BLIS reuse win). Byte-identical: out[r] is
+// the SAME contiguous K-dot as gemm_dot_i32_avx2(a_r, bt) — same products,
+// i64 sum (associative), single final >>16. a0..a3 are the 4 A rows.
+__attribute__((target("avx2,fma")))
+static void mind_nerve_blas_gemm_micro_mr4_avx2(
+    const int32_t *a0, const int32_t *a1,
+    const int32_t *a2, const int32_t *a3,
+    const int32_t *bt, int64_t K, int64_t out[4]
+) {
+    __m256i c0 = _mm256_setzero_si256();
+    __m256i c1 = _mm256_setzero_si256();
+    __m256i c2 = _mm256_setzero_si256();
+    __m256i c3 = _mm256_setzero_si256();
+    int64_t k = 0;
+    for (; k + 8 <= K; k += 8) {
+        __m256i vb  = _mm256_loadu_si256((const __m256i *)(bt + k));
+        __m256i vbo = _mm256_srli_epi64(vb, 32);
+        #define MIND_MR4_STEP(VA, CC) do {                              \
+            __m256i va  = _mm256_loadu_si256((const __m256i *)((VA)+k));\
+            __m256i vao = _mm256_srli_epi64(va, 32);                    \
+            CC = _mm256_add_epi64(CC, _mm256_mul_epi32(va,  vb));       \
+            CC = _mm256_add_epi64(CC, _mm256_mul_epi32(vao, vbo));      \
+        } while (0)
+        MIND_MR4_STEP(a0, c0);
+        MIND_MR4_STEP(a1, c1);
+        MIND_MR4_STEP(a2, c2);
+        MIND_MR4_STEP(a3, c3);
+        #undef MIND_MR4_STEP
+    }
+    int64_t b0[4], b1[4], b2[4], b3[4] __attribute__((aligned(32)));
+    _mm256_storeu_si256((__m256i *)b0, c0);
+    _mm256_storeu_si256((__m256i *)b1, c1);
+    _mm256_storeu_si256((__m256i *)b2, c2);
+    _mm256_storeu_si256((__m256i *)b3, c3);
+    int64_t s0 = b0[0]+b0[1]+b0[2]+b0[3];
+    int64_t s1 = b1[0]+b1[1]+b1[2]+b1[3];
+    int64_t s2 = b2[0]+b2[1]+b2[2]+b2[3];
+    int64_t s3 = b3[0]+b3[1]+b3[2]+b3[3];
+    for (; k < K; ++k) {
+        int64_t bk = (int64_t)bt[k];
+        s0 += (int64_t)a0[k]*bk; s1 += (int64_t)a1[k]*bk;
+        s2 += (int64_t)a2[k]*bk; s3 += (int64_t)a3[k]*bk;
+    }
+    out[0]=(int64_t)(int32_t)(s0>>16); out[1]=(int64_t)(int32_t)(s1>>16);
+    out[2]=(int64_t)(int32_t)(s2>>16); out[3]=(int64_t)(int32_t)(s3>>16);
+}
 #endif
 
 int64_t __mind_nerve_blas_matmul_q16_i64(
@@ -593,18 +642,42 @@ int64_t __mind_nerve_blas_matmul_q16_i64(
         if (Ap != NULL && Btp != NULL) {
             mind_nerve_blas_pack_i32_rowmajor(A, Ap, M, K);
             mind_nerve_blas_pack_i32_transpose(B, Btp, K, N);
-            for (int64_t i = 0; i < M; ++i) {
-                const int32_t *arow = Ap + (size_t)i * (size_t)K;
-                int64_t *C_row = C + (size_t)i * (size_t)N;
-                for (int64_t j = 0; j < N; ++j) {
-                    const int32_t *btrow = Btp + (size_t)j * (size_t)K;
+            int64_t i = 0;
 #if MIND_NERVE_BLAS_X86_64
-                    C_row[j] = mind_nerve_blas_use_avx2
-                        ? mind_nerve_blas_gemm_dot_i32_avx2(arow, btrow, K)
-                        : mind_nerve_blas_gemm_dot_i32_scalar(arow, btrow, K);
-#else
-                    C_row[j] = mind_nerve_blas_gemm_dot_i32_scalar(arow, btrow, K);
+            if (mind_nerve_blas_use_avx2) {
+                // MR=4 blocked: reuse each Bt row across 4 A rows.
+                for (; i + 4 <= M; i += 4) {
+                    const int32_t *a0 = Ap + (size_t)(i+0)*(size_t)K;
+                    const int32_t *a1 = Ap + (size_t)(i+1)*(size_t)K;
+                    const int32_t *a2 = Ap + (size_t)(i+2)*(size_t)K;
+                    const int32_t *a3 = Ap + (size_t)(i+3)*(size_t)K;
+                    int64_t *C0 = C + (size_t)(i+0)*(size_t)N;
+                    int64_t *C1 = C + (size_t)(i+1)*(size_t)N;
+                    int64_t *C2 = C + (size_t)(i+2)*(size_t)N;
+                    int64_t *C3 = C + (size_t)(i+3)*(size_t)N;
+                    for (int64_t j = 0; j < N; ++j) {
+                        const int32_t *btrow = Btp + (size_t)j * (size_t)K;
+                        int64_t o[4];
+                        mind_nerve_blas_gemm_micro_mr4_avx2(a0,a1,a2,a3,btrow,K,o);
+                        C0[j]=o[0]; C1[j]=o[1]; C2[j]=o[2]; C3[j]=o[3];
+                    }
+                }
+                for (; i < M; ++i) {  // M % 4 tail
+                    const int32_t *arow = Ap + (size_t)i * (size_t)K;
+                    int64_t *C_row = C + (size_t)i * (size_t)N;
+                    for (int64_t j = 0; j < N; ++j)
+                        C_row[j] = mind_nerve_blas_gemm_dot_i32_avx2(
+                            arow, Btp + (size_t)j*(size_t)K, K);
+                }
+            } else
 #endif
+            {
+                for (; i < M; ++i) {
+                    const int32_t *arow = Ap + (size_t)i * (size_t)K;
+                    int64_t *C_row = C + (size_t)i * (size_t)N;
+                    for (int64_t j = 0; j < N; ++j)
+                        C_row[j] = mind_nerve_blas_gemm_dot_i32_scalar(
+                            arow, Btp + (size_t)j*(size_t)K, K);
                 }
             }
             free(Ap);

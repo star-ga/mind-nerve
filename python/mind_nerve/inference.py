@@ -381,7 +381,20 @@ class _NativeEncoderRuntime:
             return None
 
     def _tokenize(self, text: str) -> np.ndarray:
-        """Return int32 token IDs for *text* (max 512 tokens)."""
+        """Return int32 token IDs for *text*, truncated to the model's
+        ``max_seq_length`` (256).
+
+        #228: this MUST match the reference SentenceTransformer, which
+        truncates to ``sentence_bert_config.json`` ``max_seq_length`` (256)
+        then CLS-pools the single window. Previously this used
+        ``max_length=512``, so any input >256 tokens reached the native
+        encoder's sliding-window ("later-window-wins") path and silently
+        produced a *different* embedding than pytorch — the A1.5 gate never
+        caught it because its harness tokenizes at 256. Truncating at 256
+        here makes native route()/encode pytorch-SentenceTransformer-
+        identical for all inputs; the sliding-window kernel stays available
+        for explicit long-document use but is never silently on this path.
+        """
         if self._tokenizer is None:
             raise RuntimeError(
                 "transformers is not installed; cannot tokenize text for the "
@@ -391,7 +404,7 @@ class _NativeEncoderRuntime:
         enc = self._tokenizer(
             text,
             truncation=True,
-            max_length=512,
+            max_length=256,  # = model max_seq_length; pytorch-ST-equivalent (#228)
             return_tensors="np",
             return_attention_mask=False,
             return_token_type_ids=False,

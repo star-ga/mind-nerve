@@ -46,7 +46,7 @@ jobs:
           # tests, lint, build); release wheels published to PyPI are
           # built separately.
           echo "CI builds an OSS-surface wheel. Release wheels are built separately."
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist/
@@ -180,7 +180,7 @@ jobs:
 
       - name: Upload coverage XML
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-xml
           path: coverage.xml

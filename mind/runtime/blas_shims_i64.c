@@ -495,6 +495,84 @@ static void mind_nerve_blas_gemm_accrow_scalar(
     }
 }
 
+// ---------------------------------------------------------------------------
+// RFC 0006 / task #236 — dense-int32 transposed-B GEMM.
+//
+// Byte-identical to the i64-stride-8 k-outer reference: C[i,j] =
+// (int32_t)( ( sum_k A[i,k]*B[k,j] ) >> 16 ), products widened i32*i32
+// -> i64, summed in i64 (wrap mod 2^64 => associative+commutative, so any
+// k-order/repack/SIMD-reassociation is bit-identical), a SINGLE >>16
+// narrow at the end (NO per-product shift — matches gemm_accrow_scalar,
+// the matmul oracle).
+//
+// Repack once per call: A (M x K, i64-stride-8) -> dense int32 A' (M x K),
+// B (K x N) -> dense TRANSPOSED int32 Bt' (N x K) so every output element
+// C[i,j] = dot(A'[i,:], Bt'[j,:]) over a CONTIGUOUS length-K vector. This
+// kills (1) the 2x memory / half-SIMD penalty of the i64-stride-8 layout
+// and (2) the strided B[:,j] access of the old path — the two #235/#237
+// bottlenecks. The dot reuses the proven 8-wide even/odd _mm256_mul_epi32
+// technique (exact full-range i32*i32->i64; madd_epi16 is NOT bit-safe
+// for the unsigned low halves — #237 Copilot catch).
+static void mind_nerve_blas_pack_i32_rowmajor(
+    const int64_t *src, int32_t *dst, int64_t rows, int64_t cols
+) {
+    for (int64_t r = 0; r < rows; ++r) {
+        const int64_t *s = src + (size_t)r * (size_t)cols;
+        int32_t       *d = dst + (size_t)r * (size_t)cols;
+        for (int64_t c = 0; c < cols; ++c) d[c] = (int32_t)s[c];
+    }
+}
+
+// B is K x N row-major (i64-stride-8); produce Bt' = N x K dense int32
+// (Bt'[j,k] = (int32_t)B[k,j]) — bit-exact value copy, transposed layout.
+static void mind_nerve_blas_pack_i32_transpose(
+    const int64_t *B, int32_t *Bt, int64_t K, int64_t N
+) {
+    for (int64_t k = 0; k < K; ++k) {
+        const int64_t *brow = B + (size_t)k * (size_t)N;
+        for (int64_t j = 0; j < N; ++j) {
+            Bt[(size_t)j * (size_t)K + (size_t)k] = (int32_t)brow[j];
+        }
+    }
+}
+
+// Q32.32 dot of two contiguous dense-int32 Q16.16 vectors; single final
+// >>16 narrow. Scalar = the byte-identity oracle for the AVX2 variant.
+static int64_t mind_nerve_blas_gemm_dot_i32_scalar(
+    const int32_t *a, const int32_t *bt, int64_t K
+) {
+    int64_t acc = 0;
+    for (int64_t k = 0; k < K; ++k) acc += (int64_t)a[k] * (int64_t)bt[k];
+    return (int64_t)(int32_t)(acc >> 16);
+}
+
+#if MIND_NERVE_BLAS_X86_64
+__attribute__((target("avx2,fma")))
+static int64_t mind_nerve_blas_gemm_dot_i32_avx2(
+    const int32_t *a, const int32_t *bt, int64_t K
+) {
+    __m256i acc = _mm256_setzero_si256();   // 4 x i64 partial sums (raw, no shift)
+    int64_t k = 0;
+    for (; k + 8 <= K; k += 8) {
+        __m256i va = _mm256_loadu_si256((const __m256i *)(a + k));
+        __m256i vb = _mm256_loadu_si256((const __m256i *)(bt + k));
+        // Even 32-bit lanes: 4 x exact i32*i32->i64 (mul_epi32 sign-extends).
+        __m256i pe = _mm256_mul_epi32(va, vb);
+        // Odd lanes: shift them into the low 32 of each i64 slot, then mul.
+        __m256i ao = _mm256_srli_epi64(va, 32);
+        __m256i bo = _mm256_srli_epi64(vb, 32);
+        __m256i po = _mm256_mul_epi32(ao, bo);
+        acc = _mm256_add_epi64(acc, pe);
+        acc = _mm256_add_epi64(acc, po);
+    }
+    int64_t buf[4] __attribute__((aligned(32)));
+    _mm256_store_si256((__m256i *)buf, acc);
+    int64_t sum = buf[0] + buf[1] + buf[2] + buf[3];
+    for (; k < K; ++k) sum += (int64_t)a[k] * (int64_t)bt[k];
+    return (int64_t)(int32_t)(sum >> 16);   // single final narrow
+}
+#endif
+
 int64_t __mind_nerve_blas_matmul_q16_i64(
     int64_t a_addr, int64_t b_addr, int64_t c_addr,
     int64_t M, int64_t K, int64_t N
@@ -505,6 +583,38 @@ int64_t __mind_nerve_blas_matmul_q16_i64(
     const int64_t *A = (const int64_t *)(uintptr_t)a_addr;
     const int64_t *B = (const int64_t *)(uintptr_t)b_addr;
     int64_t       *C = (int64_t       *)(uintptr_t)c_addr;
+
+    // --- task #236: dense-int32 transposed-B path (byte-identical) ---
+    {
+        size_t a_n = (size_t)M * (size_t)K;
+        size_t b_n = (size_t)K * (size_t)N;
+        int32_t *Ap  = (int32_t *)malloc(a_n * sizeof(int32_t));
+        int32_t *Btp = (int32_t *)malloc(b_n * sizeof(int32_t));
+        if (Ap != NULL && Btp != NULL) {
+            mind_nerve_blas_pack_i32_rowmajor(A, Ap, M, K);
+            mind_nerve_blas_pack_i32_transpose(B, Btp, K, N);
+            for (int64_t i = 0; i < M; ++i) {
+                const int32_t *arow = Ap + (size_t)i * (size_t)K;
+                int64_t *C_row = C + (size_t)i * (size_t)N;
+                for (int64_t j = 0; j < N; ++j) {
+                    const int32_t *btrow = Btp + (size_t)j * (size_t)K;
+#if MIND_NERVE_BLAS_X86_64
+                    C_row[j] = mind_nerve_blas_use_avx2
+                        ? mind_nerve_blas_gemm_dot_i32_avx2(arow, btrow, K)
+                        : mind_nerve_blas_gemm_dot_i32_scalar(arow, btrow, K);
+#else
+                    C_row[j] = mind_nerve_blas_gemm_dot_i32_scalar(arow, btrow, K);
+#endif
+                }
+            }
+            free(Ap);
+            free(Btp);
+            return 0;
+        }
+        // malloc failed → fall through to the in-place i64-stride reference.
+        if (Ap)  free(Ap);
+        if (Btp) free(Btp);
+    }
 
     // Per-row Q32.32 accumulator: stack for N <= MIND_NERVE_BLAS_GEMM_STACK_N,
     // heap otherwise (the FFN expansion output dimension is N=1536 > 512).

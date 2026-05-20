@@ -88,6 +88,15 @@ constraint on library growth.
 pip install mind-nerve
 ```
 
+> **On the 0.3.0 beta line.** The current stable is `0.2.0`. The active beta
+> series (`0.3.0b*`) ships the rebuilt native runtime, the offline quantizer,
+> and the Phase 2 encoder rewire. To install the latest beta:
+> ```bash
+> pip install --pre mind-nerve
+> ```
+> Pre-release tags are PEP 440 `bN` suffixes; `--pre` is required because
+> pip skips pre-releases by default.
+
 The first `route()` call auto-downloads the Phase-1 weights (~150 MB) from
 [`star-ga/mind-nerve`](https://huggingface.co/star-ga/mind-nerve)
 into `~/.local/share/mind-nerve/runtime/`. To pre-seed or use a custom

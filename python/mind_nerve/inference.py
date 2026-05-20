@@ -105,10 +105,13 @@ def _verify_encoder_weights_sha256(path: Path) -> None:
             f"  path           : {path}\n"
             "This usually means a cached blob from an older mind-nerve\n"
             "release is being used with a newer cdylib (or vice versa).\n"
-            "Delete the cached blob (or set $MIND_NERVE_ENCODER_WEIGHTS\n"
-            "to the matching file) and re-download from Hugging Face\n"
-            f"({_HF_REPO_ID}), or pin the mind-nerve version that\n"
-            "matches your local blob."
+            "Fix: delete the cached blob and re-run the local quantizer\n"
+            "against the Hugging Face checkpoint:\n"
+            f"  rm {path}\n"
+            f"  python -m mind_nerve.tools.quantize_encoder_to_q16 \\\n"
+            f"      --checkpoint <runtime_dir>/checkpoint\n"
+            f"(or pin the mind-nerve version that matches your local\n"
+            "blob via $MIND_NERVE_ENCODER_WEIGHTS)."
         )
 
 

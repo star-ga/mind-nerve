@@ -2,6 +2,35 @@
 
 All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.0b7] — 2026-05-20 — thesis-pure encode
+
+### Feat — thesis-pure encode matmul via dot_q16_v intrinsic (#233 a)
+
+- `mind/kernels/matmul_q16.mind`: the per-token linear matmul now
+  composes the mindc-emitted `__mind_blas_dot_q16_v` MLIR vector
+  dialect intrinsic in pure MIND, with no Track-A C-shim involvement.
+  Loop order is outer-row, inner-token so each `W[r,:]` (3-12 KB)
+  stays hot in L1 across all T inner iterations (closing the inc5
+  weight-cache equivalent gap that the initial per-token order had).
+- `tools/quantize_encoder_to_q16.py`: encoder weight blob now ships
+  in `(out, in) = (N, K)` row-major (PyTorch nn.Linear native
+  layout); the historical `.T` is gone. Re-quantize locally from the
+  Hugging Face checkpoint to produce the new blob.
+- `python/mind_nerve/inference.py`: fail-fast `_verify_encoder_weights_sha256`
+  check on runtime construction. Old cached blob + new cdylib (or
+  vice versa) raises immediately with a clear remediation hint,
+  preventing the silent wrong-embedding mode an unchecked mismatch
+  would produce.
+
+Byte-identity (cosine 0.999996, top-5 0.9975 vs pytorch
+SentenceTransformer) preserved. Perf A/B vs v0.3.0b6 / 45eabdd
+baseline (50 iters, native): p50 -2.2 / -5.7 / +3.5 pct,
+p95 +1.2 / -5.8 / +1.2 pct at approx T 64 / 128 / 256. Pure-MIND
+BEATS the Track-A C-shim + inc4 + inc5 path at T=128; at-parity
+within run-to-run noise at T=64 / T=256. Thesis-pure goal met: zero
+C-shim dependency in the encoder linear matmul path. vs MIND's own
+prior path.
+
 ## [Unreleased] — v0.3.0 preparation
 
 ### Fix — native tokenize truncates to model max_seq_length (#228)

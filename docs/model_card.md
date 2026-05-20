@@ -8,8 +8,8 @@ Q16.16 backend is in progress and not yet end-to-end (see
 
 | Field | Value |
 | --- | --- |
-| Model name | `mind-nerve-phase1` |
-| Hugging Face repo | [`star-ga/mind-nerve-phase1`](https://huggingface.co/star-ga/mind-nerve-phase1) |
+| Model name | `mind-nerve` |
+| Hugging Face repo | [`star-ga/mind-nerve`](https://huggingface.co/star-ga/mind-nerve) |
 | Maintainer | STARGA, Inc. — <info@star.ga> |
 | Type | Sentence-encoder fine-tune for intent classification over a route catalog |
 | Base model | `BAAI/bge-small-en-v1.5` |

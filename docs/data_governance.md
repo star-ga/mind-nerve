@@ -9,7 +9,7 @@ catalog assembled by `mind_nerve.discovery.scan`.
 In scope:
 
 - The Phase-1 v1.1-oss training corpus and the
-  [`star-ga/mind-nerve-phase1`](https://huggingface.co/star-ga/mind-nerve-phase1)
+  [`star-ga/mind-nerve`](https://huggingface.co/star-ga/mind-nerve)
   Hugging Face artefact.
 - The `route_table.jsonl` shipped inside the runtime directory.
 - Catalogs produced locally by users running

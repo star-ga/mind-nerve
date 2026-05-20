@@ -56,7 +56,7 @@ In scope:
 - The mind-nerve Python wheel published on PyPI.
 - The repository source at <https://github.com/star-ga/mind-nerve>.
 - The Phase-1 weights published at
-  <https://huggingface.co/star-ga/mind-nerve-phase1>.
+  <https://huggingface.co/star-ga/mind-nerve>.
 - The MCP server (`mind-nerve-mcp`), the UNIX-socket daemon
   (`mind-nerve-routed`), the installer (`mind-nerve-install`), and the
   `mind-nerve-preselect` hook.

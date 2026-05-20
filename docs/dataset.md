@@ -5,7 +5,7 @@ and routes against. It is the contract between the corpus, the trainer
 (`mind_train.train`), and the runtime (`mind_nerve.route`).
 
 The Phase-1 public-clean catalog shipped with the
-[`star-ga/mind-nerve-phase1`](https://huggingface.co/star-ga/mind-nerve-phase1)
+[`star-ga/mind-nerve`](https://huggingface.co/star-ga/mind-nerve)
 weights is **`route_table.jsonl` v1.0**: **11,922 routes**, frozen and
 signed.
 

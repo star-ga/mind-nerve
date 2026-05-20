@@ -49,7 +49,7 @@ GitHub release at
 Single change on top of beta.1 is the flock-guarded `ensure()` daemon
 spawn (closes the multi-spawn race that pinned memory under
 high-concurrency CLI use). Weights on Hugging Face under Apache-2.0
-(`star-ga/mind-nerve-phase1`). The PyTorch-based inference path remains
+(`star-ga/mind-nerve`). The PyTorch-based inference path remains
 the trial surface that drives adoption; Phase-2 native MIND inference +
 cross-arch bit-identity + p95 ≤ 30 ms remain on the deferred list below,
 but the upstream `mindc` blockers underneath that list have moved — see

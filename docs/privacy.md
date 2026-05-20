@@ -61,7 +61,7 @@ By default `scan` ignores artefacts with no declared license (the
 ## Hugging Face model downloads
 
 On first use, mind-nerve auto-downloads the Phase-1 weights from
-[`star-ga/mind-nerve-phase1`](https://huggingface.co/star-ga/mind-nerve-phase1)
+[`star-ga/mind-nerve`](https://huggingface.co/star-ga/mind-nerve)
 into the runtime directory. This is a one-time network call per machine
 per runtime-dir.
 
@@ -113,6 +113,6 @@ exercise rights against. All prompts, logs, and catalog content sit on the
 user's machine under the user's control; deletion is `rm` on the
 appropriate path.
 
-For the Phase-1 training corpus (`star-ga/mind-nerve-phase1` on Hugging
+For the Phase-1 training corpus (`star-ga/mind-nerve` on Hugging
 Face) and any reports of inappropriate content discovered in the public
 catalog, contact [`info@star.ga`](mailto:info@star.ga).

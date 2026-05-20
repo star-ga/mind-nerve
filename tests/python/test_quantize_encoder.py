@@ -204,12 +204,11 @@ def test_word_table_padding_slots_are_zero(emod: Any, tmp_path: Path) -> None:
 
 
 def test_weight_layout_orientation(emod: Any, tmp_path: Path) -> None:
-    """#233(a): Wq is stored (out, in) — the PyTorch nn.Linear native
-    layout, no transpose. The thesis-pure matmul_rmajor_q16_v reads
-    W[r, :] as one output row's input-dotted contribution, so each
-    stored row direction is the OUTPUT axis (formerly transposed
-    under Track-A's matmul_q16_i64 (K, N) contract; see CHANGELOG
-    v0.3.0b7 #233 a)."""
+    """Wq is stored (in, out) — the transpose of the PyTorch (out, in)
+    weight. Track A's `__mind_nerve_blas_matmul_q16_i64` consumes B
+    as (K, N) row-major. (v0.3.0b7's thesis-pure (N, K) layout was
+    yanked in v0.3.0b8 — see CHANGELOG for the dot_q16_v stride bug
+    that motivated the revert.)"""
     from safetensors.numpy import save_file
 
     ckpt = tmp_path / "ckpt"
@@ -231,8 +230,8 @@ def test_weight_layout_orientation(emod: Any, tmp_path: Path) -> None:
 
     base = EMB_BLOCK_BYTES // 8  # layer 0, OFF_WQ == 0
     stored = blob[base : base + HIDDEN * HIDDEN].reshape(HIDDEN, HIDDEN)
-    # New layout (#233(a)): stored == quantize(wq) directly, NO .T.
-    expected, _ = emod.quantize_array(np.ascontiguousarray(wq))
+    # Track A layout: stored == quantize(wq.T).
+    expected, _ = emod.quantize_array(np.ascontiguousarray(wq.T))
     assert np.array_equal(stored, expected.reshape(HIDDEN, HIDDEN))
 
 

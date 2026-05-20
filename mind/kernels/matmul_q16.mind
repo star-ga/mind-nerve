@@ -147,31 +147,40 @@ pub fn matmul_q16(a: i64, b: i64, c: i64, M: i64, K: i64, N: i64) -> i64 {
 // reserved prefix — so it resolves without a `use std.blas;` import
 // regardless of the encoder build's cross-module-import gate.)
 // ---------------------------------------------------------------------------
-fn matmul_thesis_row(
-    w: i64, x: i64, y: i64, K: i64, row_bytes: i64, N: i64, r: i64
-) -> i64 {
-    if r >= N { return 0; }
-    let w_row: i64 = w + r * row_bytes;
-    let acc: i64 = __mind_blas_dot_q16_v(w_row, x, K);
-    __mind_store_i64(y + r * 8, acc);
-    matmul_thesis_row(w, x, y, K, row_bytes, N, r + 1)
-}
-
-fn matmul_thesis_token(
-    a: i64, b: i64, c: i64, K: i64, N: i64, row_bytes: i64, T: i64, t: i64
+// #233(a) Phase 2 — outer-row, inner-token loop order. The per-token
+// outer order re-streamed W (~1.18 MB at 384×384, ~2.36 MB at 384×1536)
+// T times per matmul = the inc5-equivalent gap that made the initial
+// thesis-pure version ~5-8% slower at T=256. Flipping the order keeps
+// each W[r,:] (3-12 KB) hot in L1 across all T inner iterations; A[t,:]
+// fits in L2 across N outer iterations. Byte-identical to the previous
+// order (same dot calls, just sequenced differently — c[t,r] only
+// depends on W[r,:] and A[t,:], no cross-element dependencies).
+fn matmul_thesis_inner_tok(
+    a: i64, c: i64, w_row: i64, r: i64,
+    K: i64, N: i64, T: i64, t: i64
 ) -> i64 {
     if t >= T { return 0; }
     let x_token: i64 = a + t * K * 8;
-    let y_token: i64 = c + t * N * 8;
-    matmul_thesis_row(b, x_token, y_token, K, row_bytes, N, 0);
-    matmul_thesis_token(a, b, c, K, N, row_bytes, T, t + 1)
+    let y_addr: i64 = c + (t * N + r) * 8;
+    let acc: i64 = __mind_blas_dot_q16_v(w_row, x_token, K);
+    __mind_store_i64(y_addr, acc);
+    matmul_thesis_inner_tok(a, c, w_row, r, K, N, T, t + 1)
+}
+
+fn matmul_thesis_outer_row(
+    a: i64, b: i64, c: i64, K: i64, N: i64, row_bytes: i64, T: i64, r: i64
+) -> i64 {
+    if r >= N { return 0; }
+    let w_row: i64 = b + r * row_bytes;
+    matmul_thesis_inner_tok(a, c, w_row, r, K, N, T, 0);
+    matmul_thesis_outer_row(a, b, c, K, N, row_bytes, T, r + 1)
 }
 
 fn matmul_thesis_pure(
     a: i64, b: i64, c: i64, T: i64, K: i64, N: i64
 ) -> i64 {
     let row_bytes: i64 = K * 8;
-    matmul_thesis_token(a, b, c, K, N, row_bytes, T, 0)
+    matmul_thesis_outer_row(a, b, c, K, N, row_bytes, T, 0)
 }
 
 // ---------------------------------------------------------------------------

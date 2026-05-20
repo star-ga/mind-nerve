@@ -68,53 +68,6 @@ def _load_runtime() -> "_Runtime | _NativeEncoderRuntime":
 _HF_REPO_ID = "star-ga/mind-nerve"
 _USER_RUNTIME_DIR = Path.home() / ".local" / "share" / "mind-nerve" / "runtime"
 
-# #233(a) encoder weight-blob layout gate. Bumped whenever the blob
-# layout that mn_encoder_encode reads changes (e.g. the (K, N) -> (N, K)
-# thesis-pure transpose introduced with the matmul_thesis_pure path).
-# Mismatch on load raises immediately, preventing the silent
-# wrong-embedding mode that an unchecked stale-blob + new-cdylib (or
-# vice versa) would produce. Update this constant together with the
-# quantizer transpose change + the HF artifact re-upload as a single
-# release event.
-_EXPECTED_ENCODER_WEIGHTS_SHA256 = (
-    "17489317722fcb2681b7f8db51bb500a9096f4c382429597fbbd529a5d994942"
-)
-
-
-def _verify_encoder_weights_sha256(path: Path) -> None:
-    """Fail-fast if encoder_weights.q16.bin has a layout incompatible
-    with this build. The sha256 is hardcoded per cdylib release; any
-    mismatch means the loaded blob and the encoder cdylib disagree on
-    layout, which would silently produce wrong embeddings. Caller
-    should propagate the RuntimeError so users get a clear actionable
-    message instead of corrupt output.
-    """
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        while True:
-            chunk = f.read(1 << 20)
-            if not chunk:
-                break
-            h.update(chunk)
-    got = h.hexdigest()
-    if got != _EXPECTED_ENCODER_WEIGHTS_SHA256:
-        raise RuntimeError(
-            f"encoder_weights.q16.bin layout mismatch.\n"
-            f"  expected sha256: {_EXPECTED_ENCODER_WEIGHTS_SHA256}\n"
-            f"  got      sha256: {got}\n"
-            f"  path           : {path}\n"
-            "This usually means a cached blob from an older mind-nerve\n"
-            "release is being used with a newer cdylib (or vice versa).\n"
-            "Fix: delete the cached blob and re-run the local quantizer\n"
-            "against the Hugging Face checkpoint:\n"
-            f"  rm {path}\n"
-            f"  python -m mind_nerve.tools.quantize_encoder_to_q16 \\\n"
-            f"      --checkpoint <runtime_dir>/checkpoint\n"
-            f"(or pin the mind-nerve version that matches your local\n"
-            "blob via $MIND_NERVE_ENCODER_WEIGHTS)."
-        )
-
-
 def _seed_from_hf(target: Path) -> None:
     """Snapshot-download the Phase-1 weights from Hugging Face into *target*.
 
@@ -365,15 +318,6 @@ class _NativeEncoderRuntime:
         self._encoder_weights_loaded = q16_blob_path.exists()
         if q16_blob_path.exists():
             import ctypes as _ct
-
-            # #233(a) — fail-fast on blob/cdylib layout mismatch. The
-            # encoder_weights.q16.bin sha256 is hardcoded per cdylib
-            # release; whenever the blob layout changes (e.g. the
-            # (K, N) -> (N, K) thesis-pure transpose), this constant
-            # bumps. Old cached blob + new cdylib (or new blob + old
-            # cdylib) both raise here, preventing the silent
-            # wrong-embedding mode an unchecked mismatch would produce.
-            _verify_encoder_weights_sha256(q16_blob_path)
 
             # Pin the blob for the lifetime of the handle; the native side
             # stores the raw address and reads it on every encode call.

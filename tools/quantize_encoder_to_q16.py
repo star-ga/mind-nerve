@@ -277,21 +277,16 @@ def build_encoder_blob(state: dict[str, np.ndarray]) -> tuple[np.ndarray, int]:
         base = EMB_BLOCK_BYTES + layer * LAYER_STRIDE_BYTES
         pfx = f"encoder.layer.{layer}."
 
-        # PyTorch nn.Linear weight is (out, in); #233(a) thesis-pure encode
-        # path uses matmul_rmajor_q16_v which expects W laid out
-        # (out=rows, in=cols) row-major — the PyTorch native layout, no
-        # transpose. (Previously the Track-A C-shim matmul_q16_i64 wanted
-        # (in, out), so a .T was applied; that .T is gone in the
-        # thesis-pure path.) Each row r of the stored matrix becomes one
-        # output element via dot(W[r,:], x_token).
-        wq = need(pfx + "attention.self.query.weight", (HIDDEN, HIDDEN))
-        wk = need(pfx + "attention.self.key.weight", (HIDDEN, HIDDEN))
-        wv = need(pfx + "attention.self.value.weight", (HIDDEN, HIDDEN))
-        wo = need(pfx + "attention.output.dense.weight", (HIDDEN, HIDDEN))
-        # intermediate.dense: (FFN, HIDDEN) — out=FFN, in=HIDDEN.
-        wf1 = need(pfx + "intermediate.dense.weight", (FFN, HIDDEN))
-        # output.dense: (HIDDEN, FFN) — out=HIDDEN, in=FFN.
-        wf2 = need(pfx + "output.dense.weight", (HIDDEN, FFN))
+        # PyTorch nn.Linear weight is (out, in); the MIND matmul wants
+        # b laid out (in, out) row-major → transpose then C-contiguous.
+        wq = need(pfx + "attention.self.query.weight", (HIDDEN, HIDDEN)).T
+        wk = need(pfx + "attention.self.key.weight", (HIDDEN, HIDDEN)).T
+        wv = need(pfx + "attention.self.value.weight", (HIDDEN, HIDDEN)).T
+        wo = need(pfx + "attention.output.dense.weight", (HIDDEN, HIDDEN)).T
+        # intermediate.dense: (FFN, HIDDEN) → (HIDDEN, FFN)
+        wf1 = need(pfx + "intermediate.dense.weight", (FFN, HIDDEN)).T
+        # output.dense: (HIDDEN, FFN) → (FFN, HIDDEN)
+        wf2 = need(pfx + "output.dense.weight", (HIDDEN, FFN)).T
 
         bq = need(pfx + "attention.self.query.bias", (HIDDEN,))
         bk = need(pfx + "attention.self.key.bias", (HIDDEN,))

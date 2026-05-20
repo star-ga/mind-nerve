@@ -130,31 +130,86 @@ pub fn matmul_q16(a: i64, b: i64, c: i64, M: i64, K: i64, N: i64) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
+// #233(a) thesis-pure per-token matvec: (T, K) · (N, K)_rowmajor → (T, N)
+// via __mind_blas_dot_q16_v (mindc-emitted MLIR vector dialect, no C
+// shim). Weight blob is stored offline as (N, K) row-major after the
+// quantizer drops the historical .T (see
+// tools/quantize_encoder_to_q16.py). Each token t produces one output
+// row via N calls to dot_q16_v(W[r,:], x_token, K).
+//
+// Byte-identity: each output element c[t, r] = sum_k W[r,k] * x[t,k]
+// reduced as Q32.32 i64 with a single >>16 narrow — exactly the same
+// integer products and ascending-k associative i64 reduction as the
+// Track-A C-shim matmul_q16_i64 per element. Two paths producing the
+// same per-element output ⇒ byte-identical A1.5.
+//
+// (NB: __mind_blas_dot_q16_v is a mindc intrinsic — the `__mind_blas_*`
+// reserved prefix — so it resolves without a `use std.blas;` import
+// regardless of the encoder build's cross-module-import gate.)
+// ---------------------------------------------------------------------------
+// #233(a) Phase 2 — outer-row, inner-token loop order. The per-token
+// outer order re-streamed W (~1.18 MB at 384×384, ~2.36 MB at 384×1536)
+// T times per matmul = the inc5-equivalent gap that made the initial
+// thesis-pure version ~5-8% slower at T=256. Flipping the order keeps
+// each W[r,:] (3-12 KB) hot in L1 across all T inner iterations; A[t,:]
+// fits in L2 across N outer iterations. Byte-identical to the previous
+// order (same dot calls, just sequenced differently — c[t,r] only
+// depends on W[r,:] and A[t,:], no cross-element dependencies).
+fn matmul_thesis_inner_tok(
+    a: i64, c: i64, w_row: i64, r: i64,
+    K: i64, N: i64, T: i64, t: i64
+) -> i64 {
+    if t >= T { return 0; }
+    let x_token: i64 = a + t * K * 8;
+    let y_addr: i64 = c + (t * N + r) * 8;
+    let acc: i64 = __mind_blas_dot_q16_v(w_row, x_token, K);
+    __mind_store_i64(y_addr, acc);
+    matmul_thesis_inner_tok(a, c, w_row, r, K, N, T, t + 1)
+}
+
+fn matmul_thesis_outer_row(
+    a: i64, b: i64, c: i64, K: i64, N: i64, row_bytes: i64, T: i64, r: i64
+) -> i64 {
+    if r >= N { return 0; }
+    let w_row: i64 = b + r * row_bytes;
+    matmul_thesis_inner_tok(a, c, w_row, r, K, N, T, 0);
+    matmul_thesis_outer_row(a, b, c, K, N, row_bytes, T, r + 1)
+}
+
+fn matmul_thesis_pure(
+    a: i64, b: i64, c: i64, T: i64, K: i64, N: i64
+) -> i64 {
+    let row_bytes: i64 = K * 8;
+    matmul_thesis_outer_row(a, b, c, K, N, row_bytes, T, 0)
+}
+
+// ---------------------------------------------------------------------------
 // Shape-specialised wrappers (doc: spec §A1.2 regime table)
 // ---------------------------------------------------------------------------
 
 // (T, 384) · (384, 384) — Q/K/V projections and output projection.
 // bias_vec: length-384 Q16.16 buffer (or 0 = no bias).
-// Phase A1.5 Step 1: routed through BLAS SIMD path (byte-identical to scalar).
+// #233(a) thesis-pure: per-token matvec via dot_q16_v intrinsic (no C
+// shim). Byte-identical to the prior matmul_q16_blas path.
 pub fn matmul_384_384(a: i64, b: i64, bias: i64, c: i64, T: i64) -> i64 {
-    matmul_q16_blas(a, b, c, T, 384, 384);
+    matmul_thesis_pure(a, b, c, T, 384, 384);
     if bias == 0 { return 0; }
     add_bias_row(c, bias, T, 384, 0)
 }
 
 // (T, 384) · (384, 1536) — FFN expansion.
-// Phase A1.5 Step 1: routed through BLAS SIMD path (byte-identical to scalar).
+// #233(a) thesis-pure: per-token matvec via dot_q16_v intrinsic.
 pub fn matmul_384_1536(a: i64, b: i64, bias: i64, c: i64, T: i64) -> i64 {
-    matmul_q16_blas(a, b, c, T, 384, 1536);
+    matmul_thesis_pure(a, b, c, T, 384, 1536);
     if bias == 0 { return 0; }
     add_bias_row(c, bias, T, 1536, 0)
 }
 
 // (T, 1536) · (1536, 384) — FFN contraction.
 // Widest reduction in the network: k=1536, Q32.32 accumulator mandatory.
-// Phase A1.5 Step 1: routed through BLAS SIMD path (byte-identical to scalar).
+// #233(a) thesis-pure: per-token matvec via dot_q16_v intrinsic.
 pub fn matmul_1536_384(a: i64, b: i64, bias: i64, c: i64, T: i64) -> i64 {
-    matmul_q16_blas(a, b, c, T, 1536, 384);
+    matmul_thesis_pure(a, b, c, T, 1536, 384);
     if bias == 0 { return 0; }
     add_bias_row(c, bias, T, 384, 0)
 }

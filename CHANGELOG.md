@@ -2,6 +2,51 @@
 
 All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.0b8] — 2026-05-20 — hotfix: revert #233(a), yanks v0.3.0b7
+
+### Fix — yank v0.3.0b7, restore Track A C-shim encoder matmul
+
+The v0.3.0b7 "thesis-pure encode" path (#233 a) shipped a silent
+correctness regression. Root cause: `__mind_blas_dot_q16_v` expects
+i32-stride-4 dense buffers (`elem_bytes = sizeof::<i32>() = 4`,
+`vector<8xi32>` load + `extsi to vector<8xi64>` per the mindc
+lowering), but mind-nerve's encoder weight blob is i64-stride-8.
+Passing i64-stride pointers to dot_q16_v made every iteration read 4
+real values + 4 sign-extension halves; the sign-ext lanes' products
+shift to 0 after `>>16`, so each dot accumulated only the first K/2
+input dims of every linear matmul, then the encoder's terminal
+L2-normalize hid the magnitude loss. The A1.5 cosine ≥ 0.92 /
+top-5 ≥ 0.92 thresholds and the L2-normalize-then-cosine harness
+were both too loose to catch the residual direction error.
+
+Verified directly via ctypes: dot_q16_v(n=8) returns 13369344 (full
+1²+2²+…+8² Q16.16) on an i32 buffer but only 1966080 (first half
+1²+2²+3²+4²) on an i64 buffer.
+
+**Action**: revert the `#233(a)` merge (`f1f7f0b`) on `main`
+(`0333666`). matmul_384_384/384_1536/1536_384 are back on Track A
+`matmul_q16_blas` → C-shim `__mind_nerve_blas_matmul_q16_i64` (the
+correct path that matches the i64-stride blob). Quantizer reverts
+to the `(in, out) = (K, N)` layout that Track A expects. Encoder
+weight blob on HF `star-ga/mind-nerve` is deleted (was only
+consumed by v0.3.0b7); users continue to build their blob locally
+via `tools/quantize_encoder_to_q16.py` against the HF checkpoint as
+they did pre-v0.3.0b7.
+
+**Correct-path future work**: either (a) add a new mindc intrinsic
+`__mind_blas_dot_q16_v_i64` whose lowering reads i64-stride-8
+(small, targeted compiler change in `mindc/src/mlir/lowering.rs`)
+so thesis-pure works with the existing blob, **OR** (b) full
+dense-int32 storage path (offline blob change to 4-byte stride +
+keeps using existing dot_q16_v as-is). Either is multi-session
+deliberate work and **must include a strict bit-identity gate**
+(not cosine-after-normalize) before any future re-release. Tracked
+on task #233.
+
+`mind-nerve@0333666`. mindc / matmul_rmajor_q16_v in `std/blas.mind`
+(mind `641e6cb`) is unaffected — the primitive itself is correct
+for its i32-stride ABI; the bug was in the mind-nerve consumer.
+
 ## [0.3.0b7] — 2026-05-20 — thesis-pure encode
 
 ### Feat — thesis-pure encode matmul via dot_q16_v intrinsic (#233 a)

@@ -18,7 +18,7 @@ and `route_table.jsonl`. Resolution order, first hit wins:
   1. Explicit ``runtime_dir`` argument to ``route()`` / ``load_default_runtime()``
   2. ``MIND_NERVE_RUNTIME_DIR`` env var
   3. ``~/.local/share/mind-nerve/runtime/`` (auto-seeded from
-     ``star-ga/mind-nerve-phase1`` on Hugging Face on first use)
+     ``star-ga/mind-nerve`` on Hugging Face on first use)
 """
 
 from __future__ import annotations
@@ -65,7 +65,7 @@ def _load_runtime() -> "_Runtime | _NativeEncoderRuntime":
     return _Runtime(rdir)
 
 
-_HF_REPO_ID = "star-ga/mind-nerve-phase1"
+_HF_REPO_ID = "star-ga/mind-nerve"
 _USER_RUNTIME_DIR = Path.home() / ".local" / "share" / "mind-nerve" / "runtime"
 
 # #233(a) encoder weight-blob layout gate. Bumped whenever the blob

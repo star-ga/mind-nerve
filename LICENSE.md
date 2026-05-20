@@ -9,7 +9,7 @@ integration shims (`integrations/`), Python wheel (`python/mind_nerve/`),
 and tests (`tests/`) are licensed under the Apache License, Version 2.0.
 
 The Phase-1 v1.1-oss trained weights published at
-<https://huggingface.co/star-ga/mind-nerve-phase1> are also distributed
+<https://huggingface.co/star-ga/mind-nerve> are also distributed
 under Apache 2.0. The training corpus used for those weights is public-clean
 (no STARGA-private content) — the model card and `manifest.json` carry the
 corpus hash for reproducibility.

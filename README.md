@@ -11,7 +11,7 @@
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/pypi/l/mind-nerve.svg?color=4c1"></a>
   <a href="https://github.com/star-ga/mind-nerve/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/star-ga/mind-nerve/actions/workflows/ci.yml/badge.svg?branch=main"></a>
   <a href="https://pypi.org/project/mind-nerve/"><img alt="Downloads" src="https://img.shields.io/pypi/dm/mind-nerve.svg"></a>
-  <a href="https://huggingface.co/star-ga/mind-nerve-phase1"><img alt="Hugging Face" src="https://img.shields.io/badge/weights-Hugging%20Face-FFD21E"></a>
+  <a href="https://huggingface.co/star-ga/mind-nerve"><img alt="Hugging Face" src="https://img.shields.io/badge/weights-Hugging%20Face-FFD21E"></a>
   <a href="https://github.com/star-ga/mind-nerve/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/star-ga/mind-nerve?style=social"></a>
 </p>
 
@@ -89,7 +89,7 @@ pip install mind-nerve
 ```
 
 The first `route()` call auto-downloads the Phase-1 weights (~150 MB) from
-[`star-ga/mind-nerve-phase1`](https://huggingface.co/star-ga/mind-nerve-phase1)
+[`star-ga/mind-nerve`](https://huggingface.co/star-ga/mind-nerve)
 into `~/.local/share/mind-nerve/runtime/`. To pre-seed or use a custom
 location, set `MIND_NERVE_RUNTIME_DIR`.
 
@@ -230,7 +230,7 @@ Phase 2 is being brought up incrementally and is not yet end-to-end.
   dense dot product against the precomputed `route_table.npy` →
   deterministic top-K with SHA-256 tie-break and `top_k ∈ [1, 64]` bounds.
 - **Weights:** auto-downloaded on first use from
-  [`star-ga/mind-nerve-phase1`](https://huggingface.co/star-ga/mind-nerve-phase1)
+  [`star-ga/mind-nerve`](https://huggingface.co/star-ga/mind-nerve)
   at the pinned revision recorded in the wheel (override via
   `MIND_NERVE_HF_REVISION`).
 - **Latency:** warm-daemon p95 ~23 ms on GPU, ~90 ms on a 4-core CPU. The
@@ -288,7 +288,7 @@ catalog.
 **Phase 2 (next)** — Native MIND Q16.16 inference loop replaces PyTorch.
 Cross-architecture bit-identity gate. p95 budget tightens. The HF artifact
 will be `star-ga/mind-nerve-phase2` (parallel to the current
-[`star-ga/mind-nerve-phase1`](https://huggingface.co/star-ga/mind-nerve-phase1)) —
+[`star-ga/mind-nerve`](https://huggingface.co/star-ga/mind-nerve)) —
 same corpus + tokenizer + model hash contract, different inference path.
 Toolchain prerequisites all shipped: `mindc` 0.2.6 (C-ABI export),
 [`mindc` 0.3.0](https://github.com/star-ga/mind/releases/tag/v0.3.0)
@@ -332,7 +332,7 @@ mind-nerve ships under a **dual license**:
 - **Apache-2.0** — the repository source (`python/`, `src/`, `spec/`,
   `cli/`, `integrations/`, `tests/`), the Python wheel surface, and the
   Phase-1 trained weights at
-  [`star-ga/mind-nerve-phase1`](https://huggingface.co/star-ga/mind-nerve-phase1)
+  [`star-ga/mind-nerve`](https://huggingface.co/star-ga/mind-nerve)
   are Apache-2.0. Phase-1 PyTorch inference runs entirely under Apache-2.0
   and does **not** load any STARGA-licensed binary.
 - **STARGA Commercial** — the wheel additionally bundles
@@ -375,7 +375,7 @@ If mind-nerve helps your work, a citation is appreciated:
 ## Links
 
 - **PyPI**: <https://pypi.org/project/mind-nerve/>
-- **Phase-1 weights**: <https://huggingface.co/star-ga/mind-nerve-phase1>
+- **Phase-1 weights**: <https://huggingface.co/star-ga/mind-nerve>
 - **MIND language**: <https://mindlang.dev>
 - **Changelog**: [`CHANGELOG.md`](./CHANGELOG.md)
 - **Roadmap**: [`ROADMAP.md`](./ROADMAP.md)

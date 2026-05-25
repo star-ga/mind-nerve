@@ -25,21 +25,19 @@ license = "Apache-2.0"
 [mind]
 # Pinned to the toolchain surface that compiles the current source tree.
 #
-# mindc 0.2.5 ships the Pratt expression parser + Phase 10.5 surface
-# (module / const / type / struct / enum / use / export / [attribute] /
-# assert / as / && || / bitwise) — exactly what mind-nerve's source
-# tree consumes. Earlier versions reject `use crate::foo::bar` paths.
+# Floor (0.5.0): the std-surface era — pure-MIND std.vec / std.string /
+# std.map / std.io baked into mindc (RFC 0005 Phase C), `use std.*`
+# import resolution, and first-class Q16.16 (RFC 0001) — exactly what
+# mind-nerve's source tree consumes. Earlier versions reject the
+# qualified `use` paths and emulate Q16.16 through scalar math.
 #
-# mindc 0.2.6 (Unreleased) adds native BitNet + first-class Q16.16
-# dtype (RFC 0001) plus the content-addressed compile cache that
-# locks in the 1.8–15.5 µs frontend baseline. mind-nerve adopts it
-# as soon as it releases — Q16.16 stops being emulation and becomes
-# a typed primitive.
-#
-# mindc 0.3.0 introduces breaking IR changes and is gated until the
-# Phase 2 IR-load migration of the inference path lands.
-mindc-min    = "0.2.5"
-mindc-max    = "0.3.0"
+# Ceiling (0.8.0, exclusive): pre-allocates one major-minor of headroom
+# above the current shipping series so routine mindc upgrades stay
+# inside the manifest without a release cycle. Attribute surface is
+# unified on the single canonical `#[name]` form (RFC 0012); bare
+# `[name]` at item position is no longer an attribute.
+mindc-min    = "0.5.0"
+mindc-max    = "0.8.0"
 spec-version = "1.0"
 
 # IR contract — mind-nerve compiles to mic@1 textual IR and is consumed

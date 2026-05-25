@@ -250,10 +250,10 @@ jobs:
             echo "::endgroup::"
           done
           if [ $fail -ne 0 ]; then
-            echo "::error::One or more .mind files failed to parse under mindc v0.4.4"
+            echo "::error::One or more .mind files failed to parse under the in-tree mindc"
             exit 1
           fi
-          echo "All .mind kernels + LUTs parse cleanly under mindc v0.4.4."
+          echo "All .mind kernels + LUTs parse cleanly under the in-tree mindc."
 
   bit-identity-cpu:
     name: Bit-identity harness (CPU / PyTorch baseline)

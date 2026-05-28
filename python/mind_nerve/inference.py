@@ -677,7 +677,8 @@ def precompute_routes(
 
     Catalog-v2 (SOTA-track #3): when ``emit_stride_thresholds=True`` also
     emit ``stride_thresholds.json`` with a calibrated entropy → stride map
-    consumed by the native-MIND windowed encoder once mindc 0.3.0 lands.
+    consumed by the native-MIND windowed encoder once mind-nerve's wheel-side
+    cdylib integration lands (the mindc 0.3.0 compiler-side shipped 2026-05-18).
     The Phase-1 sentence-transformers path ignores this file; emit is
     forward-compatible bookkeeping.
     """

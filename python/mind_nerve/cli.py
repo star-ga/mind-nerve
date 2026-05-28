@@ -419,7 +419,8 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["python", "native"],
         default="python",
         help="'python' = PyTorch bring-up (available now); 'native' = MIND cdylib "
-        "(NotImplementedError until mindc 0.3.0).",
+        "(NotImplementedError until mind-nerve integrates the cdylib path — "
+        "the mindc 0.3.0 --emit-shared compiler side shipped 2026-05-18).",
     )
     p_train.add_argument("--base-model", default="BAAI/bge-small-en-v1.5")
     p_train.add_argument("--epochs", type=int, default=3)

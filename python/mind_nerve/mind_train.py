@@ -496,9 +496,11 @@ def _train_python_backend(config: TrainConfig) -> TrainResult:
 
 def _train_native_backend(config: TrainConfig) -> TrainResult:
     raise NotImplementedError(
-        "Native MIND backend lands with mindc 0.3.0 --emit-shared cdylib + the "
-        "Q16.16 native kernel. v0.3.0-beta.1 ships the Python (PyTorch) bring-up "
-        "backend; set TrainConfig(backend='python')."
+        "Native MIND backend pending mind-nerve cdylib integration. The compiler "
+        "side (mindc 0.3.0 --emit-shared + Q16.16 native kernels) shipped "
+        "2026-05-18; mind-nerve's wheel still ships the Python (PyTorch) bring-up "
+        "backend until the wheel-side link-and-load is wired. Set "
+        "TrainConfig(backend='python')."
     )
 
 
@@ -508,8 +510,9 @@ def train(config: TrainConfig) -> TrainResult:
     Backend resolution:
       - ``python`` (default) — PyTorch + sentence-transformers bring-up.
         Available now.
-      - ``native``           — Q16.16 native MIND kernel via mindc 0.3.0
-        cdylib. Raises ``NotImplementedError`` until that lands.
+      - ``native``           — Q16.16 native MIND kernel via the mindc 0.3.0
+        cdylib. Raises ``NotImplementedError`` until mind-nerve's wheel-side
+        integration lands (the compiler-side shipped 2026-05-18).
     """
     if config.backend == "python":
         return _train_python_backend(config)

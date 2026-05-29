@@ -93,6 +93,7 @@ def main() -> int:
             req = json.loads(line.decode("utf-8", errors="replace"))
             prompt = str(req.get("prompt") or "").strip()
             k = int(req.get("top_k") or 20)
+            k = max(1, min(k, 64))  # clamp to route()'s [1,64] bounds (matches mcp_server)
             t_q = time.time()
             result = _route(prompt, top_k=k)
             reply: dict = {

@@ -1,3 +1,4 @@
+import os
 """Integration tests for catalog-v2 route_prior loading + scoring.
 
 The runtime gains an optional `route_table_prior.npy` column. When
@@ -21,7 +22,7 @@ import numpy as np
 import pytest
 
 pytestmark = pytest.mark.skipif(
-    not Path("/home/n/mind-nerve").exists(),
+    os.environ.get("MIND_NERVE_RUN_INTEGRATION") != "1",
     reason="needs mind-nerve checkout",
 )
 

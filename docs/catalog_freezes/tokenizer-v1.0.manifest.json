@@ -2,7 +2,7 @@
   "actual_vocab_size": 16384,
   "byte_fallback": true,
   "corpus_bytes": 12704103,
-  "corpus_path": "/data/datasets/mind-nerve-catalog/tokenizer/corpus.txt",
+  "corpus_path": "catalog-data/tokenizer/corpus.txt",
   "corpus_sha256": "4283384566f4af64156e0ac0feac02cf824eee716d7355da0464cfa52996fd36",
   "min_frequency": 2,
   "model_kind": "BPE",

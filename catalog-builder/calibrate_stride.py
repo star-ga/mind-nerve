@@ -40,12 +40,12 @@ Usage
     # From a plain integer-per-line lengths file:
     python3 calibrate_stride.py \\
         --lengths /tmp/request_lengths.txt \\
-        --output  /data/datasets/mind-nerve-catalog/stride/
+        --output  catalog-data/stride/
 
     # From JSONL with "token_count" field:
     python3 calibrate_stride.py \\
         --lengths /tmp/events.jsonl \\
-        --output  /data/datasets/mind-nerve-catalog/stride/
+        --output  catalog-data/stride/
 
     # Dry-run (print only, write nothing):
     python3 calibrate_stride.py --lengths /tmp/lengths.txt --dry-run

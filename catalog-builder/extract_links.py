@@ -15,8 +15,8 @@ import json
 import re
 from pathlib import Path
 
-ROOT = Path("/data/datasets/mind-nerve-catalog/sources")
-OUT = Path("/data/datasets/mind-nerve-catalog/index/items.jsonl")
+ROOT = Path("catalog-data/sources")
+OUT = Path("catalog-data/index/items.jsonl")
 
 # Repo must look like an awesome list, list, directory, or curated registry.
 AWESOME_RE = re.compile(r"(awesome|directory|registry|collection|list|tools|toolkit)", re.IGNORECASE)

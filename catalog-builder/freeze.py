@@ -2,7 +2,7 @@
 """Freeze the live `items.jsonl` into a versioned catalog release.
 
 Outputs a deterministic, content-addressed artifact under
-`/data/datasets/mind-nerve-catalog/freeze/<version>/`:
+`catalog-data/freeze/<version>/`:
 
   items.jsonl     — canonical: dedup'd, sorted by id, newline-terminated
   manifest.json   — version header, item count, sha256, provenance
@@ -35,7 +35,7 @@ import sys
 import time
 from pathlib import Path
 
-ROOT = Path("/data/datasets/mind-nerve-catalog")
+ROOT = Path("catalog-data")
 ITEMS = ROOT / "index" / "items.jsonl"
 FREEZE_DIR = ROOT / "freeze"
 

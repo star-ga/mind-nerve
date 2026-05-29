@@ -36,14 +36,14 @@ seen in the co-occurrence log gets log(1 + 1) = log(2) ≈ 0.693.
 Usage
 -----
     python3 build_prior.py \\
-        --catalog /data/datasets/mind-nerve-catalog/freeze/v1.0/items.jsonl \\
-        --cooccurrence /data/datasets/mind-nerve-catalog/stats/cooccurrence.jsonl \\
-        --output /data/datasets/mind-nerve-catalog/prior/route_prior.json
+        --catalog catalog-data/freeze/v1.0/items.jsonl \\
+        --cooccurrence catalog-data/stats/cooccurrence.jsonl \\
+        --output catalog-data/prior/route_prior.json
 
     # Dry-run with no stats (uniform prior):
     python3 build_prior.py \\
-        --catalog /data/datasets/mind-nerve-catalog/freeze/v1.0/items.jsonl \\
-        --output /data/datasets/mind-nerve-catalog/prior/route_prior.json
+        --catalog catalog-data/freeze/v1.0/items.jsonl \\
+        --output catalog-data/prior/route_prior.json
 """
 
 from __future__ import annotations

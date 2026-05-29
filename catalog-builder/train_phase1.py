@@ -17,7 +17,7 @@ Recipe
 
 Outputs
 -------
-  /data/datasets/mind-nerve-catalog/phase1/
+  catalog-data/phase1/
     ├── checkpoint/       (sentence-transformers save_directory)
     ├── train.log
     ├── eval.json
@@ -35,10 +35,10 @@ import sys
 import time
 from pathlib import Path
 
-CORPUS = Path("/data/datasets/mind-nerve-catalog/tokenizer/corpus.txt")
-FREEZE_MANIFEST = Path("/data/datasets/mind-nerve-catalog/freeze/v1.0/manifest.json")
-TOKENIZER_MANIFEST = Path("/data/datasets/mind-nerve-catalog/tokenizer/v1.0/manifest.json")
-OUT_ROOT = Path("/data/datasets/mind-nerve-catalog/phase1")
+CORPUS = Path("catalog-data/tokenizer/corpus.txt")
+FREEZE_MANIFEST = Path("catalog-data/freeze/v1.0/manifest.json")
+TOKENIZER_MANIFEST = Path("catalog-data/tokenizer/v1.0/manifest.json")
+OUT_ROOT = Path("catalog-data/phase1")
 
 DEFAULT_BASE = "BAAI/bge-small-en-v1.5"
 DEFAULT_EPOCHS = 3

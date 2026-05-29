@@ -2,7 +2,7 @@
 
 - **Trained:** 2026-05-16T02:28:07Z (UTC)
 - **Status:** draft-unsigned. `manifest.sig` is a placeholder.
-- **Location:** `/data/datasets/mind-nerve-catalog/tokenizer/v1.0/`
+- **Location:** `catalog-data/tokenizer/v1.0/`
 - **Manifest:** [`tokenizer-v1.0.manifest.json`](./tokenizer-v1.0.manifest.json)
   (copied here for provenance).
 - **Bound to:** catalog [`v1.0`](./v1.0.md)

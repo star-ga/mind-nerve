@@ -17,7 +17,7 @@ Reserves 8 special token IDs that mind-nerve's encoder relies on:
     7  [SEP]      reserved separator
 
 Outputs:
-  /data/datasets/mind-nerve-catalog/tokenizer/v1.0/
+  catalog-data/tokenizer/v1.0/
     ├── tokenizer.json     (HF tokenizers format)
     ├── manifest.json      (vocab size, hash, training config)
     └── manifest.sig       (STARGA HMAC placeholder)
@@ -31,7 +31,7 @@ import sys
 import time
 from pathlib import Path
 
-ROOT = Path("/data/datasets/mind-nerve-catalog/tokenizer")
+ROOT = Path("catalog-data/tokenizer")
 CORPUS = ROOT / "corpus.txt"
 
 # Default vocab; can be overridden by CLI.

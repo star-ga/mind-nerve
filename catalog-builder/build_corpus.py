@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Materialise the BPE training corpus from the frozen catalog.
 
-Reads /data/datasets/mind-nerve-catalog/freeze/v1.0/items.jsonl,
+Reads catalog-data/freeze/v1.0/items.jsonl,
 re-loads each item's underlying bytes (or synthesises them for tool
 entries), and emits a flat text corpus with one item per line:
 
     <NAME>\t<KIND>\t<BODY-FIRST-N-CHARS>
 
-Output: /data/datasets/mind-nerve-catalog/tokenizer/corpus.txt
+Output: catalog-data/tokenizer/corpus.txt
 Used by train_bpe.py.
 """
 
@@ -17,9 +17,9 @@ import json
 import sys
 from pathlib import Path
 
-FREEZE = Path("/data/datasets/mind-nerve-catalog/freeze/v1.0/items.jsonl")
-SOURCES = Path("/data/datasets/mind-nerve-catalog/sources")
-OUT_DIR = Path("/data/datasets/mind-nerve-catalog/tokenizer")
+FREEZE = Path("catalog-data/freeze/v1.0/items.jsonl")
+SOURCES = Path("catalog-data/sources")
+OUT_DIR = Path("catalog-data/tokenizer")
 OUT = OUT_DIR / "corpus.txt"
 
 MAX_CHARS_PER_ITEM = 2048   # trim long bodies so the corpus stays mineable

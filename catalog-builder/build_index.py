@@ -36,9 +36,9 @@ import re
 import sys
 from pathlib import Path
 
-ROOT = Path("/data/datasets/mind-nerve-catalog/sources")
-OUT = Path("/data/datasets/mind-nerve-catalog/index/items.jsonl")
-STATS = Path("/data/datasets/mind-nerve-catalog/index/stats.json")
+ROOT = Path("catalog-data/sources")
+OUT = Path("catalog-data/index/items.jsonl")
+STATS = Path("catalog-data/index/stats.json")
 
 # Embedding dimensionality — must match ROUTE_EMBEDDING_DIM in src/lib.mind.
 ROUTE_EMBEDDING_DIM = 256

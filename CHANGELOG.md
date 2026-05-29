@@ -423,7 +423,7 @@ conflicts.
   Governance section linking new docs.
 - `pyproject.toml` long-description now states the Apache-2.0 +
   separately-licensed-runtime split.
-- `python/mind_nerve/cli.py` stale `/data/datasets/...` help text
+- `python/mind_nerve/cli.py` stale `an absolute dataset path` help text
   replaced with `$MIND_NERVE_RUNTIME_DIR` + auto-seeded HF cache.
 
 ### Tests, CI, and dependency hardening (Stream B — `f3c79ba`)
@@ -1069,7 +1069,7 @@ Tracked but not in this release; see `docs/plans/FINAL_SHIP_PLAN_2026_05_17.md`:
   `None`; resolution mirrors the new auto-seed flow.
 
 ### Removed
-- Hardcoded `/data/datasets/mind-nerve-catalog/...` default. Replaced by
+- Hardcoded `catalog-data/...` default. Replaced by
   the user-local + HF-auto-seeded path. STARGA-internal use sets
   `MIND_NERVE_RUNTIME_DIR` explicitly.
 

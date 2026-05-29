@@ -62,7 +62,7 @@ def test_save_table_atomic_does_not_leak_tmp_npy(tmp_path: Path) -> None:
 
 
 def test_cli_learn_does_not_use_hardcoded_fallback(tmp_path: Path) -> None:
-    """0.1.0a4 regression: cli.cmd_learn used to hardcode /data/datasets/...
+    """0.1.0a4 regression: cli.cmd_learn used to hardcode an absolute dataset path
     as the runtime_dir fallback, ignoring MIND_NERVE_RUNTIME_DIR. The fix
     routes through _DEFAULT_RUNTIME_DIR which honors the env var. We verify
     by pointing the env var at a bogus path and asserting the error message
@@ -92,7 +92,7 @@ def test_cli_learn_does_not_use_hardcoded_fallback(tmp_path: Path) -> None:
         timeout=60,
     )
     out = result.stdout + result.stderr
-    # Old bug: would error on /data/datasets/mind-nerve-catalog/phase1/v1.[10]-oss
-    assert "/data/datasets/mind-nerve-catalog" not in out, (
+    # Old bug: would error on catalog-data/phase1/v1.[10]-oss
+    assert "catalog-data" not in out, (
         "regression: legacy hardcoded fallback path appeared in CLI error"
     )

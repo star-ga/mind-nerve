@@ -34,10 +34,10 @@
 //   const-blob support cycle when the offline quantizer ships.
 //
 // Build:
-//   cd /home/n/mind
+//   cd <mind-checkout>
 //   cargo run --features "std-surface cross-module-imports mlir-build" \
-//       --bin mindc -- /home/n/mind-nerve/mind/exports/c_abi.mind \
-//       --emit-shared /home/n/mind-nerve/python/mind_nerve/_native/libmind_nerve_encoder.so \
+//       --bin mindc -- <mind-nerve>/mind/exports/c_abi.mind \
+//       --emit-shared <mind-nerve>/python/mind_nerve/_native/libmind_nerve_encoder.so \
 //       --target=x86_64-unknown-linux-gnu \
 //       --features "std-surface cross-module-imports"
 //

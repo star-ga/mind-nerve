@@ -2,7 +2,7 @@
 
 - **Trained:** 2026-05-16
 - **Path:** PyTorch internal (per `docs/catalog_and_training_plan.md`)
-- **Location:** `/data/datasets/mind-nerve-catalog/phase1/v1.0/`
+- **Location:** `catalog-data/phase1/v1.0/`
 - **Bound to:** catalog [`v1.0`](./v1.0.md) + tokenizer
   [`v1.0`](./tokenizer-v1.0.md) (the latter is locked in for the
   Phase 2 native-MIND retrain; Phase 1 uses BGE's bundled tokenizer).

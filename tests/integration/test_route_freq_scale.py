@@ -1,3 +1,4 @@
+import os
 """Integration tests for catalog-v2 route_table_freq_scale.npy.
 
 SOTA-track #4 — Frequency-adaptive route scaling. The runtime, at load,
@@ -22,7 +23,7 @@ import numpy as np
 import pytest
 
 pytestmark = pytest.mark.skipif(
-    not Path("/home/n/mind-nerve").exists(),
+    os.environ.get("MIND_NERVE_RUN_INTEGRATION") != "1",
     reason="needs mind-nerve checkout",
 )
 

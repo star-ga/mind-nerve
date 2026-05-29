@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Mass-clone agent-skill / claude-skill / mcp-server collection repos.
-# Shallow clones (--depth 1) into /data/datasets/mind-nerve-catalog/sources/.
+# Shallow clones (--depth 1) into catalog-data/sources/.
 
 set -uo pipefail
 
-ROOT=/data/datasets/mind-nerve-catalog
+ROOT=catalog-data
 SOURCES=$ROOT/sources
 MANIFEST=$ROOT/index/clone_manifest.tsv
 LOG=$ROOT/index/clone_log.tsv

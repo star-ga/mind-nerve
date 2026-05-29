@@ -134,7 +134,7 @@ Requires mindc v0.4.4+ with `std-surface cross-module-imports mlir-build`:
 ```bash
 ./tools/build_native_encoder.sh
 # or with an existing checkout:
-MIND_CHECKOUT=/home/n/mind ./tools/build_native_encoder.sh
+MIND_CHECKOUT=<mind-checkout> ./tools/build_native_encoder.sh
 ```
 
 The output `.so` is staged to `python/mind_nerve/_native/libmind_nerve_encoder.so`

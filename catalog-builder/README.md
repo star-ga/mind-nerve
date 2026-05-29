@@ -2,7 +2,7 @@
 
 Tools for mining the public skill/agent/rule/prompt corpus that becomes
 the mind-nerve catalog. Output lands on the data SSD at
-`/data/datasets/mind-nerve-catalog/`, not in this repo, because the
+`catalog-data/`, not in this repo, because the
 corpus is hundreds of megabytes of third-party content under varied
 licenses.
 
@@ -40,7 +40,7 @@ Schema:
 ## Files
 
 - `clone_all.sh` — shallow-clone every repo in `clone_manifest_vN.tsv`
-  into `/data/datasets/mind-nerve-catalog/sources/`, log to TSV.
+  into `catalog-data/sources/`, log to TSV.
 - `clone_manifest_v1.tsv` through `clone_manifest_v4.tsv` — curated
   TSVs of `(stars, size_kb, full_name, description)` selected from
   `gh search repos` queries.
@@ -59,8 +59,8 @@ for v in 1 2 3 4; do
 done
 
 # 2. (optional) symlink local STARGA-curated skills so they're indexed
-ln -sfn ~/.agents/skills /data/datasets/mind-nerve-catalog/sources/STARGA__local-skills
-ln -sfn ~/.claude/agents /data/datasets/mind-nerve-catalog/sources/STARGA__claude-agents
+ln -sfn ~/.agents/skills catalog-data/sources/STARGA__local-skills
+ln -sfn ~/.claude/agents catalog-data/sources/STARGA__claude-agents
 
 # 3. build the flat index from file-level skill/command/agent/rule artefacts
 python3 build_index.py
@@ -72,7 +72,7 @@ python3 extract_links.py
 python3 -c "
 import json
 from collections import Counter
-items = [json.loads(l) for l in open('/data/datasets/mind-nerve-catalog/index/items.jsonl')]
+items = [json.loads(l) for l in open('catalog-data/index/items.jsonl')]
 print('total', len(items))
 print('kinds', Counter(i['kind'] for i in items).most_common())
 "

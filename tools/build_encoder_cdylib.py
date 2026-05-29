@@ -473,7 +473,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--mind-checkout",
-        default=os.environ.get("MIND_CHECKOUT", "/home/n/mind"),
+        default=os.environ.get("MIND_CHECKOUT", os.path.expanduser("~/mind")),
         help="Path to the star-ga/mind checkout with built mindc",
     )
     parser.add_argument(

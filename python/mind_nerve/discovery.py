@@ -56,7 +56,7 @@ PUBLIC_LICENSES = {
 COMMERCIAL_MARKERS = re.compile(
     r"\b(starga[\s-]*commercial|proprietary|confidential|"
     r"all[\s-]*rights[\s-]*reserved|do[\s-]*not[\s-]*distribute|"
-    r"closed[\s-]*source|naestro-defense|mind-internal)\b",
+    r"closed[\s-]*source)\b",
     re.IGNORECASE,
 )
 

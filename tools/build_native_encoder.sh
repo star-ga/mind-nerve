@@ -33,7 +33,7 @@
 #
 # Usage:
 #   ./tools/build_native_encoder.sh
-#   MIND_CHECKOUT=/home/n/mind ./tools/build_native_encoder.sh
+#   MIND_CHECKOUT=<mind-checkout> ./tools/build_native_encoder.sh
 #
 # Limitation (A1.3):
 #   This script builds the C-ABI export surface (c_abi.mind) linked against
@@ -46,7 +46,7 @@
 # Output:
 #   $OUT_DIR/libmind_nerve_encoder.so
 #
-# The .so is a sibling of the existing FORTRESS-protected libmindnerve.so;
+# The .so is a sibling of the existing protected encoder runtime library;
 # it is NOT a replacement. Both files are bundled into the wheel via
 # the MANIFEST.in / pyproject.toml package-data glob.
 
@@ -180,7 +180,7 @@ if [[ $MISSING -gt 0 ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 6. Leak verifier (matches existing FORTRESS pattern in ROADMAP.md §42-44)
+# 6. Leak verifier (matches the standard symbol-leak verification)
 # ---------------------------------------------------------------------------
 echo "[build] Running leak verifier against $OUTPUT_SO..."
 if command -v strings >/dev/null 2>&1; then

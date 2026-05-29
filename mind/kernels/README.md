@@ -94,18 +94,18 @@ winning window for any token t (used by the A1.4 bit-identity harness).
 Requires mindc v0.4.4 with `std-surface` and `cross-module-imports` features:
 
 ```
-cd /home/n/mind
+cd <mind-checkout>
 cargo run --features "std-surface cross-module-imports" \
-    --bin mindc -- /home/n/mind-nerve/mind/kernels/<file>.mind --emit-ir
+    --bin mindc -- <mind-nerve>/mind/kernels/<file>.mind --emit-ir
 ```
 
 Full shared-library build (after A1.1 lands):
 
 ```
-cd /home/n/mind
+cd <mind-checkout>
 cargo run --features "std-surface cross-module-imports mlir-build" \
-    --bin mindc -- /home/n/mind-nerve/mind/kernels/encode.mind \
-    --emit-shared /home/n/mind-nerve/python/mind_nerve/_native/libmind_nerve_encoder.so \
+    --bin mindc -- <mind-nerve>/mind/kernels/encode.mind \
+    --emit-shared <mind-nerve>/python/mind_nerve/_native/libmind_nerve_encoder.so \
     --target=x86_64-unknown-linux-gnu
 ```
 

@@ -3,7 +3,7 @@
 ## The problem solved tonight
 
 `pip install mind-nerve` ships the wheel but the runtime expects weights
-at a local path (`/data/datasets/mind-nerve-catalog/phase1/...`). For an
+at a local path (`catalog-data/phase1/...`). For an
 end-user, this is a broken UX. We need a weights-delivery story.
 
 ## Three-tier delivery (preferred)
@@ -74,17 +74,17 @@ pip install huggingface_hub
 
 # 1. Encoder repo
 huggingface-cli upload star-ga/mind-nerve-encoder-v1.1-oss \
-  /data/datasets/mind-nerve-catalog/phase1/v1.1-oss/checkpoint/ \
+  catalog-data/phase1/v1.1-oss/checkpoint/ \
   --repo-type model --commit-message "v1.1-oss initial"
 
 # 2. Catalog dataset repo
 huggingface-cli upload-large-folder star-ga/mind-nerve-catalog-v1.1-oss \
-  /data/datasets/mind-nerve-catalog/freeze/v1.1-oss/ \
+  catalog-data/freeze/v1.1-oss/ \
   --repo-type dataset --commit-message "v1.1-oss initial"
 
 # 3. Tokenizer
 huggingface-cli upload star-ga/mind-nerve-encoder-v1.1-oss \
-  /data/datasets/mind-nerve-catalog/tokenizer/v1.1-oss/tokenizer.json \
+  catalog-data/tokenizer/v1.1-oss/tokenizer.json \
   tokenizer.json --repo-type model
 ```
 

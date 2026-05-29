@@ -61,7 +61,21 @@ def _load_runtime() -> "_Runtime | _NativeEncoderRuntime":
     backend = _active_backend()
     rdir = _resolve_runtime_dir()
     if backend == _BACKEND_NATIVE:
-        return _NativeEncoderRuntime(rdir)
+        try:
+            return _NativeEncoderRuntime(rdir)
+        except (FileNotFoundError, ImportError) as exc:
+            # The native Q16.16 encoder shared library is not present — the
+            # common case for a plain `pip install`, where the encoder is
+            # built/shipped separately from the wheel. Fall back to the
+            # pytorch path so route() works out of the box instead of raising
+            # on the default backend. Set MIND_NERVE_BACKEND=pytorch to select
+            # it explicitly and silence this notice.
+            print(
+                f"mind-nerve: native encoder unavailable ({exc}); "
+                "falling back to pytorch backend.",
+                file=sys.stderr,
+            )
+            return _Runtime(rdir)
     return _Runtime(rdir)
 
 

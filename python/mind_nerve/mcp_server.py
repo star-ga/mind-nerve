@@ -95,7 +95,13 @@ def handle(msg: dict) -> dict | None:
         query = args.get("query", "").strip()
         if not query:
             return _err(req_id, -32602, "missing query")
-        top_k = int(args.get("top_k", 5))
+        if len(query) > 100_000:
+            return _err(req_id, -32602, "query too long")
+        try:
+            top_k = int(args.get("top_k", 5))
+        except (ValueError, TypeError):
+            return _err(req_id, -32602, "top_k must be an integer")
+        top_k = max(1, min(top_k, 64))
         result = _route(query, top_k=top_k)
         body = json.dumps(result.as_dict(), indent=2)
         return _ok(req_id, {"content": [{"type": "text", "text": body}]})
@@ -120,7 +126,11 @@ def main(argv: list[str] | None = None) -> int:
             sys.stdout.write(json.dumps(_err(None, -32700, f"parse error: {exc}")) + "\n")
             sys.stdout.flush()
             continue
-        resp = handle(msg)
+        try:
+            resp = handle(msg)
+        except Exception as exc:  # noqa: BLE001 — never let one bad request kill the loop
+            req_id = msg.get("id") if isinstance(msg, dict) else None
+            resp = _err(req_id, -32603, f"internal error: {exc}")
         if resp is not None:
             sys.stdout.write(json.dumps(resp, separators=(",", ":")) + "\n")
             sys.stdout.flush()

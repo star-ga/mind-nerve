@@ -128,7 +128,8 @@ def _load_table(runtime_dir: Path) -> tuple[Any, list[dict]]:
     import numpy as np
 
     emb = np.load(runtime_dir / "route_table.npy")
-    meta = [json.loads(line) for line in (runtime_dir / "route_table.jsonl").open()]
+    with (runtime_dir / "route_table.jsonl").open() as _f:
+        meta = [json.loads(line) for line in _f]
     return emb, meta
 
 

@@ -205,7 +205,8 @@ class _Runtime:
                 f"Run mind_nerve.installer.precompute_routes() first."
             )
         self.embeddings: "np.ndarray" = np.load(emb_path)
-        self.routes: list[dict] = [json.loads(ln) for ln in meta_path.open("r")]
+        with meta_path.open("r") as _f:
+            self.routes: list[dict] = [json.loads(ln) for ln in _f]
         if self.embeddings.shape[0] != len(self.routes):
             raise RuntimeError("Route table embeddings/meta length mismatch")
 
@@ -363,7 +364,8 @@ class _NativeEncoderRuntime:
         # Store as Q16.16 int64 for native scoring path.
         self._catalog_q16: np.ndarray = np.ascontiguousarray(self._f32_to_q16(embeddings_f32))
 
-        self.routes: list[dict] = [json.loads(ln) for ln in meta_path.open("r")]
+        with meta_path.open("r") as _f:
+            self.routes: list[dict] = [json.loads(ln) for ln in _f]
         if self._catalog_q16.shape[0] != len(self.routes):
             raise RuntimeError("Native catalog embeddings/meta length mismatch")
 

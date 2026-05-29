@@ -82,6 +82,7 @@ def _load_runtime() -> "_Runtime | _NativeEncoderRuntime":
 _HF_REPO_ID = "star-ga/mind-nerve"
 _USER_RUNTIME_DIR = Path.home() / ".local" / "share" / "mind-nerve" / "runtime"
 
+
 def _seed_from_hf(target: Path) -> None:
     """Snapshot-download the Phase-1 weights from Hugging Face into *target*.
 

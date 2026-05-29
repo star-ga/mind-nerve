@@ -1,4 +1,3 @@
-import os
 """Integration tests for catalog-v2 route_table_freq_scale.npy.
 
 SOTA-track #4 — Frequency-adaptive route scaling. The runtime, at load,
@@ -17,6 +16,7 @@ Invariants checked:
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import numpy as np

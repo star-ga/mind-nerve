@@ -1,4 +1,3 @@
-import os
 """Integration tests for catalog-v2 route_prior loading + scoring.
 
 The runtime gains an optional `route_table_prior.npy` column. When
@@ -16,6 +15,7 @@ Invariants checked:
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import numpy as np

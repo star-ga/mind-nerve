@@ -117,6 +117,13 @@ def _resolve_runtime_dir(runtime_dir: str | None = None) -> Path:
     Auto-seeds ``~/.local/share/mind-nerve/runtime/`` from Hugging Face when
     no explicit runtime is provided.
     """
+    # ``_DEFAULT_RUNTIME_DIR`` is a lazy ``str`` proxy whose raw value is the
+    # sentinel ``"<lazy:mind-nerve-runtime>"``.  When it is threaded through a
+    # CLI default (e.g. ``mind-nerve learn`` with no ``--runtime-dir``) it can
+    # arrive here verbatim instead of resolving; treat it as "unset" so we fall
+    # back to env / HF resolution rather than ``Path("<lazy:...>")``.
+    if runtime_dir is not None and runtime_dir == "<lazy:mind-nerve-runtime>":
+        runtime_dir = None
     if runtime_dir:
         p = Path(runtime_dir).expanduser()
         if not p.is_dir():
@@ -459,6 +466,12 @@ def load_default_runtime(
     """
     p = _resolve_runtime_dir(runtime_dir)
     return _load_cached(str(p), _active_backend())
+
+
+# The actual LRU cache lives on ``_load_cached``; expose its ``cache_clear`` on
+# the public wrapper so callers (e.g. ``discovery.scan`` after a route-table
+# rebuild) can invalidate the in-memory runtime without an AttributeError.
+load_default_runtime.cache_clear = _load_cached.cache_clear  # type: ignore[attr-defined]
 
 
 def _count_bpe_tokens(query: str, rt: "_Runtime | _NativeEncoderRuntime") -> int:

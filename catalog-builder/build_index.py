@@ -50,35 +50,41 @@ I32_MIN = -2_147_483_648
 
 
 SKILL_PATTERNS = [
-    (re.compile(r"(^|/)SKILL\.md$",                       re.IGNORECASE), "skill"),
-    (re.compile(r"(^|/)skills?/[^/]+\.md$",               re.IGNORECASE), "skill"),
-    (re.compile(r"(^|/)skills?/[^/]+/[^/]+\.md$",         re.IGNORECASE), "skill"),
-    (re.compile(r"(\.claude|^claude)/(skills|commands|agents|hooks)/.*\.md$", re.IGNORECASE), "skill"),
-    (re.compile(r"(^|/)commands?/[^/]+\.md$",             re.IGNORECASE), "command"),
-    (re.compile(r"(^|/)commands?/[^/]+/[^/]+\.md$",       re.IGNORECASE), "command"),
-    (re.compile(r"(^|/)agents?/[^/]+\.md$",               re.IGNORECASE), "agent"),
-    (re.compile(r"(^|/)agents?/[^/]+/[^/]+\.md$",         re.IGNORECASE), "agent"),
-    (re.compile(r"(^|/)subagents?/[^/]+\.md$",            re.IGNORECASE), "agent"),
-    (re.compile(r"(^|/)plugins?/[^/]+\.md$",              re.IGNORECASE), "skill"),
-    (re.compile(r"(^|/)workflows?/[^/]+\.md$",            re.IGNORECASE), "skill"),
-    (re.compile(r"(^|/)recipes?/[^/]+\.md$",              re.IGNORECASE), "skill"),
-    (re.compile(r"(^|/)playbooks?/[^/]+\.md$",            re.IGNORECASE), "skill"),
-    (re.compile(r"(^|/)hooks?/[^/]+\.md$",                re.IGNORECASE), "skill"),
-    (re.compile(r"(^|/)instructions/[^/]+\.md$",          re.IGNORECASE), "prompt"),
-    (re.compile(r"\.cursorrules$",                        re.IGNORECASE), "rule"),
-    (re.compile(r"\.mdc$",                                re.IGNORECASE), "rule"),
-    (re.compile(r"(^|/)\.cursor/rules/.*\.mdc?$",         re.IGNORECASE), "rule"),
-    (re.compile(r"(^|/)extensions?/[^/]+/[^/]+\.md$",     re.IGNORECASE), "extension"),
-    (re.compile(r"(^|/)extensions?/[^/]+\.md$",           re.IGNORECASE), "extension"),
-    (re.compile(r"(^|/)prompts?/[^/]+\.md$",              re.IGNORECASE), "prompt"),
-    (re.compile(r"(^|/)prompts?/[^/]+/[^/]+\.md$",        re.IGNORECASE), "prompt"),
-    (re.compile(r"(^|/)system[-_]prompts?/[^/]+",         re.IGNORECASE), "prompt"),
-    (re.compile(r"(^|/)tools/[^/]+/[^/]+\.md$",           re.IGNORECASE), "skill"),
-    (re.compile(r"copilot-instructions\.md$",             re.IGNORECASE), "prompt"),
-    (re.compile(r"AGENTS?\.md$",                          re.IGNORECASE), "prompt"),
-    (re.compile(r"CLAUDE\.md$",                           re.IGNORECASE), "prompt"),
+    (re.compile(r"(^|/)SKILL\.md$", re.IGNORECASE), "skill"),
+    (re.compile(r"(^|/)skills?/[^/]+\.md$", re.IGNORECASE), "skill"),
+    (re.compile(r"(^|/)skills?/[^/]+/[^/]+\.md$", re.IGNORECASE), "skill"),
+    (
+        re.compile(r"(\.claude|^claude)/(skills|commands|agents|hooks)/.*\.md$", re.IGNORECASE),
+        "skill",
+    ),
+    (re.compile(r"(^|/)commands?/[^/]+\.md$", re.IGNORECASE), "command"),
+    (re.compile(r"(^|/)commands?/[^/]+/[^/]+\.md$", re.IGNORECASE), "command"),
+    (re.compile(r"(^|/)agents?/[^/]+\.md$", re.IGNORECASE), "agent"),
+    (re.compile(r"(^|/)agents?/[^/]+/[^/]+\.md$", re.IGNORECASE), "agent"),
+    (re.compile(r"(^|/)subagents?/[^/]+\.md$", re.IGNORECASE), "agent"),
+    (re.compile(r"(^|/)plugins?/[^/]+\.md$", re.IGNORECASE), "skill"),
+    (re.compile(r"(^|/)workflows?/[^/]+\.md$", re.IGNORECASE), "skill"),
+    (re.compile(r"(^|/)recipes?/[^/]+\.md$", re.IGNORECASE), "skill"),
+    (re.compile(r"(^|/)playbooks?/[^/]+\.md$", re.IGNORECASE), "skill"),
+    (re.compile(r"(^|/)hooks?/[^/]+\.md$", re.IGNORECASE), "skill"),
+    (re.compile(r"(^|/)instructions/[^/]+\.md$", re.IGNORECASE), "prompt"),
+    (re.compile(r"\.cursorrules$", re.IGNORECASE), "rule"),
+    (re.compile(r"\.mdc$", re.IGNORECASE), "rule"),
+    (re.compile(r"(^|/)\.cursor/rules/.*\.mdc?$", re.IGNORECASE), "rule"),
+    (re.compile(r"(^|/)extensions?/[^/]+/[^/]+\.md$", re.IGNORECASE), "extension"),
+    (re.compile(r"(^|/)extensions?/[^/]+\.md$", re.IGNORECASE), "extension"),
+    (re.compile(r"(^|/)prompts?/[^/]+\.md$", re.IGNORECASE), "prompt"),
+    (re.compile(r"(^|/)prompts?/[^/]+/[^/]+\.md$", re.IGNORECASE), "prompt"),
+    (re.compile(r"(^|/)system[-_]prompts?/[^/]+", re.IGNORECASE), "prompt"),
+    (re.compile(r"(^|/)tools/[^/]+/[^/]+\.md$", re.IGNORECASE), "skill"),
+    (re.compile(r"copilot-instructions\.md$", re.IGNORECASE), "prompt"),
+    (re.compile(r"AGENTS?\.md$", re.IGNORECASE), "prompt"),
+    (re.compile(r"CLAUDE\.md$", re.IGNORECASE), "prompt"),
     # JSON variants
-    (re.compile(r"(^|/)(skills|agents|commands|subagents|plugins)/[^/]+\.json$", re.IGNORECASE), "skill"),
+    (
+        re.compile(r"(^|/)(skills|agents|commands|subagents|plugins)/[^/]+\.json$", re.IGNORECASE),
+        "skill",
+    ),
 ]
 SKIP_DIRS = {".git", "node_modules", "dist", "build", "target", "__pycache__", ".venv", "venv"}
 
@@ -105,10 +111,23 @@ def repo_name_for(repo_dir: Path) -> str:
     return repo_dir.name.replace("__", "/", 1)
 
 
-PROMPT_REPO_RE = re.compile(r"(prompt|leak|cl4r1t4s|heimdall|oss-system|cursor-rules)", re.IGNORECASE)
-SKIP_FILES = {"README.md", "CONTRIBUTING.md", "LICENSE", "LICENSE.md", "CODE_OF_CONDUCT.md",
-              "CHANGELOG.md", "SECURITY.md", "GOVERNANCE.md", "AUTHORS.md", "MAINTAINERS.md",
-              "PULL_REQUEST_TEMPLATE.md", "ISSUE_TEMPLATE.md"}
+PROMPT_REPO_RE = re.compile(
+    r"(prompt|leak|cl4r1t4s|heimdall|oss-system|cursor-rules)", re.IGNORECASE
+)
+SKIP_FILES = {
+    "README.md",
+    "CONTRIBUTING.md",
+    "LICENSE",
+    "LICENSE.md",
+    "CODE_OF_CONDUCT.md",
+    "CHANGELOG.md",
+    "SECURITY.md",
+    "GOVERNANCE.md",
+    "AUTHORS.md",
+    "MAINTAINERS.md",
+    "PULL_REQUEST_TEMPLATE.md",
+    "ISSUE_TEMPLATE.md",
+}
 
 
 def walk_repo(repo_dir: Path):
@@ -121,7 +140,12 @@ def walk_repo(repo_dir: Path):
             continue
         rel = str(p.relative_to(repo_dir))
         kind = detect_kind(rel)
-        if not kind and is_prompt_repo and p.suffix.lower() in {".md", ".txt"} and p.name not in SKIP_FILES:
+        if (
+            not kind
+            and is_prompt_repo
+            and p.suffix.lower() in {".md", ".txt"}
+            and p.name not in SKIP_FILES
+        ):
             # Fallback: in a prompt/skill repo, treat any non-boilerplate .md/.txt as a prompt.
             kind = "prompt"
         if not kind:
@@ -130,9 +154,9 @@ def walk_repo(repo_dir: Path):
             body = p.read_bytes()
         except OSError:
             continue
-        if len(body) > 256 * 1024:        # skip > 256 KiB (likely not a skill)
+        if len(body) > 256 * 1024:  # skip > 256 KiB (likely not a skill)
             continue
-        if len(body) < 32:                # too short to be meaningful
+        if len(body) < 32:  # too short to be meaningful
             continue
         h = hashlib.sha256(body).hexdigest()
         name = first_h1(body) or p.stem
@@ -156,7 +180,6 @@ def load_prior_file(prior_path: Path) -> dict[str, float]:
     data = json.loads(prior_path.read_text(encoding="utf-8"))
     raw: dict = data.get("priors", {})
     return {k: float(v) for k, v in raw.items()}
-
 
 
 def scale_embedding_q16(embedding: list[int], scale: float) -> list[int]:
@@ -220,23 +243,33 @@ def main() -> None:
         description="Walk skill repos and emit JSONL catalog index (+ optional v2 binary)"
     )
     ap.add_argument(
-        "--sources", type=Path, default=ROOT,
+        "--sources",
+        type=Path,
+        default=ROOT,
         help="Root directory of cloned skill repos",
     )
     ap.add_argument(
-        "--out-jsonl", type=Path, default=OUT,
+        "--out-jsonl",
+        type=Path,
+        default=OUT,
         help="Destination JSONL index path",
     )
     ap.add_argument(
-        "--out-stats", type=Path, default=STATS,
+        "--out-stats",
+        type=Path,
+        default=STATS,
         help="Destination stats JSON path",
     )
     ap.add_argument(
-        "--output", type=Path, default=None,
+        "--output",
+        type=Path,
+        default=None,
         help="If given, also write a v2 binary catalog to this path",
     )
     ap.add_argument(
-        "--prior-file", type=Path, default=None,
+        "--prior-file",
+        type=Path,
+        default=None,
         help="route_prior.json from build_prior.py; used for the v2 binary emit",
     )
     args = ap.parse_args()
@@ -292,9 +325,7 @@ def main() -> None:
         "unique": counts["unique"],
         "dedup_drops": counts["dedup_drops"],
         "by_kind": counts["by_kind"],
-        "by_repo_top10": dict(
-            sorted(counts["by_repo"].items(), key=lambda kv: -kv[1])[:10]
-        ),
+        "by_repo_top10": dict(sorted(counts["by_repo"].items(), key=lambda kv: -kv[1])[:10]),
     }
 
     if args.output is not None:

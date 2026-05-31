@@ -22,7 +22,7 @@ SOURCES = Path("catalog-data/sources")
 OUT_DIR = Path("catalog-data/tokenizer")
 OUT = OUT_DIR / "corpus.txt"
 
-MAX_CHARS_PER_ITEM = 2048   # trim long bodies so the corpus stays mineable
+MAX_CHARS_PER_ITEM = 2048  # trim long bodies so the corpus stays mineable
 
 
 def synth_tool_body(item: dict) -> str:
@@ -77,20 +77,25 @@ def main():
                     n_loaded += 1
                 else:
                     n_empty += 1
-                    body = name   # last-ditch fallback so the item is still seen
+                    body = name  # last-ditch fallback so the item is still seen
 
             # Squash whitespace runs and trim
             body = " ".join(body.split())[:MAX_CHARS_PER_ITEM]
             fout.write(f"{name}\t{kind}\t{body}\n")
 
-    print(json.dumps({
-        "items_total": n_total,
-        "items_with_loaded_body": n_loaded,
-        "items_tool_synthesised": n_tool,
-        "items_with_empty_body": n_empty,
-        "corpus_path": str(OUT),
-        "corpus_bytes": OUT.stat().st_size,
-    }, indent=2))
+    print(
+        json.dumps(
+            {
+                "items_total": n_total,
+                "items_with_loaded_body": n_loaded,
+                "items_tool_synthesised": n_tool,
+                "items_with_empty_body": n_empty,
+                "corpus_path": str(OUT),
+                "corpus_bytes": OUT.stat().st_size,
+            },
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":

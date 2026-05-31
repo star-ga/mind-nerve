@@ -158,10 +158,10 @@ def _resolve_runtime_dir(runtime_dir: str | None = None) -> Path:
 # Compatibility shim: discovery.py and the CLI used to import this constant.
 # It now lazy-evaluates on first attribute access so the HF download isn't
 # triggered at import time.
-class _DefaultRuntimeDirProxy(str):  # type: ignore[misc]
+class _DefaultRuntimeDirProxy(str):
     """str-compatible proxy that resolves to the runtime dir on str-cast."""
 
-    def __new__(cls):
+    def __new__(cls) -> "_DefaultRuntimeDirProxy":
         return super().__new__(cls, "<lazy:mind-nerve-runtime>")
 
     def __str__(self) -> str:
@@ -221,7 +221,7 @@ class _Runtime:
             )
         self.embeddings: "np.ndarray" = np.load(emb_path)
         with meta_path.open("r") as _f:
-            self.routes: list[dict] = [json.loads(ln) for ln in _f]
+            self.routes: list[dict[str, Any]] = [json.loads(ln) for ln in _f]
         if self.embeddings.shape[0] != len(self.routes):
             raise RuntimeError("Route table embeddings/meta length mismatch")
 
@@ -270,7 +270,7 @@ class _Runtime:
         # it's load-only metadata for forward compatibility.
         stride_path = runtime_dir / "stride_thresholds.json"
         if stride_path.exists():
-            self.stride_thresholds: "dict | None" = json.loads(stride_path.read_text())
+            self.stride_thresholds: "dict[str, Any] | None" = json.loads(stride_path.read_text())
         else:
             self.stride_thresholds = None
 
@@ -380,7 +380,7 @@ class _NativeEncoderRuntime:
         self._catalog_q16: np.ndarray = np.ascontiguousarray(self._f32_to_q16(embeddings_f32))
 
         with meta_path.open("r") as _f:
-            self.routes: list[dict] = [json.loads(ln) for ln in _f]
+            self.routes: list[dict[str, Any]] = [json.loads(ln) for ln in _f]
         if self._catalog_q16.shape[0] != len(self.routes):
             raise RuntimeError("Native catalog embeddings/meta length mismatch")
 
@@ -395,7 +395,7 @@ class _NativeEncoderRuntime:
     def _load_tokenizer(self, runtime_dir: Path) -> Any:
         """Load the HuggingFace fast tokenizer from the checkpoint directory."""
         try:
-            from transformers import AutoTokenizer  # type: ignore[import]
+            from transformers import AutoTokenizer
 
             return AutoTokenizer.from_pretrained(str(runtime_dir / "checkpoint"), use_fast=True)
         except ImportError:
@@ -432,7 +432,7 @@ class _NativeEncoderRuntime:
             return_attention_mask=False,
             return_token_type_ids=False,
         )
-        return enc["input_ids"][0].astype(np.int32)
+        return np.asarray(enc["input_ids"][0], dtype=np.int32)
 
     def encode_query(self, text: str) -> np.ndarray:
         """Tokenize and encode a query string; returns Q16.16 int64 vector (384,)."""
@@ -499,7 +499,9 @@ def _count_bpe_tokens(query: str, rt: "_Runtime | _NativeEncoderRuntime") -> int
     backend the tokenizer is already loaded as rt._tokenizer.
     """
     try:
-        if hasattr(rt, "_tokenizer") and rt._tokenizer is not None:
+        if isinstance(rt, _NativeEncoderRuntime):
+            if rt._tokenizer is None:
+                return 0
             # Native backend: uses HF AutoTokenizer.
             enc = rt._tokenizer(
                 query,
@@ -728,7 +730,7 @@ def precompute_routes(
             )
 
     model = SentenceTransformer(str(rdir / "checkpoint"))
-    items: list[dict] = []
+    items: list[dict[str, Any]] = []
     texts: list[str] = []
     with open(catalog_path, "r", encoding="utf-8") as f:
         for line in f:

@@ -87,14 +87,21 @@ def evaluate(model, eval_pairs, all_positives, device, k_list=(1, 5, 10)):
                        positives so the index match works.
     """
     import torch
+
     queries = [q for q, _ in eval_pairs]
-    q_emb = model.encode(queries, batch_size=128, convert_to_tensor=True,
-                         show_progress_bar=False, device=device)
-    p_emb = model.encode(all_positives, batch_size=128, convert_to_tensor=True,
-                         show_progress_bar=False, device=device)
+    q_emb = model.encode(
+        queries, batch_size=128, convert_to_tensor=True, show_progress_bar=False, device=device
+    )
+    p_emb = model.encode(
+        all_positives,
+        batch_size=128,
+        convert_to_tensor=True,
+        show_progress_bar=False,
+        device=device,
+    )
     q_emb = torch.nn.functional.normalize(q_emb, dim=-1)
     p_emb = torch.nn.functional.normalize(p_emb, dim=-1)
-    sims = q_emb @ p_emb.T                     # [Q, |corpus|]
+    sims = q_emb @ p_emb.T  # [Q, |corpus|]
     correct_idx = torch.arange(len(eval_pairs), device=device)
     out = {"candidate_pool": len(all_positives)}
     for k in k_list:
@@ -112,16 +119,17 @@ def main():
     ap.add_argument("--lr", type=float, default=DEFAULT_LR)
     ap.add_argument("--max-len", type=int, default=DEFAULT_MAX_LEN)
     ap.add_argument("--out-version", default="v1.0")
-    ap.add_argument("--smoke-test", action="store_true",
-                    help="Use 500 pairs and 1 epoch; ~1 min total runtime.")
+    ap.add_argument(
+        "--smoke-test", action="store_true", help="Use 500 pairs and 1 epoch; ~1 min total runtime."
+    )
     args = ap.parse_args()
 
     random.seed(SEED)
     os.environ["PYTHONHASHSEED"] = str(SEED)
 
     import torch
+    from sentence_transformers import InputExample, SentenceTransformer, losses
     from torch.utils.data import DataLoader
-    from sentence_transformers import SentenceTransformer, InputExample, losses
 
     torch.manual_seed(SEED)
     if torch.cuda.is_available():
@@ -157,11 +165,14 @@ def main():
     train_positives = [p for _, p in train]
     all_positives = eval_positives + train_positives
 
-    print(f"[phase1] baseline eval (full-catalog candidate pool of {len(all_positives)}) ...", file=sys.stderr)
+    print(
+        f"[phase1] baseline eval (full-catalog candidate pool of {len(all_positives)}) ...",
+        file=sys.stderr,
+    )
     base_metrics = evaluate(model, evald, all_positives, device)
     print(f"[phase1] baseline: {base_metrics}", file=sys.stderr)
 
-    print(f"[phase1] fine-tuning ...", file=sys.stderr)
+    print("[phase1] fine-tuning ...", file=sys.stderr)
     t0 = time.time()
     model.fit(
         train_objectives=[(train_loader, train_loss)],
@@ -174,7 +185,7 @@ def main():
     )
     train_seconds = time.time() - t0
 
-    print(f"[phase1] post-train eval (full-catalog pool) ...", file=sys.stderr)
+    print("[phase1] post-train eval (full-catalog pool) ...", file=sys.stderr)
     final_metrics = evaluate(model, evald, all_positives, device)
     print(f"[phase1] final: {final_metrics}", file=sys.stderr)
 
@@ -214,21 +225,26 @@ def main():
         "device": device,
         "torch_version": torch.__version__,
         "note": "Phase 1 = PyTorch internal training per docs/catalog_and_training_plan.md. "
-                "Phase 2 retrains under native MIND via mind-train v0.1.",
+        "Phase 2 retrains under native MIND via mind-train v0.1.",
     }
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     (out_dir / "eval.json").write_text(json.dumps(final_metrics, indent=2) + "\n")
 
     print()
-    print(json.dumps({
-        "phase1_version": args.out_version,
-        "out_dir": str(out_dir),
-        "model_hash": model_hash[:16] + "…",
-        "metrics": final_metrics,
-        "baseline": base_metrics,
-        "improvement": manifest["improvement"],
-        "train_seconds": manifest["train_seconds"],
-    }, indent=2))
+    print(
+        json.dumps(
+            {
+                "phase1_version": args.out_version,
+                "out_dir": str(out_dir),
+                "model_hash": model_hash[:16] + "…",
+                "metrics": final_metrics,
+                "baseline": base_metrics,
+                "improvement": manifest["improvement"],
+                "train_seconds": manifest["train_seconds"],
+            },
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":

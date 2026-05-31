@@ -98,10 +98,7 @@ def compute_log_priors(
     Prior formula:  log(1 + raw_count_r + alpha)
     The +alpha additive smoothing ensures no route ever reaches log(1) = 0.
     """
-    return {
-        rid: math.log(1.0 + raw_counts.get(rid, 0) + alpha)
-        for rid in route_ids
-    }
+    return {rid: math.log(1.0 + raw_counts.get(rid, 0) + alpha) for rid in route_ids}
 
 
 def main() -> None:

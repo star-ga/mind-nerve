@@ -28,7 +28,6 @@ import hashlib
 import json
 import os
 import re
-import sys
 import time
 from pathlib import Path
 
@@ -36,11 +35,22 @@ _FREEZE_BASE = Path(os.environ.get("MIND_NERVE_CATALOG_FREEZE", "./catalog-build
 V1 = _FREEZE_BASE / "v1.0" / "items.jsonl"
 OUT_DIR = _FREEZE_BASE / "v1.1-oss"
 
-LOCAL_SKILLS = Path(os.environ.get("MIND_NERVE_LOCAL_SKILLS", str(Path.home() / ".agents" / "skills")))
+LOCAL_SKILLS = Path(
+    os.environ.get("MIND_NERVE_LOCAL_SKILLS", str(Path.home() / ".agents" / "skills"))
+)
 
 PUBLIC_LICENSES = {
-    "apache-2.0", "apache 2.0", "apache2", "mit", "bsd-3-clause",
-    "bsd-2-clause", "isc", "cc0", "cc0-1.0", "unlicense", "cc-by-4.0",
+    "apache-2.0",
+    "apache 2.0",
+    "apache2",
+    "mit",
+    "bsd-3-clause",
+    "bsd-2-clause",
+    "isc",
+    "cc0",
+    "cc0-1.0",
+    "unlicense",
+    "cc-by-4.0",
 }
 COMMERCIAL_MARKERS = re.compile(
     r"\b(starga[\s-]*commercial|proprietary|confidential|"
@@ -53,11 +63,16 @@ COMMERCIAL_MARKERS = re.compile(
 # Accept both naming conventions (single-underscore from `tr '/' '__'`
 # and slash-separated from repo_name_for() output).
 _EXCLUDED = [
-    "jujumilk3_leaked-system-prompts", "jujumilk3/leaked-system-prompts",
-    "YeeKal_leaked-system-prompts",   "YeeKal/leaked-system-prompts",
-    "elder-plinius_CL4R1T4S",          "elder-plinius/CL4R1T4S",
-    "AiFeatures_system-prompts-collection", "AiFeatures/system-prompts-collection",
-    "STARGA_claude-agents",            "STARGA/claude-agents",
+    "jujumilk3_leaked-system-prompts",
+    "jujumilk3/leaked-system-prompts",
+    "YeeKal_leaked-system-prompts",
+    "YeeKal/leaked-system-prompts",
+    "elder-plinius_CL4R1T4S",
+    "elder-plinius/CL4R1T4S",
+    "AiFeatures_system-prompts-collection",
+    "AiFeatures/system-prompts-collection",
+    "STARGA_claude-agents",
+    "STARGA/claude-agents",
     # awesome-aigc / awesome-ai-prompts that turned out to be image-prompt
     # collections (visual art prompts; off-domain for routing).
     "weekend-project-space_awesome-aigc-prompts",
@@ -137,8 +152,10 @@ def main():
     drop_reasons: dict[str, int] = {}
     n_seen = 0
 
-    with V1.open("r", encoding="utf-8") as fin, \
-         exclusion_log_path.open("w", encoding="utf-8") as flog:
+    with (
+        V1.open("r", encoding="utf-8") as fin,
+        exclusion_log_path.open("w", encoding="utf-8") as flog,
+    ):
         for line in fin:
             n_seen += 1
             item = json.loads(line)
@@ -147,13 +164,15 @@ def main():
                 kept.append(item)
             else:
                 drop_reasons[reason] = drop_reasons.get(reason, 0) + 1
-                flog.write(json.dumps({**item, "_drop_reason": reason},
-                                       separators=(",", ":")) + "\n")
+                flog.write(
+                    json.dumps({**item, "_drop_reason": reason}, separators=(",", ":")) + "\n"
+                )
 
     # Canonicalise + write
     kept_sorted = sorted(kept, key=lambda i: i["sha256"])
-    lines = [json.dumps(i, separators=(",", ":"), sort_keys=True,
-                        ensure_ascii=True) for i in kept_sorted]
+    lines = [
+        json.dumps(i, separators=(",", ":"), sort_keys=True, ensure_ascii=True) for i in kept_sorted
+    ]
     canon = ("\n".join(lines) + "\n").encode("utf-8")
     out_items_path.write_bytes(canon)
 
@@ -185,18 +204,24 @@ def main():
     }
     (OUT_DIR / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     (OUT_DIR / "manifest.sig").write_text(
-        "DRAFT-UNSIGNED\n" f"freeze_id: {freeze_id}\n"
+        "DRAFT-UNSIGNED\n"
+        f"freeze_id: {freeze_id}\n"
         "To sign: overwrite with HMAC-SHA256(manifest.json) under STARGA-ROOT-2026.\n"
     )
 
-    print(json.dumps({
-        "v1_seen": n_seen,
-        "v1.1_kept": len(kept),
-        "dropped": n_seen - len(kept),
-        "drop_reasons": drop_reasons,
-        "freeze_id": freeze_id,
-        "out_dir": str(OUT_DIR),
-    }, indent=2))
+    print(
+        json.dumps(
+            {
+                "v1_seen": n_seen,
+                "v1.1_kept": len(kept),
+                "dropped": n_seen - len(kept),
+                "drop_reasons": drop_reasons,
+                "freeze_id": freeze_id,
+                "out_dir": str(OUT_DIR),
+            },
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":

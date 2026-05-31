@@ -69,9 +69,9 @@ P_LOW: float = 25.0
 P_HIGH: float = 75.0
 
 # Stride presets (token counts).
-STRIDE_COMPACT: int = 192   # short requests — window stride (default)
-STRIDE_DEFAULT: int = 192   # mid requests — same as compact in base config
-STRIDE_LONG: int = 128      # long requests — more overlap
+STRIDE_COMPACT: int = 192  # short requests — window stride (default)
+STRIDE_DEFAULT: int = 192  # mid requests — same as compact in base config
+STRIDE_LONG: int = 128  # long requests — more overlap
 
 
 def load_lengths(path: Path) -> list[int]:

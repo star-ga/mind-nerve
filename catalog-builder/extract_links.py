@@ -19,17 +19,19 @@ ROOT = Path("catalog-data/sources")
 OUT = Path("catalog-data/index/items.jsonl")
 
 # Repo must look like an awesome list, list, directory, or curated registry.
-AWESOME_RE = re.compile(r"(awesome|directory|registry|collection|list|tools|toolkit)", re.IGNORECASE)
+AWESOME_RE = re.compile(
+    r"(awesome|directory|registry|collection|list|tools|toolkit)", re.IGNORECASE
+)
 
 # Markdown link followed by description: `- [Name](url) [- — :] desc`
 # Tolerant of bold, italics, badges before the link.
 LINK_LINE_RE = re.compile(
-    r"^[*\-+]\s+"                          # bullet
-    r"(?:\*\*|\[!\[.*?\)\s*)*"             # optional bold or badge prefix
-    r"\[([^\]\n]{2,120})\]"                # name in [ ]
-    r"\(([^\)\s]+)\)"                      # url in ( )
-    r"\s*[:\-—–]?\s*"                       # optional separator
-    r"(.{10,400})?\s*$",                   # optional description
+    r"^[*\-+]\s+"  # bullet
+    r"(?:\*\*|\[!\[.*?\)\s*)*"  # optional bold or badge prefix
+    r"\[([^\]\n]{2,120})\]"  # name in [ ]
+    r"\(([^\)\s]+)\)"  # url in ( )
+    r"\s*[:\-—–]?\s*"  # optional separator
+    r"(.{10,400})?\s*$",  # optional description
     re.MULTILINE,
 )
 
@@ -40,15 +42,24 @@ def extract_from(readme: Path, source_repo: str):
         name = m.group(1).strip()
         url = m.group(2).strip()
         desc = (m.group(3) or "").strip()
-        if url.startswith("#"):              # skip anchor-only ToC links
+        if url.startswith("#"):  # skip anchor-only ToC links
             continue
         if url.startswith("./") or url.startswith("/"):
-            continue                          # skip internal repo links (already indexed elsewhere)
+            continue  # skip internal repo links (already indexed elsewhere)
         if not url.startswith(("http://", "https://")):
             continue
         if len(name) < 2 or len(name) > 120:
             continue
-        if name.lower() in {"home", "back to top", "table of contents", "contributing", "license", "github", "twitter", "x"}:
+        if name.lower() in {
+            "home",
+            "back to top",
+            "table of contents",
+            "contributing",
+            "license",
+            "github",
+            "twitter",
+            "x",
+        }:
             continue
         body = f"# {name}\n\n{desc}\n\nurl: {url}\n".encode("utf-8")
         h = hashlib.sha256(body).hexdigest()
@@ -70,7 +81,7 @@ def main():
     repos_scanned = 0
     out_seen = set()
     if OUT.exists():
-        out_seen = {json.loads(l).get("sha256") for l in OUT.open()}
+        out_seen = {json.loads(ln).get("sha256") for ln in OUT.open()}
 
     with OUT.open("a", encoding="utf-8") as out:
         for repo_dir in sorted(ROOT.iterdir()):
@@ -95,11 +106,16 @@ def main():
                 out.write(json.dumps(item, separators=(",", ":")) + "\n")
                 added += 1
 
-    print(json.dumps({
-        "repos_scanned": repos_scanned,
-        "tool_entries_added": added,
-        "items_jsonl_total_lines": sum(1 for _ in OUT.open()),
-    }, indent=2))
+    print(
+        json.dumps(
+            {
+                "repos_scanned": repos_scanned,
+                "tool_entries_added": added,
+                "items_jsonl_total_lines": sum(1 for _ in OUT.open()),
+            },
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":

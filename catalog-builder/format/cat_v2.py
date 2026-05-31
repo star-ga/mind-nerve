@@ -95,9 +95,7 @@ def decode_prior_block(data: bytes, route_count: int) -> list[float]:
     """
     expected_tail = PRIOR_SENTINEL_BYTES + PRIOR_COUNT_BYTES + route_count * PRIOR_VALUE_BYTES
     if len(data) < expected_tail:
-        raise ValueError(
-            f"prior block too short: need {expected_tail} bytes, got {len(data)}"
-        )
+        raise ValueError(f"prior block too short: need {expected_tail} bytes, got {len(data)}")
     tail = data[-expected_tail:]
     sentinel = tail[:PRIOR_SENTINEL_BYTES]
     if sentinel != MAGIC_PRIOR:
@@ -106,9 +104,7 @@ def decode_prior_block(data: bytes, route_count: int) -> list[float]:
         )
     (count,) = struct.unpack_from("<I", tail, PRIOR_SENTINEL_BYTES)
     if count != route_count:
-        raise ValueError(
-            f"prior block route count {count} != catalog route count {route_count}"
-        )
+        raise ValueError(f"prior block route count {count} != catalog route count {route_count}")
     offset = PRIOR_SENTINEL_BYTES + PRIOR_COUNT_BYTES
     return [
         q16_to_float(struct.unpack_from("<i", tail, offset + i * PRIOR_VALUE_BYTES)[0])
@@ -192,9 +188,7 @@ def decode_any(data: bytes) -> dict[str, Any]:
     raise ValueError(f"unrecognised catalog magic {magic!r}")
 
 
-def _decode_route_blocks(
-    data: bytes, offset: int, route_count: int
-) -> list[dict[str, Any]]:
+def _decode_route_blocks(data: bytes, offset: int, route_count: int) -> list[dict[str, Any]]:
     """Parse route_count sequential route blocks starting at ``offset``."""
     routes: list[dict[str, Any]] = []
     for _ in range(route_count):

@@ -41,6 +41,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 HOME = Path(os.path.expanduser("~"))
 
@@ -99,7 +100,7 @@ def _target_config_paths(target: str) -> list[Path]:
     }.get(target, [])
 
 
-def rollback_last(target: str) -> dict:
+def rollback_last(target: str) -> dict[str, Any]:
     """Restore each known config file for *target* from its sibling ``.bak``.
 
     For every path returned by :func:`_target_config_paths`, if a
@@ -132,7 +133,7 @@ def rollback_last(target: str) -> dict:
 
     restored: list[str] = []
     missing: list[str] = []
-    errors: list[dict] = []
+    errors: list[dict[str, Any]] = []
 
     for path in _target_config_paths(target):
         bak = path.with_suffix(path.suffix + ".bak")
@@ -196,7 +197,9 @@ STUB_CLIS = [
 ]
 
 
-def _mcp_entry(command: str = "mind-nerve-mcp", env: dict | None = None) -> dict:
+def _mcp_entry(
+    command: str = "mind-nerve-mcp", env: dict[str, str] | None = None
+) -> dict[str, Any]:
     """Generic MCP server registration entry, used by every CLI."""
     return {
         "command": command,
@@ -210,7 +213,7 @@ def _mcp_entry(command: str = "mind-nerve-mcp", env: dict | None = None) -> dict
 # ---------------------------------------------------------------------------
 
 
-def install_claude_code(cfg: dict) -> dict:
+def install_claude_code(cfg: dict[str, Any]) -> dict[str, Any]:
     """Use the `claude mcp add` CLI command (preferred, validated by claude itself)."""
     if not shutil.which("claude"):
         return _install_claude_code_manual()
@@ -231,14 +234,14 @@ def install_claude_code(cfg: dict) -> dict:
         return {"installed": False, "error": str(exc)}
 
 
-def _install_claude_code_manual() -> dict:
+def _install_claude_code_manual() -> dict[str, Any]:
     """Fall back: patch ~/.claude.json directly (Claude Code's project config).
 
     Claude Code stores MCP servers per-project in ~/.claude.json. Patching
     the top-level `mcpServers` makes them visible across all projects.
     """
     cfg_path = HOME / ".claude.json"
-    existing: dict = {}
+    existing: dict[str, Any] = {}
     if cfg_path.exists():
         try:
             existing = json.loads(cfg_path.read_text())
@@ -250,7 +253,7 @@ def _install_claude_code_manual() -> dict:
     return {"installed": True, "method": "manual_claude_json", "path": str(cfg_path)}
 
 
-def install_claude_desktop(cfg: dict) -> dict:
+def install_claude_desktop(cfg: dict[str, Any]) -> dict[str, Any]:
     """Patch ~/.config/Claude/claude_desktop_config.json (Linux) or macOS path."""
     candidates = [
         HOME / ".config" / "Claude" / "claude_desktop_config.json",
@@ -258,7 +261,7 @@ def install_claude_desktop(cfg: dict) -> dict:
     ]
     cfg_path = next((c for c in candidates if c.parent.exists()), candidates[0])
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
-    existing: dict = {}
+    existing: dict[str, Any] = {}
     if cfg_path.exists():
         try:
             existing = json.loads(cfg_path.read_text())
@@ -270,11 +273,11 @@ def install_claude_desktop(cfg: dict) -> dict:
     return {"installed": True, "method": "json_mcp_servers", "path": str(cfg_path)}
 
 
-def install_cursor(cfg: dict) -> dict:
+def install_cursor(cfg: dict[str, Any]) -> dict[str, Any]:
     """Patch ~/.cursor/mcp.json."""
     cfg_path = HOME / ".cursor" / "mcp.json"
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
-    existing: dict = {}
+    existing: dict[str, Any] = {}
     if cfg_path.exists():
         try:
             existing = json.loads(cfg_path.read_text())
@@ -286,7 +289,7 @@ def install_cursor(cfg: dict) -> dict:
     return {"installed": True, "method": "json_mcp_servers", "path": str(cfg_path)}
 
 
-def install_codex(cfg: dict) -> dict:
+def install_codex(cfg: dict[str, Any]) -> dict[str, Any]:
     """Patch ~/.codex/config.toml — add `[mcp_servers.mind-nerve]` block.
 
     Codex's config is TOML; we read-edit-write minimally to preserve
@@ -315,7 +318,7 @@ def install_codex(cfg: dict) -> dict:
     return {"installed": True, "method": "toml_mcp_servers", "path": str(cfg_path)}
 
 
-def install_claude_code_hook(cfg: dict) -> dict:
+def install_claude_code_hook(cfg: dict[str, Any]) -> dict[str, Any]:
     """Alternative claude-code path: UserPromptSubmit hook instead of MCP.
 
     Patches ~/.claude/settings.json `hooks.UserPromptSubmit` with a
@@ -324,7 +327,7 @@ def install_claude_code_hook(cfg: dict) -> dict:
     """
     cfg_path = HOME / ".claude" / "settings.json"
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
-    existing: dict = {}
+    existing: dict[str, Any] = {}
     if cfg_path.exists():
         try:
             existing = json.loads(cfg_path.read_text())
@@ -349,7 +352,7 @@ def install_claude_code_hook(cfg: dict) -> dict:
     return {"installed": True, "method": "claude_user_prompt_hook", "path": str(cfg_path)}
 
 
-def install_gemini(cfg: dict) -> dict:
+def install_gemini(cfg: dict[str, Any]) -> dict[str, Any]:
     """Write a Gemini CLI extension manifest at ~/.gemini/extensions/mind-nerve/.
 
     The Gemini CLI discovers extensions by scanning ~/.gemini/extensions/. Each
@@ -376,7 +379,7 @@ def install_gemini(cfg: dict) -> dict:
     return {"installed": True, "method": "gemini_extension_manifest", "path": str(manifest_path)}
 
 
-def install_vibe(cfg: dict) -> dict:
+def install_vibe(cfg: dict[str, Any]) -> dict[str, Any]:
     """Write the vibe (Mistral CLI) MCP config at ~/.vibe/mcp.json.
 
     vibe follows the same JSON ``mcpServers`` shape as Claude Desktop and
@@ -385,7 +388,7 @@ def install_vibe(cfg: dict) -> dict:
     """
     cfg_path = HOME / ".vibe" / "mcp.json"
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
-    existing: dict = {}
+    existing: dict[str, Any] = {}
     if cfg_path.exists():
         try:
             existing = json.loads(cfg_path.read_text())
@@ -397,7 +400,7 @@ def install_vibe(cfg: dict) -> dict:
     return {"installed": True, "method": "json_mcp_servers", "path": str(cfg_path)}
 
 
-def _install_claw(claw_name: str) -> dict:
+def _install_claw(claw_name: str) -> dict[str, Any]:
     """Shared implementation for the claw-family installers (openclaw / nanoclaw / nemoclaw).
 
     All three runtimes share the same JSON ``mcpServers`` config shape, each
@@ -406,7 +409,7 @@ def _install_claw(claw_name: str) -> dict:
     """
     cfg_path = HOME / f".{claw_name}" / "mcp.json"
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
-    existing: dict = {}
+    existing: dict[str, Any] = {}
     if cfg_path.exists():
         try:
             existing = json.loads(cfg_path.read_text())
@@ -418,17 +421,17 @@ def _install_claw(claw_name: str) -> dict:
     return {"installed": True, "method": "json_mcp_servers", "path": str(cfg_path)}
 
 
-def install_openclaw(cfg: dict) -> dict:
+def install_openclaw(cfg: dict[str, Any]) -> dict[str, Any]:
     """Wire mind-nerve MCP into ~/.openclaw/mcp.json."""
     return _install_claw("openclaw")
 
 
-def install_nanoclaw(cfg: dict) -> dict:
+def install_nanoclaw(cfg: dict[str, Any]) -> dict[str, Any]:
     """Wire mind-nerve MCP into ~/.nanoclaw/mcp.json."""
     return _install_claw("nanoclaw")
 
 
-def install_nemoclaw(cfg: dict) -> dict:
+def install_nemoclaw(cfg: dict[str, Any]) -> dict[str, Any]:
     """Wire mind-nerve MCP into ~/.nemoclaw/mcp.json."""
     return _install_claw("nemoclaw")
 
@@ -468,7 +471,7 @@ def _looks_like_projection_dir(p: Path) -> bool:
     return link_count > len(children) // 2
 
 
-def _detect_skill_layout() -> dict:
+def _detect_skill_layout() -> dict[str, Any]:
     """Decide the source/projection layout for the preselect hook.
 
     Probed in this order — most users hit case 4 (regular) or 5 (empty):
@@ -537,7 +540,7 @@ def _detect_skill_layout() -> dict:
     }
 
 
-def _install_preselect_hook(layout: dict) -> dict:
+def _install_preselect_hook(layout: dict[str, Any]) -> dict[str, Any]:
     """Patch ~/.claude/settings.json with the SessionStart + UserPromptSubmit hooks.
 
     SessionStart spawns the daemon idempotently (no-op if already running).
@@ -545,7 +548,7 @@ def _install_preselect_hook(layout: dict) -> dict:
     """
     cfg_path = HOME / ".claude" / "settings.json"
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
-    existing: dict = {}
+    existing: dict[str, Any] = {}
     if cfg_path.exists():
         try:
             existing = json.loads(cfg_path.read_text())
@@ -602,7 +605,7 @@ def _install_preselect_hook(layout: dict) -> dict:
     return {"installed": True, "method": "session_and_prompt_hooks", "path": str(cfg_path)}
 
 
-def install_claude_code_preselect() -> dict:
+def install_claude_code_preselect() -> dict[str, Any]:
     """Wire SessionStart + UserPromptSubmit hooks for skill preselection.
 
     Migrates a regular user's existing ``~/.claude/skills`` directory to
@@ -656,10 +659,10 @@ def install_claude_code_preselect() -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _register_mind_mem_in(cfg_path: Path, fmt: str) -> dict:
+def _register_mind_mem_in(cfg_path: Path, fmt: str) -> dict[str, Any]:
     """Idempotent mind-mem MCP entry write into a JSON or TOML CLI config."""
     if fmt == "json":
-        existing: dict = {}
+        existing: dict[str, Any] = {}
         if cfg_path.exists():
             try:
                 existing = json.loads(cfg_path.read_text())
@@ -690,7 +693,7 @@ def _register_mind_mem_in(cfg_path: Path, fmt: str) -> dict:
     return {"installed": False, "error": f"unknown fmt: {fmt}"}
 
 
-def install_mind_mem_companion(targets: list[str]) -> dict:
+def install_mind_mem_companion(targets: list[str]) -> dict[str, Any]:
     """Register the ``mind-mem-mcp`` MCP server next to ``mind-nerve``.
 
     Only writes to CLI configs the user is already installing mind-nerve
@@ -704,7 +707,7 @@ def install_mind_mem_companion(targets: list[str]) -> dict:
     else:
         warning = None
 
-    results: dict[str, dict] = {}
+    results: dict[str, dict[str, Any]] = {}
     for cli in targets:
         try:
             if cli == "claude-code":
@@ -757,7 +760,7 @@ def install_mind_mem_companion(targets: list[str]) -> dict:
         except Exception as exc:  # noqa: BLE001
             results[cli] = {"installed": False, "error": str(exc)}
 
-    out: dict = {"results": results}
+    out: dict[str, Any] = {"results": results}
     if warning:
         out["warning"] = warning
     return out
@@ -768,8 +771,8 @@ def install_mind_mem_companion(targets: list[str]) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def detect() -> dict[str, dict]:
-    out: dict[str, dict] = {}
+def detect() -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
     for cli, info in {**MCP_CAPABLE, **HOOK_BASED}.items():
         detect_path: Path = info["detect"]  # type: ignore[assignment]
         present = detect_path.exists()
@@ -788,7 +791,7 @@ def detect() -> dict[str, dict]:
     return out
 
 
-def cmd_list(args) -> int:
+def cmd_list(args: argparse.Namespace) -> int:
     print("MCP-capable CLIs (preferred path — single binary):")
     for cli in MCP_CAPABLE:
         print(f"  - {cli}")
@@ -804,12 +807,12 @@ def cmd_list(args) -> int:
     return 0
 
 
-def cmd_detect(args) -> int:
+def cmd_detect(args: argparse.Namespace) -> int:
     print(json.dumps(detect(), indent=2))
     return 0
 
 
-def cmd_install(args) -> int:
+def cmd_install(args: argparse.Namespace) -> int:
     known = set(INSTALLERS) | {"all"}
     if args.cli not in known:
         print(
@@ -824,7 +827,7 @@ def cmd_install(args) -> int:
     if args.cli == "all":
         targets = [t for t in targets if t != "claude-code-hook"]
 
-    results: dict[str, dict] = {}
+    results: dict[str, dict[str, Any]] = {}
     for cli in targets:
         try:
             results[cli] = INSTALLERS[cli](MCP_CAPABLE.get(cli) or HOOK_BASED.get(cli) or {})
@@ -857,7 +860,7 @@ def cmd_install(args) -> int:
 # ---------------------------------------------------------------------------
 
 
-def install_systemd_user_unit() -> dict:
+def install_systemd_user_unit() -> dict[str, Any]:
     """Install the long-lived `mind-nerve-routed.service` user unit so the
     route daemon runs in its own cgroup and survives parent-CLI restarts.
 
@@ -932,7 +935,7 @@ def install_systemd_user_unit() -> dict:
     }
 
 
-def cmd_rollback(args) -> int:
+def cmd_rollback(args: argparse.Namespace) -> int:
     """CLI handler for ``mind-nerve-install rollback --target <name>``."""
     result = rollback_last(args.target)
     print(json.dumps(result, indent=2))
@@ -986,7 +989,7 @@ def main(argv: list[str] | None = None) -> int:
     p_ins.set_defaults(func=cmd_install)
 
     args = ap.parse_args(argv)
-    return args.func(args)
+    return int(args.func(args))
 
 
 if __name__ == "__main__":

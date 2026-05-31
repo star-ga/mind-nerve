@@ -38,14 +38,20 @@ CORPUS = ROOT / "corpus.txt"
 DEFAULT_VOCAB = 16384
 
 SPECIAL_TOKENS = [
-    "[PAD]", "[BOS]", "[EOS]",
-    "[QUERY]", "[POSITIVE]", "[SINK]",
-    "[MASK]", "[SEP]",
+    "[PAD]",
+    "[BOS]",
+    "[EOS]",
+    "[QUERY]",
+    "[POSITIVE]",
+    "[SINK]",
+    "[MASK]",
+    "[SEP]",
 ]
 
 
 def main():
     import argparse
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--version", default="v1.0")
     ap.add_argument("--vocab-size", type=int, default=DEFAULT_VOCAB)
@@ -55,7 +61,7 @@ def main():
     if not CORPUS.exists():
         sys.exit(f"corpus.txt not found at {CORPUS}; run build_corpus.py first")
 
-    from tokenizers import Tokenizer, models, pre_tokenizers, trainers, decoders, normalizers
+    from tokenizers import Tokenizer, decoders, models, normalizers, pre_tokenizers, trainers
 
     tok = Tokenizer(models.BPE(unk_token=None, byte_fallback=True))
     tok.normalizer = normalizers.NFC()
@@ -119,15 +125,20 @@ def main():
     sample = "search for all repos that offer skill collections and add them to data SSD"
     encoded = tok.encode(sample)
 
-    print(json.dumps({
-        **manifest,
-        "smoke_test": {
-            "input":  sample,
-            "ids":    encoded.ids[:20],
-            "tokens": encoded.tokens[:20],
-            "n_tokens": len(encoded.ids),
-        },
-    }, indent=2))
+    print(
+        json.dumps(
+            {
+                **manifest,
+                "smoke_test": {
+                    "input": sample,
+                    "ids": encoded.ids[:20],
+                    "tokens": encoded.tokens[:20],
+                    "n_tokens": len(encoded.ids),
+                },
+            },
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":

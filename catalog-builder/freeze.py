@@ -30,7 +30,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import sys
 import time
 from pathlib import Path
@@ -42,7 +41,7 @@ FREEZE_DIR = ROOT / "freeze"
 
 def canonicalise(raw_path: Path) -> tuple[bytes, int, int]:
     """Return (canonical_bytes, total_items, raw_lines) for the catalog."""
-    items: dict[str, dict] = {}            # dedupe by sha256 (real content hash)
+    items: dict[str, dict] = {}  # dedupe by sha256 (real content hash)
     raw_lines = 0
     with raw_path.open("r", encoding="utf-8") as f:
         for line in f:
@@ -59,8 +58,15 @@ def canonicalise(raw_path: Path) -> tuple[bytes, int, int]:
             else:
                 # On collision, keep the entry from the highest-priority
                 # source. Skill files beat tool entries beats raw prompts.
-                kind_pri = {"skill": 0, "agent": 1, "command": 2, "rule": 3,
-                            "extension": 4, "tool": 5, "prompt": 6}
+                kind_pri = {
+                    "skill": 0,
+                    "agent": 1,
+                    "command": 2,
+                    "rule": 3,
+                    "extension": 4,
+                    "tool": 5,
+                    "prompt": 6,
+                }
                 old_pri = kind_pri.get(items[sha]["kind"], 9)
                 new_pri = kind_pri.get(obj["kind"], 9)
                 if new_pri < old_pri:
@@ -70,8 +76,7 @@ def canonicalise(raw_path: Path) -> tuple[bytes, int, int]:
     out_lines = []
     for sha in sorted(items):
         item = items[sha]
-        out_lines.append(json.dumps(item, separators=(",", ":"),
-                                    sort_keys=True, ensure_ascii=True))
+        out_lines.append(json.dumps(item, separators=(",", ":"), sort_keys=True, ensure_ascii=True))
     canon = ("\n".join(out_lines) + "\n").encode("utf-8")
     return canon, len(items), raw_lines
 
@@ -148,7 +153,7 @@ def main():
             "key_id": "STARGA-ROOT-2026",
             "status": "draft-unsigned",
             "note": "Signature lives in manifest.sig and is applied "
-                    "out-of-band with the STARGA root key.",
+            "out-of-band with the STARGA root key.",
         },
     }
 
@@ -168,9 +173,9 @@ def main():
         "computed with the STARGA-ROOT-2026 key.\n"
     )
     upstream_path = out_dir / "upstream.txt"
-    upstream_path.write_text("\n".join(
-        f"{e['name']}\t{e.get('head','-')}" for e in upstream_summary()
-    ) + "\n")
+    upstream_path.write_text(
+        "\n".join(f"{e['name']}\t{e.get('head','-')}" for e in upstream_summary()) + "\n"
+    )
 
     print(json.dumps(manifest, indent=2))
     print(f"\nfrozen to: {out_dir}", file=sys.stderr)

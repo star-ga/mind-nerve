@@ -61,11 +61,16 @@ dist/
 *.dll
 
 # arch-mind transient state (Tranche 5). Including last_summary.json keeps
-# the local absolute repo path out of the public tree.
+# the local absolute repo path out of the public tree. key.local is the
+# per-repo evidence-chain HMAC secret and MUST never be published; store.lock
+# is a runtime lock file. rules.mind (the governance gate) IS tracked.
 .arch-mind/store/
 .arch-mind/_log_*
 .arch-mind/scan_before.json
 .arch-mind/last_summary.json
+.arch-mind/key.local
+.arch-mind/store.lock
+.arch-mind/store.pre-rotation.bak/
 
 # Python build artifacts
 *.egg-info/

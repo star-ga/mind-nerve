@@ -1,0 +1,64 @@
+// mind-nerve (skill-router: pure-MIND Q16.16 encoder + Python orchestration)
+// architectural-governance rules.
+//
+// Regenerate the live fixture, then enforce:
+//   arch-mind sidecar-scan --repo . --out .arch-mind/last_summary.json
+//   arch-mind check-rules  --repo . --fixture .arch-mind/last_summary.json \
+//                          --rules .arch-mind/rules.mind --mode enforce
+//
+// Thresholds are on the 0..10000 decoded scale (the engine scales each by
+// 2^16 before comparing to the raw Q16.16 metric). Floors are pinned just
+// below the present measured state: CI fires on a real regression without
+// fighting the current architecture. Update the "Currently N" comments and
+// the floor together whenever the surface legitimately shifts.
+//
+// Copyright 2026 STARGA, Inc. — Apache-2.0.
+
+[protection]
+module mind_nerve_rules {
+
+    // Currently 10000 (acyclic). Any import cycle drops below 10000 -> fail.
+    [arch_rule(acyclicity_q16, eq)]
+    const NO_CYCLES: i32 = 10000
+
+    // Currently 10000 (no MCP-tool surface overlap in the router package).
+    [arch_rule(mcp_tool_isolation, eq)]
+    const MCP_ISOLATION: i32 = 10000
+
+    // Currently 9828.
+    [arch_rule(redundancy_q16, ge)]
+    const REDUNDANCY_FLOOR: i32 = 9500
+
+    // Currently 6747. mind-nerve's Q16.16 native encoder keeps purity high
+    // (most modules are integer fixed-point, not f32). Floor catches a ~7-pp
+    // slide toward float drift.
+    [arch_rule(q16_determinism_purity, ge)]
+    const PURITY_FLOOR: i32 = 6000
+
+    // Currently 4251.
+    [arch_rule(equality_q16, ge)]
+    const EQUALITY_FLOOR: i32 = 3800
+
+    // Currently 10000 (shallow dependency depth). Floor leaves headroom for
+    // legitimate layering growth.
+    [arch_rule(depth_q16, ge)]
+    const DEPTH_FLOOR: i32 = 7000
+
+    // Currently 10000 — DEGENERATE: the sidecar resolves 0 inter-module import
+    // edges for this package layout, so the intra/total ratio clamps to max.
+    // The floor is pinned low and is NOT a meaningful signal yet; once edge
+    // resolution lands (real fanout numbers), raise it to the conservative-
+    // below-current value like the other metrics.
+    [arch_rule(modularity_q16, ge)]
+    const MODULARITY_FLOOR: i32 = 500
+
+    // Currently 0 — the protected runtime ships as a compiled .so, not as
+    // [protection]-annotated .mind/.py source, so the scanned surface has no
+    // protected declarations. Floor 0; lift when source-level kernels are added.
+    [arch_rule(governance_kernel_coverage, ge)]
+    const GOVERNANCE_FLOOR: i32 = 0
+
+    // Currently 0 — no compile-time evidence-chain calls in the router source.
+    [arch_rule(evidence_chain_density, ge)]
+    const EVIDENCE_FLOOR: i32 = 0
+}

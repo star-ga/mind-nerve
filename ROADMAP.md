@@ -349,6 +349,36 @@ design:
    under audit) but "evidence-chained collective evolution" — every
    evolutionary step signed, deterministic, replayable across substrates.
 
+**Transport reuse — do NOT rebuild the distributed-systems plumbing.**
+mind-mem v4 (Group D) already ships and has hardened the dangerous half:
+per-agent version vectors + explicit conflict log (`federation.py`),
+conflict-resolution strategies including a `three_way_merge` that routes
+through the v3 governance propose/approve layer (= the HITL guardrail,
+already wired), and a stdlib-only HTTP transport (`federation_client.py`
++ `http_transport.py`: bearer-token auth, `/federation/{vclock,conflicts,
+write,resolve}` endpoints, peer-allowlist + DoS hardening per issue 529).
+An "agent" there is any opaque ID, which maps onto a federation *node*.
+
+So leg 1 is a **scope reduction, not a from-scratch build**: consume
+mind-mem v4's transport + conflict machinery; build only the layers on
+top that are genuinely new —
+
+| Component | Source |
+|-----------|--------|
+| Vclock exchange, auth, conflict wire-format | **mind-mem v4 — reuse** |
+| HITL-gated conflict resolution (`three_way_merge` → propose/approve) | **mind-mem v4 — reuse** |
+| Per-node versioned contributions | **mind-mem v4 — reuse** |
+| Trust-rating scoring (DRD reputation + badge tiers) | **new — mind-nerve** |
+| Ed25519 signed contributions | **new** (mind-mem leaves TLS to a proxy; no signing yet) |
+| Q16.16 deterministic score-aggregation | **new** (mind-mem vectors are integer logical clocks) |
+
+Boundary: the rating system stays in mind-nerve — it is **not** absorbed
+into mind-mem. mind-mem owns the *generic, domain-agnostic transport*;
+mind-nerve owns the *skill/agent/MCP rating product* that consumes it.
+The dependency arrow is `mind-nerve → mind-mem v4 federation` (product
+depends on primitive, never the reverse). Keeping mind-mem's federation
+payload-agnostic is what lets anything federate over it later.
+
 Sequencing: builds on the existing Phase 3 federated-routing spec
 (`spec/federated_routing.md`) and remains gated behind Phase 2 completion
 + the typed-edges composition layer. The CLI is the delivery vehicle.

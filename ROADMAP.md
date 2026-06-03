@@ -343,6 +343,28 @@ Sequencing: builds on the existing Phase 3 federated-routing spec
 composition layer. The CLI surfaces the rating signal in routing; the
 federation/scoring it consumes is built in naestro.
 
+**Open decisions — defer to roadmap review (do not bank as decided):**
+
+1. **Operator CLI ownership.** The federation/observability workstream needs
+   an operator control surface (enroll node, view swarm trust, approve rating
+   deltas, inspect telemetry). Candidates: `starga` umbrella CLI (shim
+   currently dangling — `~/starga-cli` missing), `mind` (rejected — domain-locked
+   compiler), a new `naestro` CLI (naestro is API-driven, has no CLI by design).
+   Working lean: `starga` as the single umbrella that drives naestro's API.
+   **Decide at review.**
+2. **mind-nerve as a CLI.** Working assumption: mind-nerve stays a
+   library + daemon + MCP tool, *not* a product CLI (keeps only the small
+   `learn`/runtime-dir admin binary). Don't re-fatten the router with
+   operator commands. **Confirm at review.**
+3. **Decentralized vs central LLM-model observability.** Lean: decentralized
+   signed-telemetry gossip over the mind-mem append-only path (no conflict
+   resolution — telemetry is monotonic), aggregated-summaries-only for privacy,
+   feeding the trust-rating scorer in naestro. No central collector. This is the
+   *input layer* to the rating system, not a separate system. **Decide at review.**
+
+Build-time framing: these are architecture/ownership calls, settled when we
+review roadmaps before writing the federation code — not pre-committed here.
+
 ### Phase 3 design landables (status: 2026-05-18)
 
 | Item | Status |

@@ -330,6 +330,14 @@ leaky boundary is the signal to leave it in mind-mem. Not observability:
 federation is a write/consistency layer; observability is the read layer
 on top.
 
+Layer note (per-node vs cross-node cost): the federation/rating work is the
+*cross-node* half (signed deltas, not re-shipped context). The *per-node*
+prefill-explosion half (O(b^d × T), KV-cache eviction) is answered
+structurally by **rfn-mind** — no KV cache by construction, deterministic
+carried state via explicit memory slots — not by mind-nerve. Different layer;
+mind-nerve neither owns nor needs it. Claim scoped to "rfn-mind removes the
+KV-cache problem by construction" (rfn-mind empirical Stages A–E unstarted).
+
 Sequencing: builds on the existing Phase 3 federated-routing spec
 (`spec/federated_routing.md`), gated behind Phase 2 + the typed-edges
 composition layer. The CLI surfaces the rating signal in routing; the

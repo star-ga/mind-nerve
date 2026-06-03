@@ -291,111 +291,49 @@ Q16.16 in flight, INT8 weights, cross-arch bit-identity, 30 ms p95).
 - mind-mem v4 cognitive-kernel integration so route history becomes a
   first-class memory class
 
-### Federated trust-rating (design, 2026-06-03) — CLI workstream owns this
+### Federated trust-rating — mind-nerve's slice (design, 2026-06-03, revised)
 
-The separate `mind-nerve` CLI will implement the federated trust-rating
-layer; tracked here so that work has a home. Three legs, one coherent
-design:
+**Ownership correction (2026-06-03):** the federated trust-rating *system*
+— node federation, consent/governance, DRD-derived scoring, Ed25519
+signing, Q16.16 aggregation, evidence-chained collective evolution — is an
+**OS-level concern and lives in naestro** (`ROADMAP.md` R19), next to the
+existing `AI Agent Governance` module. See naestro for the full three-leg
+design. Putting reputation scoring + badge tiers inside a skill-router was
+too much product in a router.
 
-1. **Federated trust-rating (three artifact classes: MCPs, skills,
-   agents).** Registry-fetch of skills/tools from a STARGA-owned repo
-   (naestro.ai) is the commodity baseline. The wedge is a trust-scored
-   federation across nodes, lifting the Trust Certification layer from DRD
-   (`drd.io`, parked): reputation scoring + Bronze / Silver / Gold /
-   Government badge tiers as maturity tiers (an artifact clean on many
-   nodes with high success-rate = Gold; fresh/untested = Bronze) + Ed25519
-   verifiable credentials so each node signs its rating contribution. The
-   rating system covers all three federatable unit types, with a
-   **per-class rating signal**:
-   - **Skills** — reliability (per-node success-count) + quality (when
-     the body is shared).
-   - **Agents** — outcome-based: task-completion success across nodes, not
-     merely "did it run." An agent is a config + role + toolset; rate the
-     job-done quality. Direct lift of DRD's `AI Agent Governance` module,
-     which already scores agents.
-   - **MCPs** — tool reliability + availability (does the server respond,
-     do its tools succeed) — closer to uptime/SLA scoring than quality
-     scoring.
+**What mind-nerve keeps is the thin consumer slice: rating-as-routing-input.**
+mind-nerve *reads* the trust score / badge tier that naestro's federation
+produces and uses it as a routing signal — prefer higher-tier
+skills/agents/MCPs, break ties by node-local fit. mind-nerve does not own
+the federation, the consent model, the governance gate, or the scoring
+math; it consumes their output.
 
-   Same badge tiers sit on top of all three, fed by the different
-   per-class metrics. Routing prefers higher-tier artifacts; node-local
-   fit breaks ties. Reuses parked-DRD IP rather than depending on a live
-   DRD.
+Boundary (three layers):
 
-2. **Consent + three-tier sharing model.** Installing the mind-nerve
-   module in Naestro = opting into the federation, with explicit
-   disclosure at install (not silent enrollment). Opt-in mints a signed
-   Ed25519 federation membership credential (tamper-evident, revocable —
-   the mechanism for evicting a poisoning node). A per-skill
-   `federation: public | rated-only | private` frontmatter flag governs
-   sharing: `public` = shared + pullable, `rated-only` = contributes
-   reliability scores without distributing the body, `private` = local
-   only. Reliability-only rating (success/failure telemetry, no body)
-   keeps the privacy story clean; quality rating requires body or richer
-   telemetry.
+| Concern | Home |
+|---------|------|
+| Federation transport (vclock, conflict log, propose/approve) | **mind-mem v4 (Group D)** — generic primitive |
+| Node federation + consent + governance + DRD scoring + badge tiers + Ed25519 + Q16.16 aggregation + collective-evolution gate | **naestro** (R19) — OS-level |
+| Rating consumed as a routing signal (tier-preference, tie-break) | **mind-nerve** — this slice |
+| Trust-score dashboards / badge distributions / swarm-health views | observability (read/telemetry, on top) |
 
-3. **Evidence-chained collective evolution.** Nodes collaborate by
-   emitting *signed, deterministic improvement proposals* (better skill
-   variants, route-table deltas, agent configs); the network aggregates
-   them through a replayable, HITL-or-consensus-gated decision. Hard
-   guardrails (same invariant that kills naive "self-improving network"):
-   no node autonomously rewires the global route table or another node;
-   aggregation is deterministic Q16.16, not f32 averaging; what propagates
-   is always reproducible from the signed evidence chain. Federated
-   *skill / route* evolution is in-scope (discrete, signable, replayable);
-   federated *weight* evolution is out unless it goes down the Q16.16 path
-   (non-deterministic f32 weight-drift breaks cross-substrate
-   bit-identity). Positioning line: not "self-improving network" (breaks
-   under audit) but "evidence-chained collective evolution" — every
-   evolutionary step signed, deterministic, replayable across substrates.
+Dependency arrows: `naestro federation → mind-mem v4 transport` (product
+on primitive); `mind-nerve routing → naestro rating output` (router
+consumes governance). mind-nerve never reaches into mind-mem internals or
+reimplements scoring.
 
-**Transport reuse — do NOT rebuild the distributed-systems plumbing.**
-mind-mem v4 (Group D) already ships and has hardened the dangerous half:
-per-agent version vectors + explicit conflict log (`federation.py`),
-conflict-resolution strategies including a `three_way_merge` that routes
-through the v3 governance propose/approve layer (= the HITL guardrail,
-already wired), and a stdlib-only HTTP transport (`federation_client.py`
-+ `http_transport.py`: bearer-token auth, `/federation/{vclock,conflicts,
-write,resolve}` endpoints, peer-allowlist + DoS hardening per issue 529).
-An "agent" there is any opaque ID, which maps onto a federation *node*.
-
-So leg 1 is a **scope reduction, not a from-scratch build**: consume
-mind-mem v4's transport + conflict machinery; build only the layers on
-top that are genuinely new —
-
-| Component | Source |
-|-----------|--------|
-| Vclock exchange, auth, conflict wire-format | **mind-mem v4 — reuse** |
-| HITL-gated conflict resolution (`three_way_merge` → propose/approve) | **mind-mem v4 — reuse** |
-| Per-node versioned contributions | **mind-mem v4 — reuse** |
-| Trust-rating scoring (DRD reputation + badge tiers) | **new — mind-nerve** |
-| Ed25519 signed contributions | **new** (mind-mem leaves TLS to a proxy; no signing yet) |
-| Q16.16 deterministic score-aggregation | **new** (mind-mem vectors are integer logical clocks) |
-
-Boundary: the rating system stays in mind-nerve — it is **not** absorbed
-into mind-mem. mind-mem owns the *generic, domain-agnostic transport*;
-mind-nerve owns the *skill/agent/MCP rating product* that consumes it.
-The dependency arrow is `mind-nerve → mind-mem v4 federation` (product
-depends on primitive, never the reverse). Keeping mind-mem's federation
-payload-agnostic is what lets anything federate over it later.
-
-Deferred decision (gated on second consumer): mind-mem v4 Group-D
-federation currently has exactly one user (mind-mem itself). mind-nerve
-becomes the second. If the `mind-nerve → mind-mem` import boundary stays
-clean — mind-nerve touches only the transport, never mind-mem internals —
-that *proves* the transport is extractable, and it should be pulled into a
-standalone, domain-agnostic `mind-federation` (vclock + conflict log +
-HTTP + propose/approve resolution) that both products import. Extract on
-the second *real* consumer, not the anticipated one; a leaky boundary is
-itself the signal to leave it in mind-mem. Not observability: federation
-is a write/consistency layer (moves and reconciles state), observability
-is the read/telemetry layer (the trust-score dashboards, badge
-distributions, swarm-health views sit *on top* of the rating system, not
-inside the transport).
+Deferred decision (gated on second consumer): if naestro's use of
+mind-mem v4 Group-D transport keeps a clean import boundary, extract the
+transport into a standalone domain-agnostic `mind-federation` package both
+import. Extract on the second *real* consumer, not the anticipated one; a
+leaky boundary is the signal to leave it in mind-mem. Not observability:
+federation is a write/consistency layer; observability is the read layer
+on top.
 
 Sequencing: builds on the existing Phase 3 federated-routing spec
-(`spec/federated_routing.md`) and remains gated behind Phase 2 completion
-+ the typed-edges composition layer. The CLI is the delivery vehicle.
+(`spec/federated_routing.md`), gated behind Phase 2 + the typed-edges
+composition layer. The CLI surfaces the rating signal in routing; the
+federation/scoring it consumes is built in naestro.
 
 ### Phase 3 design landables (status: 2026-05-18)
 

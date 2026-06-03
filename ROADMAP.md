@@ -291,6 +291,68 @@ Q16.16 in flight, INT8 weights, cross-arch bit-identity, 30 ms p95).
 - mind-mem v4 cognitive-kernel integration so route history becomes a
   first-class memory class
 
+### Federated trust-rating (design, 2026-06-03) — CLI workstream owns this
+
+The separate `mind-nerve` CLI will implement the federated trust-rating
+layer; tracked here so that work has a home. Three legs, one coherent
+design:
+
+1. **Federated trust-rating (three artifact classes: MCPs, skills,
+   agents).** Registry-fetch of skills/tools from a STARGA-owned repo
+   (naestro.ai) is the commodity baseline. The wedge is a trust-scored
+   federation across nodes, lifting the Trust Certification layer from DRD
+   (`drd.io`, parked): reputation scoring + Bronze / Silver / Gold /
+   Government badge tiers as maturity tiers (an artifact clean on many
+   nodes with high success-rate = Gold; fresh/untested = Bronze) + Ed25519
+   verifiable credentials so each node signs its rating contribution. The
+   rating system covers all three federatable unit types, with a
+   **per-class rating signal**:
+   - **Skills** — reliability (per-node success-count) + quality (when
+     the body is shared).
+   - **Agents** — outcome-based: task-completion success across nodes, not
+     merely "did it run." An agent is a config + role + toolset; rate the
+     job-done quality. Direct lift of DRD's `AI Agent Governance` module,
+     which already scores agents.
+   - **MCPs** — tool reliability + availability (does the server respond,
+     do its tools succeed) — closer to uptime/SLA scoring than quality
+     scoring.
+
+   Same badge tiers sit on top of all three, fed by the different
+   per-class metrics. Routing prefers higher-tier artifacts; node-local
+   fit breaks ties. Reuses parked-DRD IP rather than depending on a live
+   DRD.
+
+2. **Consent + three-tier sharing model.** Installing the mind-nerve
+   module in Naestro = opting into the federation, with explicit
+   disclosure at install (not silent enrollment). Opt-in mints a signed
+   Ed25519 federation membership credential (tamper-evident, revocable —
+   the mechanism for evicting a poisoning node). A per-skill
+   `federation: public | rated-only | private` frontmatter flag governs
+   sharing: `public` = shared + pullable, `rated-only` = contributes
+   reliability scores without distributing the body, `private` = local
+   only. Reliability-only rating (success/failure telemetry, no body)
+   keeps the privacy story clean; quality rating requires body or richer
+   telemetry.
+
+3. **Evidence-chained collective evolution.** Nodes collaborate by
+   emitting *signed, deterministic improvement proposals* (better skill
+   variants, route-table deltas, agent configs); the network aggregates
+   them through a replayable, HITL-or-consensus-gated decision. Hard
+   guardrails (same invariant that kills naive "self-improving network"):
+   no node autonomously rewires the global route table or another node;
+   aggregation is deterministic Q16.16, not f32 averaging; what propagates
+   is always reproducible from the signed evidence chain. Federated
+   *skill / route* evolution is in-scope (discrete, signable, replayable);
+   federated *weight* evolution is out unless it goes down the Q16.16 path
+   (non-deterministic f32 weight-drift breaks cross-substrate
+   bit-identity). Positioning line: not "self-improving network" (breaks
+   under audit) but "evidence-chained collective evolution" — every
+   evolutionary step signed, deterministic, replayable across substrates.
+
+Sequencing: builds on the existing Phase 3 federated-routing spec
+(`spec/federated_routing.md`) and remains gated behind Phase 2 completion
++ the typed-edges composition layer. The CLI is the delivery vehicle.
+
 ### Phase 3 design landables (status: 2026-05-18)
 
 | Item | Status |

@@ -337,6 +337,10 @@ structurally by **rfn-mind** — no KV cache by construction, deterministic
 carried state via explicit memory slots — not by mind-nerve. Different layer;
 mind-nerve neither owns nor needs it. Claim scoped to "rfn-mind removes the
 KV-cache problem by construction" (rfn-mind empirical Stages A–E unstarted).
+Note: rfn-mind is the roadmap target, not the live substrate — naestro runs
+frontier models today, so the per-node prefill cost is mitigated at the ops/
+routing layer for now. The rating signal mind-nerve consumes is substrate-agnostic
+and does not depend on rfn-mind being live.
 
 Sequencing: builds on the existing Phase 3 federated-routing spec
 (`spec/federated_routing.md`), gated behind Phase 2 + the typed-edges

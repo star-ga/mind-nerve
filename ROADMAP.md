@@ -379,6 +379,20 @@ The dependency arrow is `mind-nerve → mind-mem v4 federation` (product
 depends on primitive, never the reverse). Keeping mind-mem's federation
 payload-agnostic is what lets anything federate over it later.
 
+Deferred decision (gated on second consumer): mind-mem v4 Group-D
+federation currently has exactly one user (mind-mem itself). mind-nerve
+becomes the second. If the `mind-nerve → mind-mem` import boundary stays
+clean — mind-nerve touches only the transport, never mind-mem internals —
+that *proves* the transport is extractable, and it should be pulled into a
+standalone, domain-agnostic `mind-federation` (vclock + conflict log +
+HTTP + propose/approve resolution) that both products import. Extract on
+the second *real* consumer, not the anticipated one; a leaky boundary is
+itself the signal to leave it in mind-mem. Not observability: federation
+is a write/consistency layer (moves and reconciles state), observability
+is the read/telemetry layer (the trust-score dashboards, badge
+distributions, swarm-health views sit *on top* of the rating system, not
+inside the transport).
+
 Sequencing: builds on the existing Phase 3 federated-routing spec
 (`spec/federated_routing.md`) and remains gated behind Phase 2 completion
 + the typed-edges composition layer. The CLI is the delivery vehicle.

@@ -27,6 +27,7 @@ import functools
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -35,6 +36,63 @@ from typing import Any
 import numpy as np
 
 from .types import Route, RouteResult
+
+
+# ---------------------------------------------------------------------------
+# Shared skill-text helpers (used by precompute_routes and discovery.scan)
+# ---------------------------------------------------------------------------
+
+
+def _parse_skill_frontmatter(text: str) -> dict[str, str]:
+    """Parse YAML frontmatter from a skill file; returns key→value dict."""
+    if not text.startswith("---"):
+        return {}
+    end = text.find("\n---", 3)
+    if end == -1:
+        return {}
+    out: dict[str, str] = {}
+    for line in text[3:end].splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = re.match(r"^([A-Za-z_][\w-]*)\s*:\s*(.*)$", line)
+        if m:
+            key = m.group(1).strip().lower()
+            val = m.group(2).strip().strip('"').strip("'")
+            out[key] = val
+    return out
+
+
+def _skill_embedding_text(item: dict[str, Any]) -> str:
+    """Return the canonical text to encode for a catalog item.
+
+    Priority:
+      1. When ``source_path`` is set and the file is readable:
+         ``description + "\\n\\n" + body[:1024]`` — matches discovery.scan.
+      2. Tool items with a ``url``: ``name — url``.
+      3. Fallback: ``name`` only.
+
+    This function is the single source of truth for what text goes into the
+    embedding — both ``precompute_routes`` (batch rebuild) and
+    ``discovery.scan`` (incremental) must produce the same text for the
+    same source file.
+    """
+    name = item.get("name", "")
+    source_path = item.get("source_path", "")
+    if source_path:
+        p = Path(source_path)
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+            if 32 <= len(text) <= 256 * 1024:
+                fm = _parse_skill_frontmatter(text)
+                body = text[text.find("\n---", 3) + 4 :] if text.startswith("---") else text
+                desc = fm.get("description", "")
+                return (desc or name) + "\n\n" + body[:1024]
+        except OSError:
+            pass
+    if item.get("kind") == "tool" and item.get("url"):
+        return f"{name} — {item['url']}"
+    return name
 
 # ---------------------------------------------------------------------------
 # Backend selection
@@ -735,12 +793,10 @@ def precompute_routes(
     with open(catalog_path, "r", encoding="utf-8") as f:
         for line in f:
             obj = json.loads(line)
-            text = obj.get("name", "")
-            # Tool entries have url; for them include url in the text.
-            if obj.get("kind") == "tool" and obj.get("url"):
-                text = f"{text} — {obj['url']}"
+            # Use rich body text when available (description + body[:1024]), matching
+            # the discovery.scan path so batch rebuilds produce equivalent embeddings.
+            texts.append(_skill_embedding_text(obj))
             items.append(obj)
-            texts.append(text)
 
     emb = model.encode(
         texts,

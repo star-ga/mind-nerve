@@ -37,7 +37,7 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
-from .inference import _DEFAULT_RUNTIME_DIR, load_default_runtime
+from .inference import _DEFAULT_RUNTIME_DIR, _skill_embedding_text, load_default_runtime
 
 PUBLIC_LICENSES = {
     "apache-2.0",
@@ -170,9 +170,8 @@ def _item_from_file(path: Path, source_repo: str, kind: str) -> dict | None:
     fm = _parse_frontmatter(text)
     bucket, reasons = _classify(text, fm)
     name = fm.get("name") or _first_h1(text) or path.stem
-    body = text[text.find("\n---", 3) + 4 :] if text.startswith("---") else text
     sha = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
-    return {
+    item: dict = {
         "id": sha[:16],
         "source_repo": source_repo,
         "source_path": str(path),
@@ -183,8 +182,10 @@ def _item_from_file(path: Path, source_repo: str, kind: str) -> dict | None:
         "tokens_est": max(1, len(text) // 4),
         "_license_bucket": bucket,
         "_license_reasons": reasons,
-        "_embedded_text": (fm.get("description") or name) + "\n\n" + body[:1024],
     }
+    # Use the shared helper so discovery and precompute_routes produce identical text.
+    item["_embedded_text"] = _skill_embedding_text(item)
+    return item
 
 
 def _walk_dir(root: Path, source_repo: str) -> Iterable[dict]:

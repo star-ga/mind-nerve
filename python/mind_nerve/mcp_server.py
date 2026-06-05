@@ -23,11 +23,31 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 from typing import Any
 
 from . import __version__
 from .inference import load_default_runtime
 from .inference import route as _route
+
+# Model warmup runs off the stdin loop (see ``main``) so the JSON-RPC
+# ``initialize`` handshake is never blocked by the multi-second model load.
+# Strict MCP clients otherwise mark the server "failed" before it answers.
+# ``_ensure_loaded`` is idempotent and thread-safe: the background warmup thread
+# and any early ``tools/call`` converge on a single one-time load.
+_warm_lock = threading.Lock()
+_warmed = False
+
+
+def _ensure_loaded() -> None:
+    """Load the default runtime once (thread-safe). Blocks until warm."""
+    global _warmed
+    if _warmed:
+        return
+    with _warm_lock:
+        if not _warmed:
+            load_default_runtime()
+            _warmed = True
 
 
 def _ok(req_id: Any, result: Any) -> dict:
@@ -102,6 +122,7 @@ def handle(msg: dict) -> dict | None:
         except (ValueError, TypeError):
             return _err(req_id, -32602, "top_k must be an integer")
         top_k = max(1, min(top_k, 64))
+        _ensure_loaded()
         result = _route(query, top_k=top_k)
         body = json.dumps(result.as_dict(), indent=2)
         return _ok(req_id, {"content": [{"type": "text", "text": body}]})
@@ -110,11 +131,17 @@ def handle(msg: dict) -> dict | None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    # Eagerly warm the model so the first `tools/call` isn't slow.
-    try:
-        load_default_runtime()
-    except Exception as exc:  # noqa: BLE001
-        sys.stderr.write(f"[mind-nerve-mcp] warmup failed: {exc}\n")
+    # Warm the model in a background thread (not inline) so ``initialize`` and
+    # ``tools/list`` answer immediately; the model still starts loading right
+    # away, so the first ``tools/call`` is rarely slow. A ``tools/call`` that
+    # arrives before warmup finishes blocks in ``_ensure_loaded`` until ready.
+    def _warm() -> None:
+        try:
+            _ensure_loaded()
+        except Exception as exc:  # noqa: BLE001
+            sys.stderr.write(f"[mind-nerve-mcp] background warmup failed: {exc}\n")
+
+    threading.Thread(target=_warm, name="mind-nerve-warmup", daemon=True).start()
 
     for line in sys.stdin:
         line = line.strip()

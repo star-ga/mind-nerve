@@ -2,6 +2,20 @@
 
 All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fix — MCP server: non-blocking model warmup (instant handshake for strict MCP clients)
+
+`mind-nerve-mcp` warmed the embedding model inline before entering the stdin
+loop, so the JSON-RPC `initialize` handshake stayed unanswered for the duration
+of the cold model load (several seconds). MCP clients that enforce a short
+startup deadline marked the server as "failed" even though it would have come up
+moments later. Warmup now runs in a background thread: `initialize` /
+`tools/list` respond immediately while the model still starts loading right
+away, and a `tools/call` arriving before warmup finishes blocks until the model
+is ready (thread-safe, one-time load). No API or behaviour change to the
+`mind_nerve_route` tool — it just works out of the box across MCP clients.
+
 ## [0.3.0b8] — 2026-05-20 — hotfix: revert #233(a), yanks v0.3.0b7
 
 ### Fix — yank v0.3.0b7, restore Track A C-shim encoder matmul

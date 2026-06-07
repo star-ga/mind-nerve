@@ -100,14 +100,21 @@ def _classify(text: str, fm: dict[str, str]) -> tuple[str, list[str]]:
     """Return (bucket, reasons)."""
     lic = (fm.get("license") or "").lower().strip()
 
-    if COMMERCIAL_MARKERS.search(text):
-        return "commercial_risk", ["matched commercial marker"]
+    # An explicit private/internal visibility flag always wins.
     if fm.get("visibility", "").lower() in {"private", "confidential", "internal"}:
         return "commercial_risk", [f"visibility={fm['visibility']}"]
+    # A declared public license in the frontmatter is authoritative and must
+    # take precedence over body-text markers: security/forensics skills legitimately
+    # *discuss* words like "proprietary"/"confidential"/"do not distribute" as subject
+    # matter, which would otherwise be mis-bucketed as commercial_risk.
     if lic in PUBLIC_LICENSES:
         return "public_ok", [f"license={lic}"]
     if lic and "commercial" in lic:
         return "commercial_risk", [f"license={lic}"]
+    # No authoritative license: fall back to scanning the body for commercial markers
+    # (catches skills that declare a commercial/internal license only in prose).
+    if COMMERCIAL_MARKERS.search(text):
+        return "commercial_risk", ["matched commercial marker"]
 
     return "unknown", ["no license declared"]
 

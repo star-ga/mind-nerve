@@ -401,3 +401,38 @@ review roadmaps before writing the federation code — not pre-committed here.
 | `mind-mem` | v4.1 §7 tool-routing preselector consumes mind-nerve at the MCP layer |
 | `MindLLM` | Per-neuron weight attestation discipline applies symmetrically to mind-nerve |
 | native-MIND training pipeline | v3.x deterministic fine-tuning path applies to mind-nerve training in Phase 2 |
+
+## Calibrated Routing Confidence (sidecar)
+
+Surface a **calibrated confidence/utility score** on each intent→skill route — a
+usable signal for how strongly the selected skill matches intent, beyond the raw
+route rank.
+
+- **Outside the deterministic path.** The confidence is a sidecar field on the
+  routing result, not an input to the deterministic route table lookup. Route
+  selection stays deterministic and reproducible; the confidence rides beside it
+  and is **excluded from any identity hash**. A probabilistic estimate must never
+  become load-bearing for the deterministic route.
+- **Calibrated, not raw.** Report a calibrated score (reliability-curve fit over
+  the existing route scoring), not a raw distance, so a caller can threshold on it
+  to fall back to a broader catalog or ask for clarification.
+- **Use.** Low-confidence routes can defer to a wider search or a clarifying turn
+  instead of committing to a weak match.
+- **Status:** Planned. Composes over the existing route scoring; no change to the
+  deterministic route table.
+
+## Pure-MIND Self-Hosting Migration
+
+> Ecosystem-wide milestone — gated on the `mind` compiler reaching self-host completeness.
+
+Once the `mind` toolchain self-hosts (the open-core compiler builds itself byte-identically),
+this repository's **TypeScript + Python** implementation is migrated to **pure, executing MIND**, so the whole
+MIND ecosystem runs on its own deterministic, byte-identical, evidence-carrying toolchain — the
+wedge applied to ourselves.
+
+- **Gate:** `mind` self-host keystone complete (see the `mind` roadmap self-host track).
+- **Approach:** port via the `mind-migrator` path — to the executable MIND subset, verifying every
+  emitted symbol actually runs and reusing `std` primitives; no silent AOT-only stubs.
+- **Invariant:** migration preserves behavior and the cross-substrate byte-identity gate — no
+  regression in determinism or the signed evidence chain.
+- **Status:** Planned — sequenced after `mind` self-host; tracked here so the endgame is explicit.

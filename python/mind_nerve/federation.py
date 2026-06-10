@@ -11,7 +11,182 @@ Consumers may import and type-check against these interfaces today.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
+
+# ---------------------------------------------------------------------------
+# Federated route table — deterministic merge of per-node manifests
+# ---------------------------------------------------------------------------
+#
+# This is the data-plane primitive that lets one mind-nerve instance route a
+# query against the agents + skills of EVERY naestro node in the federation,
+# not just its own. It is deliberately separate from the evidence-chain
+# reconciliation below (`reconcile`/`discover_peers`/...), which is gated on
+# Phase 2. A table merge is a pure function of its inputs and needs no native
+# inference, so it ships now.
+#
+# Wedge guardrails (identical contract to scan_repo / route):
+#   * The merge is a pure function of the input manifests — no network, no
+#     clock, no env. Two nodes fed the same manifest set produce a
+#     byte-identical federated table (same `table_hash`).
+#   * Each manifest is the node's OWN governed route table, signed by that
+#     node. Routes are never trusted because a peer relayed them; the owning
+#     node's signature is authoritative and an artifact is fetched from its
+#     origin (see `broadcast_route_delta` chain-of-custody rule).
+#   * Collisions on `id` keep the higher-score entry; ties broken by
+#     SHA-256(node_id || id) ascending — bit-stable, order-independent.
+
+
+@dataclass(frozen=True)
+class FederatedRoute:
+    """One route in the merged federated table, tagged with its owner node."""
+
+    id: str
+    name: str
+    kind: str
+    source_repo: str
+    sha256: str
+    score: float
+    node_id: str  # SHA-256(pubkey)[:16] of the node that owns this route
+
+    def _tiebreak_key(self) -> str:
+        return hashlib.sha256((self.node_id + self.id).encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class NodeManifest:
+    """A single node's contribution to the federation.
+
+    `routes` is that node's full governed route table (the same JSONL records
+    `route_table.jsonl` holds: id, name, kind, source_repo, sha256, ...).
+    `table_hash` is SHA-256 over the canonical serialization of `routes`;
+    `sig` is the node's ed25519 signature over (node_id || table_hash).
+    """
+
+    node_id: str
+    table_hash: str
+    routes: list[dict]
+    sig: bytes = b""
+
+
+@dataclass(frozen=True)
+class FederatedTable:
+    """The deterministic merge of a set of node manifests."""
+
+    routes: list[FederatedRoute]
+    table_hash: str  # SHA-256 over the canonical merged serialization
+    contributing_node_ids: list[str]
+
+
+def compute_table_hash(routes: list[dict]) -> str:
+    """SHA-256 over a node's route list, canonicalized for cross-host stability.
+
+    Routes are sorted by `id` and serialized with sorted keys and no
+    whitespace so the digest is independent of on-disk ordering.
+    """
+    canon = [
+        json.dumps(r, sort_keys=True, separators=(",", ":"))
+        for r in sorted(routes, key=lambda r: r["id"])
+    ]
+    blob = "\n".join(canon).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
+
+
+def merge_manifests(manifests: list[NodeManifest]) -> FederatedTable:
+    """Merge per-node manifests into one deterministic federated table.
+
+    Pure function: the result depends only on the manifest contents, never on
+    the order they are passed or the host doing the merge.
+
+    Collision policy on duplicate route `id`: keep the higher `score`; on a
+    score tie keep the lower SHA-256(node_id || id). This mirrors the
+    cross-arch tie-break used by `route()` and `scan_repo`, so the federated
+    table is bit-stable.
+
+    Manifests whose `table_hash` does not match a recomputation over their
+    `routes` are dropped (a node that misreports its table is excluded, not
+    trusted).
+    """
+    best: dict[str, FederatedRoute] = {}
+    contributing: set[str] = set()
+
+    for m in sorted(manifests, key=lambda m: m.node_id):
+        if compute_table_hash(m.routes) != m.table_hash:
+            continue  # node misreported its own table — drop it
+        contributing.add(m.node_id)
+        for r in m.routes:
+            fr = FederatedRoute(
+                id=r["id"],
+                name=r["name"],
+                kind=r["kind"],
+                source_repo=r.get("source_repo", ""),
+                sha256=r.get("sha256", r["id"]),
+                score=float(r.get("score", 0.0)),
+                node_id=m.node_id,
+            )
+            prev = best.get(fr.id)
+            if prev is None or _better(fr, prev):
+                best[fr.id] = fr
+
+    merged = sorted(
+        best.values(),
+        key=lambda fr: (-fr.score, fr._tiebreak_key()),
+    )
+    canon = "\n".join(f"{fr.id}|{fr.node_id}|{fr.score:.6f}|{fr.sha256}" for fr in merged).encode(
+        "utf-8"
+    )
+    return FederatedTable(
+        routes=merged,
+        table_hash=hashlib.sha256(canon).hexdigest(),
+        contributing_node_ids=sorted(contributing),
+    )
+
+
+def _better(a: FederatedRoute, b: FederatedRoute) -> bool:
+    """True if `a` should win a route-id collision against `b`."""
+    if a.score != b.score:
+        return a.score > b.score
+    return a._tiebreak_key() < b._tiebreak_key()
+
+
+def load_local_manifest(route_table_path: str, node_id: str) -> NodeManifest:
+    """Build this node's manifest from its on-disk `route_table.jsonl`.
+
+    The resulting `table_hash` is a pure function of the table's contents, so
+    two nodes with the same catalog publish the same hash.
+    """
+    routes: list[dict] = []
+    with open(route_table_path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                routes.append(json.loads(line))
+    return NodeManifest(
+        node_id=node_id,
+        table_hash=compute_table_hash(routes),
+        routes=routes,
+    )
+
+
+def manifest_from_json(obj: dict) -> NodeManifest:
+    """Parse a peer manifest emitted by `to_json` back into a NodeManifest."""
+    return NodeManifest(
+        node_id=obj["node_id"],
+        table_hash=obj["table_hash"],
+        routes=obj["routes"],
+    )
+
+
+def to_json(m: NodeManifest) -> dict:
+    """Serialize a node manifest for publication to peers."""
+    return {
+        "protocol": "mind-nerve-federation/1",
+        "node_id": m.node_id,
+        "table_hash": m.table_hash,
+        "routes": m.routes,
+    }
+
 
 # ---------------------------------------------------------------------------
 # Public types

@@ -93,6 +93,72 @@ def cmd_learn(args) -> int:
     return 0
 
 
+def cmd_scan_repo(args) -> int:
+    from .scan_repo import scan_repo
+
+    out = scan_repo(
+        args.repo,
+        per_signal_k=args.per_signal_k,
+        bundle_size=args.bundle_size,
+        runtime_dir=args.runtime_dir,
+        max_files=args.max_files,
+    )
+    if args.ids_only:
+        for entry in out["bundle"]:
+            print(entry["id"])
+    else:
+        print(
+            json.dumps(
+                out,
+                indent=2 if args.indent else None,
+                separators=None if args.indent else (",", ":"),
+            )
+        )
+    return 0
+
+
+def cmd_federate(args) -> int:
+    from . import federation as fed
+
+    rtd = args.runtime_dir or _DEFAULT_RUNTIME_DIR
+    local_table = f"{rtd}/route_table.jsonl"
+    manifests = [fed.load_local_manifest(local_table, args.node_id)]
+    for path in args.peer or []:
+        with open(path, encoding="utf-8") as fh:
+            manifests.append(fed.manifest_from_json(json.load(fh)))
+
+    if args.publish:
+        print(json.dumps(fed.to_json(manifests[0]), separators=(",", ":"), sort_keys=True))
+        return 0
+
+    table = fed.merge_manifests(manifests)
+    if args.ids_only:
+        for fr in table.routes:
+            print(fr.id)
+        return 0
+    out = {
+        "table_hash": table.table_hash,
+        "contributing_node_ids": table.contributing_node_ids,
+        "size": len(table.routes),
+        "routes": [
+            {
+                "id": fr.id,
+                "name": fr.name,
+                "kind": fr.kind,
+                "node_id": fr.node_id,
+                "score": round(fr.score, 6),
+            }
+            for fr in table.routes
+        ],
+    }
+    print(
+        json.dumps(
+            out, indent=2 if args.indent else None, separators=None if args.indent else (",", ":")
+        )
+    )
+    return 0
+
+
 def cmd_train(args) -> int:
     from pathlib import Path
 
@@ -401,6 +467,63 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_learn.add_argument("--dry-run", action="store_true")
     p_learn.set_defaults(func=cmd_learn)
+
+    p_scan = sub.add_parser(
+        "scan-repo",
+        help="Scan a target repo and recommend a capability bundle "
+        "(skills/agents) routed over the governed table.",
+    )
+    p_scan.add_argument("repo", help="Path to the repository to scan")
+    p_scan.add_argument(
+        "--per-signal-k",
+        type=int,
+        default=5,
+        help="Top-K routes to pull for each extracted signal (default: 5).",
+    )
+    p_scan.add_argument(
+        "--bundle-size",
+        type=int,
+        default=15,
+        help="Max number of routes in the merged bundle (default: 15).",
+    )
+    p_scan.add_argument(
+        "--max-files",
+        type=int,
+        default=20000,
+        help="Cap on files walked during signal extraction (default: 20000).",
+    )
+    p_scan.add_argument(
+        "--ids-only", action="store_true", help="One route id per line (overrides JSON)."
+    )
+    p_scan.add_argument("--indent", action="store_true", help="Pretty-print JSON output.")
+    p_scan.set_defaults(func=cmd_scan_repo)
+
+    p_fed = sub.add_parser(
+        "federate",
+        help="Merge this node's route table with peer manifests into one "
+        "deterministic federated table (all agents/skills across all nodes), "
+        "or --publish this node's signed manifest.",
+    )
+    p_fed.add_argument(
+        "--node-id",
+        required=True,
+        help="This node's id (SHA-256(pubkey)[:16] in production; any stable "
+        "string for local-stub use).",
+    )
+    p_fed.add_argument(
+        "--peer",
+        action="append",
+        metavar="MANIFEST.json",
+        help="Path to a peer manifest (as emitted by --publish). Repeatable.",
+    )
+    p_fed.add_argument(
+        "--publish",
+        action="store_true",
+        help="Emit this node's manifest as JSON (for peers to consume) instead " "of merging.",
+    )
+    p_fed.add_argument("--ids-only", action="store_true", help="One merged route id per line.")
+    p_fed.add_argument("--indent", action="store_true", help="Pretty-print JSON output.")
+    p_fed.set_defaults(func=cmd_federate)
 
     p_train = sub.add_parser(
         "train",

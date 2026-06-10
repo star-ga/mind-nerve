@@ -37,7 +37,6 @@ import numpy as np
 
 from .types import Route, RouteResult
 
-
 # ---------------------------------------------------------------------------
 # Shared skill-text helpers (used by precompute_routes and discovery.scan)
 # ---------------------------------------------------------------------------
@@ -77,7 +76,7 @@ def _skill_embedding_text(item: dict[str, Any]) -> str:
     ``discovery.scan`` (incremental) must produce the same text for the
     same source file.
     """
-    name = item.get("name", "")
+    name: str = item.get("name", "")
     source_path = item.get("source_path", "")
     if source_path:
         p = Path(source_path)
@@ -93,6 +92,7 @@ def _skill_embedding_text(item: dict[str, Any]) -> str:
     if item.get("kind") == "tool" and item.get("url"):
         return f"{name} — {item['url']}"
     return name
+
 
 # ---------------------------------------------------------------------------
 # Backend selection

@@ -88,6 +88,7 @@ def cmd_learn(args) -> int:
         include_unknown=args.include_unknown,
         runtime_dir=args.runtime_dir or _DEFAULT_RUNTIME_DIR,
         dry_run=args.dry_run,
+        trusted=True if args.trusted else None,
     )
     print(json.dumps(out, indent=2))
     return 0
@@ -466,6 +467,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Include items with no declared license. OFF by default.",
     )
     p_learn.add_argument("--dry-run", action="store_true")
+    p_learn.add_argument(
+        "--trusted",
+        action="store_true",
+        help="Treat the directory as a first-party trust root: items classify "
+        "as first_party_ok and bypass the license gate. Directories under "
+        "$MIND_NERVE_TRUSTED_PATHS or listed in <runtime_dir>/trusted_paths.json "
+        "are trusted automatically.",
+    )
     p_learn.set_defaults(func=cmd_learn)
 
     p_scan = sub.add_parser(

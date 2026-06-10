@@ -21,6 +21,14 @@ skill it can't classify as OSS-compatible
 (license: MIT / Apache-2.0 / BSD / CC0 / ISC / etc.). Override with
 `--include-unknown` (CLI) or `include_unknown=True` (Python).
 
+First-party trust: the license gate exists to vet *external* content;
+trust in the operator's own skills is an origin question, not a license
+question. Directories listed in `$MIND_NERVE_TRUSTED_PATHS`
+(os.pathsep-separated) or in `<runtime_dir>/trusted_paths.json` (a JSON
+list of paths) are trust roots: anything scanned under them classifies
+as `first_party_ok` — never license-scanned, never refused. A scan can
+also be forced trusted with `--trusted` (CLI) / `trusted=True` (Python).
+
 The route table is updated atomically: write to `route_table.npy.tmp`
 + `route_table.jsonl.tmp` then `os.replace()` so a concurrent reader
 never sees a partial state.
@@ -60,6 +68,40 @@ COMMERCIAL_MARKERS = re.compile(
     re.IGNORECASE,
 )
 
+
+def _trusted_roots(runtime_dir: str | Path | None = None) -> list[Path]:
+    """First-party trust roots: $MIND_NERVE_TRUSTED_PATHS plus
+    <runtime_dir>/trusted_paths.json (a JSON list of directories)."""
+    roots: list[Path] = []
+    for part in os.environ.get("MIND_NERVE_TRUSTED_PATHS", "").split(os.pathsep):
+        part = part.strip()
+        if part:
+            roots.append(Path(part).expanduser())
+    if runtime_dir:
+        cfg = Path(runtime_dir) / "trusted_paths.json"
+        try:
+            if cfg.is_file():
+                entries = json.loads(cfg.read_text(encoding="utf-8"))
+                if isinstance(entries, list):
+                    roots.extend(Path(str(e)).expanduser() for e in entries)
+        except (OSError, ValueError):
+            pass
+    resolved = []
+    for r in roots:
+        try:
+            resolved.append(r.resolve())
+        except OSError:
+            continue
+    return resolved
+
+
+def _is_trusted_dir(directory: str | Path, runtime_dir: str | Path | None = None) -> bool:
+    try:
+        d = Path(directory).expanduser().resolve()
+    except OSError:
+        return False
+    return any(d == root or root in d.parents for root in _trusted_roots(runtime_dir))
+
 SKILL_PATTERNS = [
     (re.compile(r"(^|/)SKILL\.md$", re.I), "skill"),
     (re.compile(r"(^|/)skills?/[^/]+\.md$", re.I), "skill"),
@@ -96,8 +138,17 @@ def _parse_frontmatter(text: str) -> dict[str, str]:
     return out
 
 
-def _classify(text: str, fm: dict[str, str]) -> tuple[str, list[str]]:
+def _classify(
+    text: str, fm: dict[str, str], *, trusted: bool = False
+) -> tuple[str, list[str]]:
     """Return (bucket, reasons)."""
+    # First-party content from a trust root is exempt from the license gate
+    # entirely: the gate vets external content, and a trusted origin is the
+    # operator's own. Marker words in the body ("proprietary", "internal")
+    # are subject matter here, not a license declaration.
+    if trusted:
+        return "first_party_ok", ["trusted source path"]
+
     lic = (fm.get("license") or "").lower().strip()
 
     # An explicit private/internal visibility flag always wins.
@@ -167,7 +218,9 @@ def _first_h1(body: str) -> str | None:
     return None
 
 
-def _item_from_file(path: Path, source_repo: str, kind: str) -> dict | None:
+def _item_from_file(
+    path: Path, source_repo: str, kind: str, trusted: bool = False
+) -> dict | None:
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -175,7 +228,7 @@ def _item_from_file(path: Path, source_repo: str, kind: str) -> dict | None:
     if len(text) < 32 or len(text) > 256 * 1024:
         return None
     fm = _parse_frontmatter(text)
-    bucket, reasons = _classify(text, fm)
+    bucket, reasons = _classify(text, fm, trusted=trusted)
     name = fm.get("name") or _first_h1(text) or path.stem
     sha = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
     item: dict = {
@@ -195,7 +248,7 @@ def _item_from_file(path: Path, source_repo: str, kind: str) -> dict | None:
     return item
 
 
-def _walk_dir(root: Path, source_repo: str) -> Iterable[dict]:
+def _walk_dir(root: Path, source_repo: str, trusted: bool = False) -> Iterable[dict]:
     for p in root.rglob("*"):
         if not p.is_file():
             continue
@@ -208,7 +261,7 @@ def _walk_dir(root: Path, source_repo: str) -> Iterable[dict]:
             kind = "skill"
         if not kind:
             continue
-        item = _item_from_file(p, source_repo, kind)
+        item = _item_from_file(p, source_repo, kind, trusted=trusted)
         if item is not None:
             yield item
 
@@ -224,8 +277,13 @@ def scan(
     include_unknown: bool = False,
     runtime_dir: str = _DEFAULT_RUNTIME_DIR,
     dry_run: bool = False,
+    trusted: bool | None = None,
 ) -> dict:
     """One-shot scan: discover new skills under `directory`, embed, persist.
+
+    `trusted=None` (default) auto-detects: the scan is trusted when
+    `directory` falls under a configured trust root (see module docstring).
+    Pass `trusted=True`/`False` to force.
 
     Returns a summary dict.
     """
@@ -234,11 +292,13 @@ def scan(
     rt = load_default_runtime(runtime_dir)
     rdir = Path(runtime_dir)
     seen_ids = {m["sha256"] for m in rt.routes}
+    if trusted is None:
+        trusted = _is_trusted_dir(directory, rdir)
 
     new_items: list[dict] = []
     skipped: dict[str, int] = {"already_indexed": 0, "license_excluded": 0, "unknown_excluded": 0}
 
-    for item in _walk_dir(Path(directory), source_repo):
+    for item in _walk_dir(Path(directory), source_repo, trusted=trusted):
         if item["sha256"] in seen_ids:
             skipped["already_indexed"] += 1
             continue
@@ -252,7 +312,12 @@ def scan(
         new_items.append(item)
 
     if not new_items:
-        return {"added": 0, "skipped": skipped, "total_routes_after": len(rt.routes)}
+        return {
+            "added": 0,
+            "skipped": skipped,
+            "total_routes_after": len(rt.routes),
+            "trusted": trusted,
+        }
 
     if dry_run:
         return {
@@ -288,16 +353,21 @@ def scan(
         "skipped": skipped,
         "total_routes_after": len(combined_meta),
         "names_added": [i["name"] for i in new_items[:20]],
+        "trusted": trusted,
     }
 
 
 def add_route(
-    item: dict, runtime_dir: str = _DEFAULT_RUNTIME_DIR, include_unknown: bool = False
+    item: dict,
+    runtime_dir: str = _DEFAULT_RUNTIME_DIR,
+    include_unknown: bool = False,
+    trusted: bool = False,
 ) -> dict:
     """Programmatic single-route registration.
 
     `item` must contain at minimum {name, description, kind} and may
-    include {license, source_repo, url}.
+    include {license, source_repo, url}. `trusted=True` marks the item
+    first-party and bypasses the license gate.
     """
     import numpy as np
 
@@ -312,7 +382,7 @@ def add_route(
     text += "---\n\n" + desc
 
     fm = _parse_frontmatter(text)
-    bucket, reasons = _classify(text, fm)
+    bucket, reasons = _classify(text, fm, trusted=trusted)
     if bucket == "commercial_risk":
         raise PermissionError(f"refusing commercial-risk item: {reasons}")
     if bucket == "unknown" and not include_unknown:

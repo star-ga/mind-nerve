@@ -6,13 +6,17 @@
 </p>
 
 <p align="center">
-  <a href="https://pypi.org/project/mind-nerve/"><img alt="PyPI" src="https://img.shields.io/pypi/v/mind-nerve.svg?color=blue"></a>
-  <a href="https://pypi.org/project/mind-nerve/"><img alt="Python versions" src="https://img.shields.io/pypi/pyversions/mind-nerve.svg"></a>
-  <a href="LICENSE"><img alt="License" src="https://img.shields.io/pypi/l/mind-nerve.svg?color=4c1"></a>
-  <a href="https://github.com/star-ga/mind-nerve/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/star-ga/mind-nerve/actions/workflows/ci.yml/badge.svg?branch=main"></a>
-  <a href="https://pypi.org/project/mind-nerve/"><img alt="Downloads" src="https://img.shields.io/pypi/dm/mind-nerve.svg"></a>
-  <a href="https://huggingface.co/star-ga/mind-nerve"><img alt="Hugging Face" src="https://img.shields.io/badge/weights-Hugging%20Face-FFD21E"></a>
-  <a href="https://github.com/star-ga/mind-nerve/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/star-ga/mind-nerve?style=social"></a>
+  <strong>Mind-Nerve</strong> implements a drop-the-decoder + sliding-window encoder design compiled to native Q16.16 fixed-point — the same deterministic architecture as MIND, with byte-identical routing output across CPU, ARM, and GPU substrates.
+</p>
+
+<p align="center">
+  <a href="https://pypi.org/project/mind-nerve/"><img alt="PyPI" src="https://img.shields.io/pypi/v/mind-nerve.svg?color=blue&style=flat-square"></a>
+  <a href="https://pypi.org/project/mind-nerve/"><img alt="Python versions" src="https://img.shields.io/pypi/pyversions/mind-nerve.svg?style=flat-square"></a>
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/License-Apache_2.0-blue?style=flat-square"></a>
+  <a href="https://github.com/star-ga/mind-nerve/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/star-ga/mind-nerve/ci.yml?branch=main&style=flat-square&label=CI"></a>
+  <a href="https://github.com/star-ga/mind-nerve/releases"><img alt="Release" src="https://img.shields.io/github/v/release/star-ga/mind-nerve?include_prereleases&style=flat-square&color=green&label=Release"></a>
+  <img alt="Deterministic" src="https://img.shields.io/badge/deterministic-byte--identical-brightgreen?style=flat-square">
+  <a href="https://huggingface.co/star-ga/mind-nerve"><img alt="Hugging Face" src="https://img.shields.io/badge/weights-HuggingFace-FFD21E?style=flat-square"></a>
 </p>
 
 ---

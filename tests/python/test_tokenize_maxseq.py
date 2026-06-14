@@ -67,8 +67,7 @@ def test_native_tokenize_truncates_to_model_max_seq() -> None:
 def test_inference_tokenize_uses_max_seq_not_512() -> None:
     """Source guard: InferenceEngine._tokenize must not regress to
     max_length=512 (the #228 bug)."""
-    src = (Path(__file__).resolve().parents[2]
-           / "python/mind_nerve/inference.py").read_text()
+    src = (Path(__file__).resolve().parents[2] / "python/mind_nerve/inference.py").read_text()
     # Match the CODE form (kwarg with trailing comma) — prose/docstring
     # mentions of the old value (e.g. ``max_length=512``) are fine.
     assert "max_length=512," not in src, (
@@ -77,6 +76,5 @@ def test_inference_tokenize_uses_max_seq_not_512() -> None:
         "inputs and diverge from pytorch SentenceTransformer"
     )
     assert "max_length=256," in src, (
-        "expected the _tokenize call to use max_length=256 "
-        "(= model max_seq_length) in inference.py"
+        "expected the _tokenize call to use max_length=256 (= model max_seq_length) in inference.py"
     )

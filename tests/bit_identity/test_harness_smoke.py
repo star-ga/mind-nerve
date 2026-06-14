@@ -72,6 +72,7 @@ _SKIP_SLOW = os.environ.get("BIT_IDENTITY_SKIP_SLOW", "").lower() in ("1", "true
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture(scope="session")
 def corpus() -> list[dict]:
     """Load or build the committed corpus."""
@@ -81,6 +82,7 @@ def corpus() -> list[dict]:
     # Fallback: build on the fly (happens only in fresh checkout without corpus.json).
     sys.path.insert(0, str(THIS_DIR))
     from corpus import build_corpus  # type: ignore[import-not-found]
+
     return build_corpus()
 
 
@@ -150,6 +152,7 @@ def _resolve_runtime_dir() -> Path:
 # Test 1: Corpus is well-formed
 # ---------------------------------------------------------------------------
 
+
 class TestCorpusWellFormed:
     def test_corpus_total_count(self, corpus: list[dict]) -> None:
         assert len(corpus) == CORPUS_SIZE, (
@@ -195,8 +198,7 @@ class TestCorpusWellFormed:
         short_count = sum(1 for e in long_entries if len(e["text"]) < min_long_chars)
         # Allow at most 10% of long queries to be under the threshold.
         assert short_count <= len(long_entries) * 0.1, (
-            f"{short_count} long-category queries are too short "
-            f"(< {min_long_chars} chars)"
+            f"{short_count} long-category queries are too short (< {min_long_chars} chars)"
         )
 
     def test_adversarial_contains_empty_string(self, corpus: list[dict]) -> None:
@@ -219,6 +221,7 @@ class TestCorpusWellFormed:
 # ---------------------------------------------------------------------------
 # Test 2: Hash blob structure
 # ---------------------------------------------------------------------------
+
 
 def _is_valid_hash(h: str | None) -> bool:
     """Return True if h is a valid 64-char hex SHA-256 or a known sentinel."""
@@ -245,17 +248,13 @@ class TestHashBlobStructure:
         for rec in pytorch_hashes_small["records"]:
             hashes = rec.get("hashes", {})
             for key in HASH_KEYS:
-                assert key in hashes, (
-                    f"Missing hash key {key!r} in record {rec['id']!r}"
-                )
+                assert key in hashes, f"Missing hash key {key!r} in record {rec['id']!r}"
 
     def test_small_blob_all_hashes_valid(self, pytorch_hashes_small: dict) -> None:
         for rec in pytorch_hashes_small["records"]:
             for key in HASH_KEYS:
                 h = rec["hashes"].get(key)
-                assert _is_valid_hash(h), (
-                    f"Invalid hash for {key!r} in {rec['id']!r}: {h!r}"
-                )
+                assert _is_valid_hash(h), f"Invalid hash for {key!r} in {rec['id']!r}: {h!r}"
 
     def test_small_blob_backend_field(self, pytorch_hashes_small: dict) -> None:
         assert pytorch_hashes_small["backend"] == "pytorch"
@@ -295,6 +294,7 @@ class TestHashBlobStructure:
 # Test 3: PyTorch baseline full run (session-scoped, slow)
 # ---------------------------------------------------------------------------
 
+
 class TestPytorchBaseline:
     def test_full_corpus_hash_count(self, pytorch_hashes: dict) -> None:
         assert pytorch_hashes["total_hashes"] == TOTAL_HASHES, (
@@ -317,9 +317,7 @@ class TestPytorchBaseline:
         for rec in pytorch_hashes["records"]:
             for key in HASH_KEYS:
                 h = rec["hashes"].get(key)
-                assert _is_valid_hash(h), (
-                    f"Invalid hash at {rec['id']!r}.{key}: {h!r}"
-                )
+                assert _is_valid_hash(h), f"Invalid hash at {rec['id']!r}.{key}: {h!r}"
 
     def test_full_corpus_json_serializable(self, pytorch_hashes: dict) -> None:
         """Verify the blob round-trips through JSON."""
@@ -340,9 +338,7 @@ class TestPytorchBaseline:
 
         result = compare_blobs(pytorch_hashes, pytorch_hashes)
 
-        assert result.hash_fail == 0, (
-            f"Self-comparison produced {result.hash_fail} hash mismatches"
-        )
+        assert result.hash_fail == 0, f"Self-comparison produced {result.hash_fail} hash mismatches"
         if result.topk_overlaps:
             avg = sum(result.topk_overlaps) / len(result.topk_overlaps)
             assert avg >= 0.90, f"Self-comparison top-K overlap {avg:.4f} < 0.90"
@@ -351,6 +347,7 @@ class TestPytorchBaseline:
 # ---------------------------------------------------------------------------
 # Test 4: Sentinel backend blobs
 # ---------------------------------------------------------------------------
+
 
 class TestSentinelBackends:
     def test_native_sentinel_blob_structure(self, corpus: list[dict]) -> None:
@@ -423,6 +420,7 @@ class TestSentinelBackends:
 # Test 5: Sliding-window invariant (§3.3)
 # ---------------------------------------------------------------------------
 
+
 class TestSlidingWindowInvariant:
     def test_single_window_when_t_lte_256(self) -> None:
         sys.path.insert(0, str(THIS_DIR))
@@ -475,9 +473,7 @@ class TestSlidingWindowInvariant:
         # Tokens 192..255 are in both windows -> must go to window 1
         for t in range(STRIDE, WINDOW_SIZE):
             w = plan.token_to_window[t]
-            assert w == 1, (
-                f"T={T}, t={t} in overlap: expected window 1 (later), got {w}"
-            )
+            assert w == 1, f"T={T}, t={t} in overlap: expected window 1 (later), got {w}"
 
     def test_every_token_assigned_exactly_once(self) -> None:
         sys.path.insert(0, str(THIS_DIR))
@@ -485,9 +481,7 @@ class TestSlidingWindowInvariant:
 
         for T in [0, 1, 50, 256, 257, 300, 400, 512, 1000]:
             plan = compute_window_plan(T)
-            assert len(plan.token_to_window) == T, (
-                f"T={T}: token_to_window length mismatch"
-            )
+            assert len(plan.token_to_window) == T, f"T={T}: token_to_window length mismatch"
             for t, w in enumerate(plan.token_to_window):
                 assert 0 <= w < plan.window_count or plan.window_count == 0, (
                     f"T={T}, t={t}: window {w} out of range [0, {plan.window_count})"
@@ -503,9 +497,7 @@ class TestSlidingWindowInvariant:
         for T in [0, 1, 50, 256, 257, 300, 400, 512, 750, 1000]:
             plan = compute_window_plan(T)
             violations = check_invariants(plan, f"test_T{T}")
-            assert not violations, (
-                f"T={T}: unexpected violations: {violations[:3]}"
-            )
+            assert not violations, f"T={T}: unexpected violations: {violations[:3]}"
 
     def test_corpus_long_queries_invariant(self, corpus: list[dict]) -> None:
         """All long-category corpus entries pass the §3.3 invariant."""
@@ -528,9 +520,9 @@ class TestSlidingWindowInvariant:
             (1, 1),
             (256, 1),
             (257, 2),
-            (448, 2),   # 192 + 256 = 448, just one full second window
-            (449, 3),   # needs third window
-            (640, 3),   # 2*192 + 256 = 640
+            (448, 2),  # 192 + 256 = 448, just one full second window
+            (449, 3),  # needs third window
+            (640, 3),  # 2*192 + 256 = 640
             (641, 4),
         ],
     )
@@ -547,6 +539,7 @@ class TestSlidingWindowInvariant:
 # ---------------------------------------------------------------------------
 # Test 6: Gate thresholds (overlap math)
 # ---------------------------------------------------------------------------
+
 
 class TestGateThresholds:
     def test_compare_topk_overlap_perfect(self) -> None:

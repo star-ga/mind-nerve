@@ -66,6 +66,7 @@ _DEFAULT_RUNTIME_DIR = Path.home() / ".local" / "share" / "mind-nerve" / "runtim
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _sha256_bytes(data: bytes) -> str:
     """Return lowercase hex SHA-256 of raw bytes."""
     return hashlib.sha256(data).hexdigest()
@@ -111,6 +112,7 @@ def _resolve_runtime_dir() -> Path:
 # ---------------------------------------------------------------------------
 # PyTorch backend — ground truth
 # ---------------------------------------------------------------------------
+
 
 class _PyTorchHook:
     """
@@ -289,10 +291,15 @@ def _run_pytorch_backend(
 # Native backend (A1.3 ctypes wiring stub)
 # ---------------------------------------------------------------------------
 
+
 def _find_native_so() -> Path | None:
     """Locate the native encoder .so in the standard search paths."""
     candidates = [
-        Path(__file__).parent.parent.parent / "python" / "mind_nerve" / "_native" / "libmind_nerve_encoder.so",
+        Path(__file__).parent.parent.parent
+        / "python"
+        / "mind_nerve"
+        / "_native"
+        / "libmind_nerve_encoder.so",
         Path(os.environ.get("MIND_NERVE_NATIVE_SO", "")),
     ]
     for c in candidates:
@@ -451,7 +458,9 @@ def _run_native_so(lib: Any, corpus: list[dict], runtime_dir: Path) -> list[dict
         # Encode — fills out_vec with Q16.16 L2-normalized output (hash 5)
         rc = lib.mn_encoder_encode(handle, token_ptr, token_len, out_vec)
         if rc != 0:
-            records.append(_error_record(query_id, entry["category"], "native", f"encode_error_{rc}"))
+            records.append(
+                _error_record(query_id, entry["category"], "native", f"encode_error_{rc}")
+            )
             continue
 
         # We only get the final output from the ABI; for intermediate hashes
@@ -469,7 +478,9 @@ def _run_native_so(lib: Any, corpus: list[dict], runtime_dir: Path) -> list[dict
         # Hash 6: catalog scores
         rc = lib.mn_encoder_score(handle, out_vec, catalog_ptr, n_catalog, out_scores)
         if rc != 0:
-            records.append(_error_record(query_id, entry["category"], "native", f"score_error_{rc}"))
+            records.append(
+                _error_record(query_id, entry["category"], "native", f"score_error_{rc}")
+            )
             continue
 
         scores_q16 = np.ctypeslib.as_array(out_scores, shape=(n_catalog,)).copy()
@@ -513,6 +524,7 @@ def _run_native_so(lib: Any, corpus: list[dict], runtime_dir: Path) -> list[dict
 # CUDA backend — deferred to v0.4.1 (§3.2)
 # ---------------------------------------------------------------------------
 
+
 def _run_cuda_backend(corpus: list[dict], runtime_dir: Path) -> list[dict]:
     """CUDA bit-identity gate deferred to A2 (v0.4.1). Emits sentinels."""
     print(
@@ -537,9 +549,7 @@ HASH_KEYS = (
 )
 
 
-def _sentinel_records(
-    corpus: list[dict], backend: str, sentinel: str
-) -> list[dict]:
+def _sentinel_records(corpus: list[dict], backend: str, sentinel: str) -> list[dict]:
     return [
         {
             "id": e["id"],
@@ -553,9 +563,7 @@ def _sentinel_records(
     ]
 
 
-def _error_record(
-    query_id: str, category: str, backend: str, error: str
-) -> dict:
+def _error_record(query_id: str, category: str, backend: str, error: str) -> dict:
     return {
         "id": query_id,
         "category": category,
@@ -569,6 +577,7 @@ def _error_record(
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
+
 
 def run_backend(
     backend: str,
@@ -631,6 +640,7 @@ def main() -> None:
         print(f"Corpus not found at {args.corpus}, building on-the-fly...", file=sys.stderr)
         sys.path.insert(0, str(THIS_DIR))
         from corpus import build_corpus
+
         corpus = build_corpus()
 
     if args.limit:

@@ -40,9 +40,8 @@ MIND_NERVE_CATALOG).
 """
 
 import hashlib
-import struct
 import os
-import sys
+import struct
 
 # ---------------------------------------------------------------------------
 # Fixed seeds — NEVER change these. Changing a seed invalidates all golden
@@ -52,16 +51,16 @@ import sys
 SEED_TOKENS_001 = 0xDEAD_BEEF_0001
 SEED_TOKENS_002 = 0xDEAD_BEEF_0002
 SEED_TOKENS_003 = 0xDEAD_BEEF_0003
-SEED_CATALOG    = 0xFEED_FACE_CA7A
+SEED_CATALOG = 0xFEED_FACE_CA7A
 
-VOCAB_SIZE   = 32000   # 32k BPE vocabulary
-HIDDEN_DIM   = 256     # route embedding dimension (matches architecture.md)
+VOCAB_SIZE = 32000  # 32k BPE vocabulary
+HIDDEN_DIM = 256  # route embedding dimension (matches architecture.md)
 
 # Q16.16 range: i32, fractional bits = 16.
 # Embeddings drawn from N(0, 0.02) in float, scaled to Q16.16.
 # scale = 2^16 = 65536; 0.02 * 65536 = 1310.72 -> we draw integers from
 # the discrete approximation using a Box-Muller transform over the PRNG.
-EMBED_SCALE  = 65536   # 2^16
+EMBED_SCALE = 65536  # 2^16
 EMBED_STDDEV_FLOAT = 0.02
 
 FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
@@ -69,8 +68,8 @@ EXPECTED_DIR = os.path.join(FIXTURE_DIR, "expected")
 
 CATALOG_SIZES = [44, 440, 4400]
 REQUESTS = [
-    ("request_001", 16,   5,  SEED_TOKENS_001),
-    ("request_002", 256,  10, SEED_TOKENS_002),
+    ("request_001", 16, 5, SEED_TOKENS_001),
+    ("request_002", 256, 10, SEED_TOKENS_002),
     ("request_003", 1024, 64, SEED_TOKENS_003),
 ]
 
@@ -79,11 +78,13 @@ REQUESTS = [
 # Minimal deterministic PRNG (xorshift64, stdlib only)
 # ---------------------------------------------------------------------------
 
+
 class Xorshift64:
     """
     Xorshift64 PRNG. Deterministic, fast, no stdlib dependency.
     Period: 2^64 - 1. Not cryptographic.
     """
+
     def __init__(self, seed: int):
         # Seed must be non-zero; fold to 64-bit unsigned.
         self._state = (seed & 0xFFFF_FFFF_FFFF_FFFF) or 1
@@ -91,7 +92,7 @@ class Xorshift64:
     def next_u64(self) -> int:
         x = self._state
         x ^= (x << 13) & 0xFFFF_FFFF_FFFF_FFFF
-        x ^= (x >> 7)  & 0xFFFF_FFFF_FFFF_FFFF
+        x ^= (x >> 7) & 0xFFFF_FFFF_FFFF_FFFF
         x ^= (x << 17) & 0xFFFF_FFFF_FFFF_FFFF
         self._state = x & 0xFFFF_FFFF_FFFF_FFFF
         return self._state
@@ -116,6 +117,7 @@ class Xorshift64:
         Consumes two u64 draws.
         """
         import math
+
         while True:
             u1 = self.next_float_01()
             u2 = self.next_float_01()
@@ -130,6 +132,7 @@ class Xorshift64:
 # Route ID derivation
 # ---------------------------------------------------------------------------
 
+
 def route_id_bytes(seq: int) -> bytes:
     """
     Derive the 32-byte RouteId for route number `seq` (0-based).
@@ -143,6 +146,7 @@ def route_id_bytes(seq: int) -> bytes:
 # ---------------------------------------------------------------------------
 # Fixture builders
 # ---------------------------------------------------------------------------
+
 
 def build_mic2_request(
     name: str,
@@ -217,6 +221,7 @@ def build_catalog_bin(n_routes: int) -> bytes:
 # Catalog hash (mirrors architecture.md §Catalog hashing)
 # ---------------------------------------------------------------------------
 
+
 def catalog_hash(n_routes: int) -> bytes:
     """
     Compute the CatalogHash per the spec:
@@ -241,7 +246,7 @@ def catalog_hash(n_routes: int) -> bytes:
     pairs.sort(key=lambda p: p[0])
 
     h = hashlib.sha256()
-    for sort_key, rid, desc_sha in pairs:
+    for _sort_key, rid, desc_sha in pairs:
         # length-prefixed route_id (u32 LE length + bytes)
         h.update(struct.pack("<I", len(rid)))
         h.update(rid)
@@ -277,6 +282,7 @@ def write_golden_placeholder(name: str) -> None:
 # Manifest file — machine-readable list of all (request, catalog) pairs
 # ---------------------------------------------------------------------------
 
+
 def write_manifest(pairs: list) -> None:
     """
     Write fixtures/MANIFEST listing all (request_file, catalog_file, golden_file).
@@ -295,6 +301,7 @@ def write_manifest(pairs: list) -> None:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
 
 def main():
     os.makedirs(FIXTURE_DIR, exist_ok=True)
@@ -330,7 +337,7 @@ def main():
 
     print("\nWriting fixture manifest...")
     write_manifest([(r, c) for r, c in pairs])
-    print(f"  fixtures/MANIFEST")
+    print("  fixtures/MANIFEST")
 
     print("\nDone. Next step: build the mind-nerve binary, then run:")
     print("  bash tests/bit_identity/run.sh --generate-golden")

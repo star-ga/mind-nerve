@@ -64,9 +64,7 @@ def _emit_mlir(mindc: Path, source: Path) -> str:
         timeout=60,
     )
     if result.returncode != 0:
-        raise RuntimeError(
-            f"mindc --emit-mlir failed for {source.name}:\n{result.stderr}"
-        )
+        raise RuntimeError(f"mindc --emit-mlir failed for {source.name}:\n{result.stderr}")
     return result.stdout
 
 
@@ -119,7 +117,7 @@ def _merge_mlir(per_file_mlir: list[str]) -> str:
     rather than declared external.
     """
     all_privates: dict[str, str] = {}  # name -> declaration line
-    all_defs: dict[str, str] = {}      # name -> full function block
+    all_defs: dict[str, str] = {}  # name -> full function block
 
     for mlir_text in per_file_mlir:
         privates, defs = _extract_functions(mlir_text)
@@ -138,11 +136,7 @@ def _merge_mlir(per_file_mlir: list[str]) -> str:
                 all_defs[name] = block
 
     # Any private declaration that has a concrete definition → remove from privates.
-    remaining_privates = {
-        name: decl
-        for name, decl in all_privates.items()
-        if name not in all_defs
-    }
+    remaining_privates = {name: decl for name, decl in all_privates.items() if name not in all_defs}
 
     lines: list[str] = ["module {"]
 
@@ -153,7 +147,7 @@ def _merge_mlir(per_file_mlir: list[str]) -> str:
     # Emit all function definitions
     for block in all_defs.values():
         # Indent the block by 2 spaces (it's already at module top level)
-        indented = "\n".join(f"  {l}" if l.strip() else "" for l in block.splitlines())
+        indented = "\n".join(f"  {line}" if line.strip() else "" for line in block.splitlines())
         lines.append(indented)
 
     lines.append("}")
@@ -272,8 +266,15 @@ def _compile_runtime_support(
         tmp_blas_o.close()
         result = subprocess.run(
             [
-                clang, "-c", "-fPIC", "-O2", "-mavx2", "-mfma",
-                str(blas_shim), "-o", tmp_blas_o.name,
+                clang,
+                "-c",
+                "-fPIC",
+                "-O2",
+                "-mavx2",
+                "-mfma",
+                str(blas_shim),
+                "-o",
+                tmp_blas_o.name,
             ],
             capture_output=True,
             text=True,
@@ -345,9 +346,7 @@ def _compile_shared(
             timeout=120,
         )
         if result.returncode != 0:
-            raise RuntimeError(
-                f"clang shared link failed:\n{result.stderr}"
-            )
+            raise RuntimeError(f"clang shared link failed:\n{result.stderr}")
     finally:
         os.unlink(ll_path)
 
@@ -393,8 +392,7 @@ def build(
 
     if verbose:
         fn_count = combined.count("func.func @")
-        print(f"[build] Combined module: {fn_count} function definitions, "
-              f"{len(combined)} chars")
+        print(f"[build] Combined module: {fn_count} function definitions, {len(combined)} chars")
 
     # Step 3: lower combined MLIR via mlir-opt
     if verbose:
@@ -446,23 +444,28 @@ def build(
     defined_t = set(re.findall(r" T (\w+)", result.stdout))
     missing = [sym for sym in required if sym not in defined_t]
     if missing:
-        raise RuntimeError(
-            f"Required symbols missing from {output}: {missing}"
-        )
+        raise RuntimeError(f"Required symbols missing from {output}: {missing}")
     if verbose:
         print("[build] Symbol check: all 6 mn_encoder_* symbols present as T")
         undefined = re.findall(r" U (\w+)", result.stdout)
         # Filter expected libc/libm symbols (versioned or bare)
         expected_undef = {
-            "malloc", "free", "calloc", "realloc", "memcpy",
-            "read", "write", "pread", "pwrite",
-            "exp", "sqrt", "tanh",
-            "getenv", "strcmp",
+            "malloc",
+            "free",
+            "calloc",
+            "realloc",
+            "memcpy",
+            "read",
+            "write",
+            "pread",
+            "pwrite",
+            "exp",
+            "sqrt",
+            "tanh",
+            "getenv",
+            "strcmp",
         }
-        unexpected_undef = [
-            u for u in undefined
-            if u.split("@")[0] not in expected_undef
-        ]
+        unexpected_undef = [u for u in undefined if u.split("@")[0] not in expected_undef]
         if unexpected_undef:
             print(f"[build] WARNING: unexpected undefined symbols: {unexpected_undef}")
         else:
@@ -491,8 +494,10 @@ def main() -> None:
 
     nerve_root = Path(args.nerve_root).resolve()
     mind_checkout = Path(args.mind_checkout).resolve()
-    output = Path(args.output) if args.output else (
-        nerve_root / "python/mind_nerve/_native/libmind_nerve_encoder.so"
+    output = (
+        Path(args.output)
+        if args.output
+        else (nerve_root / "python/mind_nerve/_native/libmind_nerve_encoder.so")
     )
 
     print(f"[build] mind-nerve root: {nerve_root}")

@@ -174,7 +174,7 @@ def main():
     )
     upstream_path = out_dir / "upstream.txt"
     upstream_path.write_text(
-        "\n".join(f"{e['name']}\t{e.get('head','-')}" for e in upstream_summary()) + "\n"
+        "\n".join(f"{e['name']}\t{e.get('head', '-')}" for e in upstream_summary()) + "\n"
     )
 
     print(json.dumps(manifest, indent=2))

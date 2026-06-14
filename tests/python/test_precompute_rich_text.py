@@ -11,12 +11,10 @@ RED: these tests must fail before the fix.
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
 
 import numpy as np
 import pytest
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -43,13 +41,18 @@ def _fake_model(dim: int = 8):
 
     class _FakeModel:
         def encode(
-            self, texts: list[str], *, batch_size: int = 128, convert_to_numpy: bool = True,
-            show_progress_bar: bool = False, normalize_embeddings: bool = False,
+            self,
+            texts: list[str],
+            *,
+            batch_size: int = 128,
+            convert_to_numpy: bool = True,
+            show_progress_bar: bool = False,
+            normalize_embeddings: bool = False,
         ) -> np.ndarray:
             out = np.zeros((len(texts), dim), dtype=np.float32)
             for i, t in enumerate(texts):
                 # hash text into float vector — deterministic, unique for different inputs
-                h = abs(hash(t)) % (2 ** 31)
+                h = abs(hash(t)) % (2**31)
                 for j in range(dim):
                     out[i, j] = float((h >> j) & 0xFF) / 255.0
             return out
@@ -65,7 +68,9 @@ def _fake_model(dim: int = 8):
 # ---------------------------------------------------------------------------
 
 
-def _run_precompute(tmp_path: Path, items: list[dict], monkeypatch: pytest.MonkeyPatch) -> tuple[np.ndarray, list[dict]]:
+def _run_precompute(
+    tmp_path: Path, items: list[dict], monkeypatch: pytest.MonkeyPatch
+) -> tuple[np.ndarray, list[dict]]:
     """Run precompute_routes with a fake model and return (embeddings, meta)."""
     from mind_nerve import inference as inf
 
@@ -92,16 +97,17 @@ def _run_precompute(tmp_path: Path, items: list[dict], monkeypatch: pytest.Monke
     )
     # Patch at the call site inside precompute_routes (it does its own import)
     import sentence_transformers
+
     monkeypatch.setattr(sentence_transformers, "SentenceTransformer", lambda *a, **kw: fake_model)
 
-    result = inf.precompute_routes(
+    inf.precompute_routes(
         runtime_dir=str(rdir),
         catalog_path=str(catalog),
     )
 
     emb = np.load(rdir / "route_table.npy")
     with (rdir / "route_table.jsonl").open() as f:
-        meta = [json.loads(l) for l in f]
+        meta = [json.loads(line) for line in f]
 
     return emb, meta, fake_model
 
@@ -119,12 +125,14 @@ class TestPrecomputeUsesRichText:
     ) -> None:
         """Two items with the same name but different descriptions must differ."""
         skill_a = _write_skill(
-            tmp_path, "compute-embedding",
+            tmp_path,
+            "compute-embedding",
             description="Encode text sequences using transformer models",
             body="# Compute Embedding\n\nUse BERT, RoBERTa, or sentence-transformers.",
         )
         skill_b = _write_skill(
-            tmp_path, "deploy-kubernetes",
+            tmp_path,
+            "deploy-kubernetes",
             description="Deploy containerised services to a Kubernetes cluster",
             body="# Deploy Kubernetes\n\nUse kubectl, Helm charts, and manifests.",
         )
@@ -165,7 +173,8 @@ class TestPrecomputeUsesRichText:
         With the fix it should match the rich text (description + body).
         """
         skill_file = _write_skill(
-            tmp_path, "ml-pipeline-workflow",
+            tmp_path,
+            "ml-pipeline-workflow",
             description=(
                 "Build end-to-end MLOps pipelines from data preparation through "
                 "model training, validation, and production deployment."
@@ -198,7 +207,7 @@ class TestPrecomputeUsesRichText:
                 if ":" in line and not line.strip().startswith("#"):
                     k, v = line.split(":", 1)
                     fm[k.strip().lower()] = v.strip().strip('"').strip("'")
-        body = text[text.find("\n---", 3) + 4:] if text.startswith("---") else text
+        body = text[text.find("\n---", 3) + 4 :] if text.startswith("---") else text
         desc = fm.get("description", "")
         rich_text = (desc or "ml-pipeline-workflow") + "\n\n" + body[:1024]
         rich_emb = model.encode([rich_text])

@@ -29,6 +29,7 @@ import socket
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 from ._runtime_dir import runtime_socket_dir
 
@@ -96,7 +97,7 @@ def main() -> int:
             k = max(1, min(k, 64))  # clamp to route()'s [1,64] bounds (matches mcp_server)
             t_q = time.time()
             result = _route(prompt, top_k=k)
-            reply: dict = {
+            reply: dict[str, Any] = {
                 "routes": [{"name": r.name, "score": float(r.score)} for r in result.routes],
                 "ms": int((time.time() - t_q) * 1000),
             }

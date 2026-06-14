@@ -18,44 +18,49 @@ in spec/numerics.md §5.
 import math
 import os
 import random
-import struct
 
 # ── constants ──────────────────────────────────────────────────────────────────
-Q16_ONE   = 1 << 16          # 65536
-Q32_ONE   = 1 << 32          # 4294967296
-Q16_MAX   = (1 << 31) - 1    # i64 stored as i64; Q16.16 max representable ~32767.9999
-Q16_MIN   = -(1 << 31)
-Q32_MAX   = (1 << 63) - 1
-Q32_MIN   = -(1 << 63)
+Q16_ONE = 1 << 16  # 65536
+Q32_ONE = 1 << 32  # 4294967296
+Q16_MAX = (1 << 31) - 1  # i64 stored as i64; Q16.16 max representable ~32767.9999
+Q16_MIN = -(1 << 31)
+Q32_MAX = (1 << 63) - 1
+Q32_MIN = -(1 << 63)
 
-REPO_ROOT   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LUTS_DIR    = os.path.join(REPO_ROOT, "mind", "luts")
-TESTS_DIR   = os.path.join(REPO_ROOT, "tests")
-TOOLS_DIR   = os.path.join(REPO_ROOT, "tools")
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LUTS_DIR = os.path.join(REPO_ROOT, "mind", "luts")
+TESTS_DIR = os.path.join(REPO_ROOT, "tests")
+TOOLS_DIR = os.path.join(REPO_ROOT, "tools")
 
 os.makedirs(LUTS_DIR, exist_ok=True)
 os.makedirs(TESTS_DIR, exist_ok=True)
 
 # ── helpers ────────────────────────────────────────────────────────────────────
 
+
 def to_q16(x: float) -> int:
     """Convert float to Q16.16 i64, floor-truncated, clamped to i32 range."""
     raw = math.floor(x * Q16_ONE)
     return max(Q16_MIN, min(Q16_MAX, raw))
 
+
 def from_q16(q: int) -> float:
     return q / Q16_ONE
+
 
 def to_q32(x: float) -> int:
     """Convert float to Q32.32 i64, floor-truncated, clamped to i64 range."""
     raw = math.floor(x * Q32_ONE)
     return max(Q32_MIN, min(Q32_MAX, raw))
 
+
 def from_q32(q: int) -> float:
     return q / Q32_ONE
 
+
 def clamp_i64(v: int) -> int:
     return max(Q32_MIN, min(Q32_MAX, v))
+
 
 def emit_header(name: str) -> str:
     return f"""\
@@ -67,7 +72,9 @@ use std.vec;
 
 """
 
+
 # ── 1. recip_q32 (256-entry, domain [1, 256], Q32.32) ─────────────────────────
+
 
 def gen_recip_q32() -> list[int]:
     """
@@ -81,7 +88,9 @@ def gen_recip_q32() -> list[int]:
         table.append(clamp_i64(val))
     return table
 
+
 # ── 2. exp_q16 (4096-entry, domain [-16, 0], Q16.16) ─────────────────────────
+
 
 def gen_exp_q16() -> list[int]:
     """
@@ -99,7 +108,9 @@ def gen_exp_q16() -> list[int]:
         table.append(max(0, min(Q16_MAX, val)))
     return table
 
+
 # ── 3. tanh_q16 (4096-entry, domain [-8, 8], Q16.16) ──────────────────────────
+
 
 def gen_tanh_q16() -> list[int]:
     """
@@ -115,6 +126,7 @@ def gen_tanh_q16() -> list[int]:
         table.append(max(Q16_MIN, min(Q16_MAX, val)))
     return table
 
+
 # ── 4. softmax_q16 — no separate table; composed in .mind ─────────────────────
 
 # ── 5. sqrt_q16 / rsqrt_q16 (2048-entry, domain [ULP, 256], Q16.16) ──────────
@@ -129,7 +141,7 @@ def gen_tanh_q16() -> list[int]:
 # native-vs-pytorch top-5 route overlap from 0.37 to >= 0.92.
 RSQRT_ENTRIES = 16384
 SQRT_ENTRIES = 2048
-RSQRT_DOMAIN_HI = 256.0   # real units; matches the original [ULP, 256] domain
+RSQRT_DOMAIN_HI = 256.0  # real units; matches the original [ULP, 256] domain
 
 
 def gen_sqrt_q16() -> list[int]:
@@ -146,6 +158,7 @@ def gen_sqrt_q16() -> list[int]:
         table.append(max(0, min(Q16_MAX, val)))
     return table
 
+
 def gen_rsqrt_q16() -> list[int]:
     """
     RSQRT_ENTRIES entries: table[i] = floor(1 / sqrt(x_i) * Q16_ONE) where
@@ -159,7 +172,9 @@ def gen_rsqrt_q16() -> list[int]:
         table.append(max(0, min(Q16_MAX, val)))
     return table
 
+
 # ── MIND source emitters ───────────────────────────────────────────────────────
+
 
 def q16(val: int) -> str:
     """Render an integer as a mindc-safe i64 literal expression.
@@ -181,8 +196,9 @@ def emit_store_seq(table: list[int], buf_var: str, indent: str = "    ") -> str:
     return "\n".join(lines)
 
 
-def emit_chunked_init(table: list[int], fn_prefix: str, buf_var: str,
-                       chunk: int = 1024) -> tuple[str, str]:
+def emit_chunked_init(
+    table: list[int], fn_prefix: str, buf_var: str, chunk: int = 1024
+) -> tuple[str, str]:
     """Emit a chunked table initialiser.
 
     Large LUTs (16K+ entries) produce a single function body too big for the
@@ -198,22 +214,20 @@ def emit_chunked_init(table: list[int], fn_prefix: str, buf_var: str,
         end = min(start + chunk, n)
         body_lines = []
         for i in range(start, end):
-            body_lines.append(
-                f"    __mind_store_i64({buf_var} + {i * 8}, {q16(table[i])});"
-            )
+            body_lines.append(f"    __mind_store_i64({buf_var} + {i * 8}, {q16(table[i])});")
         body = "\n".join(body_lines)
-        helpers.append(
-            f"fn {fn_prefix}_fill_{part}({buf_var}: i64) -> i64 {{\n"
-            f"{body}\n    0\n}}"
-        )
+        helpers.append(f"fn {fn_prefix}_fill_{part}({buf_var}: i64) -> i64 {{\n{body}\n    0\n}}")
         calls.append(f"    {fn_prefix}_fill_{part}({buf_var});")
         part += 1
     return "\n\n".join(helpers), "\n".join(calls)
 
+
 def write_recip_q32(table: list[int]) -> None:
     n = len(table)  # 256
     stores = emit_store_seq(table, "buf")
-    src = emit_header("recip_q32.mind") + f"""\
+    src = (
+        emit_header("recip_q32.mind")
+        + f"""\
 // recip_q32 — 256-entry Q32.32 reciprocal LUT.
 //
 // Domain: denominator d in [1, 256] (integer).
@@ -277,6 +291,7 @@ pub fn recip_q32_free(handle: i64) -> i64 {{
     0
 }}
 """
+    )
     path = os.path.join(LUTS_DIR, "recip_q32.mind")
     with open(path, "w") as f:
         f.write(src)
@@ -295,7 +310,9 @@ def write_exp_q16(table: list[int]) -> None:
         stores_hi_lines.append(f"    __mind_store_i64(buf + {(half + i) * 8}, {q16(val)});")
     stores_hi = "\n".join(stores_hi_lines)
 
-    src = emit_header("exp_q16.mind") + f"""\
+    src = (
+        emit_header("exp_q16.mind")
+        + f"""\
 // exp_q16 — 4096-entry Q16.16 exp LUT.
 //
 // Domain: x in [-16.0, 0.0] (Q16.16 input values).
@@ -342,6 +359,7 @@ pub fn exp_q16_free(handle: i64) -> i64 {{
     0
 }}
 """
+    )
     path = os.path.join(LUTS_DIR, "exp_q16.mind")
     with open(path, "w") as f:
         f.write(src)
@@ -356,7 +374,9 @@ def write_tanh_q16(table: list[int]) -> None:
         stores_hi_lines.append(f"    __mind_store_i64(buf + {(2048 + i) * 8}, {q16(val)});")
     stores_hi = "\n".join(stores_hi_lines)
 
-    src = emit_header("tanh_q16.mind") + f"""\
+    src = (
+        emit_header("tanh_q16.mind")
+        + f"""\
 // tanh_q16 — 4096-entry Q16.16 tanh LUT.
 //
 // Domain: x in [-8.0, 8.0] (Q16.16 input values).
@@ -425,6 +445,7 @@ pub fn tanh_q16(x: i64) -> i64 {{
     tanh_q16_lookup(h, x)
 }}
 """
+    )
     path = os.path.join(LUTS_DIR, "tanh_q16.mind")
     with open(path, "w") as f:
         f.write(src)
@@ -432,7 +453,9 @@ pub fn tanh_q16(x: i64) -> i64 {{
 
 
 def write_softmax_q16() -> None:
-    src = emit_header("softmax_q16.mind") + """\
+    src = (
+        emit_header("softmax_q16.mind")
+        + """\
 // softmax_q16 — Q16.16 softmax kernel.
 //
 // Implements the 5-stage pinned pipeline from spec/numerics.md §5 and
@@ -580,6 +603,7 @@ pub fn softmax_q16(buf: i64, n_rows: i64, row_len: i64) -> i64 {
     softmax_q16_rows(exp_h, recip_h, buf, n_rows, row_len, 0)
 }
 """
+    )
     path = os.path.join(LUTS_DIR, "softmax_q16.mind")
     with open(path, "w") as f:
         f.write(src)
@@ -587,20 +611,20 @@ pub fn softmax_q16(buf: i64, n_rows: i64, row_len: i64) -> i64 {
 
 
 def write_sqrt_q16(sqrt_table: list[int], rsqrt_table: list[int]) -> None:
-    ns = len(sqrt_table)    # SQRT_ENTRIES   (2048; sqrt not on encode path)
-    nr = len(rsqrt_table)   # RSQRT_ENTRIES  (16384; A1.5 finer seed)
+    ns = len(sqrt_table)  # SQRT_ENTRIES   (2048; sqrt not on encode path)
+    nr = len(rsqrt_table)  # RSQRT_ENTRIES  (16384; A1.5 finer seed)
 
     # Q16.16 bucket strides (integer, exact since DOMAIN_HI * Q16 is divisible).
     sqrt_stride_q16 = int(round(RSQRT_DOMAIN_HI * Q16_ONE)) // ns
     rsqrt_stride_q16 = int(round(RSQRT_DOMAIN_HI * Q16_ONE)) // nr
-    domain_hi_q16 = int(round(RSQRT_DOMAIN_HI * Q16_ONE))   # 16777216
+    domain_hi_q16 = int(round(RSQRT_DOMAIN_HI * Q16_ONE))  # 16777216
 
     sqrt_helpers, sqrt_calls = emit_chunked_init(sqrt_table, "sqrt_q16", "sqrt_buf")
-    rsqrt_helpers, rsqrt_calls = emit_chunked_init(
-        rsqrt_table, "rsqrt_q16", "rsqrt_buf"
-    )
+    rsqrt_helpers, rsqrt_calls = emit_chunked_init(rsqrt_table, "rsqrt_q16", "rsqrt_buf")
 
-    src = emit_header("sqrt_q16.mind") + f"""\
+    src = (
+        emit_header("sqrt_q16.mind")
+        + f"""\
 // sqrt_q16 ({ns}-entry) / rsqrt_q16 ({nr}-entry) Q16.16 LUTs.
 //
 // Domain: x in [ULP, {RSQRT_DOMAIN_HI:.1f}] (Q16.16 input values, ULP = 1).
@@ -735,6 +759,7 @@ pub fn rsqrt_q16_free(handle: i64) -> i64 {{
     0
 }}
 """
+    )
     path = os.path.join(LUTS_DIR, "sqrt_q16.mind")
     with open(path, "w") as f:
         f.write(src)
@@ -742,6 +767,7 @@ pub fn rsqrt_q16_free(handle: i64) -> i64 {{
 
 
 # ── smoke test fixture ─────────────────────────────────────────────────────────
+
 
 def gen_smoke_fixture(
     recip_table: list[int],
@@ -775,7 +801,7 @@ def gen_smoke_fixture(
     exp_samples = []
     for _ in range(n_samples):
         i = rng.randint(0, 4095)
-        x_q16 = -1048576 + i * 256   # domain_lo + i * stride
+        x_q16 = -1048576 + i * 256  # domain_lo + i * stride
         expected = exp_table[i]
         exp_samples.append((x_q16, expected))
 
@@ -783,7 +809,7 @@ def gen_smoke_fixture(
     tanh_samples = []
     for _ in range(n_samples):
         i = rng.randint(0, 4095)
-        x_q16 = -524288 + i * 256   # domain_lo + i * stride
+        x_q16 = -524288 + i * 256  # domain_lo + i * stride
         expected = tanh_table[i]
         tanh_samples.append((x_q16, expected))
 
@@ -804,7 +830,9 @@ def gen_smoke_fixture(
         for d, exp in samples:
             lines.append(f"    let r_{d}: i64 = recip_q32_lookup(rh, {d});")
             lines.append(f"    let diff_{d}: i64 = r_{d} - {exp};")
-            lines.append(f"    let adiff_{d}: i64 = if diff_{d} < 0 {{ 0 - diff_{d} }} else {{ diff_{d} }};")
+            lines.append(
+                f"    let adiff_{d}: i64 = if diff_{d} < 0 {{ 0 - diff_{d} }} else {{ diff_{d} }};"
+            )
             lines.append(f"    if adiff_{d} > 1 {{ return {d}; }}")
         return "\n".join(lines)
 
@@ -813,7 +841,9 @@ def gen_smoke_fixture(
         for idx, (x, exp) in enumerate(samples):
             lines.append(f"    let ex_{idx}: i64 = exp_q16_lookup(eh, {x});")
             lines.append(f"    let ediff_{idx}: i64 = ex_{idx} - {exp};")
-            lines.append(f"    let eadiff_{idx}: i64 = if ediff_{idx} < 0 {{ 0 - ediff_{idx} }} else {{ ediff_{idx} }};")
+            lines.append(
+                f"    let eadiff_{idx}: i64 = if ediff_{idx} < 0 {{ 0 - ediff_{idx} }} else {{ ediff_{idx} }};"
+            )
             lines.append(f"    if eadiff_{idx} > 1 {{ return {x}; }}")
         return "\n".join(lines)
 
@@ -822,7 +852,9 @@ def gen_smoke_fixture(
         for idx, (x, exp) in enumerate(samples):
             lines.append(f"    let tx_{idx}: i64 = tanh_q16_lookup(th, {x});")
             lines.append(f"    let tdiff_{idx}: i64 = tx_{idx} - {exp};")
-            lines.append(f"    let tadiff_{idx}: i64 = if tdiff_{idx} < 0 {{ 0 - tdiff_{idx} }} else {{ tdiff_{idx} }};")
+            lines.append(
+                f"    let tadiff_{idx}: i64 = if tdiff_{idx} < 0 {{ 0 - tdiff_{idx} }} else {{ tdiff_{idx} }};"
+            )
             lines.append(f"    if tadiff_{idx} > 1 {{ return {x}; }}")
         return "\n".join(lines)
 
@@ -831,16 +863,21 @@ def gen_smoke_fixture(
         for idx, (x, esq) in enumerate(s_samples):
             lines.append(f"    let sqx_{idx}: i64 = sqrt_q16_lookup(sh, {x});")
             lines.append(f"    let sqdiff_{idx}: i64 = sqx_{idx} - {esq};")
-            lines.append(f"    let sqadiff_{idx}: i64 = if sqdiff_{idx} < 0 {{ 0 - sqdiff_{idx} }} else {{ sqdiff_{idx} }};")
+            lines.append(
+                f"    let sqadiff_{idx}: i64 = if sqdiff_{idx} < 0 {{ 0 - sqdiff_{idx} }} else {{ sqdiff_{idx} }};"
+            )
             lines.append(f"    if sqadiff_{idx} > 1 {{ return {x}; }}")
         for idx, (x, erq) in enumerate(r_samples):
             lines.append(f"    let rsqx_{idx}: i64 = rsqrt_q16_lookup(rsh, {x});")
             lines.append(f"    let rsqdiff_{idx}: i64 = rsqx_{idx} - {erq};")
-            lines.append(f"    let rsqadiff_{idx}: i64 = if rsqdiff_{idx} < 0 {{ 0 - rsqdiff_{idx} }} else {{ rsqdiff_{idx} }};")
+            lines.append(
+                f"    let rsqadiff_{idx}: i64 = if rsqdiff_{idx} < 0 {{ 0 - rsqdiff_{idx} }} else {{ rsqdiff_{idx} }};"
+            )
             lines.append(f"    if rsqadiff_{idx} > 1 {{ return {x}; }}")
         return "\n".join(lines)
 
-    src = """\
+    src = (
+        """\
 // tests/luts_smoke.mind — LUT family smoke tests.
 // Auto-generated by tools/gen_luts.py. DO NOT edit by hand.
 //
@@ -851,31 +888,43 @@ def gen_smoke_fixture(
 use std.vec;
 
 // ── Smoke test: recip_q32 ─────────────────────────────────────────────────────
-// Checks """ + str(n_samples) + """ fixed (d, expected_Q32.32) pairs.
+// Checks """
+        + str(n_samples)
+        + """ fixed (d, expected_Q32.32) pairs.
 // Returns 0 on pass; returns failing d on first mismatch.
 pub fn smoke_recip_q32() -> i64 {
     let rh: i64 = recip_q32_init();
-""" + emit_recip_checks(recip_samples) + """
+"""
+        + emit_recip_checks(recip_samples)
+        + """
     recip_q32_free(rh);
     0
 }
 
 // ── Smoke test: exp_q16 ───────────────────────────────────────────────────────
-// Checks """ + str(n_samples) + """ fixed (x_Q16, expected_Q16) pairs.
+// Checks """
+        + str(n_samples)
+        + """ fixed (x_Q16, expected_Q16) pairs.
 // Returns 0 on pass; returns failing x on first mismatch.
 pub fn smoke_exp_q16() -> i64 {
     let eh: i64 = exp_q16_init();
-""" + emit_exp_checks(exp_samples) + """
+"""
+        + emit_exp_checks(exp_samples)
+        + """
     exp_q16_free(eh);
     0
 }
 
 // ── Smoke test: tanh_q16 ─────────────────────────────────────────────────────
-// Checks """ + str(n_samples) + """ fixed (x_Q16, expected_Q16) pairs.
+// Checks """
+        + str(n_samples)
+        + """ fixed (x_Q16, expected_Q16) pairs.
 // Returns 0 on pass; returns failing x on first mismatch.
 pub fn smoke_tanh_q16() -> i64 {
     let th: i64 = tanh_q16_init();
-""" + emit_tanh_checks(tanh_samples) + """
+"""
+        + emit_tanh_checks(tanh_samples)
+        + """
     tanh_q16_free(th);
     0
 }
@@ -918,12 +967,16 @@ pub fn smoke_softmax_q16() -> i64 {
 }
 
 // ── Smoke test: sqrt_q16 / rsqrt_q16 ─────────────────────────────────────────
-// Checks """ + str(n_samples) + """ fixed (x_Q16, expected_sqrt, expected_rsqrt) triples.
+// Checks """
+        + str(n_samples)
+        + """ fixed (x_Q16, expected_sqrt, expected_rsqrt) triples.
 // Returns 0 on pass; returns failing x on first mismatch.
 pub fn smoke_sqrt_q16() -> i64 {
     let sh: i64 = sqrt_q16_init();
     let rsh: i64 = rsqrt_q16_init();
-""" + emit_sqrt_checks(sqrt_samples, rsqrt_samples) + """
+"""
+        + emit_sqrt_checks(sqrt_samples, rsqrt_samples)
+        + """
     sqrt_q16_free(sh);
     rsqrt_q16_free(rsh);
     0
@@ -945,6 +998,7 @@ pub fn run_all_smoke_tests() -> i64 {
     0
 }
 """
+    )
     path = os.path.join(TESTS_DIR, "luts_smoke.mind")
     with open(path, "w") as f:
         f.write(src)
@@ -952,6 +1006,7 @@ pub fn run_all_smoke_tests() -> i64 {
 
 
 # ── validation ─────────────────────────────────────────────────────────────────
+
 
 def validate_tables(
     recip_table: list[int],
@@ -1021,12 +1076,13 @@ def validate_tables(
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
+
 def main() -> None:
     print("generating LUT tables...")
     recip_table = gen_recip_q32()
-    exp_table   = gen_exp_q16()
-    tanh_table  = gen_tanh_q16()
-    sqrt_table  = gen_sqrt_q16()
+    exp_table = gen_exp_q16()
+    tanh_table = gen_tanh_q16()
+    sqrt_table = gen_sqrt_q16()
     rsqrt_table = gen_rsqrt_q16()
 
     print("validating tables...")

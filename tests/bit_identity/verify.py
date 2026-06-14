@@ -26,9 +26,9 @@ Stdlib only. No numpy.
 """
 
 import hashlib
+import os
 import struct
 import sys
-import os
 
 # ---------------------------------------------------------------------------
 # mic-b frame layout (from cli/main.mind)
@@ -42,7 +42,7 @@ import os
 #  TOTAL = 218 + 36*k
 # ---------------------------------------------------------------------------
 
-MAGIC = b'MNB1'
+MAGIC = b"MNB1"
 ENVELOPE_SIZE = 212
 
 # Attestation envelope v2 layout (from architecture.md):
@@ -80,6 +80,7 @@ Q16_SCALE = 65536.0  # 2^16
 # Parser
 # ---------------------------------------------------------------------------
 
+
 class ParseError(Exception):
     pass
 
@@ -95,28 +96,26 @@ def parse_frame(data: bytes) -> dict:
     if data[0:4] != MAGIC:
         raise ParseError(f"Bad magic: {data[0:4].hex()} (expected 4d4e4231)")
 
-    k = struct.unpack_from('<H', data, 4)[0]
+    k = struct.unpack_from("<H", data, 4)[0]
     expected_size = 218 + 36 * k
     if len(data) != expected_size:
-        raise ParseError(
-            f"Wrong frame size: got {len(data)}, expected {expected_size} (k={k})"
-        )
+        raise ParseError(f"Wrong frame size: got {len(data)}, expected {expected_size} (k={k})")
 
     routes = []
     for i in range(k):
         offset = 6 + 32 * i
-        route_id = data[offset:offset + 32]
+        route_id = data[offset : offset + 32]
         routes.append(route_id)
 
     scores = []
     score_base = 6 + 32 * k
     for i in range(k):
         offset = score_base + 4 * i
-        score_i32 = struct.unpack_from('<i', data, offset)[0]
+        score_i32 = struct.unpack_from("<i", data, offset)[0]
         scores.append(score_i32)
 
     env_start = 6 + 36 * k
-    env = data[env_start:env_start + ENVELOPE_SIZE]
+    env = data[env_start : env_start + ENVELOPE_SIZE]
     envelope = parse_envelope(env)
 
     # chain_curr is NOT stored; computed as SHA-256(212-byte envelope).
@@ -137,36 +136,36 @@ def parse_envelope(env: bytes) -> dict:
     if len(env) != ENVELOPE_SIZE:
         raise ParseError(f"Envelope wrong size: {len(env)} (expected {ENVELOPE_SIZE})")
 
-    version          = env[0]
-    entry_kind       = env[1]
-    wire_version     = struct.unpack_from('<H', env, 2)[0]
-    k_env            = struct.unpack_from('<I', env, 4)[0]
-    timestamp_ms     = struct.unpack_from('<q', env, 8)[0]
-    architecture     = env[16]
-    reserved         = env[17]
-    chain_reset_reason = struct.unpack_from('<H', env, 18)[0]
-    model_hash       = env[20:52]
-    tokenizer_hash   = env[52:84]
-    catalog_hash     = env[84:116]
-    request_hash     = env[116:148]
-    result_hash      = env[148:180]
-    chain_prev       = env[180:212]
+    version = env[0]
+    entry_kind = env[1]
+    wire_version = struct.unpack_from("<H", env, 2)[0]
+    k_env = struct.unpack_from("<I", env, 4)[0]
+    timestamp_ms = struct.unpack_from("<q", env, 8)[0]
+    architecture = env[16]
+    reserved = env[17]
+    chain_reset_reason = struct.unpack_from("<H", env, 18)[0]
+    model_hash = env[20:52]
+    tokenizer_hash = env[52:84]
+    catalog_hash = env[84:116]
+    request_hash = env[116:148]
+    result_hash = env[148:180]
+    chain_prev = env[180:212]
 
     return {
-        "version":            version,
-        "entry_kind":         entry_kind,
-        "wire_version":       wire_version,
-        "k":                  k_env,
-        "timestamp_ms":       timestamp_ms,
-        "architecture":       architecture,
-        "reserved":           reserved,
+        "version": version,
+        "entry_kind": entry_kind,
+        "wire_version": wire_version,
+        "k": k_env,
+        "timestamp_ms": timestamp_ms,
+        "architecture": architecture,
+        "reserved": reserved,
         "chain_reset_reason": chain_reset_reason,
-        "model_hash":         model_hash,
-        "tokenizer_hash":     tokenizer_hash,
-        "catalog_hash":       catalog_hash,
-        "request_hash":       request_hash,
-        "result_hash":        result_hash,
-        "chain_prev":         chain_prev,
+        "model_hash": model_hash,
+        "tokenizer_hash": tokenizer_hash,
+        "catalog_hash": catalog_hash,
+        "request_hash": request_hash,
+        "result_hash": result_hash,
+        "chain_prev": chain_prev,
     }
 
 
@@ -174,12 +173,13 @@ def parse_envelope(env: bytes) -> dict:
 # Masked frame (zeros timestamp_ms and architecture for comparison)
 # ---------------------------------------------------------------------------
 
+
 def mask_frame_bytes(data: bytes) -> bytes:
     """
     Return a copy of the frame with timestamp_ms and architecture zeroed.
     This is the canonical preimage for cross-arch bit-identity comparison.
     """
-    k = struct.unpack_from('<H', data, 4)[0]
+    k = struct.unpack_from("<H", data, 4)[0]
     env_start = 6 + 36 * k
     out = bytearray(data)
 
@@ -196,6 +196,7 @@ def mask_frame_bytes(data: bytes) -> bytes:
 # ---------------------------------------------------------------------------
 # Printer
 # ---------------------------------------------------------------------------
+
 
 def hex16(b: bytes) -> str:
     """Return first 16 bytes as hex, with '...' if longer."""
@@ -219,23 +220,29 @@ def print_frame(path: str, frame: dict) -> None:
     print()
 
     print("Routes (top-K results):")
-    for i, (rid, score) in enumerate(zip(frame["routes"], frame["scores"])):
+    for i, (rid, score) in enumerate(zip(frame["routes"], frame["scores"], strict=False)):
         score_f = q16_to_float(score)
         print(f"  [{i:2d}] route_id={hex16(rid)}  score_q16={score:+011d}  ({score_f:+.6f})")
     print()
 
     print("Attestation envelope:")
     print(f"  version:            {env['version']}")
-    print(f"  entry_kind:         {env['entry_kind']} "
-          f"({ENTRY_KIND_NAMES.get(env['entry_kind'], 'unknown')})")
+    print(
+        f"  entry_kind:         {env['entry_kind']} "
+        f"({ENTRY_KIND_NAMES.get(env['entry_kind'], 'unknown')})"
+    )
     print(f"  wire_version:       {env['wire_version']}")
     print(f"  k:                  {env['k']}")
     print(f"  timestamp_ms:       {env['timestamp_ms']}")
-    print(f"  architecture:       {env['architecture']} "
-          f"({ARCH_NAMES.get(env['architecture'], 'unknown')})")
+    print(
+        f"  architecture:       {env['architecture']} "
+        f"({ARCH_NAMES.get(env['architecture'], 'unknown')})"
+    )
     print(f"  reserved:           {env['reserved']}")
-    print(f"  chain_reset_reason: {env['chain_reset_reason']} "
-          f"({CHAIN_RESET_NAMES.get(env['chain_reset_reason'], 'unknown')})")
+    print(
+        f"  chain_reset_reason: {env['chain_reset_reason']} "
+        f"({CHAIN_RESET_NAMES.get(env['chain_reset_reason'], 'unknown')})"
+    )
     print()
 
     print(f"  model_hash:         {hex16(env['model_hash'])}")
@@ -248,22 +255,16 @@ def print_frame(path: str, frame: dict) -> None:
     print(f"  chain_curr (computed): {frame['chain_curr'].hex()}")
 
     masked = mask_frame_bytes(frame["envelope_raw"])
-    masked_hash = hashlib.sha256(
-        mask_frame_bytes(
-            # Re-read the full frame to mask timestamp+arch properly.
-            # We stored envelope_raw; rebuild a minimal frame for the hash.
-            frame["envelope_raw"]
-        )
-    ).hexdigest()
-    # Actually compute from the full frame stored elsewhere — we do it via
-    # masking the envelope bytes directly (same as run.sh does for the full
-    # frame, but here we expose the envelope portion for diagnostic clarity).
+    # Compute the masked-envelope digest directly (same masking run.sh does for
+    # the full frame, but here we expose the envelope portion for diagnostic
+    # clarity).
     print(f"  masked_envelope_sha256: {hashlib.sha256(masked).hexdigest()}")
 
 
 # ---------------------------------------------------------------------------
 # Byte-level diff between two masked frames
 # ---------------------------------------------------------------------------
+
 
 def diff_frames(path_a: str, data_a: bytes, path_b: str, data_b: bytes) -> int:
     """
@@ -305,7 +306,7 @@ def diff_frames(path_a: str, data_a: bytes, path_b: str, data_b: bytes) -> int:
 
     if first_diff is not None:
         # Decode which field this offset falls in.
-        k = struct.unpack_from('<H', data_a, 4)[0]
+        k = struct.unpack_from("<H", data_a, 4)[0]
         env_start = 6 + 36 * k
         field = _field_name_at(first_diff, k, env_start)
         print(f"  First divergence at byte {first_diff} ({field})")
@@ -345,17 +346,17 @@ def _field_name_at(offset: int, k: int, env_start: int) -> str:
         return "padding(?)"
     env_off = offset - env_start
     ENV_FIELDS = [
-        (0,   1,  "version"),
-        (1,   1,  "entry_kind"),
-        (2,   2,  "wire_version"),
-        (4,   4,  "envelope.k"),
-        (8,   8,  "timestamp_ms (should be zeroed)"),
-        (16,  1,  "architecture (should be zeroed)"),
-        (17,  1,  "reserved"),
-        (18,  2,  "chain_reset_reason"),
-        (20,  32, "model_hash"),
-        (52,  32, "tokenizer_hash"),
-        (84,  32, "catalog_hash"),
+        (0, 1, "version"),
+        (1, 1, "entry_kind"),
+        (2, 2, "wire_version"),
+        (4, 4, "envelope.k"),
+        (8, 8, "timestamp_ms (should be zeroed)"),
+        (16, 1, "architecture (should be zeroed)"),
+        (17, 1, "reserved"),
+        (18, 2, "chain_reset_reason"),
+        (20, 32, "model_hash"),
+        (52, 32, "tokenizer_hash"),
+        (84, 32, "catalog_hash"),
         (116, 32, "request_hash"),
         (148, 32, "result_hash"),
         (180, 32, "chain_prev"),
@@ -369,6 +370,7 @@ def _field_name_at(offset: int, k: int, env_start: int) -> str:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
 
 def main():
     args = sys.argv[1:]
@@ -384,7 +386,7 @@ def main():
         if not os.path.isfile(path):
             print(f"ERROR: file not found: {path}", file=sys.stderr)
             sys.exit(1)
-        with open(path, 'rb') as f:
+        with open(path, "rb") as f:
             data = f.read()
         try:
             frame = parse_frame(data)
@@ -397,8 +399,10 @@ def main():
 
     if len(raw_datas) == 2:
         diff_frames(
-            raw_datas[0][0], raw_datas[0][1],
-            raw_datas[1][0], raw_datas[1][1],
+            raw_datas[0][0],
+            raw_datas[0][1],
+            raw_datas[1][0],
+            raw_datas[1][1],
         )
     elif len(raw_datas) > 2:
         # Pairwise diffs for more than 2 frames.
@@ -406,8 +410,10 @@ def main():
         for i in range(len(raw_datas)):
             for j in range(i + 1, len(raw_datas)):
                 count = diff_frames(
-                    raw_datas[i][0], raw_datas[i][1],
-                    raw_datas[j][0], raw_datas[j][1],
+                    raw_datas[i][0],
+                    raw_datas[i][1],
+                    raw_datas[j][0],
+                    raw_datas[j][1],
                 )
                 if count > 0:
                     any_diff = True

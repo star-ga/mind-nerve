@@ -102,6 +102,7 @@ def _is_trusted_dir(directory: str | Path, runtime_dir: str | Path | None = None
         return False
     return any(d == root or root in d.parents for root in _trusted_roots(runtime_dir))
 
+
 SKILL_PATTERNS = [
     (re.compile(r"(^|/)SKILL\.md$", re.I), "skill"),
     (re.compile(r"(^|/)skills?/[^/]+\.md$", re.I), "skill"),
@@ -138,9 +139,7 @@ def _parse_frontmatter(text: str) -> dict[str, str]:
     return out
 
 
-def _classify(
-    text: str, fm: dict[str, str], *, trusted: bool = False
-) -> tuple[str, list[str]]:
+def _classify(text: str, fm: dict[str, str], *, trusted: bool = False) -> tuple[str, list[str]]:
     """Return (bucket, reasons)."""
     # First-party content from a trust root is exempt from the license gate
     # entirely: the gate vets external content, and a trusted origin is the
@@ -182,7 +181,7 @@ def _detect_kind(rel: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-def _load_table(runtime_dir: Path) -> tuple[Any, list[dict]]:
+def _load_table(runtime_dir: Path) -> tuple[Any, list[dict[str, Any]]]:
     import numpy as np
 
     emb = np.load(runtime_dir / "route_table.npy")
@@ -191,7 +190,7 @@ def _load_table(runtime_dir: Path) -> tuple[Any, list[dict]]:
     return emb, meta
 
 
-def _save_table_atomic(runtime_dir: Path, emb, meta: list[dict]) -> None:
+def _save_table_atomic(runtime_dir: Path, emb: Any, meta: list[dict[str, Any]]) -> None:
     import numpy as np
 
     tmp_npy = runtime_dir / "route_table.tmp.npy"
@@ -220,7 +219,7 @@ def _first_h1(body: str) -> str | None:
 
 def _item_from_file(
     path: Path, source_repo: str, kind: str, trusted: bool = False
-) -> dict | None:
+) -> dict[str, Any] | None:
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -231,7 +230,7 @@ def _item_from_file(
     bucket, reasons = _classify(text, fm, trusted=trusted)
     name = fm.get("name") or _first_h1(text) or path.stem
     sha = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
-    item: dict = {
+    item: dict[str, Any] = {
         "id": sha[:16],
         "source_repo": source_repo,
         "source_path": str(path),
@@ -248,7 +247,7 @@ def _item_from_file(
     return item
 
 
-def _walk_dir(root: Path, source_repo: str, trusted: bool = False) -> Iterable[dict]:
+def _walk_dir(root: Path, source_repo: str, trusted: bool = False) -> Iterable[dict[str, Any]]:
     for p in root.rglob("*"):
         if not p.is_file():
             continue
@@ -278,7 +277,7 @@ def scan(
     runtime_dir: str = _DEFAULT_RUNTIME_DIR,
     dry_run: bool = False,
     trusted: bool | None = None,
-) -> dict:
+) -> dict[str, Any]:
     """One-shot scan: discover new skills under `directory`, embed, persist.
 
     `trusted=None` (default) auto-detects: the scan is trusted when
@@ -295,7 +294,7 @@ def scan(
     if trusted is None:
         trusted = _is_trusted_dir(directory, rdir)
 
-    new_items: list[dict] = []
+    new_items: list[dict[str, Any]] = []
     skipped: dict[str, int] = {"already_indexed": 0, "license_excluded": 0, "unknown_excluded": 0}
 
     for item in _walk_dir(Path(directory), source_repo, trusted=trusted):
@@ -329,7 +328,7 @@ def scan(
 
     # Embed the new items using the same model the route table was built with
     texts = [i["_embedded_text"] for i in new_items]
-    new_emb = rt.model.encode(
+    new_emb = rt.model.encode(  # type: ignore[union-attr]
         texts,
         batch_size=64,
         convert_to_numpy=True,
@@ -346,7 +345,7 @@ def scan(
     _save_table_atomic(rdir, combined_emb, combined_meta)
 
     # Invalidate the in-memory cache so the next route() call reloads
-    load_default_runtime.cache_clear()
+    load_default_runtime.cache_clear()  # type: ignore[attr-defined]
 
     return {
         "added": len(new_items),
@@ -358,11 +357,11 @@ def scan(
 
 
 def add_route(
-    item: dict,
+    item: dict[str, Any],
     runtime_dir: str = _DEFAULT_RUNTIME_DIR,
     include_unknown: bool = False,
     trusted: bool = False,
-) -> dict:
+) -> dict[str, Any]:
     """Programmatic single-route registration.
 
     `item` must contain at minimum {name, description, kind} and may
@@ -397,7 +396,7 @@ def add_route(
     if any(m["sha256"] == sha for m in rt.routes):
         return {"added": 0, "reason": "already indexed", "sha256": sha}
 
-    emb = rt.model.encode(
+    emb = rt.model.encode(  # type: ignore[union-attr]
         [f"{name}\n\n{desc}"],
         convert_to_numpy=True,
         show_progress_bar=False,
@@ -419,7 +418,7 @@ def add_route(
         new_meta["url"] = item["url"]
     meta.append(new_meta)
     _save_table_atomic(rdir, combined_emb, meta)
-    load_default_runtime.cache_clear()
+    load_default_runtime.cache_clear()  # type: ignore[attr-defined]
     return {"added": 1, "sha256": sha, "total_routes_after": len(meta)}
 
 
@@ -453,7 +452,7 @@ class Watcher:
         self._thread: threading.Thread | None = None
         self._last_summary: dict[str, Any] = {}
 
-    def _loop(self):
+    def _loop(self) -> None:
         while not self._stop.is_set():
             try:
                 for d, src in self.dirs:

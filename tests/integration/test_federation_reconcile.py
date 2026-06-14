@@ -16,7 +16,6 @@ import inspect
 from typing import get_type_hints
 
 import pytest
-
 from mind_nerve.federation import (
     Peer,
     ReconciledChain,
@@ -25,7 +24,6 @@ from mind_nerve.federation import (
     discover_peers,
     reconcile,
 )
-
 
 # ---------------------------------------------------------------------------
 # Peer dataclass contract
@@ -61,7 +59,7 @@ class TestPeerContract:
         peer = Peer(
             host="10.0.0.5",
             port=47361,
-            pubkey=bytes(32),   # 32-byte ed25519 public key
+            pubkey=bytes(32),  # 32-byte ed25519 public key
             chain_tip=bytes(32),  # 32-byte SHA-256 chain tip
         )
         assert peer.host == "10.0.0.5"

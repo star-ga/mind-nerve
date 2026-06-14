@@ -54,6 +54,7 @@ import socket
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 
 def _default_socket() -> str:
@@ -61,7 +62,10 @@ def _default_socket() -> str:
     xdg = f"/run/user/{uid}/mind-nerve.sock"
     if os.path.isdir(os.path.dirname(xdg)):
         return xdg
-    return f"/tmp/mind-nerve-{uid}.sock"
+    # nosec B108 — intentional, documented fallback when $XDG_RUNTIME_DIR is
+    # absent; the path is uid-scoped and the socket is created with private
+    # permissions by the daemon.
+    return f"/tmp/mind-nerve-{uid}.sock"  # nosec B108
 
 
 def _default_source_dir() -> Path:
@@ -110,7 +114,7 @@ CORE_ALWAYS_ON: tuple[str, ...] = tuple(
 _slug_re = re.compile(r"[^a-z0-9]+")
 
 
-def _log(record: dict) -> None:
+def _log(record: dict[str, Any]) -> None:
     try:
         LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         record["ts"] = time.time()

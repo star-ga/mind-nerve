@@ -24,7 +24,7 @@ from .discovery import scan as discovery_scan
 from .inference import _DEFAULT_RUNTIME_DIR, load_default_runtime, precompute_routes, route
 
 
-def cmd_route(args) -> int:
+def cmd_route(args: argparse.Namespace) -> int:
     if args.query:
         query = args.query
     else:
@@ -50,7 +50,7 @@ def cmd_route(args) -> int:
     return 0
 
 
-def cmd_info(args) -> int:
+def cmd_info(args: argparse.Namespace) -> int:
     rt = load_default_runtime(args.runtime_dir) if args.runtime_dir else load_default_runtime()
     out = {
         "version": __version__,
@@ -64,7 +64,7 @@ def cmd_info(args) -> int:
     return 0
 
 
-def cmd_precompute(args) -> int:
+def cmd_precompute(args: argparse.Namespace) -> int:
     kwargs = {}
     if args.runtime_dir:
         kwargs["runtime_dir"] = args.runtime_dir
@@ -81,7 +81,7 @@ def cmd_precompute(args) -> int:
     return 0
 
 
-def cmd_learn(args) -> int:
+def cmd_learn(args: argparse.Namespace) -> int:
     out = discovery_scan(
         args.dir,
         source_repo=args.source or "local",
@@ -94,7 +94,7 @@ def cmd_learn(args) -> int:
     return 0
 
 
-def cmd_scan_repo(args) -> int:
+def cmd_scan_repo(args: argparse.Namespace) -> int:
     from .scan_repo import scan_repo
 
     out = scan_repo(
@@ -118,7 +118,7 @@ def cmd_scan_repo(args) -> int:
     return 0
 
 
-def cmd_federate(args) -> int:
+def cmd_federate(args: argparse.Namespace) -> int:
     from . import federation as fed
 
     rtd = args.runtime_dir or _DEFAULT_RUNTIME_DIR
@@ -160,7 +160,7 @@ def cmd_federate(args) -> int:
     return 0
 
 
-def cmd_train(args) -> int:
+def cmd_train(args: argparse.Namespace) -> int:
     from pathlib import Path
 
     from .mind_train import TrainConfig, config_to_dict, train
@@ -205,7 +205,7 @@ def cmd_train(args) -> int:
     return 0
 
 
-def cmd_quantize(args) -> int:
+def cmd_quantize(args: argparse.Namespace) -> int:
     """Phase 6.2 offline Q16.16 quantizer — wraps ``tools/quantize_phase1_to_q16.py``.
 
     Imports the tool module lazily so the rest of the CLI surface stays
@@ -235,10 +235,10 @@ def cmd_quantize(args) -> int:
         argv.extend(["--hidden-dim", str(args.hidden_dim)])
     if args.dry_run:
         argv.append("--dry-run")
-    return module.main(argv)
+    return int(module.main(argv))
 
 
-def cmd_quantize_encoder(args) -> int:
+def cmd_quantize_encoder(args: argparse.Namespace) -> int:
     """Phase 6.x offline encoder-weights quantizer.
 
     Wraps ``tools/quantize_encoder_to_q16.py``: loads a safetensors
@@ -263,10 +263,10 @@ def cmd_quantize_encoder(args) -> int:
         argv.extend(["--output", args.output])
     if args.dry_run:
         argv.append("--dry-run")
-    return module.main(argv)
+    return int(module.main(argv))
 
 
-def cmd_attest_sign(args) -> int:
+def cmd_attest_sign(args: argparse.Namespace) -> int:
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
     from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
@@ -305,7 +305,7 @@ def cmd_attest_sign(args) -> int:
     return 0
 
 
-def cmd_attest_verify(args) -> int:
+def cmd_attest_verify(args: argparse.Namespace) -> int:
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
     from .attestation import application_verify_binding, deserialize_binding_record
@@ -362,7 +362,7 @@ def cmd_attest_verify(args) -> int:
     return 0 if result == "ok" else 1
 
 
-def cmd_rollback(args) -> int:
+def cmd_rollback(args: argparse.Namespace) -> int:
     """Restore a target CLI's config files from their last ``.bak`` snapshots.
 
     Thin wrapper over :func:`mind_nerve.installer.rollback_last` so users
@@ -376,7 +376,7 @@ def cmd_rollback(args) -> int:
     return 1 if result.get("errors") else 0
 
 
-def cmd_watch(args) -> int:
+def cmd_watch(args: argparse.Namespace) -> int:
     dirs = [(d, args.source or "local") for d in args.dirs]
     w = Watcher(
         dirs,
@@ -528,7 +528,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_fed.add_argument(
         "--publish",
         action="store_true",
-        help="Emit this node's manifest as JSON (for peers to consume) instead " "of merging.",
+        help="Emit this node's manifest as JSON (for peers to consume) instead of merging.",
     )
     p_fed.add_argument("--ids-only", action="store_true", help="One merged route id per line.")
     p_fed.add_argument("--indent", action="store_true", help="Pretty-print JSON output.")
@@ -685,7 +685,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     ap = build_parser()
     args = ap.parse_args(argv)
-    return args.func(args)
+    return int(args.func(args))
 
 
 if __name__ == "__main__":

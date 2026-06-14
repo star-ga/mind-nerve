@@ -17,7 +17,6 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-
 from mind_nerve.installer import (
     INSTALLERS,
     STUB_CLIS,
@@ -25,7 +24,6 @@ from mind_nerve.installer import (
     install_nemoclaw,
     install_openclaw,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -155,11 +153,13 @@ def test_claw_idempotent_preserves_other_servers(tmp_path: Path, name: str) -> N
     fake_home = _fake_home(tmp_path)
     cfg_path = fake_home / CLAW_PATHS[name]
     cfg_path.parent.mkdir(parents=True)
-    cfg_path.write_text(json.dumps({
-        "mcpServers": {
-            "some-other-tool": {"command": "other-mcp", "args": [], "env": {}}
-        }
-    }, indent=2) + "\n")
+    cfg_path.write_text(
+        json.dumps(
+            {"mcpServers": {"some-other-tool": {"command": "other-mcp", "args": [], "env": {}}}},
+            indent=2,
+        )
+        + "\n"
+    )
 
     installer = CLAW_INSTALLERS[name]
     with patch("mind_nerve.installer.HOME", fake_home):

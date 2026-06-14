@@ -25,7 +25,7 @@ from __future__ import annotations
 import hashlib
 import struct
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
@@ -203,7 +203,7 @@ def deserialize_binding_record(buf: bytes) -> BindingRecord:
 
 
 def manifest_export_bytes(
-    tensors: list[dict],
+    tensors: list[dict[str, Any]],
     aggregate_hex: str,
 ) -> bytes:
     """Deterministic Python build of the manifest JSON document.

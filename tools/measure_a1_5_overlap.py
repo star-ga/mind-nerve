@@ -24,7 +24,9 @@ import numpy as np
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "python"))
 
-RUNTIME = Path(os.environ.get("MIND_NERVE_RUNTIME_DIR", str(Path.home() / ".local/share/mind-nerve/runtime")))
+RUNTIME = Path(
+    os.environ.get("MIND_NERVE_RUNTIME_DIR", str(Path.home() / ".local/share/mind-nerve/runtime"))
+)
 
 N_QUERIES = int(os.environ.get("A15_N", "160"))
 N_DOCS = int(os.environ.get("A15_DOCS", "400"))

@@ -50,15 +50,15 @@ def _ensure_loaded() -> None:
             _warmed = True
 
 
-def _ok(req_id: Any, result: Any) -> dict:
+def _ok(req_id: Any, result: Any) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": req_id, "result": result}
 
 
-def _err(req_id: Any, code: int, message: str) -> dict:
+def _err(req_id: Any, code: int, message: str) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
 
 
-def handle(msg: dict) -> dict | None:
+def handle(msg: dict[str, Any]) -> dict[str, Any] | None:
     """Dispatch one JSON-RPC message."""
     method = msg.get("method")
     req_id = msg.get("id")

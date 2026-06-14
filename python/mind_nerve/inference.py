@@ -129,8 +129,7 @@ def _load_runtime() -> "_Runtime | _NativeEncoderRuntime":
             # on the default backend. Set MIND_NERVE_BACKEND=pytorch to select
             # it explicitly and silence this notice.
             print(
-                f"mind-nerve: native encoder unavailable ({exc}); "
-                "falling back to pytorch backend.",
+                f"mind-nerve: native encoder unavailable ({exc}); falling back to pytorch backend.",
                 file=sys.stderr,
             )
             return _Runtime(rdir)
@@ -455,7 +454,12 @@ class _NativeEncoderRuntime:
         try:
             from transformers import AutoTokenizer
 
-            return AutoTokenizer.from_pretrained(str(runtime_dir / "checkpoint"), use_fast=True)
+            # nosec B615 — loads from a LOCAL checkpoint directory, not a remote
+            # Hub repo; the runtime is already revision-pinned at seed time by
+            # _seed_from_hf, so a `revision=` argument is not applicable here.
+            return AutoTokenizer.from_pretrained(  # nosec B615
+                str(runtime_dir / "checkpoint"), use_fast=True
+            )
         except ImportError:
             # transformers not installed; tokenizer unavailable.
             # route() will raise a clear error if encode is called.

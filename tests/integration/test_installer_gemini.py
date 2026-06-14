@@ -14,10 +14,7 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
-
 from mind_nerve.installer import INSTALLERS, STUB_CLIS, install_gemini
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -38,9 +35,7 @@ def _fake_home(tmp_path: Path) -> Path:
 
 def test_gemini_not_in_stub_clis() -> None:
     """gemini must be removed from STUB_CLIS once the real installer exists."""
-    assert "gemini" not in STUB_CLIS, (
-        "gemini is still listed as a stub — move it to INSTALLERS"
-    )
+    assert "gemini" not in STUB_CLIS, "gemini is still listed as a stub — move it to INSTALLERS"
 
 
 def test_gemini_in_installers() -> None:

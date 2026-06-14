@@ -62,6 +62,7 @@ TOP_K = 5
 # Loader
 # ---------------------------------------------------------------------------
 
+
 def _load_blob(path: Path) -> dict:
     if not path.exists():
         print(f"ERROR: blob not found: {path}", file=sys.stderr)
@@ -78,6 +79,7 @@ def _index_records(blob: dict) -> dict[str, dict]:
 # ---------------------------------------------------------------------------
 # Comparison logic
 # ---------------------------------------------------------------------------
+
 
 def _is_sentinel(h: str | None) -> bool:
     return h is None or h in SENTINELS or (isinstance(h, str) and h.startswith("ERROR:"))
@@ -151,6 +153,7 @@ def _compute_topk_overlap(rec_a: dict, rec_b: dict, k: int) -> dict[str, float |
 # ---------------------------------------------------------------------------
 # Report
 # ---------------------------------------------------------------------------
+
 
 class CompareResult:
     def __init__(self) -> None:
@@ -275,9 +278,7 @@ def print_report(
     if result.topk_overlaps:
         avg_topk = sum(result.topk_overlaps) / len(result.topk_overlaps)
         avg_top1 = (
-            sum(result.top1_overlaps) / len(result.top1_overlaps)
-            if result.top1_overlaps
-            else 0.0
+            sum(result.top1_overlaps) / len(result.top1_overlaps) if result.top1_overlaps else 0.0
         )
         topk_gate = avg_topk >= topk_threshold
         top1_gate = avg_top1 >= top1_threshold
@@ -305,8 +306,7 @@ def print_report(
         print(f"First {min(5, len(result.failing_queries))} failing queries:")
         for row in result.failing_queries[:5]:
             print(
-                f"  id={row['id']}  category={row['category']}"
-                f"  mismatches={row['mismatch_count']}"
+                f"  id={row['id']}  category={row['category']}  mismatches={row['mismatch_count']}"
             )
             for k, v in row["positions"].items():
                 if "FAIL" in v:
@@ -333,6 +333,7 @@ def print_report(
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -394,9 +395,7 @@ def main() -> None:
     blob_a = _load_blob(path_a)
     blob_b = _load_blob(path_b)
 
-    result = compare_blobs(
-        blob_a, blob_b, top_k=args.top_k, verbose=args.verbose
-    )
+    result = compare_blobs(blob_a, blob_b, top_k=args.top_k, verbose=args.verbose)
 
     print_report(
         result,
@@ -412,9 +411,7 @@ def main() -> None:
     topk_overlaps = result.topk_overlaps
     avg_topk = sum(topk_overlaps) / len(topk_overlaps) if topk_overlaps else 1.0
     avg_top1 = (
-        sum(result.top1_overlaps) / len(result.top1_overlaps)
-        if result.top1_overlaps
-        else 1.0
+        sum(result.top1_overlaps) / len(result.top1_overlaps) if result.top1_overlaps else 1.0
     )
 
     gate_passed = (

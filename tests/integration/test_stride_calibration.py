@@ -12,9 +12,7 @@ Covers:
 from __future__ import annotations
 
 import json
-import math
 import sys
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -23,8 +21,6 @@ CATALOG_BUILDER = Path(__file__).parent.parent.parent / "catalog-builder"
 sys.path.insert(0, str(CATALOG_BUILDER))
 
 from calibrate_stride import (  # noqa: E402
-    P_HIGH,
-    P_LOW,
     STRIDE_COMPACT,
     STRIDE_DEFAULT,
     STRIDE_LONG,
@@ -37,7 +33,6 @@ from calibrate_stride import (  # noqa: E402
     percentile,
 )
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -48,9 +43,7 @@ def write_lengths_file(tmp_path: Path, lengths: list[int], fmt: str = "plain") -
     if fmt == "plain":
         p.write_text("\n".join(str(n) for n in lengths) + "\n")
     elif fmt == "jsonl":
-        p.write_text(
-            "\n".join(json.dumps({"token_count": n}) for n in lengths) + "\n"
-        )
+        p.write_text("\n".join(json.dumps({"token_count": n}) for n in lengths) + "\n")
     return p
 
 
@@ -204,16 +197,16 @@ class TestCalibrateStrideCLI:
     def test_cli_writes_manifest_json(self, tmp_path: Path) -> None:
         import subprocess
 
-        lengths_file = write_lengths_file(
-            tmp_path, list(range(96, 512, 8)), fmt="plain"
-        )
+        lengths_file = write_lengths_file(tmp_path, list(range(96, 512, 8)), fmt="plain")
         out_dir = tmp_path / "stride_out"
         result = subprocess.run(
             [
                 sys.executable,
                 str(CATALOG_BUILDER / "calibrate_stride.py"),
-                "--lengths", str(lengths_file),
-                "--output", str(out_dir),
+                "--lengths",
+                str(lengths_file),
+                "--output",
+                str(out_dir),
             ],
             capture_output=True,
             text=True,
@@ -237,8 +230,10 @@ class TestCalibrateStrideCLI:
             [
                 sys.executable,
                 str(CATALOG_BUILDER / "calibrate_stride.py"),
-                "--lengths", str(lengths_file),
-                "--output", str(out_dir),
+                "--lengths",
+                str(lengths_file),
+                "--output",
+                str(out_dir),
             ],
             capture_output=True,
             check=True,
@@ -258,7 +253,8 @@ class TestCalibrateStrideCLI:
             [
                 sys.executable,
                 str(CATALOG_BUILDER / "calibrate_stride.py"),
-                "--lengths", str(lengths_file),
+                "--lengths",
+                str(lengths_file),
                 "--dry-run",
             ],
             capture_output=True,

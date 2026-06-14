@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # Federated route table — deterministic merge of per-node manifests
@@ -66,7 +67,7 @@ class NodeManifest:
 
     node_id: str
     table_hash: str
-    routes: list[dict]
+    routes: list[dict[str, Any]]
     sig: bytes = b""
 
 
@@ -79,7 +80,7 @@ class FederatedTable:
     contributing_node_ids: list[str]
 
 
-def compute_table_hash(routes: list[dict]) -> str:
+def compute_table_hash(routes: list[dict[str, Any]]) -> str:
     """SHA-256 over a node's route list, canonicalized for cross-host stability.
 
     Routes are sorted by `id` and serialized with sorted keys and no
@@ -156,7 +157,7 @@ def load_local_manifest(route_table_path: str, node_id: str) -> NodeManifest:
     The resulting `table_hash` is a pure function of the table's contents, so
     two nodes with the same catalog publish the same hash.
     """
-    routes: list[dict] = []
+    routes: list[dict[str, Any]] = []
     with open(route_table_path, encoding="utf-8") as fh:
         for line in fh:
             line = line.strip()
@@ -169,7 +170,7 @@ def load_local_manifest(route_table_path: str, node_id: str) -> NodeManifest:
     )
 
 
-def manifest_from_json(obj: dict) -> NodeManifest:
+def manifest_from_json(obj: dict[str, Any]) -> NodeManifest:
     """Parse a peer manifest emitted by `to_json` back into a NodeManifest."""
     return NodeManifest(
         node_id=obj["node_id"],
@@ -178,7 +179,7 @@ def manifest_from_json(obj: dict) -> NodeManifest:
     )
 
 
-def to_json(m: NodeManifest) -> dict:
+def to_json(m: NodeManifest) -> dict[str, Any]:
     """Serialize a node manifest for publication to peers."""
     return {
         "protocol": "mind-nerve-federation/1",

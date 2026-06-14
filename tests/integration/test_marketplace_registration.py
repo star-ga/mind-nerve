@@ -16,7 +16,6 @@ import inspect
 from typing import get_type_hints
 
 import pytest
-
 from mind_nerve.marketplace import (
     ProviderDelta,
     SkillProvider,
@@ -25,7 +24,6 @@ from mind_nerve.marketplace import (
     query_route_delta,
     register_skill_provider,
 )
-
 
 # ---------------------------------------------------------------------------
 # SkillProvider dataclass contract
@@ -141,10 +139,7 @@ class TestRegisterSkillProviderSignature:
 class TestListProvidersSignature:
     def test_takes_no_required_parameters(self) -> None:
         sig = inspect.signature(list_providers)
-        required = [
-            p for p in sig.parameters.values()
-            if p.default is inspect.Parameter.empty
-        ]
+        required = [p for p in sig.parameters.values() if p.default is inspect.Parameter.empty]
         assert len(required) == 0
 
     def test_raises_not_implemented(self) -> None:

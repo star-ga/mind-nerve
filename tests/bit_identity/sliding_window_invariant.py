@@ -42,15 +42,17 @@ THIS_DIR = Path(__file__).parent
 CORPUS_PATH = THIS_DIR / "corpus.json"
 
 WINDOW_SIZE = 256  # encoder max tokens per window
-STRIDE = 192       # window stride per §3.3 "later-window-wins"
+STRIDE = 192  # window stride per §3.3 "later-window-wins"
 
 
 # ---------------------------------------------------------------------------
 # Window arithmetic (pure Python, no deps)
 # ---------------------------------------------------------------------------
 
+
 class WindowPlan(NamedTuple):
     """Sliding-window layout for a sequence of length T."""
+
     T: int
     window_count: int
     # For each token index, the winning window index (0-based).
@@ -130,6 +132,7 @@ def compute_window_plan(T: int) -> WindowPlan:
 # Invariant checks
 # ---------------------------------------------------------------------------
 
+
 class InvariantViolation(Exception):
     pass
 
@@ -169,9 +172,9 @@ def check_invariants(plan: WindowPlan, query_id: str) -> list[str]:
         for t in range(overlap_start, min(overlap_end, plan.T)):
             if plan.token_to_window[t] != w + 1:
                 violations.append(
-                    f"{query_id}: overlap token {t} (windows {w} and {w+1}) "
+                    f"{query_id}: overlap token {t} (windows {w} and {w + 1}) "
                     f"assigned to window {plan.token_to_window[t]}, "
-                    f"expected later window {w+1}"
+                    f"expected later window {w + 1}"
                 )
                 break  # One example per window pair is enough
 
@@ -208,6 +211,7 @@ def check_invariants(plan: WindowPlan, query_id: str) -> list[str]:
 # Token length estimation (without running a real tokenizer)
 # ---------------------------------------------------------------------------
 
+
 def _estimate_token_count(text: str) -> int:
     """
     Estimate BERT WordPiece token count from character count.
@@ -223,9 +227,7 @@ def _estimate_token_count(text: str) -> int:
     return estimate
 
 
-def _get_token_count_from_blob(
-    query_id: str, hashes_blob: dict | None
-) -> int | None:
+def _get_token_count_from_blob(query_id: str, hashes_blob: dict | None) -> int | None:
     """
     Extract actual token count from a runner.py hash blob if available.
     """
@@ -241,6 +243,7 @@ def _get_token_count_from_blob(
 # ---------------------------------------------------------------------------
 # Main test runner
 # ---------------------------------------------------------------------------
+
 
 class SlidingWindowTestResult(NamedTuple):
     long_queries_tested: int
@@ -290,10 +293,7 @@ def run_invariant_tests(
                     print(f"  VIOLATION: {v}")
         else:
             if verbose:
-                print(
-                    f"PASS {query_id}: T={T}, windows={plan.window_count}, "
-                    f"stride={STRIDE}"
-                )
+                print(f"PASS {query_id}: T={T}, windows={plan.window_count}, stride={STRIDE}")
 
     passed = total_violations == 0
 
@@ -321,6 +321,7 @@ def print_summary(result: SlidingWindowTestResult) -> None:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -353,6 +354,7 @@ def main() -> None:
         print(f"Corpus not found at {args.corpus}, building...", file=sys.stderr)
         sys.path.insert(0, str(THIS_DIR))
         from corpus import build_corpus
+
         corpus = build_corpus()
 
     # Load hashes blob if provided

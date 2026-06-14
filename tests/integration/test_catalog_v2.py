@@ -18,7 +18,6 @@ import json
 import math
 import struct
 import sys
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -130,7 +129,7 @@ class TestPriorBlock:
         # Wrap in dummy catalog bytes so decode_prior_block can find the tail.
         dummy = b"\x00" * 16 + encoded
         recovered = decode_prior_block(dummy, len(priors))
-        for orig, rec in zip(priors, recovered):
+        for orig, rec in zip(priors, recovered, strict=True):
             assert abs(orig - rec) < 1e-4, f"mismatch: {orig} vs {rec}"
 
     def test_sentinel_present(self) -> None:
@@ -172,7 +171,7 @@ class TestV2RoundTrip:
         assert len(result["routes"]) == 8
         assert len(result["log_priors"]) == 8
 
-        for i, (orig_lp, rec_lp) in enumerate(zip(log_priors, result["log_priors"])):
+        for i, (orig_lp, rec_lp) in enumerate(zip(log_priors, result["log_priors"], strict=True)):
             assert abs(orig_lp - rec_lp) < 1e-4, f"prior mismatch at route {i}"
 
     def test_magic_is_mnc2(self) -> None:
@@ -186,7 +185,7 @@ class TestV2RoundTrip:
         log_priors = [0.693] * 3
         blob = encode_v2(routes, log_priors)
         result = decode_v2(blob)
-        for orig, rec in zip(routes, result["routes"]):
+        for orig, rec in zip(routes, result["routes"], strict=True):
             assert orig["route_id"] == rec["route_id"]
 
     def test_embedding_preserved(self) -> None:
@@ -194,7 +193,7 @@ class TestV2RoundTrip:
         log_priors = [0.693] * 3
         blob = encode_v2(routes, log_priors)
         result = decode_v2(blob)
-        for orig, rec in zip(routes, result["routes"]):
+        for orig, rec in zip(routes, result["routes"], strict=True):
             assert orig["embedding"] == rec["embedding"]
 
     def test_decode_any_dispatches_v2(self) -> None:
@@ -244,7 +243,7 @@ class TestV1BackwardCompat:
         routes = synthetic_routes(3)
         v1_blob = build_v1_blob(routes)
         result = decode_v1(v1_blob)
-        for orig, rec in zip(routes, result["routes"]):
+        for orig, rec in zip(routes, result["routes"], strict=True):
             assert orig["route_id"] == rec["route_id"]
 
     def test_v2_prefix_layout_matches_v1(self) -> None:
@@ -292,7 +291,7 @@ class TestFreqAdaptiveScaling:
 
     def test_scale_decreases_with_freq(self) -> None:
         scales = [freq_adaptive_scale(f) for f in [1.0, 4.0, 16.0, 64.0]]
-        for a, b in zip(scales, scales[1:]):
+        for a, b in zip(scales, scales[1:], strict=False):
             assert a >= b, "scale should be non-increasing with frequency"
 
 
@@ -381,9 +380,7 @@ class TestBuildPrior:
             {"sha256": "bbb222", "id": "y", "kind": "agent"},
         ]
         catalog = tmp_path / "items.jsonl"
-        catalog.write_text(
-            "\n".join(json.dumps(i) for i in items) + "\n", encoding="utf-8"
-        )
+        catalog.write_text("\n".join(json.dumps(i) for i in items) + "\n", encoding="utf-8")
         ids = load_catalog_ids(catalog)
         assert ids == ["aaa111", "bbb222"]
 
@@ -392,16 +389,16 @@ class TestBuildPrior:
         import subprocess
 
         catalog = tmp_path / "items.jsonl"
-        catalog.write_text(
-            json.dumps({"sha256": "abc123", "id": "x", "kind": "skill"}) + "\n"
-        )
+        catalog.write_text(json.dumps({"sha256": "abc123", "id": "x", "kind": "skill"}) + "\n")
         out = tmp_path / "prior.json"
         result = subprocess.run(
             [
                 sys.executable,
                 str(CATALOG_BUILDER / "build_prior.py"),
-                "--catalog", str(catalog),
-                "--output", str(out),
+                "--catalog",
+                str(catalog),
+                "--output",
+                str(out),
             ],
             capture_output=True,
             text=True,

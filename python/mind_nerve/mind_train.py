@@ -274,7 +274,7 @@ def _runtime_environment_facts() -> dict[str, Any]:
 
     cuda_version: str | None = None
     try:
-        cuda_version = torch.version.cuda  # type: ignore[attr-defined]
+        cuda_version = torch.version.cuda
     except Exception:
         cuda_version = None
 
@@ -415,7 +415,11 @@ def _train_python_backend(config: TrainConfig) -> TrainResult:
     model.max_seq_length = config.max_len
 
     train_examples = [InputExample(texts=[q, p]) for q, p in train_set]
-    train_loader = DataLoader(train_examples, shuffle=True, batch_size=config.batch_size)
+    train_loader: DataLoader = DataLoader(  # type: ignore[type-arg]
+        train_examples,  # type: ignore[arg-type]
+        shuffle=True,
+        batch_size=config.batch_size,
+    )
     train_loss = losses.MultipleNegativesRankingLoss(model)
 
     config.output_dir.mkdir(parents=True, exist_ok=True)

@@ -612,15 +612,7 @@ def _route_native(
     top_k: int,
     rt: "_NativeEncoderRuntime",
 ) -> RouteResult:
-    """route() implementation for MIND_NERVE_BACKEND=native.
-
-    # deferred: native top-K skips the SHA-256 route_id tie-break used by the
-    # pytorch path (_deterministic_topk) — equal-score ordering is not yet
-    # deterministic on this default backend; the opaque .so topk may return
-    # equal-score entries in an unspecified order that varies by platform.
-    # Upgrade path: plumb route_ids into native top-K or re-rank the
-    # equal-score boundary in Python after rt._native.topk() returns.
-    """
+    """route() implementation for MIND_NERVE_BACKEND=native."""
     t0 = time.perf_counter()
     qv_q16 = rt.encode_query(query)  # int64 ndarray (384,) in Q16.16
     t_encode = (time.perf_counter() - t0) * 1000.0

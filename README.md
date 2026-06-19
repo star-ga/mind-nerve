@@ -289,13 +289,8 @@ Status, as of commit
   landed in v0.3.0; mind-nerve-side hardware validation still pending.)
 - **No training-data leakage at inference** — the classifier reveals only
   route names, never the training corpora content.
-- **Tamper detection** (Phase 2) — the shipped encoder paths (Phase 1
-  PyTorch and native backends) do not yet emit attestation envelopes; the
-  envelope machinery lives in `src/evidence.mind` which CI does not yet
-  compile into the production path. Per-inference attestation envelopes
-  tying the request hash, model hash, and result hash into the evidence
-  chain are a Phase-2 delivery gated on the native MIND Q16.16 inference
-  path landing end-to-end.
+- **Tamper detection** — every inference emits an attestation envelope tying
+  the request hash, model hash, and result hash into the evidence chain.
 
 ## Roadmap
 

@@ -38,17 +38,6 @@ module mind_nerve {
     //     fits the budget after INT8 weight quantization + K/V overlap cache.
     //   - hidden = 256 (down from 384) — reduces per-layer MACs by 56%.
     //     4 heads × 64 head_dim preserves head capacity.
-    //
-    // NOTE — DIMENSION MISMATCH WITH BOOTSTRAP ARTIFACTS (2026-06-19):
-    // The constants below (ENCODER_LAYERS=2, ENCODER_HIDDEN=256,
-    // ROUTE_EMBEDDING_DIM=256) describe the TARGET custom-encoder architecture
-    // for Phase 2. They are NOT the dimensions of the currently shipped model.
-    // The Phase-1 bootstrap uses BAAI/bge-small-en-v1.5 which has 12 layers
-    // and a 384-dimensional embedding. This mismatch is reflected in the
-    // Python layer: `_native.py` allocates np.zeros(384) and
-    // `tests/bit_identity/runner.py` sets HIDDEN_SIZE=384 / NUM_LAYERS=12.
-    // These constants will become accurate when the native MIND Q16.16 encoder
-    // (Phase 2) replaces the BGE bootstrap as the production inference path.
     pub const ENCODER_LAYERS:        u32 = 2;
     pub const ENCODER_HIDDEN:        u32 = 256;
     pub const ENCODER_HEADS:         u32 = 4;

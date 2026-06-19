@@ -18,8 +18,12 @@ shipped.
    CUDA, WebGPU, NPU without rebuild.
 4. **Latency p95 ≤ 30 ms on CPU.** Architecture decisions that cannot meet
    this on commodity CPU are rejected.
-5. **Attestation on every inference.** Request hash, model hash, result hash
-   into the evidence envelope. No opt-out.
+5. **Attestation on every inference (Phase 2).** Request hash, model hash,
+   result hash into the evidence envelope. No opt-out. The Phase-1 shipped
+   encoder paths do not yet emit envelopes — the envelope machinery
+   (`src/evidence.mind`) is not compiled into the production route() path.
+   This constraint becomes enforceable once the native MIND Q16.16 inference
+   loop (Phase 2) ships end-to-end.
 6. **Compile speed never regresses.** mind-runtime frontend compile times
    stay within the published envelope; module-level gating only.
 

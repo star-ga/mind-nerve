@@ -40,6 +40,18 @@ def default_socket_path() -> Path:
 
 
 def main() -> int:
+    if not hasattr(socket, "AF_UNIX"):
+        # The long-lived daemon serves over a UNIX-domain socket. A few
+        # Windows Python builds lack AF_UNIX entirely; there the daemon
+        # optimisation is unavailable and callers use the one-shot
+        # `mind-nerve route` path instead. Exit with a clear message rather
+        # than an opaque AttributeError.
+        print(
+            "mind-nerve-routed: AF_UNIX sockets are unavailable on this platform; "
+            "the daemon is optional — use `mind-nerve route` for one-shot queries.",
+            file=sys.stderr,
+        )
+        return 1
     sock_path = Path(os.environ.get("MIND_NERVE_SOCKET", str(default_socket_path())))
     try:
         if sock_path.exists():

@@ -91,3 +91,7 @@ coverage.xml
 # perf bench run artefacts (machine-specific timings; regenerate locally)
 tests/perf/bench_criterion.json
 tests/perf/bench_efficiency.json
+
+# secrets (audit 2026-06-20)
+.env
+.env.*

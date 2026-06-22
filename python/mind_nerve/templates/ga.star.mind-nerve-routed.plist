@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  mind-nerve route daemon — macOS launchd user agent.
+
+  The daemon is an OPTIONAL latency optimisation: it loads the runtime once
+  and answers route queries over a UNIX socket, removing the ~250 ms cold
+  load from every CLI call. Without it, `mind-nerve route` still works as a
+  one-shot command on macOS, Linux and Windows — just slower per call.
+
+  Install (one-time, per user account):
+    mkdir -p ~/Library/LaunchAgents ~/.mind-nerve
+    cp <pkg>/templates/ga.star.mind-nerve-routed.plist ~/Library/LaunchAgents/
+    # Edit ProgramArguments below to point at your installed mind-nerve-routed
+    # (e.g. the path printed by `which mind-nerve-routed`).
+    launchctl load ~/Library/LaunchAgents/ga.star.mind-nerve-routed.plist
+
+  Uninstall:
+    launchctl unload ~/Library/LaunchAgents/ga.star.mind-nerve-routed.plist
+    rm ~/Library/LaunchAgents/ga.star.mind-nerve-routed.plist
+
+  macOS has no $XDG_RUNTIME_DIR, so the daemon falls back to
+  ~/.cache/mind-nerve/run/mind-nerve.sock (see mind_nerve._runtime_dir).
+  Set MIND_NERVE_SOCKET below to pin an explicit path if you prefer.
+-->
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>ga.star.mind-nerve-routed</string>
+    <key>ProgramArguments</key>
+    <array>
+      <!-- Replace with the absolute path from `which mind-nerve-routed`. -->
+      <string>/usr/local/bin/mind-nerve-routed</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+      <key>SuccessfulExit</key>
+      <false/>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>~/.mind-nerve/daemon.log</string>
+    <key>StandardErrorPath</key>
+    <string>~/.mind-nerve/daemon.log</string>
+  </dict>
+</plist>

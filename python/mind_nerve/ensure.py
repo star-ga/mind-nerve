@@ -19,15 +19,24 @@ per socket, ever, across any number of parallel `ensure` invocations.
 
 from __future__ import annotations
 
-import fcntl
 import os
 import socket
 import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 from ._runtime_dir import runtime_socket_dir
+
+# `fcntl` is POSIX-only. On Windows it is absent; the spawn-serialisation
+# flock is then skipped (the daemon is an optional optimisation, and the
+# re-check after a would-be lock plus the socket fast-path keep multi-spawn
+# rare). Importing must never crash on Windows — guard at module load.
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - exercised only on Windows
+    fcntl = None  # type: ignore[assignment]
 
 # Max time a "loser" of the flock race will wait for the winner's daemon
 # to come up before falling through fail-open. Sized at 4x the observed
@@ -40,7 +49,7 @@ def default_socket_path() -> Path:
 
 
 def _socket_responsive(sock_path: Path, timeout: float = 1.0) -> bool:
-    if not sock_path.exists():
+    if not sock_path.exists() or not hasattr(socket, "AF_UNIX"):
         return False
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -75,6 +84,22 @@ def _lock_path_for(sock_path: Path) -> Path:
     return sock_path.with_name(sock_path.name + ".lock")
 
 
+def _detach_kwargs() -> dict[str, Any]:
+    """Return the Popen kwargs that fully detach the daemon from this process.
+
+    POSIX: ``start_new_session=True`` runs setsid so the daemon survives the
+    caller's session. Windows has no sessions; instead set the
+    DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP creation flags so the child
+    does not share the console or process group and is not killed when the
+    launching shell exits.
+    """
+    if os.name == "nt":  # pragma: no cover - exercised only on Windows
+        detached = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+        new_group = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+        return {"creationflags": detached | new_group}
+    return {"start_new_session": True}
+
+
 def _spawn_daemon(daemon: str, log_path: Path) -> None:
     """Spawn `mind-nerve-routed` detached. Caller MUST hold the spawn lock."""
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -88,7 +113,7 @@ def _spawn_daemon(daemon: str, log_path: Path) -> None:
             stdin=subprocess.DEVNULL,
             stdout=log_handle,
             stderr=log_handle,
-            start_new_session=True,
+            **_detach_kwargs(),
         )
     except OSError as e:
         try:
@@ -113,6 +138,16 @@ def main() -> int:
     log_path = Path(
         os.environ.get("MIND_NERVE_DAEMON_LOG", str(Path.home() / ".mind-nerve" / "daemon.log"))
     )
+
+    # Platforms without fcntl (Windows) can't flock; skip the concurrency
+    # guard and spawn directly after the socket re-check. The daemon is an
+    # optional optimisation, so a rare double-spawn there is harmless (the
+    # second loses the socket bind and exits); correctness is unaffected.
+    if fcntl is None:  # pragma: no cover - exercised only on Windows
+        if _socket_responsive(sock_path, timeout=0.5):
+            return 0
+        _spawn_daemon(daemon, log_path)
+        return 0
 
     # Concurrency guard. Non-blocking flock serialises the spawn decision
     # so parallel ensure() invocations during the daemon's ~5 s weight-load

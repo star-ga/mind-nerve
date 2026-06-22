@@ -86,6 +86,51 @@ jobs:
           mind-nerve --help
           mind-nerve-install list
 
+  cross-platform:
+    name: Cross-platform import + CLI (${{ matrix.os }} / py${{ matrix.python }})
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.10", "3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      # Install with NO heavy deps: this validates that the package itself
+      # imports and the OS-agnostic surfaces work on every platform. The
+      # Linux-built native .so present in the wheel is simply unloadable on
+      # Windows/macOS and triggers the pure-Python fallback path by design.
+      - name: Install wheel (no deps)
+        shell: bash
+        run: pip install --no-deps dist/*.whl
+      - name: Import + cross-platform module safety
+        shell: bash
+        run: |
+          python -c "
+          import mind_nerve
+          assert mind_nerve.__version__
+          # These modules hard-imported fcntl / touched AF_UNIX / os.getuid()
+          # before the cross-platform pass; importing them must not crash on
+          # any OS (Windows has no fcntl, may lack AF_UNIX).
+          import mind_nerve.ensure
+          import mind_nerve.daemon
+          import mind_nerve.preselect_hook
+          print('mind_nerve', mind_nerve.__version__, 'imports OK on', __import__('platform').system())
+          "
+      - name: CLI surface smoke
+        shell: bash
+        run: |
+          mind-nerve --version
+          mind-nerve --help
+
   tests:
     name: Unit tests
     runs-on: ubuntu-latest

@@ -114,28 +114,6 @@ def _active_backend() -> str:
     return raw
 
 
-def _load_runtime() -> "_Runtime | _NativeEncoderRuntime":
-    """Return the appropriate runtime based on MIND_NERVE_BACKEND."""
-    backend = _active_backend()
-    rdir = _resolve_runtime_dir()
-    if backend == _BACKEND_NATIVE:
-        try:
-            return _NativeEncoderRuntime(rdir)
-        except (FileNotFoundError, ImportError) as exc:
-            # The native Q16.16 encoder shared library is not present — the
-            # common case for a plain `pip install`, where the encoder is
-            # built/shipped separately from the wheel. Fall back to the
-            # pytorch path so route() works out of the box instead of raising
-            # on the default backend. Set MIND_NERVE_BACKEND=pytorch to select
-            # it explicitly and silence this notice.
-            print(
-                f"mind-nerve: native encoder unavailable ({exc}); falling back to pytorch backend.",
-                file=sys.stderr,
-            )
-            return _Runtime(rdir)
-    return _Runtime(rdir)
-
-
 _HF_REPO_ID = "star-ga/mind-nerve"
 _USER_RUNTIME_DIR = Path.home() / ".local" / "share" / "mind-nerve" / "runtime"
 
@@ -514,9 +492,14 @@ class _NativeEncoderRuntime:
         return str(self.manifest.get("phase1_version", "native"))
 
     def __del__(self) -> None:
-        if self._handle != 0:
+        # __init__ may raise before _handle/_native are bound (e.g. the native
+        # .so is absent). getattr guards keep __del__ from masking the real
+        # construction error with a spurious AttributeError.
+        handle = getattr(self, "_handle", 0)
+        native = getattr(self, "_native", None)
+        if handle != 0 and native is not None:
             try:
-                self._native.free(self._handle)
+                native.free(handle)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -530,7 +513,22 @@ class _NativeEncoderRuntime:
 def _load_cached(runtime_dir_str: str, backend: str) -> "_Runtime | _NativeEncoderRuntime":
     rdir = Path(runtime_dir_str)
     if backend == _BACKEND_NATIVE:
-        return _NativeEncoderRuntime(rdir)
+        try:
+            return _NativeEncoderRuntime(rdir)
+        except (FileNotFoundError, ImportError, OSError) as exc:
+            # The native Q16.16 encoder shared library is absent or unloadable
+            # — the common case on Windows/macOS and for a plain pip install
+            # where the Linux .so is not shipped. Degrade to the pure-Python
+            # (numpy + sentence-transformers) backend so route() keeps working,
+            # just slower. One-line notice; never crash on the default backend.
+            # (FileNotFoundError: missing .so; ImportError: ctypes/_native gap;
+            #  OSError: present-but-unloadable .so, e.g. wrong arch/ABI.)
+            print(
+                f"mind-nerve: native encoder unavailable ({exc}); "
+                f"falling back to the pure-Python backend.",
+                file=sys.stderr,
+            )
+            return _Runtime(rdir)
     return _Runtime(rdir)
 
 
@@ -596,15 +594,18 @@ def route(query: str, top_k: int = 5, *, runtime_dir: str | None = None) -> Rout
         raise ValueError(f"top_k must be in [1, 64]; got {top_k}")
 
     rt = load_default_runtime(runtime_dir)
-    backend = _active_backend()
 
     token_count = _count_bpe_tokens(query, rt)
     if token_count > 1024:
         raise ValueError(f"RequestTooLong: query exceeds 1024 tokens (got {token_count})")
 
-    if backend == _BACKEND_NATIVE:
-        return _route_native(query, top_k, rt)  # type: ignore[arg-type]
-    return _route_pytorch(query, top_k, rt)  # type: ignore[arg-type]
+    # Dispatch on the resolved runtime *instance*, not the env var: when the
+    # native backend was requested but the .so was unavailable, _load_cached
+    # transparently falls back to _Runtime, and the result must be ranked via
+    # the pytorch path. Selecting on type keeps that fallback correct.
+    if isinstance(rt, _NativeEncoderRuntime):
+        return _route_native(query, top_k, rt)
+    return _route_pytorch(query, top_k, rt)
 
 
 def _route_native(

@@ -4,6 +4,44 @@ All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](htt
 
 ## [Unreleased]
 
+### Feat — cross-platform: Windows + macOS + Linux universal router (v0.3.0b9)
+
+mind-nerve now runs as the universal skill-router on Windows, macOS and Linux,
+not Linux-only. The native Q16.16 encoder remains a Linux-only optimisation; on
+every other platform (and on any box without the `.so`) the router degrades to
+the pure-Python backend automatically.
+
+- **Robust pure-Python fallback.** `load_default_runtime()` (the actual loader)
+  now catches a missing/unloadable native encoder and falls back to the
+  pure-Python backend with a one-line stderr notice, instead of crashing on the
+  default `native` backend. Previously the fallback logic lived only in an
+  unused helper, so a missing `.so` raised `FileNotFoundError`. Caught cases:
+  `FileNotFoundError` (no `.so`), `ImportError` (ctypes/binding gap), and
+  `OSError` (present-but-unloadable `.so`, e.g. the Linux library on Windows/
+  macOS or the wrong CPU arch). `route()` now dispatches on the resolved runtime
+  *instance type*, so a fallback is ranked through the correct path.
+  `_NativeEncoderRuntime.__del__` is hardened against a half-built object.
+- **Cross-platform daemon imports.** `mind_nerve.ensure` no longer hard-imports
+  `fcntl` at module load (absent on Windows); the flock spawn-guard is skipped
+  where `fcntl` is unavailable. `daemon`, `ensure` and `preselect_hook` guard
+  `socket.AF_UNIX` so they exit cleanly (or pass through) on platforms that lack
+  UNIX-domain sockets. `ensure` detaches the daemon with the right flags per OS
+  (`start_new_session` on POSIX, `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`
+  on Windows). The one-shot `mind-nerve route` CLI is fully OS-agnostic and
+  needs no daemon.
+- **macOS launchd template.** Added `templates/ga.star.mind-nerve-routed.plist`
+  alongside the existing systemd unit; both ship in the wheel as package data.
+- **Universal wheel.** The wheel is `py3-none-any`. The native `.so` is packaged
+  as OPTIONAL data; absent or unloadable on a given platform it simply triggers
+  the fallback. Install on any OS: `pip install mind-nerve`.
+
+Determinism note: the **native** Q16.16 path is the bit-identical-across-substrate
+one (u32, no float, SHA-256 tiebreak). The pure-Python fallback uses float32 and
+the SHA-256 deterministic top-K, so it is run-to-run deterministic on a given
+machine but its float scores are not guaranteed bit-identical to the native path
+or across differing CPU/BLAS arch. Use the native backend where strict
+cross-substrate bit-identity is required.
+
 ### Fix — MCP server: non-blocking model warmup (instant handshake for strict MCP clients)
 
 `mind-nerve-mcp` warmed the embedding model inline before entering the stdin

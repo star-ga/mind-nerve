@@ -92,6 +92,13 @@ constraint on library growth.
 pip install mind-nerve
 ```
 
+Runs on **Linux, macOS and Windows** from the same universal (`py3-none-any`)
+wheel. The native Q16.16 encoder is a Linux-only speed-up that ships inside the
+wheel as optional data; on macOS/Windows (or any box without the native library)
+the router transparently falls back to the pure-Python backend — same results,
+slightly slower per query, with a one-line notice on first use. The one-shot
+`mind-nerve route` CLI needs no daemon and is fully OS-agnostic.
+
 > **On the 0.3.0 beta line.** The current stable is `0.2.0`. The active beta
 > series (`0.3.0b*`) ships the rebuilt native runtime, the offline quantizer,
 > and the Phase 2 encoder rewire. To install the latest beta:

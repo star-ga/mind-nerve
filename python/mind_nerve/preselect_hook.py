@@ -58,14 +58,13 @@ from typing import Any
 
 
 def _default_socket() -> str:
-    uid = os.getuid()
-    xdg = f"/run/user/{uid}/mind-nerve.sock"
-    if os.path.isdir(os.path.dirname(xdg)):
-        return xdg
-    # nosec B108 — intentional, documented fallback when $XDG_RUNTIME_DIR is
-    # absent; the path is uid-scoped and the socket is created with private
-    # permissions by the daemon.
-    return f"/tmp/mind-nerve-{uid}.sock"  # nosec B108
+    # Share the same socket-dir resolution as the daemon/ensure scripts so the
+    # three agree on one path across platforms (XDG → ~/.cache → /tmp). This is
+    # also Windows-safe: os.getuid() does not exist there, and runtime_socket_dir
+    # never touches it.
+    from ._runtime_dir import runtime_socket_dir
+
+    return str(runtime_socket_dir() / "mind-nerve.sock")
 
 
 def _default_source_dir() -> Path:
@@ -147,6 +146,11 @@ def _list_source_skills() -> dict[str, Path]:
 
 def _query_daemon(prompt: str, k: int) -> list[str] | None:
     if not prompt or not os.path.exists(SOCKET_PATH):
+        return None
+    if not hasattr(socket, "AF_UNIX"):
+        # Some Windows Python builds lack AF_UNIX; the optional daemon path is
+        # simply unavailable there. Fail-open to pass-through (the one-shot
+        # `mind-nerve route` path still works).
         return None
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

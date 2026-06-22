@@ -19,8 +19,10 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
     "Operating System :: POSIX :: Linux",
     "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -70,7 +72,24 @@ where = ["python"]
 version = { attr = "mind_nerve.__version__" }
 
 [tool.setuptools.package-data]
-mind_nerve = ["data/*.json", "data/*.bin", "lib/*.so", "lib/*.dylib", "lib/*.dll"]
+# Native accelerators are OPTIONAL: when the platform-matching shared library
+# is absent (e.g. a pure-Python wheel on Windows/macOS, or a Linux .so on the
+# wrong arch) the runtime degrades to the pure-Python backend. Glob every
+# platform extension so a native build for any OS is packaged when present and
+# simply not matched otherwise. Daemon launcher templates ship as data so the
+# systemd unit / launchd plist are installed alongside the package.
+mind_nerve = [
+    "data/*.json",
+    "data/*.bin",
+    "lib/*.so",
+    "lib/*.dylib",
+    "lib/*.dll",
+    "_native/*.so",
+    "_native/*.dylib",
+    "_native/*.dll",
+    "_native/*.pyd",
+    "templates/*",
+]
 
 [tool.ruff]
 line-length = 100

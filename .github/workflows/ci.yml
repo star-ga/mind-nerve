@@ -108,9 +108,15 @@ jobs:
       # imports and the OS-agnostic surfaces work on every platform. The
       # Linux-built native .so present in the wheel is simply unloadable on
       # Windows/macOS and triggers the pure-Python fallback path by design.
-      - name: Install wheel (no deps)
+      - name: Install wheel (minimal deps)
         shell: bash
-        run: pip install --no-deps dist/*.whl
+        # numpy is the only hard import-time dependency (mind_nerve -> inference
+        # -> numpy). The heavy ML deps (torch / sentence-transformers) are needed
+        # only for live native-fallback routing, not for import + --version +
+        # --help, so they stay excluded to keep this a fast cross-platform smoke.
+        run: |
+          pip install numpy
+          pip install --no-deps dist/*.whl
       - name: Import + cross-platform module safety
         shell: bash
         run: |

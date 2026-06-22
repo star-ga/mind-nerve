@@ -1,9 +1,9 @@
-"""mind-nerve CLI — the single binary every host (claude-code, codex,
+"""mind-nerve CLI - the single binary every host (claude-code, codex,
 vibe, gemini, cursor, etc.) ultimately calls.
 
 Two modes:
 
-  Subprocess mode (default — used by claude-code, codex):
+  Subprocess mode (default - used by claude-code, codex):
     $ echo "git status" | mind-nerve route --top-k 5
     {"routes":[{"id":"...","name":"...","kind":"skill","score":0.93,...}, ...]}
 
@@ -206,7 +206,7 @@ def cmd_train(args: argparse.Namespace) -> int:
 
 
 def cmd_quantize(args: argparse.Namespace) -> int:
-    """Phase 6.2 offline Q16.16 quantizer — wraps ``tools/quantize_phase1_to_q16.py``.
+    """Phase 6.2 offline Q16.16 quantizer - wraps ``tools/quantize_phase1_to_q16.py``.
 
     Imports the tool module lazily so the rest of the CLI surface stays
     free of the dependency. The tool's ``main`` accepts the same argv
@@ -451,7 +451,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_pre.add_argument(
         "--emit-stride-thresholds",
         action="store_true",
-        help="Emit `stride_thresholds.json` (SOTA-track #3 entropy → stride "
+        help="Emit `stride_thresholds.json` (SOTA-track #3 entropy -> stride "
         "map). Consumed by the native-MIND encoder; ignored on Phase 1.",
     )
     p_pre.set_defaults(func=cmd_precompute)
@@ -551,7 +551,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["python", "native"],
         default="python",
         help="'python' = PyTorch bring-up (available now); 'native' = MIND cdylib "
-        "(NotImplementedError until mind-nerve integrates the cdylib path — "
+        "(NotImplementedError until mind-nerve integrates the cdylib path - "
         "the mindc 0.3.0 --emit-shared compiler side shipped 2026-05-18).",
     )
     p_train.add_argument("--base-model", default="BAAI/bge-small-en-v1.5")
@@ -564,13 +564,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_train.add_argument(
         "--smoke-test",
         action="store_true",
-        help="500 pairs, 1 epoch — ~1 min run to validate the pipeline.",
+        help="500 pairs, 1 epoch - ~1 min run to validate the pipeline.",
     )
     p_train.set_defaults(func=cmd_train)
 
     p_quant = sub.add_parser(
         "quantize",
-        help="Phase 6.2 offline FP32 → Q16.16 quantizer (produces route_table.q16.bin)",
+        help="Phase 6.2 offline FP32 -> Q16.16 quantizer (produces route_table.q16.bin)",
     )
     p_quant.add_argument(
         "--catalog",
@@ -605,7 +605,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_quant_enc = sub.add_parser(
         "quantize-encoder",
-        help="Offline FP32 → Q16.16 encoder-weights quantizer (encoder_weights.q16.bin)",
+        help="Offline FP32 -> Q16.16 encoder-weights quantizer (encoder_weights.q16.bin)",
     )
     p_quant_enc.add_argument(
         "--checkpoint",
@@ -683,6 +683,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Windows consoles default to a legacy code page (cp1252) that cannot encode
+    # non-ASCII help text (e.g. the `->` arrow), which crashes `--help` with a
+    # UnicodeEncodeError. Force UTF-8 on the std streams so the CLI prints
+    # identically on every platform.
+    for _stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(_stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8")
+            except (ValueError, OSError):
+                pass
     ap = build_parser()
     args = ap.parse_args(argv)
     return int(args.func(args))

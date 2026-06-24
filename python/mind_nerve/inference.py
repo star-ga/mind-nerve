@@ -115,7 +115,34 @@ def _active_backend() -> str:
 
 
 _HF_REPO_ID = "star-ga/mind-nerve"
-_USER_RUNTIME_DIR = Path.home() / ".local" / "share" / "mind-nerve" / "runtime"
+
+
+def _default_user_runtime_dir() -> Path:
+    """Resolve the default runtime dir, preferring a populated STARGA-local
+    table over the HF auto-seed location.
+
+    Two runtime dirs coexist on STARGA hosts:
+
+    * ``~/.local/share/mind-nerve-runtime``  (dash) — the curated STARGA route
+      table (first-party trust root, ``trusted_paths.json`` present); this is
+      what the route daemon's systemd drop-in pins via ``MIND_NERVE_RUNTIME_DIR``.
+    * ``~/.local/share/mind-nerve/runtime``  (slash) — the HF auto-seed target,
+      which may default to the larger OSS catalog.
+
+    When ``MIND_NERVE_RUNTIME_DIR`` is not exported (e.g. an interactive
+    ``mind-nerve learn`` with no systemd env), resolution previously fell to the
+    slash path, so ``learn`` appended to the wrong table and trust-root
+    detection silently failed. Preferring the dash path when it has a real
+    ``manifest.json`` makes every entry point (CLI, daemon, MCP) land on the
+    curated table by default — the env/drop-in becomes a pin, not a requirement.
+    """
+    dash = Path.home() / ".local" / "share" / "mind-nerve-runtime"
+    if (dash / "manifest.json").exists():
+        return dash
+    return Path.home() / ".local" / "share" / "mind-nerve" / "runtime"
+
+
+_USER_RUNTIME_DIR = _default_user_runtime_dir()
 
 
 def _seed_from_hf(target: Path) -> None:

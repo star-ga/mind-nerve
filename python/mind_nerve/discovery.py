@@ -45,7 +45,63 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
-from .inference import _DEFAULT_RUNTIME_DIR, _skill_embedding_text, load_default_runtime
+from .inference import (
+    _DEFAULT_RUNTIME_DIR,
+    _NativeEncoderRuntime,
+    _skill_embedding_text,
+    load_default_runtime,
+)
+
+
+def _embed_texts(rt: Any, texts: list[str]) -> "Any":
+    """Embed *texts* into a float32 ``(N, 384)`` matrix for the route table.
+
+    The on-disk route table (``route_table.npy``) is float32 produced by the
+    reference sentence-transformers model. New rows MUST be embedded by that
+    same reference model so they are directly comparable: the native Q16.16
+    encoder is a *quantized scoring approximation* (built for fast routing of an
+    already-built table), not a table-builder.
+
+    The previous code called ``rt.model.encode(...)`` unconditionally. Under the
+    default ``MIND_NERVE_BACKEND=native`` the runtime is a
+    ``_NativeEncoderRuntime`` with no ``.model`` attribute, so ``learn`` crashed
+    with ``AttributeError: '_NativeEncoderRuntime' object has no attribute
+    'model'``. Two further hazards ruled out routing the native encoder into the
+    table builder when no ``encoder_weights.q16.bin`` blob is present:
+
+      * ``encode_query`` then produces all-zero (unrankable) embeddings — a
+        silent corruption of the table; and
+      * calling ``encode_query`` against the zero-length-blob handle SEGFAULTs
+        the process.
+
+    So when routing on the native backend, we obtain the reference ``_Runtime``
+    explicitly just for embedding. The route daemon keeps scoring with the
+    native Q16.16 path; only table *construction* uses pytorch.
+
+    deferred: a native table-builder (consistent Q16.16 round-trip + a shipped
+    ``encoder_weights.q16.bin``) would let ``learn`` run fully on the native
+    backend — stubbed here because the weights blob may be absent and the bare
+    handle segfaults. Upgrade path: ship/point ``MIND_NERVE_ENCODER_WEIGHTS`` at
+    a real blob, prove encode_query round-trips f32 within tolerance, then
+    dispatch on isinstance like inference._route_native does.
+    """
+    import numpy as np
+
+    model_rt = rt
+    if isinstance(rt, _NativeEncoderRuntime) or not hasattr(rt, "model"):
+        # Build the table with the reference pytorch model regardless of the
+        # routing backend, so we never re-enter the native path here.
+        from .inference import _Runtime, _resolve_runtime_dir
+
+        model_rt = _Runtime(_resolve_runtime_dir(None))
+
+    return model_rt.model.encode(
+        texts,
+        batch_size=64,
+        convert_to_numpy=True,
+        show_progress_bar=False,
+        normalize_embeddings=False,
+    ).astype(np.float32)
 
 PUBLIC_LICENSES = {
     "apache-2.0",
@@ -77,8 +133,22 @@ def _trusted_roots(runtime_dir: str | Path | None = None) -> list[Path]:
         part = part.strip()
         if part:
             roots.append(Path(part).expanduser())
-    if runtime_dir:
-        cfg = Path(runtime_dir) / "trusted_paths.json"
+    # Resolve the runtime dir through the canonical resolver so the lazy
+    # ``_DEFAULT_RUNTIME_DIR`` proxy ("<lazy:mind-nerve-runtime>") — which the
+    # CLI threads in when ``--runtime-dir`` is omitted — is unwrapped to the
+    # real path BEFORE we look for ``trusted_paths.json``. Without this,
+    # ``Path("<lazy:...>")/trusted_paths.json`` never exists, no trust roots are
+    # found, and a scan of the first-party hub is wrongly license-gated.
+    try:
+        from .inference import _resolve_runtime_dir
+
+        resolved_rdir: Path | None = _resolve_runtime_dir(
+            str(runtime_dir) if runtime_dir is not None else None
+        )
+    except Exception:  # noqa: BLE001 — never let trust resolution crash a scan
+        resolved_rdir = Path(str(runtime_dir)) if runtime_dir else None
+    if resolved_rdir is not None:
+        cfg = resolved_rdir / "trusted_paths.json"
         try:
             if cfg.is_file():
                 entries = json.loads(cfg.read_text(encoding="utf-8"))
@@ -289,7 +359,12 @@ def scan(
     import numpy as np
 
     rt = load_default_runtime(runtime_dir)
-    rdir = Path(runtime_dir)
+    # Resolve through the canonical resolver so the lazy _DEFAULT_RUNTIME_DIR
+    # proxy ("<lazy:mind-nerve-runtime>") is unwrapped before table I/O —
+    # route_table.npy lives under the REAL dir, not the literal proxy string.
+    from .inference import _resolve_runtime_dir
+
+    rdir = _resolve_runtime_dir(str(runtime_dir) if runtime_dir is not None else None)
     seen_ids = {m["sha256"] for m in rt.routes}
     if trusted is None:
         trusted = _is_trusted_dir(directory, rdir)
@@ -328,13 +403,7 @@ def scan(
 
     # Embed the new items using the same model the route table was built with
     texts = [i["_embedded_text"] for i in new_items]
-    new_emb = rt.model.encode(  # type: ignore[union-attr]
-        texts,
-        batch_size=64,
-        convert_to_numpy=True,
-        show_progress_bar=False,
-        normalize_embeddings=False,
-    ).astype(np.float32)
+    new_emb = _embed_texts(rt, texts)
 
     # Load raw table (rt.embeddings is the *normalised* in-memory copy)
     raw_emb, meta = _load_table(rdir)
@@ -391,17 +460,17 @@ def add_route(
 
     sha = hashlib.sha256(text.encode()).hexdigest()
     rt = load_default_runtime(runtime_dir)
-    rdir = Path(runtime_dir)
+    # Resolve through the canonical resolver so the lazy _DEFAULT_RUNTIME_DIR
+    # proxy ("<lazy:mind-nerve-runtime>") is unwrapped before table I/O —
+    # route_table.npy lives under the REAL dir, not the literal proxy string.
+    from .inference import _resolve_runtime_dir
+
+    rdir = _resolve_runtime_dir(str(runtime_dir) if runtime_dir is not None else None)
 
     if any(m["sha256"] == sha for m in rt.routes):
         return {"added": 0, "reason": "already indexed", "sha256": sha}
 
-    emb = rt.model.encode(  # type: ignore[union-attr]
-        [f"{name}\n\n{desc}"],
-        convert_to_numpy=True,
-        show_progress_bar=False,
-        normalize_embeddings=False,
-    ).astype(np.float32)
+    emb = _embed_texts(rt, [f"{name}\n\n{desc}"])
     raw_emb, meta = _load_table(rdir)
     combined_emb = np.concatenate([raw_emb, emb], axis=0)
     new_meta = {

@@ -85,7 +85,9 @@ def handle(msg: dict[str, Any]) -> dict[str, Any] | None:
                     {
                         "name": "mind_nerve_route",
                         "description": "Return the top-K most relevant skill/tool/agent routes for a query, "
-                        "from a catalog of ~12k entries (catalog v1.0).",
+                        "from the active mind-nerve route table (resolved via "
+                        "load_default_runtime — the curated STARGA-local catalog "
+                        "when present).",
                         "inputSchema": {
                             "type": "object",
                             "properties": {

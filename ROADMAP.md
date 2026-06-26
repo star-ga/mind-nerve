@@ -384,6 +384,89 @@ review roadmaps before writing the federation code — not pre-committed here.
 | Federated routing functional ship | **BLOCKED** — requires Phase 2 + the typed-edges composition layer |
 | mind-mem v4 cognitive-kernel integration functional ship | **BLOCKED** — requires mind-mem v4 |
 
+## Comprehensive Malicious-Code Detection (Phase 3 — design, 2026-06-25)
+
+> Goal stated by the operator: a **very comprehensive security scanner that
+> detects malicious code other scanners (Cisco/AV/SAST vendors, etc.) cannot
+> understand.** Tracked here because the routing layer is mind-nerve's; the
+> heavy detection engine is a separate subsystem (see ownership boundary).
+
+### Honest scoping first
+
+A general malicious-code detector is a **large new subsystem**, not a router
+feature. mind-nerve is a deterministic intent→skill classifier (Q16.16,
+cross-arch bit-identity, route IDs out — see *Non-goals*). It must not become
+a scanner: that would re-fatten the router, the exact mistake the federated
+trust-rating §already corrected. So the work splits into two layers with a
+clean boundary:
+
+| Concern | Home |
+|---------|------|
+| **Detection engine** — static + semantic + behavioral analysis of code/artifacts; the actual "understands what AV can't" capability | **new subsystem** (working name `mind-scan`) + the existing security-skill corpus (`analyzing-*`, `detecting-*`, `hunting-*`, `reverse-engineering-*`, hexstrike toolchain) |
+| **Routing layer** — recognize a "scan this for malicious code" intent and route to the right analyzer/skill/agent, rank by confidence, chain multi-stage | **mind-nerve** — this slice |
+
+mind-nerve's slice is **routing-to-detection**, not detection. That is the
+part that legitimately lives in this repo and belongs on this roadmap.
+
+### The differentiator — why "other scanners can't understand it"
+
+The thesis that makes this worth building (vs. wrapping ClamAV/Semgrep):
+signature/rule scanners match *known* patterns. The MIND-ecosystem edge is
+**deterministic semantic analysis with a signed evidence chain** — analyze
+the code's actual computed behavior (data-flow, capability use, obfuscation
+unfolding) reproducibly and bit-identically across substrates, and emit an
+**attested verdict** (request hash → artifact hash → verdict hash into the
+evidence envelope). A reproducible, signed, semantics-level verdict is
+something signature engines structurally cannot produce. This reuses the
+exact wedge mind-nerve already carries (Q16.16 determinism + attestation),
+applied to a detection target instead of a routing target.
+
+> Note (no public attribution): frame any external surface as "deterministic
+> semantic malware analysis," never name the inspiration sources.
+
+### mind-nerve deliverables (the routing slice)
+
+1. **Malicious-intent route class.** Add a first-class intent category for
+   "analyze/scan this code or artifact for malicious behavior" so a host CLI
+   request routes deterministically to the correct analyzer in the security
+   corpus (per-language reverse-engineering skills, behavioral-analysis
+   skills, the hexstrike families) rather than a generic match.
+2. **Multi-stage detection chaining.** Route a single scan request through an
+   ordered analyzer pipeline (triage → static → semantic/behavioral →
+   verdict) using the typed-edges composition layer, surfacing each stage's
+   route + the calibrated-confidence sidecar (§*Calibrated Routing
+   Confidence*) so low-confidence findings escalate to a deeper analyzer.
+3. **Verdict-as-routing-input (consumer slice).** mind-nerve *reads* the
+   `mind-scan` engine's attested verdict and uses it as a routing/escalation
+   signal — exactly the thin-consumer pattern used for the naestro
+   trust-rating (mind-nerve consumes the verdict; it does not own the
+   detection math or the evidence chain).
+
+### Exit criteria (Phase 3 item)
+
+- A malicious-analysis intent routes bit-identically to the right analyzer on
+  x86-CPU and at least one other backend (the routing path, not the engine).
+- Multi-stage chain demonstrated end-to-end against a labelled sample set,
+  with the confidence sidecar driving escalation.
+- The verdict the router consumes is attested (engine-side), and the route
+  decision stays **outside** any identity hash (probabilistic verdict must
+  never become load-bearing for the deterministic route — same invariant as
+  the calibrated-confidence sidecar).
+
+### Status & dependencies
+
+- **Status: design / not started.** Gated behind Phase 2 + the typed-edges
+  composition layer (same gate as federated routing).
+- **Engine dependency:** the `mind-scan` detection subsystem must exist for
+  deliverable 3; until then mind-nerve can ship deliverables 1–2 routing to
+  the *existing* security-skill corpus (which is already large and learnable
+  into the route table today).
+- **Open decision (defer to roadmap review):** does the detection engine live
+  as a standalone `mind-scan` repo, inside naestro's governance layer (it is
+  an OS-level safety concern), or as a MIND-compiled analyzer kernel? Decide
+  at review — do not pre-commit. This roadmap entry only commits mind-nerve's
+  routing slice.
+
 ## Non-goals (now and ever)
 
 - Generative output. mind-nerve emits route IDs and relevance scores, never

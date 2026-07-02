@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-  <strong>Mind-Nerve</strong> implements a drop-the-decoder + sliding-window encoder design compiled to native Q16.16 fixed-point — the same deterministic architecture as MIND, with byte-identical routing output across CPU, ARM, and GPU substrates.
+  <strong>Mind-Nerve</strong> implements a drop-the-decoder + sliding-window encoder design compiled to native Q16.16 fixed-point — the same deterministic architecture as MIND, designed for byte-identical routing output across substrates. The native backend reproduces a pinned bit-identity reference on x86 today; cross-architecture (ARM, GPU) validation is Phase 2 work.
 </p>
 
 <p align="center">
@@ -15,7 +15,7 @@
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/License-Apache_2.0-blue?style=flat-square"></a>
   <a href="https://github.com/star-ga/mind-nerve/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/star-ga/mind-nerve/ci.yml?branch=main&style=flat-square&label=CI"></a>
   <a href="https://github.com/star-ga/mind-nerve/releases"><img alt="Release" src="https://img.shields.io/github/v/release/star-ga/mind-nerve?include_prereleases&style=flat-square&color=green&label=Release"></a>
-  <img alt="Deterministic" src="https://img.shields.io/badge/deterministic-byte--identical-brightgreen?style=flat-square">
+  <img alt="Deterministic" src="https://img.shields.io/badge/deterministic-Q16.16-brightgreen?style=flat-square">
   <a href="https://huggingface.co/star-ga/mind-nerve"><img alt="Hugging Face" src="https://img.shields.io/badge/weights-HuggingFace-FFD21E?style=flat-square"></a>
 </p>
 
@@ -234,8 +234,11 @@ scoring head**. The decoder is dropped entirely; the encoder uses
 sliding-window self-attention (window 256 tokens, stride 192) and writes a
 pooled query vector that is dot-producted against the precomputed catalog
 embedding table to produce the top-K routes. Top-K extraction is
-deterministic: ties break by ascending SHA-256(route_id), so the same input
-on x86, ARM, and CUDA returns the same ranking every time. The authoritative
+deterministic on a given backend: the spec contract breaks ties by ascending
+SHA-256(route_id) (implemented in the Python scoring path); the native
+Q16.16 top-K currently breaks ties by ascending route index. Cross-architecture
+(x86 / ARM / CUDA) identity of the ranking is the Phase 2 gate and is not
+yet hardware-validated. The authoritative
 design is [`spec/architecture.md`](spec/architecture.md).
 
 That single design has two backends. Phase 1 is the one users install today.
@@ -288,16 +291,18 @@ Status, as of commit
 - **Latency p95 ≤ 30 ms** on 4-core CPU — non-negotiable end target. Phase 1
   hits 23 ms via the GPU+daemon path and ~90 ms with a warm daemon on
   4-core CPU; the full ≤30 ms-on-CPU budget closes with the Phase 2 native
-  MIND Q16.16 inference loop (toolchain-side mindc shipped through v0.4.2 /
-  RFC 0005 Phase C; mind-nerve-side native encoder is the remaining work).
+  MIND Q16.16 inference loop (toolchain-side mindc prerequisites landed by
+  v0.4.2 / RFC 0005 Phase C — mindc is on the v0.10.x line today;
+  mind-nerve-side native encoder is the remaining work).
 - **Cross-architecture bit-identity** — same request on x86, ARM, CUDA, and
   WebGPU returns the same top-K. Q16.16 fixed-point throughout, no IEEE-754
   fallback in the inference path. (Phase 2 gate; mindc-side cdylib emit
   landed in v0.3.0; mind-nerve-side hardware validation still pending.)
 - **No training-data leakage at inference** — the classifier reveals only
   route names, never the training corpora content.
-- **Tamper detection** — every inference emits an attestation envelope tying
-  the request hash, model hash, and result hash into the evidence chain.
+- **Tamper detection** — every inference can emit an attestation envelope
+  tying the request hash, model hash, and result hash into the evidence
+  chain (opt-in; see `python/mind_nerve/attestation.py`).
 
 ## Roadmap
 

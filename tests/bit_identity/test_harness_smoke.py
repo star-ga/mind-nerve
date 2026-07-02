@@ -21,6 +21,7 @@ Tests:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -58,10 +59,29 @@ SENTINELS = frozenset(
 VALID_CATEGORIES = {"eval", "long", "adversarial"}
 EXPECTED_CATEGORY_COUNTS = {"eval": 600, "long": 200, "adversarial": 200}
 
+def _candidate_runtime_dir() -> Path | None:
+    """Production-preferred runtime dir if it already exists locally.
+
+    Mirrors ``mind_nerve.inference._default_user_runtime_dir`` (dash-form curated
+    dir preferred over the OSS slash-form) and honors ``MIND_NERVE_RUNTIME_DIR``,
+    but — unlike production's resolver — never triggers the Hugging Face
+    auto-download, so importing this test module has no side effects. Returns
+    ``None`` when no runtime is present locally.
+    """
+    env = os.environ.get("MIND_NERVE_RUNTIME_DIR")
+    if env and (Path(env).expanduser() / "manifest.json").exists():
+        return Path(env).expanduser()
+    dash = Path.home() / ".local" / "share" / "mind-nerve-runtime"
+    if (dash / "manifest.json").exists():
+        return dash
+    slash = Path.home() / ".local" / "share" / "mind-nerve" / "runtime"
+    if (slash / "manifest.json").exists():
+        return slash
+    return None
+
+
 # Whether to require the runtime dir (skip heavy tests if absent)
-_RUNTIME_AVAILABLE = (
-    Path.home() / ".local" / "share" / "mind-nerve" / "runtime" / "manifest.json"
-).exists() or bool(os.environ.get("MIND_NERVE_RUNTIME_DIR"))
+_RUNTIME_AVAILABLE = _candidate_runtime_dir() is not None
 
 # Slow tests take 2-5 minutes on the full 1000-query corpus.
 # Mark them so CI can set SKIP_SLOW=1 to skip during lint-only runs.
@@ -139,13 +159,101 @@ def pytorch_hashes_small(corpus: list[dict]) -> dict:
     }
 
 
+@pytest.fixture(scope="session")
+def native_hashes_small(corpus: list[dict]) -> dict:
+    """Run the NATIVE backend over the fixed 16-query subset via the SAME loader
+    the daemon uses. Skipped only when the encoder-weights blob is genuinely
+    absent (the one legitimate stub path)."""
+    if not _native_weights_present():
+        pytest.skip("native encoder-weights blob absent; native bit-identity gate N/A")
+
+    runtime_dir = _resolve_runtime_dir()
+    subset = _fast_native_subset(corpus)
+
+    sys.path.insert(0, str(THIS_DIR))
+    from runner import run_backend  # type: ignore[import-not-found]
+
+    records = run_backend("native", subset, runtime_dir)
+    return {
+        "backend": "native",
+        "corpus_size": len(subset),
+        "total_hashes": len(records) * HASHES_PER_QUERY,
+        "records": records,
+    }
+
+
 def _resolve_runtime_dir() -> Path:
-    env = os.environ.get("MIND_NERVE_RUNTIME_DIR")
-    if env:
-        p = Path(env).expanduser()
-        if p.is_dir():
-            return p
-    return Path.home() / ".local" / "share" / "mind-nerve" / "runtime"
+    """Return the production-preferred runtime dir (dash-form curated dir).
+
+    Delegates to :func:`_candidate_runtime_dir`; callers only reach this after
+    ``_RUNTIME_AVAILABLE`` gated on a runtime being present, so the ``None``
+    branch is defensive.
+    """
+    cand = _candidate_runtime_dir()
+    if cand is not None:
+        return cand
+    return Path.home() / ".local" / "share" / "mind-nerve-runtime"
+
+
+# ---------------------------------------------------------------------------
+# Native backend reference (the de-fake-green anchor)
+# ---------------------------------------------------------------------------
+
+REFERENCE_DIR = THIS_DIR / "reference"
+NATIVE_REFERENCE_PATH = REFERENCE_DIR / "native_topk_reference.json"
+
+# Load-bearing hash positions: the top-K guarantee (Mind.toml:50). These are the
+# positions the native reference must reproduce byte-for-byte on identical inputs.
+LOAD_BEARING_KEYS = ("post_l2_norm", "catalog_scores", "topk_indices_scores")
+
+
+def _native_weights_present() -> bool:
+    """True iff the canonical encoder-weights blob exists in the resolved runtime
+    dir. Its ABSENCE is the ONE legitimate reason the native backend stubs."""
+    if not _RUNTIME_AVAILABLE:
+        return False
+    return (_resolve_runtime_dir() / "encoder_weights.q16.bin").exists()
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _current_input_fingerprint(runtime_dir: Path) -> dict:
+    """Fingerprint the INPUT artifacts that fully determine native output: the
+    catalog (route_table.npy) and the checkpoint (manifest model/tokenizer
+    hashes).
+
+    Deliberately EXCLUDES the .so: identical inputs producing different native
+    output across .so builds is a cross-substrate bit-identity violation that
+    MUST fail the reproduction gate, not be skipped past.
+    """
+    manifest = json.loads((runtime_dir / "manifest.json").read_text())
+    return {
+        "route_table_sha256": _sha256_file(runtime_dir / "route_table.npy"),
+        "model_hash": manifest.get("model_hash"),
+        "tokenizer_hash": manifest.get("tokenizer_hash"),
+    }
+
+
+def _load_native_reference() -> dict | None:
+    if not NATIVE_REFERENCE_PATH.exists():
+        return None
+    with NATIVE_REFERENCE_PATH.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _fast_native_subset(corpus: list[dict]) -> list[dict]:
+    """A fixed, deterministic 16-query subset spanning all three categories
+    (incl. the adversarial empty string) for the routine native gate."""
+    ev = [e for e in corpus if e["category"] == "eval"][:10]
+    lg = [e for e in corpus if e["category"] == "long"][:3]
+    adv = [e for e in corpus if e["category"] == "adversarial"][:3]
+    return ev + lg + adv
 
 
 # ---------------------------------------------------------------------------
@@ -326,22 +434,12 @@ class TestPytorchBaseline:
         assert reloaded["total_hashes"] == pytorch_hashes["total_hashes"]
         assert len(reloaded["records"]) == len(pytorch_hashes["records"])
 
-    def test_pytorch_vs_pytorch_self_comparison(
-        self, pytorch_hashes: dict, corpus: list[dict]
-    ) -> None:
-        """
-        Comparing a blob against itself must yield 100% pass and >= 90% top-K overlap.
-        This validates the compare module's gate logic.
-        """
-        sys.path.insert(0, str(THIS_DIR))
-        from compare import compare_blobs  # type: ignore[import-not-found]
-
-        result = compare_blobs(pytorch_hashes, pytorch_hashes)
-
-        assert result.hash_fail == 0, f"Self-comparison produced {result.hash_fail} hash mismatches"
-        if result.topk_overlaps:
-            avg = sum(result.topk_overlaps) / len(result.topk_overlaps)
-            assert avg >= 0.90, f"Self-comparison top-K overlap {avg:.4f} < 0.90"
+    # NOTE: the former `test_pytorch_vs_pytorch_self_comparison` was tautological
+    # — comparing a blob against itself trivially passes and proved nothing about
+    # the native backend or the load-bearing bit-identity guarantee. It is
+    # replaced by TestNativeGate.test_native_reproduces_reference below, which
+    # asserts a fresh native run reproduces a COMMITTED reference (a real
+    # determinism / top-K regression FAILS).
 
 
 # ---------------------------------------------------------------------------
@@ -664,3 +762,133 @@ class TestGateThresholds:
         result = compare_blobs(blob_a, blob_b)
         assert result.hash_fail == 1, f"Expected 1 FAIL, got {result.hash_fail}"
         assert result.queries_with_mismatch == 1
+
+
+# ---------------------------------------------------------------------------
+# Test 7: Native backend gate — the load-bearing bit-identity guarantee
+# ---------------------------------------------------------------------------
+
+
+class TestNativeGate:
+    """Genuinely gates the native Q16.16 backend (Mind.toml:50 "bit-identical
+    top-K outputs"). This replaces the permanently fake-green harness whose
+    hand-rolled native loader had drifted from production and always emitted
+    BACKEND_STUB_NOT_BUILT sentinels that the old test tolerated as passing.
+    """
+
+    def test_reference_fixture_committed(self) -> None:
+        """The pinned native reference must be committed alongside the test."""
+        assert NATIVE_REFERENCE_PATH.exists(), (
+            f"pinned native reference missing: {NATIVE_REFERENCE_PATH}. "
+            f"Regenerate: python tests/bit_identity/runner.py --backend native "
+            f"--out {NATIVE_REFERENCE_PATH}"
+        )
+        ref = _load_native_reference()
+        assert ref is not None and ref.get("backend") == "native"
+        assert ref.get("records"), "reference has no records"
+        assert "input_fingerprint" in ref, "reference missing input_fingerprint"
+
+    def test_native_hashes_are_real_when_weights_present(
+        self, native_hashes_small: dict
+    ) -> None:
+        """(gate a) With the encoder-weights blob present, EVERY native hash must
+        be a real 64-char hex SHA-256 — never a BACKEND_STUB_NOT_BUILT sentinel.
+
+        No sentinel tolerance: a present-but-broken backend fails here. This is
+        the assertion the old harness lacked (it accepted sentinels as valid).
+        """
+        records = native_hashes_small["records"]
+        assert records, "no native records produced"
+        for rec in records:
+            for key in HASH_KEYS:
+                h = rec["hashes"].get(key)
+                assert h not in SENTINELS, (
+                    f"native emitted sentinel {h!r} for {rec['id']!r}.{key} while "
+                    f"encoder weights are present — a broken backend, NOT an "
+                    f"acceptable stub"
+                )
+                assert (
+                    isinstance(h, str)
+                    and len(h) == 64
+                    and all(c in "0123456789abcdef" for c in h)
+                ), f"native hash for {rec['id']!r}.{key} is not real 64-hex: {h!r}"
+
+    def test_native_reproduces_reference(self, native_hashes_small: dict) -> None:
+        """(gate b) A fresh native run reproduces the pinned reference
+        byte-for-byte on the load-bearing hash positions + top-K indices. A
+        determinism / top-K regression FAILS here.
+
+        Skipped only when the runtime's INPUT artifacts (catalog + checkpoint)
+        differ from what the reference pins — a genuinely different corpus, not a
+        regression of the code under test. The .so is intentionally NOT part of
+        the fingerprint: identical inputs producing different output across
+        substrates is a bit-identity violation that must FAIL, not skip.
+        """
+        reference = _load_native_reference()
+        assert reference is not None, "pinned native reference missing"
+
+        runtime_dir = _resolve_runtime_dir()
+        current_fp = _current_input_fingerprint(runtime_dir)
+        ref_fp = reference.get("input_fingerprint", {})
+        if current_fp != ref_fp:
+            pytest.skip(
+                "runtime input artifacts differ from the pinned reference "
+                f"(current={current_fp} vs reference={ref_fp}); regenerate the "
+                "reference on this host to gate determinism here"
+            )
+
+        ref_by_id = {r["id"]: r for r in reference["records"]}
+        checked = 0
+        for rec in native_hashes_small["records"]:
+            ref_rec = ref_by_id.get(rec["id"])
+            assert ref_rec is not None, f"{rec['id']!r} missing from reference"
+            for key in LOAD_BEARING_KEYS:
+                assert rec["hashes"][key] == ref_rec["hashes"][key], (
+                    f"native {key} for {rec['id']!r} drifted from the pinned "
+                    f"reference: {rec['hashes'][key]} != {ref_rec['hashes'][key]}"
+                )
+            assert rec["topk_indices"] == ref_rec["topk_indices"], (
+                f"native top-K indices for {rec['id']!r} drifted from reference: "
+                f"{rec['topk_indices']} != {ref_rec['topk_indices']}"
+            )
+            checked += 1
+        assert checked > 0, "no native records checked against the reference"
+
+    @pytest.mark.skipif(_SKIP_SLOW, reason="BIT_IDENTITY_SKIP_SLOW=1")
+    def test_native_full_corpus_reproduces_reference(self, corpus: list[dict]) -> None:
+        """(gate b, thorough) Full 1000-query native run reproduces the pinned
+        reference byte-for-byte across all 7 hash positions + top-K indices.
+
+        Slow (~3-4 min on CPU); gated by BIT_IDENTITY_SKIP_SLOW like the pytorch
+        full run. Same input-fingerprint skip guard as the fast variant.
+        """
+        if not _native_weights_present():
+            pytest.skip("native encoder-weights blob absent; native gate N/A")
+
+        reference = _load_native_reference()
+        assert reference is not None, "pinned native reference missing"
+
+        runtime_dir = _resolve_runtime_dir()
+        if _current_input_fingerprint(runtime_dir) != reference.get("input_fingerprint", {}):
+            pytest.skip("runtime input artifacts differ from the pinned reference")
+
+        sys.path.insert(0, str(THIS_DIR))
+        from runner import run_backend  # type: ignore[import-not-found]
+
+        records = run_backend("native", corpus, runtime_dir)
+        assert len(records) == len(reference["records"]), (
+            f"record count {len(records)} != reference {len(reference['records'])}"
+        )
+        ref_by_id = {r["id"]: r for r in reference["records"]}
+        mismatches: list[str] = []
+        for rec in records:
+            ref_rec = ref_by_id[rec["id"]]
+            if (
+                rec["hashes"] != ref_rec["hashes"]
+                or rec["topk_indices"] != ref_rec["topk_indices"]
+            ):
+                mismatches.append(rec["id"])
+        assert not mismatches, (
+            f"{len(mismatches)} queries drifted from the pinned reference: "
+            f"{mismatches[:10]}"
+        )

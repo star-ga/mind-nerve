@@ -16,8 +16,12 @@ Hash points per query (per spec §A1.4):
   7. topk_indices_scores — raw bytes of top-K indices (int32) + scores (int32 Q16.16)
 
 Backend selection:
-  --backend native    Uses A1.3 ctypes wiring; emits BACKEND_STUB_NOT_BUILT
-                      sentinel per query if the .so is not present.
+  --backend native    Loads through production's _NativeEncoderRuntime
+                      (mind_nerve.inference) and hashes the REAL .so output —
+                      the same load path the routing daemon uses, so the
+                      harness can never drift from production. Emits
+                      BACKEND_STUB_NOT_BUILT only when the encoder-weights
+                      blob (encoder_weights.q16.bin) is genuinely absent.
   --backend pytorch   Uses sentence-transformers FP32 reference path (ground truth).
   --backend cuda      Emits CUDA_DEFERRED_TO_V0_4_1 sentinel per query (§3.2).
 
@@ -101,11 +105,32 @@ def _topk_to_bytes(indices: Any, scores_q16: Any) -> bytes:
 
 
 def _resolve_runtime_dir() -> Path:
+    """Resolve the runtime dir EXACTLY as production inference does.
+
+    Delegates to ``mind_nerve.inference._resolve_runtime_dir`` so the harness can
+    never drift from the routing daemon: it respects ``MIND_NERVE_RUNTIME_DIR``
+    and otherwise lands on the curated STARGA dash-form runtime dir
+    (``~/.local/share/mind-nerve-runtime``, production's ``_USER_RUNTIME_DIR``) —
+    NOT the OSS-leftover slash-form dir this harness used to default to. The old
+    default is what silently pointed the native path at a dir with no encoder
+    weights, part of the permanently fake-green gate.
+    """
+    try:
+        from mind_nerve.inference import _resolve_runtime_dir as _prod_resolve
+    except ImportError:
+        _prod_resolve = None
+    if _prod_resolve is not None:
+        return _prod_resolve(None)
+    # Fallback only when mind_nerve is unimportable: mirror production's
+    # dash-preferred preference by hand rather than falling to the OSS dir.
     env = os.environ.get("MIND_NERVE_RUNTIME_DIR")
     if env:
         p = Path(env).expanduser()
         if p.is_dir():
             return p
+    dash = Path.home() / ".local" / "share" / "mind-nerve-runtime"
+    if (dash / "manifest.json").exists():
+        return dash
     return _DEFAULT_RUNTIME_DIR
 
 
@@ -288,147 +313,63 @@ def _run_pytorch_backend(
 
 
 # ---------------------------------------------------------------------------
-# Native backend (A1.3 ctypes wiring stub)
+# Native backend — loads through production's _NativeEncoderRuntime
 # ---------------------------------------------------------------------------
 
 
-def _find_native_so() -> Path | None:
-    """Locate the native encoder .so in the standard search paths."""
-    candidates = [
-        Path(__file__).parent.parent.parent
-        / "python"
-        / "mind_nerve"
-        / "_native"
-        / "libmind_nerve_encoder.so",
-        Path(os.environ.get("MIND_NERVE_NATIVE_SO", "")),
-    ]
-    for c in candidates:
-        if c and c.exists():
-            return c
-    return None
+def _native_weights_path(runtime_dir: Path) -> Path:
+    """Resolve the encoder-weights blob path the SAME way _NativeEncoderRuntime
+    does: ``$MIND_NERVE_ENCODER_WEIGHTS`` override, else
+    ``<runtime_dir>/encoder_weights.q16.bin``.
+    """
+    env_blob = os.environ.get("MIND_NERVE_ENCODER_WEIGHTS")
+    if env_blob:
+        return Path(env_blob).expanduser()
+    return runtime_dir / "encoder_weights.q16.bin"
 
 
 def _run_native_backend(corpus: list[dict], runtime_dir: Path) -> list[dict]:
+    """Run the native (mindc-compiled .so) backend through the SAME loader the
+    routing daemon uses: ``mind_nerve.inference._NativeEncoderRuntime``.
+
+    Loading through production is deliberate and load-bearing. The previous
+    implementation re-implemented the native load path here (a hand-rolled
+    ctypes ABI + hard-coded ``_native/weights.q16.bin`` / ``route_table.q16.bin``
+    paths that production never writes), so it ALWAYS fell through to
+    ``BACKEND_STUB_NOT_BUILT`` and the gate was permanently fake-green. Delegating
+    to ``_NativeEncoderRuntime`` means this harness can never again drift from
+    the daemon: the runtime reads the encoder weights from
+    ``encoder_weights.q16.bin`` and DERIVES the Q16 catalog on load from
+    ``route_table.npy``.
+
+    Sentinel policy (de-fake-green):
+      * encoder-weights blob ABSENT  -> ``BACKEND_STUB_NOT_BUILT`` (the ONE
+        legitimate stub: the .so needs quantized weights to produce a real
+        embedding).
+      * weights PRESENT but the runtime fails to load/encode -> RAISE. A
+        broken-but-present backend must fail loudly, never degrade to a
+        green stub.
     """
-    Run the native (mindc-compiled .so) backend.
-    Emits BACKEND_STUB_NOT_BUILT sentinel when the .so is not present.
-    """
-    so_path = _find_native_so()
-
-    if so_path is None:
-        print(
-            "  native: .so not found — emitting stub sentinels. "
-            "Build the wheel with tools/build_native_encoder.sh to enable.",
-            file=sys.stderr,
-        )
-        return _sentinel_records(corpus, "native", SENTINEL_NATIVE_STUB)
-
-    # A1.3 ctypes wiring is loaded here when the .so exists.
-    # Full implementation wired in A1.3; for now we validate the ABI surface.
-    try:
-        import ctypes
-
-        lib = ctypes.CDLL(str(so_path))
-        # Verify ABI exports
-        required = [
-            "mn_encoder_init",
-            "mn_encoder_encode",
-            "mn_encoder_score",
-            "mn_encoder_topk",
-            "mn_encoder_free",
-            "mn_encoder_version",
-        ]
-        missing = [sym for sym in required if not hasattr(lib, sym)]
-        if missing:
-            print(
-                f"  native: .so missing symbols {missing} — emitting stub sentinels.",
-                file=sys.stderr,
-            )
-            return _sentinel_records(corpus, "native", SENTINEL_NATIVE_STUB)
-
-        # Full native path: call mn_encoder_init, then mn_encoder_encode per query.
-        # This path is active once A1.3 ships; here we delegate to the ctypes layer.
-        return _run_native_so(lib, corpus, runtime_dir)
-
-    except OSError as exc:
-        print(f"  native: failed to load .so ({exc}) — emitting stub sentinels.", file=sys.stderr)
-        return _sentinel_records(corpus, "native", SENTINEL_NATIVE_STUB)
-
-
-def _run_native_so(lib: Any, corpus: list[dict], runtime_dir: Path) -> list[dict]:
-    """
-    Execute the native encoder for each corpus query via ctypes.
-    Called only when the .so is present and exports the required symbols.
-    """
-    import ctypes
-
-    import numpy as np
-
-    # Configure ABI
-    lib.mn_encoder_version.restype = ctypes.c_char_p
-    lib.mn_encoder_init.argtypes = [ctypes.c_char_p, ctypes.c_size_t]
-    lib.mn_encoder_init.restype = ctypes.c_int64
-    lib.mn_encoder_encode.argtypes = [
-        ctypes.c_int64,
-        ctypes.POINTER(ctypes.c_int32),
-        ctypes.c_size_t,
-        ctypes.POINTER(ctypes.c_int32),
-    ]
-    lib.mn_encoder_encode.restype = ctypes.c_int32
-    lib.mn_encoder_score.argtypes = [
-        ctypes.c_int64,
-        ctypes.POINTER(ctypes.c_int32),
-        ctypes.POINTER(ctypes.c_int32),
-        ctypes.c_size_t,
-        ctypes.POINTER(ctypes.c_int32),
-    ]
-    lib.mn_encoder_score.restype = ctypes.c_int32
-    lib.mn_encoder_topk.argtypes = [
-        ctypes.POINTER(ctypes.c_int32),
-        ctypes.c_size_t,
-        ctypes.c_size_t,
-        ctypes.POINTER(ctypes.c_int32),
-        ctypes.POINTER(ctypes.c_int32),
-    ]
-    lib.mn_encoder_topk.restype = ctypes.c_int32
-    lib.mn_encoder_free.argtypes = [ctypes.c_int64]
-    lib.mn_encoder_free.restype = ctypes.c_int32
-
-    # Load weights blob
-    weights_path = runtime_dir / "_native" / "weights.q16.bin"
+    weights_path = _native_weights_path(runtime_dir)
     if not weights_path.exists():
         print(
-            f"  native: weights blob not found at {weights_path} — emitting stub sentinels.",
+            f"  native: encoder-weights blob absent at {weights_path} — emitting "
+            f"stub sentinels (quantize/build the encoder to enable).",
             file=sys.stderr,
         )
         return _sentinel_records(corpus, "native", SENTINEL_NATIVE_STUB)
 
-    weights_data = weights_path.read_bytes()
-    weights_buf = (ctypes.c_uint8 * len(weights_data))(*weights_data)
-    handle = lib.mn_encoder_init(weights_buf, len(weights_data))
-    if handle <= 0:
-        print("  native: mn_encoder_init failed — emitting stub sentinels.", file=sys.stderr)
-        return _sentinel_records(corpus, "native", SENTINEL_NATIVE_STUB)
+    # Weights present: load through production. Any failure past this point is a
+    # real regression and must surface, not silently stub.
+    from mind_nerve.inference import _NativeEncoderRuntime
 
-    # Load catalog Q16.16
-    catalog_path = runtime_dir / "_native" / "route_table.q16.bin"
-    if not catalog_path.exists():
-        lib.mn_encoder_free(handle)
-        return _sentinel_records(corpus, "native", SENTINEL_NATIVE_STUB)
-
-    catalog_raw = np.frombuffer(catalog_path.read_bytes(), dtype=np.int32)
-    n_catalog = catalog_raw.shape[0] // HIDDEN_SIZE
-    catalog_ptr = catalog_raw.ctypes.data_as(ctypes.POINTER(ctypes.c_int32))
-
-    # Load tokenizer (stays Python in v0.4.0 per §A1.3)
-    from transformers import BertTokenizer
-
-    tokenizer = BertTokenizer.from_pretrained(str(runtime_dir / "checkpoint"))
-
-    out_vec = (ctypes.c_int32 * HIDDEN_SIZE)()
-    out_scores = (ctypes.c_int32 * n_catalog)()
-    out_topk_idx = (ctypes.c_int32 * TOP_K)()
-    out_topk_scores = (ctypes.c_int32 * TOP_K)()
+    rt = _NativeEncoderRuntime(runtime_dir)
+    if not getattr(rt, "_encoder_weights_loaded", False) or rt._handle == 0:
+        raise RuntimeError(
+            f"native backend: encoder weights present at {weights_path} but the "
+            f"runtime did not load them (handle={getattr(rt, '_handle', 0)}). "
+            f"Refusing to emit a fake-green stub."
+        )
 
     records: list[dict] = []
     n = len(corpus)
@@ -440,61 +381,36 @@ def _run_native_so(lib: Any, corpus: list[dict], runtime_dir: Path) -> list[dict
         query_id = entry["id"]
         text = entry["text"]
 
-        enc = tokenizer(
-            text,
-            return_tensors="np",
-            padding=False,
-            truncation=True,
-            max_length=MAX_SEQ_LEN,
-        )
-        token_ids = enc["input_ids"].astype(np.int32).flatten()
-        token_len = len(token_ids)
-
-        token_ptr = token_ids.ctypes.data_as(ctypes.POINTER(ctypes.c_int32))
-
-        # Hash 1: token IDs
+        # Token IDs — int32, tokenized exactly as the daemon does (max_len 256,
+        # pytorch-SentenceTransformer-equivalent, #228).
+        token_ids = rt._tokenize(text)
+        token_len = int(token_ids.shape[0])
         h1 = _sha256_bytes(token_ids.tobytes())
 
-        # Encode — fills out_vec with Q16.16 L2-normalized output (hash 5)
-        rc = lib.mn_encoder_encode(handle, token_ptr, token_len, out_vec)
-        if rc != 0:
-            records.append(
-                _error_record(query_id, entry["category"], "native", f"encode_error_{rc}")
-            )
-            continue
+        # Final Q16.16 L2-normalized embedding straight from the .so
+        # (int64 (384,)). Re-quantize via _float32_to_q16_bytes so the record
+        # format is byte-for-byte the same int32 Q16.16 LE as the pytorch path.
+        qv_q16 = rt._native.encode(rt._handle, token_ids)
+        l2_f32 = rt._q16_to_f32(qv_q16)
+        h5 = _sha256_bytes(_float32_to_q16_bytes(l2_f32))
 
-        # We only get the final output from the ABI; for intermediate hashes
-        # (post_embed_ln, final_layer_ln, post_cls_slice) we emit the same
-        # hash as post_l2_norm since the ABI exposes only the final output vector.
-        # This is by design: the full intermediate capture requires the Python
-        # instrumentation path (pytorch backend) for A1.4 ground truth.
-        l2_vec_q16 = np.ctypeslib.as_array(out_vec).copy()
-        l2_bytes = l2_vec_q16.tobytes()
-        h5 = _sha256_bytes(l2_bytes)
+        # Intermediate LayerNorm hashes are NOT observable through the C ABI
+        # (mn_encoder_encode returns only the final vector). Set them equal to
+        # the final-output hash — the honest handling documented in A1.3.
+        h2 = h3 = h4 = h5
 
-        # For native ABI, intermediates not available — use final output hash
-        h2 = h3 = h4 = h5  # ABI limitation documented in A1.3
+        # Catalog scores — mirror _route_native EXACTLY (incl. the optional
+        # log-prior add) so the pinned reference equals the daemon's real
+        # top-K output.
+        scores_q16 = rt._native.score(rt._handle, qv_q16, rt._catalog_q16)
+        if rt._log_prior_q16 is not None:
+            scores_q16 = scores_q16 + rt._log_prior_q16
+        scores_f32 = rt._q16_to_f32(scores_q16)
+        h6 = _sha256_bytes(_float32_to_q16_bytes(scores_f32))
 
-        # Hash 6: catalog scores
-        rc = lib.mn_encoder_score(handle, out_vec, catalog_ptr, n_catalog, out_scores)
-        if rc != 0:
-            records.append(
-                _error_record(query_id, entry["category"], "native", f"score_error_{rc}")
-            )
-            continue
-
-        scores_q16 = np.ctypeslib.as_array(out_scores, shape=(n_catalog,)).copy()
-        h6 = _sha256_bytes(scores_q16.tobytes())
-
-        # Hash 7: top-K
-        k = min(TOP_K, n_catalog)
-        rc = lib.mn_encoder_topk(out_scores, n_catalog, k, out_topk_idx, out_topk_scores)
-        if rc != 0:
-            records.append(_error_record(query_id, entry["category"], "native", f"topk_error_{rc}"))
-            continue
-
-        topk_idx = np.ctypeslib.as_array(out_topk_idx, shape=(k,)).copy()
-        topk_scr = np.ctypeslib.as_array(out_topk_scores, shape=(k,)).copy()
+        # Top-K indices + scores (Q16.16) via the native selector.
+        k = min(TOP_K, int(scores_q16.shape[0]))
+        topk_idx, topk_scr = rt._native.topk(scores_q16, k)
         h7 = _sha256_bytes(_topk_to_bytes(topk_idx, topk_scr))
 
         records.append(
@@ -502,7 +418,7 @@ def _run_native_so(lib: Any, corpus: list[dict], runtime_dir: Path) -> list[dict
                 "id": query_id,
                 "category": entry["category"],
                 "backend": "native",
-                "token_len": int(token_len),
+                "token_len": token_len,
                 "hashes": {
                     "token_ids": h1,
                     "post_embed_ln": h2,
@@ -512,11 +428,10 @@ def _run_native_so(lib: Any, corpus: list[dict], runtime_dir: Path) -> list[dict
                     "catalog_scores": h6,
                     "topk_indices_scores": h7,
                 },
-                "topk_indices": topk_idx.tolist(),
+                "topk_indices": [int(i) for i in topk_idx.tolist()],
             }
         )
 
-    lib.mn_encoder_free(handle)
     return records
 
 

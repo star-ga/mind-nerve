@@ -503,6 +503,42 @@ route rank.
   instead of committing to a weak match.
 - **Status:** Planned. Composes over the existing route scoring; no change to the
   deterministic route table.
+- **Prior art (2026-07-03):** recent skill-manager tooling surfaces a raw
+  match-confidence (e.g. `92% <skill-name>`) on its recommend output — external
+  validation that a per-route confidence signal is a real, useful surface. Ours
+  goes further (calibrated + excluded from the identity hash); theirs is raw and
+  ungoverned. Confirms the direction, adds no new requirement.
+
+## Repo-Stack Fingerprint as a Routing Feature (sidecar input)
+
+Today mind-nerve routes on **intent text only** — it doesn't look at *where the
+caller is*. Recent skill-manager tooling reads the repo, detects the stack
+(Next/React/Vercel/Cargo/…), and ranks skills by stack fit. That signal is free
+to us and we currently ignore it. This is the one genuinely-additive idea from
+the recent prior-art scan for this repo (the confidence-score idea we already had;
+the format-translator is a hub concern, not a router concern).
+
+- **What:** compute a cheap **repo fingerprint** — presence of `package.json` /
+  `Cargo.toml` / `pyproject.toml` / `*.mind` / top import statements — and feed it
+  to the router as **additional query features**, sharpening intent→skill routing
+  with signal about the caller's environment.
+- **Where it sits (invariant-preserving):** the fingerprint is a **sidecar input
+  to scoring**, mirroring the Calibrated Routing Confidence sidecar above. It
+  **must not** become a load-bearing key in the deterministic route-table lookup
+  and **must be excluded from any identity hash** — a probabilistic environment
+  estimate never makes the deterministic route non-reproducible. Same fingerprint
+  in → same features in → same deterministic route out.
+- **Governance boundary:** unlike the external tooling (which pairs stack-detection
+  with ungoverned multi-source install), this stays pure routing over the **governed
+  local table + first-party trust root**. No aggregator, no deploy target, no
+  second router — those are deliberately separate federation layers (hub deploys,
+  SkillsMP discovers, mind-nerve routes).
+- **Composes with confidence:** the fingerprint sharpens the ranking; the
+  calibrated-confidence sidecar then lets the caller threshold on the sharpened
+  margin (route confidently vs. offer a shortlist vs. clarify).
+- **Status:** Planned. Self-contained, no new dependency; a cheap fingerprint
+  pass feeding existing route scoring. First step: confirm the router exposes a
+  score the fingerprint features can modulate (the confidence sidecar above).
 
 ## Pure-MIND Self-Hosting Migration
 

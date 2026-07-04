@@ -43,8 +43,8 @@ jobs:
     name: pip-audit (vulnerability scan)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Install pip-audit
@@ -88,7 +88,7 @@ jobs:
           PY
       - name: Upload pip-audit JSON
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: pip-audit-report
           path: /tmp/pip-audit.json
@@ -97,8 +97,8 @@ jobs:
     name: bandit (static security lint)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Install bandit
@@ -119,7 +119,7 @@ jobs:
               --skip B108
       - name: Upload bandit JSON
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: bandit-report
           path: /tmp/bandit.json
@@ -130,7 +130,7 @@ jobs:
     container:
       image: semgrep/semgrep:latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Run Semgrep
         run: |
           # Semgrep p/ci+p/python is an advisory semantic scan; findings are
@@ -143,7 +143,7 @@ jobs:
               python/mind_nerve || true
       - name: Upload semgrep JSON
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: semgrep-report
           path: /tmp/semgrep.json
@@ -152,8 +152,8 @@ jobs:
     name: SBOM (CycloneDX from requirements.lock)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Install cyclonedx-bom
@@ -171,7 +171,7 @@ jobs:
           assert n > 0, 'empty SBOM'
           "
       - name: Upload SBOM
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: sbom-cyclonedx
           path: sbom.cdx.json

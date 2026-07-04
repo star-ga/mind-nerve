@@ -91,7 +91,7 @@ def _embed_texts(rt: Any, texts: list[str]) -> "Any":
     if isinstance(rt, _NativeEncoderRuntime) or not hasattr(rt, "model"):
         # Build the table with the reference pytorch model regardless of the
         # routing backend, so we never re-enter the native path here.
-        from .inference import _Runtime, _resolve_runtime_dir
+        from .inference import _resolve_runtime_dir, _Runtime
 
         model_rt = _Runtime(_resolve_runtime_dir(None))
 
@@ -102,6 +102,7 @@ def _embed_texts(rt: Any, texts: list[str]) -> "Any":
         show_progress_bar=False,
         normalize_embeddings=False,
     ).astype(np.float32)
+
 
 PUBLIC_LICENSES = {
     "apache-2.0",

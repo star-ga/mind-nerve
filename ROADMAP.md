@@ -19,7 +19,12 @@ shipped.
 4. **Latency p95 ≤ 30 ms on CPU.** Architecture decisions that cannot meet
    this on commodity CPU are rejected.
 5. **Attestation on every inference.** Request hash, model hash, result hash
-   into the evidence envelope. No opt-out.
+   into the evidence envelope. No opt-out. Additive (2026-07-04): the envelope
+   also carries the routing *rationale* — matched-rule id, priority, and a
+   human-readable `rationale` string — so every routing decision explains
+   *why*, not just *what*. The auditor wants the reason for the route, not the
+   route. Small, additive field on the existing attestation envelope; no wire
+   break.
 6. **Compile speed never regresses.** mind-runtime frontend compile times
    stay within the published envelope; module-level gating only.
 
@@ -278,6 +283,21 @@ Q16.16 in flight, INT8 weights, cross-arch bit-identity, 30 ms p95).
    (see [`spec/architecture.md`](spec/architecture.md) §
    "Backwards-soft architecture switches" — this would be wired in
    as one more off-by-default compile-time switch).
+
+7. **Declarative policy overlay** (optional, added 2026-07-04). An optional
+   human-authored YAML rule layer that sits *on top of* the learned governed
+   table — it does not replace it. Schema: `rules` with `id / priority /
+   conditions / route_to / rationale`, evaluated before top-K extraction, able
+   to *pin* or *veto* a route the learned model produced. For operators who
+   need explainable/regulated routing (fintech/healthcare), a route that
+   carries its own declared reason is auditable in a way a learned score is
+   not. Complements the learned encoder+scoring head; the overlay's matched
+   `rationale` feeds directly into the constraint-#5 attestation envelope
+   (see above). Gate: overlay-off must be byte-identical to today; an overlay
+   rule may only *narrow* the learned top-K, never inject a route the model
+   scored below threshold, so the learned table stays the source of ranking
+   truth. (Prior-art shape: a declarative policy file with per-rule rationale,
+   observed 2026-07-04 — adopted as an overlay, not a routing engine.)
 
 ## Phase 3 — Ecosystem (target: Q3 2027)
 

@@ -478,3 +478,97 @@ jobs:
           echo "::notice::bit-identity-cpu: Native backend absent (open-source CI) — sentinels emitted."
           echo "::notice::bit-identity-cpu: CUDA gate deferred to v0.4.1 per spec §3.2."
           echo "::notice::bit-identity-cpu: Full 1000-query baseline run is a pre-release local gate."
+
+  determinism-gate:
+    name: Determinism gate (Q16.16 byte-identity, fail-closed)
+    needs: tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install with dev extras (torch + sentence-transformers)
+        run: pip install -e ".[dev]"
+
+      # ------------------------------------------------------------------
+      # FAIL-CLOSED Q16.16 byte-identity gate.
+      #
+      # Rationale: prior to this job the "deterministic Q16.16" guarantee was
+      # enforced by nothing automated. The bit-identity-cpu job above validates
+      # harness scaffolding + corpus determinism, but its numerical byte-identity
+      # steps run in SENTINEL mode (the protected libmindnerve.so is
+      # intentionally not in the open-source tree), so its comparator compares
+      # sentinel-against-sentinel and passes regardless of any real divergence.
+      #
+      # This job enforces the run-to-run / cross-process determinism of the
+      # GROUND-TRUTH Q16.16 hashing pipeline, which needs NO protected .so:
+      # the PyTorch reference backend is pure-Python over the PUBLIC BAAI/bge
+      # checkpoint (pinned revision, auto-seeded from Hugging Face by
+      # mind_nerve.inference._seed_from_hf). Two fresh Python processes must
+      # produce BYTE-IDENTICAL Q16.16 hashes for all seven pipeline stages.
+      #
+      # MIND_NERVE_BITID_REQUIRE=1 mirrors ~/mind's MIND_BENCH_REQUIRE: when the
+      # reference toolchain is REQUIRED, the absence of a loadable runtime (or a
+      # sentinel hash) is a HARD FAILURE, never a silent skip. The .so-backed
+      # cross-substrate (x86<->ARM<->CUDA) comparison remains a pre-release
+      # LOCAL gate because the .so cannot ship in the open-source tree.
+      # ------------------------------------------------------------------
+      - name: Seed public reference checkpoint (fail-closed if unavailable)
+        env:
+          MIND_NERVE_BITID_REQUIRE: "1"
+        run: |
+          python3 - <<'PY'
+          import sys
+          try:
+              import torch  # noqa: F401
+              from mind_nerve.inference import _resolve_runtime_dir
+          except Exception as e:  # noqa: BLE001
+              print(f"::error::determinism-gate: reference toolchain unavailable ({e!r}); "
+                    f"MIND_NERVE_BITID_REQUIRE=1 makes this a hard failure, not a skip")
+              sys.exit(1)
+          rd = _resolve_runtime_dir(None)  # auto-seeds the ~150 MB public checkpoint
+          if not (rd / "checkpoint").is_dir():
+              print(f"::error::determinism-gate: no checkpoint under {rd} after seed")
+              sys.exit(1)
+          print(f"determinism-gate: reference checkpoint ready at {rd}")
+          PY
+
+      - name: Run PyTorch reference backend twice (fresh processes)
+        env:
+          MIND_NERVE_BITID_REQUIRE: "1"
+        run: |
+          python3 tests/bit_identity/runner.py --backend pytorch --limit 24 --out /tmp/bitid_run1.json
+          python3 tests/bit_identity/runner.py --backend pytorch --limit 24 --out /tmp/bitid_run2.json
+
+      - name: Assert real hashes + byte-identity across runs (fail-closed)
+        run: |
+          python3 - <<'PY'
+          import json, sys
+          r1 = json.load(open('/tmp/bitid_run1.json'))['records']
+          r2 = json.load(open('/tmp/bitid_run2.json'))['records']
+          SENT = {'BACKEND_STUB_NOT_BUILT', 'CUDA_DEFERRED_TO_V0_4_1'}
+          # (1) REQUIRE: every hash must be a real 64-hex digest, never a sentinel.
+          real = 0
+          for rec in r1:
+              for k, v in rec['hashes'].items():
+                  if v in SENT or not (len(v) == 64 and all(c in '0123456789abcdef' for c in v)):
+                      print(f"::error::determinism-gate: non-real hash {v!r} at {rec['id']}/{k} "
+                            f"— runtime not loaded (MIND_NERVE_BITID_REQUIRE=1)")
+                      sys.exit(1)
+                  real += 1
+          # (2) Byte-identity: two fresh processes must produce identical Q16.16 hashes.
+          if len(r1) != len(r2):
+              print(f"::error::determinism-gate: record count mismatch {len(r1)} vs {len(r2)}")
+              sys.exit(1)
+          div = 0
+          for a, b in zip(r1, r2):
+              if a['hashes'] != b['hashes']:
+                  div += 1
+                  print(f"::error::determinism-gate: hash divergence run1!=run2 at {a['id']}")
+          if div:
+              print(f"::error::determinism-gate: {div} diverging records — Q16.16 byte-identity BROKEN")
+              sys.exit(1)
+          print(f"determinism-gate PASS: {len(r1)} queries x {len(r1[0]['hashes'])} positions "
+                f"= {real} real hashes, byte-identical across 2 fresh processes")
+          PY

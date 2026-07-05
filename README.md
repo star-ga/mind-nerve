@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-  <strong>Mind-Nerve</strong> implements a drop-the-decoder + sliding-window encoder design compiled to native Q16.16 fixed-point — the same deterministic architecture as MIND, designed for byte-identical routing output across substrates. The native backend reproduces a pinned bit-identity reference on x86 today; cross-architecture (ARM, GPU) validation is Phase 2 work.
+  <strong>Mind-Nerve</strong> implements a drop-the-decoder + sliding-window encoder design compiled to native Q16.16 fixed-point — the same deterministic architecture as MIND, designed for byte-identical routing output across substrates. The native backend reproduces a pinned bit-identity reference on x86_64, and the underlying MIND Q16.16 substrate is verified byte-identical across x86_64 (AVX2) and ARM64 (NEON) on real hardware; GPU validation is Phase 2 work.
 </p>
 
 <p align="center">
@@ -266,8 +266,8 @@ Phase 2 is being brought up incrementally and is not yet end-to-end.
 The same drop-the-decoder + sliding-window encoder design, compiled to a
 native MIND Q16.16 fixed-point `cdylib` that the wheel loads through a
 C-ABI shim. Goals: remove the PyTorch dependency, close the ≤30 ms-on-CPU
-budget, and prove cross-architecture bit-identity across x86, ARM, CUDA,
-and WebGPU.
+budget, and prove cross-architecture bit-identity across CUDA and WebGPU
+(x86_64 and ARM64 CPU byte-identity already verified on real hardware).
 
 Status, as of commit
 [`b9b6401`](https://github.com/star-ga/mind-nerve/commit/b9b6401)
@@ -282,9 +282,10 @@ Status, as of commit
 - 🚧 Blocked on **mindc Phase 6.2** quantizer + SIMD lowering for the
   full encoder forward; until that lands, the wheel still routes through
   the Phase 1 PyTorch backend by default.
-- 🚧 Cross-architecture bit-identity hardware validation across x86, ARM,
-  CUDA, and WebGPU is the gating step before Phase 2 becomes the
-  default backend.
+- 🚧 Cross-architecture bit-identity hardware validation across CUDA and
+  WebGPU is the gating step before Phase 2 becomes the default backend.
+  x86_64 (AVX2) and ARM64 (NEON) CPU byte-identity is verified on real
+  hardware via the MIND Q16.16 cross-substrate proof.
 
 ## Design constraints
 

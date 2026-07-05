@@ -131,6 +131,19 @@ pub fn sz_H()    -> i64 { 3072    }   // (384,)
 pub fn sz_T()    -> i64 { 2048    }   // (256,)
 pub fn sz_handle() -> i64 { 184   }   // 23 × 8
 
+// ── Minimum weight-blob length (bytes) the encoder is allowed to read. ──
+// The encode path gathers from the embedding block (word/pos/type tables +
+// embedding LayerNorm) followed by all n_layers() layer blocks. The highest
+// address any weight read touches is
+//   wb + emb_block_bytes() + n_layers()*layer_stride_bytes().
+// A blob shorter than this — or a null (address 0) blob — drives the
+// embedding/weight gathers off the end of the mapping (SIGSEGV) or into
+// unrelated heap (silent corruption). mn_encoder_encode rejects both
+// fail-loud before the first dereference (task #52).
+pub fn min_blob_bytes() -> i64 {
+    emb_block_bytes() + n_layers() * layer_stride_bytes()
+}
+
 // ---------------------------------------------------------------------------
 // Handle field accessors.
 // ---------------------------------------------------------------------------
@@ -215,7 +228,31 @@ pub fn mn_encoder_encode(handle: i64, token_ids: i64,
                          n_tokens: i64, out_vec: i64) -> i64 {
     if handle == 0 { return -1; }
 
-    let wb:  i64 = hget(handle, hf_wb());
+    // ── Fail-loud validation of untrusted C-ABI inputs (task #52). ──
+    // weights_blob (captured in the handle at init), its length, and
+    // n_tokens all arrive across the FFI as caller-controlled i64 values.
+    // Dereferencing an unvalidated blob address is an arbitrary-read
+    // primitive; the reproduced crash is a null (address 0) blob, where the
+    // embedding gather issues __mind_load_i64(0) and SIGSEGVs. Validate the
+    // blob address, the blob length, and the sequence length here — before
+    // encode() performs any load — and refuse with a distinct negative code
+    // the ctypes shim surfaces as a RuntimeError. NEVER run the encoder on a
+    // blob that cannot back every weight read.
+    let wb: i64 = hget(handle, hf_wb());
+    if wb == 0 { return -2; }                      // null weight blob
+    let blob_len: i64 = hget(handle, hf_len());
+    if blob_len < min_blob_bytes() { return -3; }  // blob too short -> OOB read
+    if n_tokens < 1 { return -4; }                 // empty / negative seq len
+    // Scratch buffers are sized for max_seq() (256). The sliding-window path
+    // for T > 256 writes window outputs at absolute token positions into a
+    // 256-row global buffer, so a request longer than the scratch capacity
+    // is a heap overflow, not a valid encode. Refuse it fail-loud here.
+    // deferred: to restore the documented 1..512 ABI range, size the global
+    //   merge/output scratch to the true max sequence length (T-sized, not
+    //   max_seq-sized) in mn_encoder_init and encode_sliding, then raise this
+    //   cap. Tracked as the sliding-window scratch-sizing follow-up.
+    if n_tokens > max_seq() { return -5; }         // exceeds scratch capacity
+
     let x:   i64 = hget(handle, hf_x());
     let lo:  i64 = hget(handle, hf_lo());
     let qp:  i64 = hget(handle, hf_qp());

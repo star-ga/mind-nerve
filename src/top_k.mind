@@ -20,7 +20,10 @@
 // tie-break key is the raw RouteId bytes — no re-hashing inside extract_top_k.
 //
 //   for i in 0..num_routes (sequential, ascending index, pinned order):
-//       entry = HeapEntry { score: logits[0, i], route_id: catalog.ids[i] }
+//       entry = HeapEntry { score: logits[0, i], route_id: catalog.ids[i], idx: i }
+//       // `idx` is an inert payload — never part of the comparator key. It
+//       // lets extract_top_k_mask recover a surviving entry's catalog index
+//       // in O(1) instead of re-deriving it by scanning catalog.ids.
 //       if heap.len() < k:
 //           heap.push(entry)                      // O(log k)
 //       else if better(entry, heap.peek_worst()): // strictly beats current worst
@@ -203,6 +206,19 @@ impl UniqueRouteCatalog {
 struct HeapEntry {
     score:    Q16_16,
     route_id: RouteId,   // doubles as tie-break key (RouteId = SHA-256(extid))
+
+    // Original catalog index of this entry (the `i` of `catalog.ids[i]` at
+    // ingest). PURE PAYLOAD — it is carried through the heap so a surviving
+    // entry can name its own position after the drain, and it is NEVER read
+    // by `entry_better`, `lex_lt`, `sift_up` or `sift_down`. The comparator
+    // key remains exactly (score DESC, route_id ASC); adding a field that no
+    // comparison consults cannot change any swap decision, so heap shape,
+    // eviction order and drain order stay bit-identical to the pre-`idx`
+    // implementation. See `extract_top_k_mask` for why it exists.
+    //
+    // Not serialized: HeapEntry is private to this module, never enters the
+    // TopK result, the canonical_result_hash preimage, or the catalog hash.
+    idx:      u32,
 }
 
 // `a` is strictly BETTER than `b` under the contract ordering.
@@ -211,6 +227,10 @@ struct HeapEntry {
 //   3. Equal route_id (which UniqueRouteCatalog forbids) returns false —
 //      neither is "better"; this branch is unreachable in well-formed
 //      inputs but is defined to avoid undefined ordering.
+//
+// The comparator reads ONLY `score` and `route_id`. `HeapEntry.idx` is not
+// part of the ordering key and must never become one — the contract ordering
+// is "score DESC, SHA-256(external_id) ASC" and nothing else.
 @[determinism(BitIdentical)]
 fn entry_better(a: HeapEntry, b: HeapEntry) -> bool {
     if a.score > b.score {
@@ -409,9 +429,12 @@ pub fn extract_top_k(
     for i in 0..num_routes {
         // RouteId IS already SHA-256(external_id), set at catalog load time.
         // No re-hashing inside the hot path — the bytes ARE the tie-break key.
+        // `idx` is inert here (extract_top_k emits route_ids, not positions);
+        // it is populated so both entry points construct the same HeapEntry.
         let entry = HeapEntry {
             score:    logits[0, i],
             route_id: catalog.ids[i],
+            idx:      i as u32,
         };
 
         if heap_len(heap) < effective_k {
@@ -470,14 +493,32 @@ pub fn extract_top_k(
 //   k == 0 or num_routes == 0   -> all-zero mask
 //   k >= num_routes             -> all-ones mask (every route survives)
 //
-// Recovery of original indices from the heap drain is by linear scan
-// over `catalog.ids`. The catalog is `UniqueRouteCatalog`-validated so
-// the SHA-256 comparison is unambiguous. Cost: O(k * num_routes) for
-// the recovery; at the Phase 1 ceiling (k ≤ 64 effective shortlist,
-// num_routes ≤ 10_000) this is well under 0.1 ms — and the cascade is
-// only ever active when MATRYOSHKA_COARSE_DIM < ROUTE_EMBEDDING_DIM,
-// at which point the scoring-head MAC reduction dominates the recovery
-// cost by ~3-4× at the same catalog size.
+// Recovery of original indices from the heap drain is O(1) per surviving
+// entry: each HeapEntry carries the catalog index it was ingested from
+// (`HeapEntry.idx`), so the drain writes `mask[popped.idx] = 1` directly.
+// Total recovery cost is O(k) — no comparison, no hashing, no scan.
+//
+// This replaces the original linear scan over `catalog.ids` (recover the
+// index by finding the RouteId that byte-equals the popped entry), which
+// was O(k * num_routes) 32-byte compares on the PER-REQUEST routing path.
+// That cost was never bounded by measurement, and it is not small: on the
+// live catalog geometry (11_922 routes) with the cascade's coarse
+// shortlist k_coarse = K_COARSE_MULTIPLIER * k, the recovery scan issued
+//
+//     k_coarse =  16  ->    110_009 route_id_eq calls (   110_913 byte cmp)
+//     k_coarse =  64  ->    365_251 route_id_eq calls (   368_641 byte cmp)
+//     k_coarse = 256  ->  1_518_727 route_id_eq calls ( 1_532_572 byte cmp)
+//
+// per routing query. All of it is now zero: the index is already known at
+// ingest, so recovering it by re-deriving it from the key was pure waste.
+//
+// Determinism: `idx` is an inert HeapEntry payload. `entry_better` reads
+// only (score, route_id), so no swap decision, heap shape, eviction, or
+// drain order changes — the emitted mask is byte-identical to the linear-
+// scan implementation for every input, including all-tied score corpora
+// where the route_id lex tie-break is the sole discriminator. The pinned
+// reduction order (ascending-r ingest, strict-better eviction, lex
+// tie-break) is untouched.
 @[determinism(BitIdentical)]
 pub fn extract_top_k_mask(
     logits:  tensor<Q16_16, [batch, num_routes]>,
@@ -519,6 +560,7 @@ pub fn extract_top_k_mask(
         let entry = HeapEntry {
             score:    logits[0, i],
             route_id: catalog.ids[i],
+            idx:      i as u32,
         };
         if heap_len(heap) < effective_k {
             heap_push(&mut heap, entry);
@@ -527,36 +569,22 @@ pub fn extract_top_k_mask(
         }
     }
 
-    // Drain the heap into the mask. For each surviving entry, recover
-    // its original index by linear scan over catalog.ids and flip the
-    // matching position. UniqueRouteCatalog forbids duplicate sha,
-    // so the first match is unique.
+    // Drain the heap into the mask. Each surviving entry already knows the
+    // catalog index it was ingested from, so the flip is a direct store —
+    // O(1) per entry, O(k) total, no comparison against catalog.ids.
+    //
+    // The drain still pops in the pinned worst-first order (unchanged); only
+    // the index recovery changed. `idx` is bounded by `num_routes` because it
+    // is only ever assigned `i` from the `0..num_routes` ingest loop above.
     let n_out = heap_len(heap);
     let mut s: usize = 0;
     while s < n_out as usize {
         let popped = heap_pop_worst(&mut heap);
-        let mut j: usize = 0;
-        while j < num_routes {
-            if route_id_eq(popped.route_id, catalog.ids[j]) {
-                mask[j] = 1u8;
-                break;
-            }
-            j = j + 1;
-        }
+        mask[popped.idx as usize] = 1u8;
         s = s + 1;
     }
 
     return mask;
-}
-
-// Byte-equality on the 32-byte RouteId. Used by `extract_top_k_mask`
-// to recover the original route index after a heap drain.
-@[determinism(BitIdentical)]
-fn route_id_eq(a: [u8; 32], b: [u8; 32]) -> bool {
-    for i in 0..32 {
-        if a[i] != b[i] { return false; }
-    }
-    true
 }
 
 // ---------------------------------------------------------------------------

@@ -36,6 +36,10 @@ use crate::mind_nerve::inference::{
     RouteId,
     TopK,
 };
+// RFC-008 coarse shortlist mask. Not re-exported through `inference` (the
+// cascade calls it qualified as `top_k::extract_top_k_mask`), so §9's tests
+// take it from its defining module.
+use crate::mind_nerve::top_k::extract_top_k_mask;
 use crate::mind_nerve::Q16_16;
 
 // ---------------------------------------------------------------------------
@@ -529,6 +533,246 @@ fn test_top_k_ulp_equal_scores_tiebreak() {
     assert_eq!(result.ids.len(), 1);
     assert_eq!(result.ids[0], route_id_of("ulp_route_b"),
                "ulp_route_b wins tie-break: SHA-256('ulp_route_b') < SHA-256('ulp_route_a')");
+}
+
+// ---------------------------------------------------------------------------
+// Section 9: extract_top_k_mask (RFC-008 Matryoshka coarse shortlist)
+// ---------------------------------------------------------------------------
+//
+// The mask path selects the SAME set of routes as extract_top_k over the same
+// (logits, catalog, k) — it just reports them positionally instead of by
+// RouteId. Since the surviving entry's catalog index is carried through the
+// heap as an inert HeapEntry payload (never a comparator key), the mask must
+// be byte-identical to "flip the index of every id extract_top_k returns".
+// These tests pin exactly that equivalence, with the all-tied corpus as the
+// adversarial case: there, the route_id lex tie-break is the SOLE
+// discriminator, so any perturbation of the pinned order shows up as a
+// different mask.
+
+// mask_popcount: number of selected routes in a shortlist mask.
+fn mask_popcount(mask: [u8]) -> usize {
+    let mut c: usize = 0;
+    let mut i: usize = 0;
+    while i < mask.len() {
+        if mask[i] == 1u8 { c = c + 1; }
+        i = i + 1;
+    }
+    c
+}
+
+// index_of_route: position of `external_id` in the catalog fixture's id list.
+fn index_of_route(ids: [str], external_id: str) -> usize {
+    let mut i: usize = 0;
+    while i < ids.len() {
+        if ids[i] == external_id { return i; }
+        i = i + 1;
+    }
+    ids.len()  // not found — callers assert against a known-present id
+}
+
+#[test]
+fn test_top_k_mask_basic_k3() {
+    // Descending scores, no ties: the top 3 are exactly indices 0,1,2.
+    let scores = [9,8,7,6,5,4,3,2,1,0].map(|v| q16(v));
+    let ids    = ["route_0","route_1","route_2","route_3","route_4",
+                  "route_5","route_6","route_7","route_8","route_9"];
+    let catalog = make_catalog(ids, scores);
+
+    let mask: [u8] = extract_top_k_mask(scores_tensor(scores), catalog, 3);
+
+    assert_eq!(mask.len(), 10);
+    assert_eq!(mask_popcount(mask), 3);
+    assert_eq!(mask[0], 1u8);
+    assert_eq!(mask[1], 1u8);
+    assert_eq!(mask[2], 1u8);
+    for i in 3..10 {
+        assert_eq!(mask[i], 0u8, "route outside the top-3 must not be shortlisted");
+    }
+}
+
+#[test]
+fn test_top_k_mask_selects_by_score_not_position() {
+    // Scores are NOT monotone in index — the mask must follow the score
+    // ordering, not the catalog order. Highest three: idx 4 (9), idx 1 (7),
+    // idx 6 (6).
+    let scores = [1,7,0,3,9,2,6,4].map(|v| q16(v));
+    let ids    = ["r0","r1","r2","r3","r4","r5","r6","r7"];
+    let catalog = make_catalog(ids, scores);
+
+    let mask: [u8] = extract_top_k_mask(scores_tensor(scores), catalog, 3);
+
+    assert_eq!(mask_popcount(mask), 3);
+    assert_eq!(mask[4], 1u8, "score 9 at index 4 must be shortlisted");
+    assert_eq!(mask[1], 1u8, "score 7 at index 1 must be shortlisted");
+    assert_eq!(mask[6], 1u8, "score 6 at index 6 must be shortlisted");
+    assert_eq!(mask[0], 0u8);
+    assert_eq!(mask[2], 0u8);
+    assert_eq!(mask[3], 0u8);
+    assert_eq!(mask[5], 0u8);
+    assert_eq!(mask[7], 0u8);
+}
+
+#[test]
+fn test_top_k_mask_k_zero() {
+    // k == 0 -> all-zero mask, length preserved. No heap traversal.
+    let scores = [3,2,1].map(|v| q16(v));
+    let ids    = ["a","b","c"];
+    let catalog = make_catalog(ids, scores);
+
+    let mask: [u8] = extract_top_k_mask(scores_tensor(scores), catalog, 0);
+
+    assert_eq!(mask.len(), 3);
+    assert_eq!(mask_popcount(mask), 0);
+}
+
+#[test]
+fn test_top_k_mask_empty_catalog() {
+    // Empty catalog -> empty mask, regardless of k.
+    let scores: [Q16_16] = [];
+    let ids:    [str]    = [];
+    let catalog = make_catalog(ids, scores);
+
+    let mask: [u8] = extract_top_k_mask(scores_tensor(scores), catalog, 5);
+
+    assert_eq!(mask.len(), 0);
+}
+
+#[test]
+fn test_top_k_mask_k_equals_n_all_ones() {
+    // k == num_routes -> every route survives (short-circuit path).
+    let scores = [5,4,3,2].map(|v| q16(v));
+    let ids    = ["a","b","c","d"];
+    let catalog = make_catalog(ids, scores);
+
+    let mask: [u8] = extract_top_k_mask(scores_tensor(scores), catalog, 4);
+
+    assert_eq!(mask.len(), 4);
+    assert_eq!(mask_popcount(mask), 4);
+}
+
+#[test]
+fn test_top_k_mask_k_exceeds_n_saturates_all_ones() {
+    // k > num_routes saturates: all-ones, no out-of-bounds mask write.
+    let scores = [5,4,3].map(|v| q16(v));
+    let ids    = ["a","b","c"];
+    let catalog = make_catalog(ids, scores);
+
+    let mask: [u8] = extract_top_k_mask(scores_tensor(scores), catalog, 99);
+
+    assert_eq!(mask.len(), 3);
+    assert_eq!(mask_popcount(mask), 3);
+}
+
+#[test]
+fn test_top_k_mask_single_route_k1() {
+    let scores = [q16(42)];
+    let ids    = ["solo"];
+    let catalog = make_catalog(ids, scores);
+
+    let mask: [u8] = extract_top_k_mask(scores_tensor(scores), catalog, 1);
+
+    assert_eq!(mask.len(), 1);
+    assert_eq!(mask[0], 1u8);
+}
+
+#[test]
+fn test_top_k_mask_all_tied_tiebreak_by_route_id() {
+    // ALL scores identical -> the SHA-256 route_id lex tie-break is the only
+    // discriminator. All-tied ascending order (file header): d < c < b < e < a.
+    // k=2 must therefore shortlist exactly "d" and "c" — by their CATALOG
+    // POSITIONS, which is the thing index recovery has to get right.
+    //
+    // Catalog order below is deliberately NOT the tie-break order, so a mask
+    // that flipped the wrong positions (e.g. the first k indices) would fail.
+    let s = q16(7);
+    let scores = [s, s, s, s, s];
+    let ids    = ["a", "b", "c", "d", "e"];
+    let catalog = make_catalog(ids, scores);
+
+    let mask: [u8] = extract_top_k_mask(scores_tensor(scores), catalog, 2);
+
+    assert_eq!(mask_popcount(mask), 2);
+    assert_eq!(mask[index_of_route(ids, "d")], 1u8,
+               "d has the lowest SHA-256 and must win the all-tied tie-break");
+    assert_eq!(mask[index_of_route(ids, "c")], 1u8,
+               "c has the second-lowest SHA-256");
+    assert_eq!(mask[index_of_route(ids, "a")], 0u8,
+               "a has the highest SHA-256 and must lose the all-tied tie-break");
+    assert_eq!(mask[index_of_route(ids, "b")], 0u8);
+    assert_eq!(mask[index_of_route(ids, "e")], 0u8);
+}
+
+#[test]
+fn test_top_k_mask_tiebreak_two_tied_one_clear() {
+    // One clear winner + two tied runners-up. k=2 takes the clear winner and
+    // the tie-break winner of the tied pair.
+    // SHA-256("banana") = b493d483... , SHA-256("zebra") = 676cb750...
+    // 676c... < b493..., so "zebra" wins the tie against "banana".
+    let scores = [q16(9), q16(5), q16(5)];
+    let ids    = ["apple", "banana", "zebra"];
+    let catalog = make_catalog(ids, scores);
+
+    let mask: [u8] = extract_top_k_mask(scores_tensor(scores), catalog, 2);
+
+    assert_eq!(mask_popcount(mask), 2);
+    assert_eq!(mask[0], 1u8, "apple (score 9) is the clear winner");
+    assert_eq!(mask[2], 1u8, "zebra wins the 5-5 tie: SHA-256('zebra') < SHA-256('banana')");
+    assert_eq!(mask[1], 0u8, "banana loses the tie-break");
+}
+
+#[test]
+fn test_top_k_mask_agrees_with_extract_top_k() {
+    // THE EQUIVALENCE that index recovery must preserve: the set of routes
+    // the mask flips is exactly the set of RouteIds extract_top_k returns,
+    // at the same catalog positions. Carrying the index through the heap
+    // (rather than re-deriving it by scanning catalog.ids) may not change
+    // this for any input.
+    let scores = [4, 9, 1, 9, 7, 2, 7, 0].map(|v| q16(v));
+    let ids    = ["r0","r1","r2","r3","r4","r5","r6","r7"];
+    let catalog = make_catalog(ids, scores);
+    let k: u32 = 4;
+
+    let top:  TopK  = extract_top_k(scores_tensor(scores), catalog, k);
+    let mask: [u8]  = extract_top_k_mask(scores_tensor(scores), catalog, k);
+
+    assert_eq!(mask_popcount(mask), top.ids.len(),
+               "mask popcount must equal the number of top-K survivors");
+
+    // Every RouteId extract_top_k returned must be flipped in the mask at its
+    // own catalog index — and nothing else may be.
+    for t in 0..top.ids.len() {
+        let mut found: bool = false;
+        for r in 0..ids.len() {
+            if top.ids[t] == route_id_of(ids[r]) {
+                assert_eq!(mask[r], 1u8,
+                           "route selected by extract_top_k must be set in the mask");
+                found = true;
+            }
+        }
+        assert!(found, "every top-K RouteId must exist in the catalog");
+    }
+}
+
+#[test]
+fn test_top_k_mask_determinism_100_runs() {
+    // Bit-identity: 100 invocations over a tie-heavy catalog must produce the
+    // exact same mask every time. Ties dominate, so this exercises the pinned
+    // heap order end-to-end (ingest -> eviction -> drain -> index recovery).
+    let s = q16(3);
+    let scores = [s, q16(9), s, s, q16(9), s, s, s];
+    let ids    = ["r0","r1","r2","r3","r4","r5","r6","r7"];
+    let catalog = make_catalog(ids, scores);
+
+    let reference: [u8] = extract_top_k_mask(scores_tensor(scores), catalog, 4);
+
+    for _ in 0..100 {
+        let mask: [u8] = extract_top_k_mask(scores_tensor(scores), catalog, 4);
+        assert_eq!(mask.len(), reference.len());
+        for i in 0..reference.len() {
+            assert_eq!(mask[i], reference[i],
+                       "extract_top_k_mask must be bit-identical across runs");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

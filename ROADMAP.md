@@ -560,6 +560,37 @@ the format-translator is a hub concern, not a router concern).
   pass feeding existing route scoring. First step: confirm the router exposes a
   score the fingerprint features can modulate (the confidence sidecar above).
 
+## Runtime-Served Workflow Guides (delivery model)
+
+> Prior-art shape observed (a public agent-driven CLI that serves versioned
+> workflow guides on demand instead of baking a static prompt into the client).
+> Idea only, source unnamed — same treatment as the other steal-list entries.
+
+Today the federation has a **surfacing/drift gap**: the hub carries ~1300 skills
+but only ~150 are surfaced by default (alphabetical), and any workflow guidance
+baked into a client's static prompt drifts from the installed skill version. The
+shape worth adopting: a **thin install stub** (~50 lines) teaches the agent to
+*fetch the guide at runtime* (`<cli> skills get <name>`) so **the served content
+always matches the installed version** — the CLI serves the guide, not the prompt.
+
+- **Where it sits (invariant-preserving):** this is a **delivery/packaging** concern
+  layered *on top of* deterministic routing — mind-nerve still routes intent→skill
+  over the governed local table + first-party trust root; the guide-fetch is a
+  separate step the router *points at*, never a load-bearing key in the route-table
+  lookup and **excluded from any identity hash**. Same intent in → same route out;
+  the served guide is versioned by the installed skill, not by the router.
+- **Fixes the drift, not the routing:** the router already picks the right skill;
+  this makes the *guidance* the sub-agent then reads match the version actually
+  installed, closing the "prompt says v2, skill is v3" gap. Complements the
+  hub-deploys / SkillsMP-discovers / mind-nerve-routes federation split — this is
+  the fourth leg (**served-on-demand**), not a second router.
+- **Governance boundary:** the guide comes from the **governed hub** (first-party
+  trust root), never an ungoverned aggregator; the stub carries no logic beyond
+  "fetch the current guide by name," so there is no second policy surface to audit.
+- **Status:** Planned. Self-contained, no new dependency — a stub + a `skills get`
+  fetch path over the existing hub. First step: decide whether the guide lives as a
+  hub artifact keyed by skill+version, and confirm the stub stays trust-root-scoped.
+
 ## Pure-MIND Self-Hosting Migration
 
 > Ecosystem-wide milestone — gated on the `mind` compiler reaching self-host completeness.

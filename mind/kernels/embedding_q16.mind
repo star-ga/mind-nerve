@@ -19,13 +19,15 @@
 //
 // No f32. No while. No luts needed (pure gather + add).
 
-use std.vec;
+import std.vec;
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-pub fn hidden_dim() -> i64 { 384 }
+pub fn hidden_dim() -> i64 {
+    384
+}
 
 // ---------------------------------------------------------------------------
 // Gather one embedding row into dst starting at dst_offset.
@@ -36,9 +38,10 @@ pub fn hidden_dim() -> i64 { 384 }
 // H:       hidden dimension.
 // Tail-recursive over j = 0..H-1.
 // ---------------------------------------------------------------------------
-pub fn gather_row_j(table: i64, idx: i64, dst: i64, t_off: i64,
-                    H: i64, j: i64) -> i64 {
-    if j >= H { return 0; }
+pub fn gather_row_j(table: i64, idx: i64, dst: i64, t_off: i64, H: i64, j: i64) -> i64 {
+    if j >= H {
+        return 0;
+    }
     let src_val: i64 = __mind_load_i64(table + (idx * H + j) * 8);
     __mind_store_i64(dst + t_off + j * 8, src_val);
     gather_row_j(table, idx, dst, t_off, H, j + 1)
@@ -50,9 +53,10 @@ pub fn gather_row_j(table: i64, idx: i64, dst: i64, t_off: i64,
 // out_base: output row base address.
 // H: hidden dim. Tail-recursive over j.
 // ---------------------------------------------------------------------------
-pub fn emb_add3_j(a_base: i64, b_base: i64, c_base: i64,
-                  out_base: i64, H: i64, j: i64) -> i64 {
-    if j >= H { return 0; }
+pub fn emb_add3_j(a_base: i64, b_base: i64, c_base: i64, out_base: i64, H: i64, j: i64) -> i64 {
+    if j >= H {
+        return 0;
+    }
     let a: i64 = __mind_load_i64(a_base + j * 8);
     let b: i64 = __mind_load_i64(b_base + j * 8);
     let c: i64 = __mind_load_i64(c_base + j * 8);
@@ -73,14 +77,13 @@ pub fn emb_add3_j(a_base: i64, b_base: i64, c_base: i64,
 // tmp_type:    (T, 384)     scratch buffer for type embeddings.
 // out:         (T, 384)     Q16.16 output.
 // ---------------------------------------------------------------------------
-pub fn embed_token_t(token_ids: i64, type_ids: i64,
-                     word_table: i64, pos_table: i64, type_table: i64,
-                     tmp_word: i64, tmp_pos: i64, tmp_type: i64,
-                     out: i64, T: i64, H: i64, t: i64) -> i64 {
-    if t >= T { return 0; }
-    let t_off: i64     = t * H * 8;
-    let tok_id: i64    = __mind_load_i64(token_ids + t * 8);
-    let type_id: i64   = __mind_load_i64(type_ids + t * 8);
+pub fn embed_token_t(token_ids: i64, type_ids: i64, word_table: i64, pos_table: i64, type_table: i64, tmp_word: i64, tmp_pos: i64, tmp_type: i64, out: i64, T: i64, H: i64, t: i64) -> i64 {
+    if t >= T {
+        return 0;
+    }
+    let t_off: i64 = t * H * 8;
+    let tok_id: i64 = __mind_load_i64(token_ids + t * 8);
+    let type_id: i64 = __mind_load_i64(type_ids + t * 8);
     // Gather word embedding
     gather_row_j(word_table, tok_id, tmp_word, t_off, H, 0);
     // Gather position embedding (position = t)
@@ -88,12 +91,8 @@ pub fn embed_token_t(token_ids: i64, type_ids: i64,
     // Gather token-type embedding
     gather_row_j(type_table, type_id, tmp_type, t_off, H, 0);
     // Three-way add into out
-    emb_add3_j(tmp_word + t_off, tmp_pos + t_off, tmp_type + t_off,
-               out + t_off, H, 0);
-    embed_token_t(token_ids, type_ids,
-                  word_table, pos_table, type_table,
-                  tmp_word, tmp_pos, tmp_type,
-                  out, T, H, t + 1)
+    emb_add3_j(tmp_word + t_off, tmp_pos + t_off, tmp_type + t_off, out + t_off, H, 0);
+    embed_token_t(token_ids, type_ids, word_table, pos_table, type_table, tmp_word, tmp_pos, tmp_type, out, T, H, t + 1)
 }
 
 // ---------------------------------------------------------------------------
@@ -104,12 +103,6 @@ pub fn embed_token_t(token_ids: i64, type_ids: i64,
 // tmp_{word,pos,type}: (T, 384) scratch.
 // out: (T, 384) Q16.16 output.
 // ---------------------------------------------------------------------------
-pub fn embedding_lookup(token_ids: i64, type_ids: i64,
-                        word_table: i64, pos_table: i64, type_table: i64,
-                        tmp_word: i64, tmp_pos: i64, tmp_type: i64,
-                        out: i64, T: i64) -> i64 {
-    embed_token_t(token_ids, type_ids,
-                  word_table, pos_table, type_table,
-                  tmp_word, tmp_pos, tmp_type,
-                  out, T, hidden_dim(), 0)
+pub fn embedding_lookup(token_ids: i64, type_ids: i64, word_table: i64, pos_table: i64, type_table: i64, tmp_word: i64, tmp_pos: i64, tmp_type: i64, out: i64, T: i64) -> i64 {
+    embed_token_t(token_ids, type_ids, word_table, pos_table, type_table, tmp_word, tmp_pos, tmp_type, out, T, hidden_dim(), 0)
 }

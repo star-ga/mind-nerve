@@ -40,11 +40,13 @@
 // __mind_nerve_lut_rsqrt_h is resolved at .so link time (same MIND<->C
 // bare-name convention as __mind_alloc / the score-path BLAS shims).
 
-use luts.sqrt_q16;
+import luts.sqrt_q16;
 
 pub fn rsqrt_q16(x: i64) -> i64 {
     let q16_max: i64 = 2147483647;
-    if x <= 0 { return q16_max; }
+    if x <= 0 {
+        return q16_max;
+    }
     let h: i64 = __mind_nerve_lut_rsqrt_h();
     rsqrt_q16_newton(h, x)
 }

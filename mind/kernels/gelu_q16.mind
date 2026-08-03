@@ -31,16 +31,24 @@
 //
 // No f32. No while. LUT import: luts.tanh_q16 (resolved at link via A1.1).
 
-use luts.tanh_q16;
+import luts.tanh_q16;
 
 // ---------------------------------------------------------------------------
 // Q16.16 constants
 // ---------------------------------------------------------------------------
 
-pub fn q16_one() -> i64    { 65536 }
-pub fn half_q16() -> i64   { 32768 }
-pub fn c044715_q16() -> i64 { 2931 }
-pub fn sqrt2pi_q16() -> i64 { 52274 }
+pub fn q16_one() -> i64 {
+    65536
+}
+pub fn half_q16() -> i64 {
+    32768
+}
+pub fn c044715_q16() -> i64 {
+    2931
+}
+pub fn sqrt2pi_q16() -> i64 {
+    52274
+}
 
 // ---------------------------------------------------------------------------
 // Pointwise GELU on a single Q16.16 value.
@@ -71,9 +79,11 @@ pub fn gelu_scalar(x: i64) -> i64 {
 // Tail-recursive over index idx = 0..n-1. In-place (out may alias buf).
 // ---------------------------------------------------------------------------
 pub fn gelu_vec_loop(buf: i64, out: i64, n: i64, idx: i64) -> i64 {
-    if idx >= n { return 0; }
-    let xv: i64  = __mind_load_i64(buf + idx * 8);
-    let yv: i64  = gelu_scalar(xv);
+    if idx >= n {
+        return 0;
+    }
+    let xv: i64 = __mind_load_i64(buf + idx * 8);
+    let yv: i64 = gelu_scalar(xv);
     __mind_store_i64(out + idx * 8, yv);
     gelu_vec_loop(buf, out, n, idx + 1)
 }

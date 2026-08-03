@@ -25,7 +25,7 @@
 //
 // No f32. No new heap allocations. Single extern call per outer iteration.
 
-use std.vec;
+import std.vec;
 
 // ---------------------------------------------------------------------------
 // C-ABI calls into mind/runtime/blas_shims_i64.c (statically linked into

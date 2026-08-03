@@ -49,13 +49,17 @@
 //
 // No f32. No while. No luts.
 
-use std.vec;
+import std.vec;
 
 // ---------------------------------------------------------------------------
 // Constants: window size, stride.
 // ---------------------------------------------------------------------------
-pub fn win_size() -> i64   { 256 }
-pub fn win_stride() -> i64 { 192 }
+pub fn win_size() -> i64 {
+    256
+}
+pub fn win_stride() -> i64 {
+    192
+}
 
 // ---------------------------------------------------------------------------
 // Number of windows needed to cover T tokens.
@@ -65,12 +69,16 @@ pub fn win_stride() -> i64 { 192 }
 // Tail-recursive count: count_wins(start, T).
 // ---------------------------------------------------------------------------
 pub fn count_wins_loop(start: i64, T: i64, n: i64) -> i64 {
-    if start >= T { return n; }
+    if start >= T {
+        return n;
+    }
     count_wins_loop(start + win_stride(), T, n + 1)
 }
 
 pub fn win_count(T: i64) -> i64 {
-    if T == 0 { return 0; }
+    if T == 0 {
+        return 0;
+    }
     count_wins_loop(0, T, 0)
 }
 
@@ -86,7 +94,9 @@ pub fn win_start(n: i64) -> i64 {
 // ---------------------------------------------------------------------------
 pub fn win_end(n: i64, T: i64) -> i64 {
     let e: i64 = win_start(n) + win_size();
-    if e > T { return T; }
+    if e > T {
+        return T;
+    }
     e
 }
 
@@ -121,15 +131,18 @@ pub fn winning_window_index(t: i64) -> i64 {
 // src and dst are (T, H) flat buffers; H = hidden_dim = 384.
 // Tail-recursive over t.
 // ---------------------------------------------------------------------------
-pub fn copy_slice_t(src: i64, dst: i64, H: i64,
-                    t_start: i64, t_end: i64, t: i64) -> i64 {
-    if t >= t_end { return 0; }
+pub fn copy_slice_t(src: i64, dst: i64, H: i64, t_start: i64, t_end: i64, t: i64) -> i64 {
+    if t >= t_end {
+        return 0;
+    }
     copy_slice_j(src, dst, H, t, 0);
     copy_slice_t(src, dst, H, t_start, t_end, t + 1)
 }
 
 pub fn copy_slice_j(src: i64, dst: i64, H: i64, t: i64, j: i64) -> i64 {
-    if j >= H { return 0; }
+    if j >= H {
+        return 0;
+    }
     let v: i64 = __mind_load_i64(src + (t * H + j) * 8);
     __mind_store_i64(dst + (t * H + j) * 8, v);
     copy_slice_j(src, dst, H, t, j + 1)
@@ -144,16 +157,18 @@ pub fn copy_slice_j(src: i64, dst: i64, H: i64, t: i64, j: i64) -> i64 {
 // global_out: (T, H) flat output buffer (token t's slot at global_out +
 //              t*H*8 corresponds to win_out offset (t - t_start)*H*8).
 // ---------------------------------------------------------------------------
-pub fn merge_window_t(win_out: i64, global_out: i64, H: i64,
-                      t_start: i64, t_end: i64, t: i64) -> i64 {
-    if t >= t_end { return 0; }
+pub fn merge_window_t(win_out: i64, global_out: i64, H: i64, t_start: i64, t_end: i64, t: i64) -> i64 {
+    if t >= t_end {
+        return 0;
+    }
     merge_window_j(win_out, global_out, H, t_start, t, 0);
     merge_window_t(win_out, global_out, H, t_start, t_end, t + 1)
 }
 
-pub fn merge_window_j(win_out: i64, global_out: i64, H: i64,
-                      t_start: i64, t: i64, j: i64) -> i64 {
-    if j >= H { return 0; }
+pub fn merge_window_j(win_out: i64, global_out: i64, H: i64, t_start: i64, t: i64, j: i64) -> i64 {
+    if j >= H {
+        return 0;
+    }
     let local_t: i64 = t - t_start;
     let v: i64 = __mind_load_i64(win_out + (local_t * H + j) * 8);
     __mind_store_i64(global_out + (t * H + j) * 8, v);

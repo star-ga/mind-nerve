@@ -42,7 +42,7 @@ dependencies = [
 mcp = ["mcp>=1.27.1"]
 dev = [
     "pytest>=9.0.3",
-    "ruff>=0.5",
+    "ruff>=0.16.1",
     "build>=1.0",
     "pytest-cov>=4.1",
     "mypy>=1.8",

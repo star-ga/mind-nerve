@@ -234,9 +234,11 @@ scoring head**. The decoder is dropped entirely; the encoder uses
 sliding-window self-attention (window 256 tokens, stride 192) and writes a
 pooled query vector that is dot-producted against the precomputed catalog
 embedding table to produce the top-K routes. Top-K extraction is
-deterministic on a given backend: the spec contract breaks ties by ascending
-SHA-256(route_id) (implemented in the Python scoring path); the native
-Q16.16 top-K currently breaks ties by ascending route index. Cross-architecture
+deterministic: both backends break ties by ascending SHA-256(route_id),
+matching the spec contract — the Python scoring path
+(`python/mind_nerve/inference.py`) and the native Q16.16 top-K
+(`src/top_k.mind`) share the same score-descending,
+SHA-256(route_id)-ascending ordering. Cross-architecture
 (x86 / ARM / CUDA) identity of the ranking is the Phase 2 gate and is not
 yet hardware-validated. The authoritative
 design is [`spec/architecture.md`](spec/architecture.md).

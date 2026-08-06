@@ -36,7 +36,7 @@ the pure-Python backend automatically.
   the fallback. Install on any OS: `pip install mind-nerve`.
 
 Determinism note: the **native** Q16.16 path is the strict-determinism one
-(integer-only, no float; the native top-K breaks ties by ascending route index).
+(integer-only, no float; the native top-K breaks ties by ascending SHA-256(route_id)).
 It reproduces a pinned bit-identity reference on x86; cross-substrate (ARM/GPU)
 bit-identity is the Phase 2 gate and is not yet hardware-validated. The
 pure-Python fallback uses float32 and the SHA-256 deterministic top-K, so it is

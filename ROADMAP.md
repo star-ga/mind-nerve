@@ -566,7 +566,7 @@ the format-translator is a hub concern, not a router concern).
 > workflow guides on demand instead of baking a static prompt into the client).
 > Idea only, source unnamed — same treatment as the other steal-list entries.
 
-Today the federation has a **surfacing/drift gap**: the hub carries ~1300 skills
+Today the federation has a **surfacing/drift gap**: the hub carries ~1,374 skills
 but only ~150 are surfaced by default (alphabetical), and any workflow guidance
 baked into a client's static prompt drifts from the installed skill version. The
 shape worth adopting: a **thin install stub** (~50 lines) teaches the agent to

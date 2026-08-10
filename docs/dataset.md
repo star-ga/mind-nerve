@@ -7,7 +7,10 @@ and routes against. It is the contract between the corpus, the trainer
 The Phase-1 public-clean catalog shipped with the
 [`star-ga/mind-nerve`](https://huggingface.co/star-ga/mind-nerve)
 weights is **`route_table.jsonl` v1.0**: **11,922 routes**, frozen and
-signed.
+**draft-unsigned** — the `manifest.sig` HMAC is a placeholder pending an
+operator signature with the real root key. The freeze is reproducible and
+hash-anchored (`SHA256SUMS` + manifest), i.e. **tamper-evident, not signed**;
+see [`catalog_freezes/v1.0.md`](./catalog_freezes/v1.0.md).
 
 ## Files
 

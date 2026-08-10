@@ -15,7 +15,7 @@ Q16.16 backend is in progress and not yet end-to-end (see
 | Base model | `BAAI/bge-small-en-v1.5` |
 | Backend | PyTorch + `sentence-transformers` |
 | Training objective | `MultipleNegativesRankingLoss` over `(name, body)` positive pairs |
-| Catalog | `route_table.jsonl` v1.0 (11,922 routes, frozen and signed) |
+| Catalog | `route_table.jsonl` v1.0 (11,922 routes, frozen; **draft-unsigned** — the `manifest.sig` HMAC is a placeholder, see [catalog_freezes/v1.0.md](./catalog_freezes/v1.0.md)) |
 | License (code) | Apache-2.0 |
 | License (weights) | Apache-2.0 |
 | Released | 2026 |

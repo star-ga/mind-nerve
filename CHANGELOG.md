@@ -6,12 +6,19 @@ All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](htt
 
 ### Feat — CLI integrations: per-prompt routing hook (reachable hub without the announce cost)
 
-A hub of ~1,380 skills symlinked into a CLI's skills directory is bulk-announced
+A hub of ~1,374 skills symlinked into a CLI's skills directory is bulk-announced
 into every session. Measured on the STARGA hub: 1,374 indexable `SKILL.md` files,
-380,446 bytes of name + description, **≈95k tokens per announce, per CLI, per
-session**. The new `integrations/` subsystem makes a hub of that size *reachable*
-without it being *announced*, in three parts — all three are needed, each alone
-leaves a real gap.
+378.5–382.9 kB of `name` + `description` frontmatter (the spread is whitespace
+handling — folding continuation lines vs. keeping them), **≈95k tokens per
+announce, per CLI, per session**. Loading every skill *body* instead would be
+~3.3 M tokens, roughly 16x a 200k context window — so routing is the only viable
+design, not merely the cheaper one. The new `integrations/` subsystem makes a hub
+of that size *reachable* without it being *announced*, in three parts — all three
+are needed, each alone leaves a real gap.
+
+> Measurement note: count the description by folding continuation lines. A
+> naive `^description:\s*(.+)$` truncates multi-line descriptions at the first
+> newline and under-reports the announce cost by ~40% (≈56k, not ≈95k).
 
 - **Structural** (`installer/src/skills_dir.ts`). The CLI's skills directory
   becomes a real directory holding only `mind-nerve-router`, dropping announce

@@ -7,11 +7,13 @@ stays *reachable* without being *announced*.
 
 A hub of ~1,374 skills symlinked into a CLI's skills directory is bulk-announced
 into every session. Re-measured 2026-08-10: the `name` + `description`
-frontmatter across 1,374 parseable `SKILL.md` files is **378,508 chars ≈ 95k
-tokens per announce**, per CLI, per session. (An earlier figure of ~115k was an
-over-estimate; a `^description:\s*(.+)$` measurement is also wrong in the other
-direction — it truncates multi-line descriptions at the first newline and
-under-reports by ~40%. Fold continuation lines before counting.) Loading every
+frontmatter across 1,374 parseable `SKILL.md` files is **378.5–382.9 kB ≈ 95k
+tokens per announce**, per CLI, per session (the spread is whitespace handling —
+folding continuation lines vs. keeping them; the token figure is stable either
+way). An earlier figure of ~115k was an over-estimate; a `^description:\s*(.+)$`
+measurement is wrong in the other direction — it truncates multi-line
+descriptions at the first newline and under-reports by ~40% (≈56k). Fold
+continuation lines before counting. Loading every
 skill *body* would be ~3.3 M tokens, roughly 16x a 200k context window — which
 is the sharper reason routing is the only viable design, not merely the cheaper
 one.

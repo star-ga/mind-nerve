@@ -128,9 +128,7 @@ def handle(msg: dict[str, Any]) -> dict[str, Any] | None:
             # is strictly better than returning plausible routes from a
             # different catalog: the caller can see the router is down, whereas
             # a silent second catalog is indistinguishable from a working one.
-            sys.stderr.write(
-                f"[mind-nerve-mcp] route daemon unavailable: {exc}\n"
-            )
+            sys.stderr.write(f"[mind-nerve-mcp] route daemon unavailable: {exc}\n")
             body = json.dumps(
                 {
                     "query": query,

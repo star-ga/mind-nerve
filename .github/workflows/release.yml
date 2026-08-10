@@ -32,7 +32,7 @@ jobs:
       wheel: ${{ steps.dist.outputs.wheel }}
       sdist: ${{ steps.dist.outputs.sdist }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v7
         with:

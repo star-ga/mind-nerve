@@ -43,7 +43,7 @@ jobs:
     name: pip-audit (vulnerability scan)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
@@ -97,7 +97,7 @@ jobs:
     name: bandit (static security lint)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
@@ -130,7 +130,7 @@ jobs:
     container:
       image: semgrep/semgrep:latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Run Semgrep
         run: |
           # Semgrep p/ci+p/python is an advisory semantic scan; findings are
@@ -152,7 +152,7 @@ jobs:
     name: SBOM (CycloneDX from requirements.lock)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"

@@ -184,7 +184,22 @@ SKILL_PATTERNS = [
     (re.compile(r"\.cursorrules$", re.I), "rule"),
     (re.compile(r"\.mdc$", re.I), "rule"),
 ]
-SKIP_DIRS = {".git", "node_modules", "dist", "build", "target", "__pycache__"}
+# `.system` holds the hub's OWN internals, not routable skills. It is excluded
+# from the INDEX (not merely from projection) because four of its entries
+# shadow real hub skills by name -- plugin-creator, openai-docs, skill-creator
+# and imagegen each exist as BOTH `.system/<name>/SKILL.md` and
+# `<name>/SKILL.md`. Projection symlinks are keyed on name, so whichever row
+# the router returned would silently overwrite the other. Excluding at ingest
+# means the ambiguity cannot reach any consumer.
+SKIP_DIRS = {
+    ".git",
+    "node_modules",
+    "dist",
+    "build",
+    "target",
+    "__pycache__",
+    ".system",
+}
 
 
 # ---------------------------------------------------------------------------

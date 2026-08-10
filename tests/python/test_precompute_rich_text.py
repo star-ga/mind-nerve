@@ -209,7 +209,18 @@ class TestPrecomputeUsesRichText:
                     fm[k.strip().lower()] = v.strip().strip('"').strip("'")
         body = text[text.find("\n---", 3) + 4 :] if text.startswith("---") else text
         desc = fm.get("description", "")
-        rich_text = (desc or "ml-pipeline-workflow") + "\n\n" + body[:1024]
+        # Ingest normalises free text before encoding (retrieval-poisoning
+        # defence): the embedded text is now name + description[:240] + tags,
+        # NOT description + raw body. The guard this test exists for is
+        # unchanged — "rich text, not name-only" — so build the expectation
+        # through the same public helper rather than pinning stale bytes.
+        from mind_nerve.inference import build_embedding_text, parse_tags
+
+        assert body  # the fixture body is still what makes desc != name
+        rich_text, warning = build_embedding_text(
+            "ml-pipeline-workflow", desc, parse_tags(fm)
+        )
+        assert warning is None
         rich_emb = model.encode([rich_text])
 
         # The actual embedding should match the RICH text, not the name-only text

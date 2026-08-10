@@ -16,6 +16,12 @@ class Route:
     score: float
     source_repo: str
     url: str | None = None
+    # Absolute path of the file this route was indexed from. Carried so that
+    # every consumer surface (daemon socket, MCP tool, CLI) can be compared for
+    # identity on (name, source_path) rather than name alone -- two hub entries
+    # can share a name under different paths (e.g. `.system/skill-creator` vs
+    # `skill-creator`), and a name-only comparison hides that.
+    source_path: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         d = {
@@ -27,6 +33,8 @@ class Route:
         }
         if self.url:
             d["url"] = self.url
+        if self.source_path:
+            d["source_path"] = self.source_path
         return d
 
 

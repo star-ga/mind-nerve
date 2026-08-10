@@ -23,31 +23,26 @@ from __future__ import annotations
 
 import json
 import sys
-import threading
 from typing import Any
 
 from . import __version__
-from .inference import load_default_runtime
-from .inference import route as _route
+from .daemon_client import DaemonUnavailable, default_socket_path, route_via_daemon
 
-# Model warmup runs off the stdin loop (see ``main``) so the JSON-RPC
-# ``initialize`` handshake is never blocked by the multi-second model load.
-# Strict MCP clients otherwise mark the server "failed" before it answers.
-# ``_ensure_loaded`` is idempotent and thread-safe: the background warmup thread
-# and any early ``tools/call`` converge on a single one-time load.
-_warm_lock = threading.Lock()
-_warmed = False
-
-
-def _ensure_loaded() -> None:
-    """Load the default runtime once (thread-safe). Blocks until warm."""
-    global _warmed
-    if _warmed:
-        return
-    with _warm_lock:
-        if not _warmed:
-            load_default_runtime()
-            _warmed = True
+# THE DAEMON IS THE ONLY CATALOG.
+#
+# This server used to rank in-process via ``inference.route()``. That made it a
+# SECOND catalog: it resolved the runtime independently of the daemon's systemd
+# pin and, at one measured moment, answered from 2475 rows while the daemon
+# answered from 1437 -- different rows AND a different score scale, so any
+# threshold calibrated against one was meaningless against the other. The
+# router skill points agents at THIS tool, so agents were being routed by the
+# stale catalog while every measurement was taken against the daemon.
+#
+# The in-process path is deleted rather than kept as a fallback. A fallback
+# would re-institutionalise exactly that split, silently, at the worst possible
+# moment (daemon down = the one time nobody is watching). When the socket is
+# unavailable this server FAILS CLOSED: no routes, one visible line saying the
+# router is unavailable. No second brain.
 
 
 def _ok(req_id: Any, result: Any) -> dict[str, Any]:
@@ -84,10 +79,12 @@ def handle(msg: dict[str, Any]) -> dict[str, Any] | None:
                 "tools": [
                     {
                         "name": "mind_nerve_route",
-                        "description": "Return the top-K most relevant skill/tool/agent routes for a query, "
-                        "from the active mind-nerve route table (resolved via "
-                        "load_default_runtime — the curated STARGA-local catalog "
-                        "when present).",
+                        "description": "Return the top-K most relevant skill/tool/agent routes for a "
+                        "query. Ranked by the mind-nerve-routed daemon — the SAME "
+                        "catalog and the SAME score scale the CLI hooks use, so a score "
+                        "seen here means the same thing there. If the daemon is down "
+                        "this returns no routes and says so; it never answers from a "
+                        "second, unpinned catalog.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -124,27 +121,47 @@ def handle(msg: dict[str, Any]) -> dict[str, Any] | None:
         except (ValueError, TypeError):
             return _err(req_id, -32602, "top_k must be an integer")
         top_k = max(1, min(top_k, 64))
-        _ensure_loaded()
-        result = _route(query, top_k=top_k)
-        body = json.dumps(result.as_dict(), indent=2)
+        try:
+            payload = route_via_daemon(query, top_k=top_k)
+        except DaemonUnavailable as exc:
+            # Fail CLOSED and LOUD. Returning zero routes with a visible reason
+            # is strictly better than returning plausible routes from a
+            # different catalog: the caller can see the router is down, whereas
+            # a silent second catalog is indistinguishable from a working one.
+            sys.stderr.write(
+                f"[mind-nerve-mcp] route daemon unavailable: {exc}\n"
+            )
+            body = json.dumps(
+                {
+                    "query": query,
+                    "top_k": top_k,
+                    "routes": [],
+                    "catalog_size": 0,
+                    "served_by": "unavailable",
+                    "error": str(exc),
+                },
+                indent=2,
+            )
+            text = (
+                "**mind-nerve router unavailable — no routes returned.**\n\n"
+                f"The route daemon did not answer ({exc}). This tool deliberately "
+                "does NOT fall back to its own catalog: a second, unpinned catalog "
+                "is how stale routes got served silently before.\n\n"
+                f"Socket: `{default_socket_path()}`\n"
+                "Start it with: `systemctl --user start mind-nerve-routed`\n\n"
+                f"```json\n{body}\n```"
+            )
+            return _ok(req_id, {"content": [{"type": "text", "text": text}]})
+        body = json.dumps(payload, indent=2)
         return _ok(req_id, {"content": [{"type": "text", "text": body}]})
 
     return _err(req_id, -32601, f"method not found: {method}")
 
 
 def main(argv: list[str] | None = None) -> int:
-    # Warm the model in a background thread (not inline) so ``initialize`` and
-    # ``tools/list`` answer immediately; the model still starts loading right
-    # away, so the first ``tools/call`` is rarely slow. A ``tools/call`` that
-    # arrives before warmup finishes blocks in ``_ensure_loaded`` until ready.
-    def _warm() -> None:
-        try:
-            _ensure_loaded()
-        except Exception as exc:  # noqa: BLE001
-            sys.stderr.write(f"[mind-nerve-mcp] background warmup failed: {exc}\n")
-
-    threading.Thread(target=_warm, name="mind-nerve-warmup", daemon=True).start()
-
+    # No warmup: this process never loads a model. Ranking belongs to the
+    # daemon, so ``initialize`` and ``tools/list`` answer instantly and the
+    # ~860 MB encoder is resident exactly once on the box instead of twice.
     for line in sys.stdin:
         line = line.strip()
         if not line:

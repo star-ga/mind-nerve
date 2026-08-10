@@ -109,8 +109,30 @@ def main() -> int:
             k = max(1, min(k, 64))  # clamp to route()'s [1,64] bounds (matches mcp_server)
             t_q = time.time()
             result = _route(prompt, top_k=k)
+            # The reply carries the FULL route record, not just name+score.
+            # Every other surface (the MCP tool, the CLI) must be able to answer
+            # a query from this socket and be byte-comparable with it -- two
+            # catalogs answering the same question with different rows is the
+            # failure this protocol widening exists to make detectable.
+            # `name` and `score` keep their historical position and types, so
+            # older hook builds keep working unchanged.
             reply: dict[str, Any] = {
-                "routes": [{"name": r.name, "score": float(r.score)} for r in result.routes],
+                "routes": [
+                    {
+                        "name": r.name,
+                        "score": float(r.score),
+                        "id": r.id,
+                        "kind": r.kind,
+                        "source_repo": r.source_repo,
+                        "source_path": r.source_path,
+                        "url": r.url,
+                    }
+                    for r in result.routes
+                ],
+                "catalog_size": result.catalog_size,
+                "catalog_version": result.catalog_version,
+                "model_version": result.model_version,
+                "top_k": result.top_k,
                 "ms": int((time.time() - t_q) * 1000),
             }
         except Exception as e:  # noqa: BLE001  daemon must keep serving

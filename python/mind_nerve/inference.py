@@ -62,12 +62,124 @@ def _parse_skill_frontmatter(text: str) -> dict[str, str]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Ingest normalisation — bounds the retrieval-poisoning surface
+# ---------------------------------------------------------------------------
+#
+# Descriptions became the ranking substrate when the catalog was re-embedded on
+# name + description + tags instead of the kebab-case name alone. That is a
+# large relevance win AND a new attack surface: third-party skills (SkillsMP
+# and any other external feed into this hub) author their own description, so a
+# keyword-stuffed "Use when the user asks to ..." paragraph can win every
+# query. Name-only ranking was accidentally hard to game because a name is
+# short and structural; free prose is not.
+#
+# The rule is mechanical, not a matter of trusting authors:
+#   * embed  name + description[:240] + first 5 tags
+#   * strip URLs, code fences and markdown syntax first
+#   * a description over 1000 RAW chars, or one containing a routing
+#     imperative ("always use", "route here for all", "ignore ..."), indexes
+#     NAME-ONLY and emits a lint warning
+#
+# Deterministic and idempotent — this catalog feeds a bit-identity-gated
+# system, so no classifier and no run-to-run variation. What was actually
+# indexed stays auditable in the row's ``text`` field.
+
+MAX_DESC_CHARS = 240
+MAX_TAGS = 5
+MAX_RAW_DESC_CHARS = 1000
+
+# Phrases whose only purpose is to bias the router itself rather than describe
+# the skill. Their presence is treated as disqualifying, not sanitisable.
+_ROUTING_IMPERATIVE_RE = re.compile(
+    r"(?:"
+    r"always\s+use|"
+    r"route\s+here\s+for\s+all|"
+    r"use\s+(?:this|me)\s+for\s+(?:all|every|any)\b|"
+    r"ignore\s+(?:all\s+)?(?:previous|other|prior)\b|"
+    r"ignore\s+the\s+above|"
+    r"disregard\s+(?:all\s+)?(?:previous|other)\b|"
+    r"highest\s+priority\s+skill|"
+    r"must\s+be\s+used\s+for\s+(?:all|every)\b"
+    r")",
+    re.I,
+)
+
+# Zero-width + bidi-override characters: invisible in a rendered SKILL.md but
+# fully present in the embedding input, so they can carry hidden ranking text.
+_INVISIBLE_RE = re.compile(r"[\u200b-\u200f\u202a-\u202e\u2060-\u2064\ufeff]")
+_URL_RE = re.compile(r"(?:https?://|www\.)\S+", re.I)
+_FENCE_RE = re.compile(r"```[\s\S]*?```|~~~[\s\S]*?~~~")
+_INLINE_CODE_RE = re.compile(r"`([^`]*)`")
+_MD_LINK_RE = re.compile(r"\[([^\]]*)\]\([^)]*\)")
+_MD_SYNTAX_RE = re.compile(r"[*_#>|]+")
+_WS_RE = re.compile(r"\s+")
+
+
+def strip_markup(text: str) -> str:
+    """Remove URLs, code fences and markdown syntax; collapse whitespace."""
+    if not text:
+        return ""
+    out = _INVISIBLE_RE.sub("", text)
+    out = _FENCE_RE.sub(" ", out)
+    out = _MD_LINK_RE.sub(r"\1", out)
+    out = _INLINE_CODE_RE.sub(r"\1", out)
+    out = _URL_RE.sub(" ", out)
+    out = _MD_SYNTAX_RE.sub(" ", out)
+    return _WS_RE.sub(" ", out).strip()
+
+
+def description_is_poisoned(raw_description: str) -> str | None:
+    """Return a lint reason when *raw_description* must not be indexed.
+
+    ``None`` means the description is usable.
+    """
+    if not raw_description:
+        return None
+    if len(raw_description) > MAX_RAW_DESC_CHARS:
+        return f"description_too_long:{len(raw_description)}>{MAX_RAW_DESC_CHARS}"
+    m = _ROUTING_IMPERATIVE_RE.search(raw_description)
+    if m:
+        return f"routing_imperative:{m.group(0).lower().strip()}"
+    return None
+
+
+def parse_tags(front_matter: dict[str, str]) -> list[str]:
+    """Extract up to MAX_TAGS tags from frontmatter (list or comma form)."""
+    raw = front_matter.get("tags") or front_matter.get("keywords") or ""
+    raw = raw.strip().strip("[]")
+    if not raw:
+        return []
+    parts = re.split(r"[,\s]+", raw)
+    return [p.strip("-\"' ") for p in parts if p.strip("-\"' ")][:MAX_TAGS]
+
+
+def build_embedding_text(
+    name: str, description: str, tags: "list[str] | None" = None
+) -> tuple[str, str | None]:
+    """Return ``(text_to_embed, lint_warning)`` for one catalog entry.
+
+    A poisoned description degrades to NAME-ONLY rather than being cleaned:
+    partially neutralising a hostile description still lets the remainder
+    influence rank, and the whole point is that the surface is bounded.
+    """
+    name = (name or "").strip()
+    warning = description_is_poisoned(description or "")
+    if warning:
+        return name, warning
+    desc = strip_markup(description or "")[:MAX_DESC_CHARS]
+    tag_part = " ".join(f"- {t}" for t in (tags or [])[:MAX_TAGS])
+    return " ".join(p for p in (name, desc, tag_part) if p), None
+
+
 def _skill_embedding_text(item: dict[str, Any]) -> str:
     """Return the canonical text to encode for a catalog item.
 
     Priority:
-      1. When ``source_path`` is set and the file is readable:
-         ``description + "\\n\\n" + body[:1024]`` — matches discovery.scan.
+      1. When ``source_path`` is set and the file is readable: the normalised
+         ``name + description[:240] + first 5 tags`` (see
+         ``build_embedding_text``). A description failing the ingest lint
+         degrades to name-only.
       2. Tool items with a ``url``: ``name — url``.
       3. Fallback: ``name`` only.
 
@@ -84,9 +196,16 @@ def _skill_embedding_text(item: dict[str, Any]) -> str:
             text = p.read_text(encoding="utf-8", errors="replace")
             if 32 <= len(text) <= 256 * 1024:
                 fm = _parse_skill_frontmatter(text)
-                body = text[text.find("\n---", 3) + 4 :] if text.startswith("---") else text
                 desc = fm.get("description", "")
-                return (desc or name) + "\n\n" + body[:1024]
+                embed_text, warning = build_embedding_text(name, desc, parse_tags(fm))
+                if warning:
+                    # Loud but non-fatal: the entry is still indexed, by NAME
+                    # ONLY, and the reason is on the record.
+                    sys.stderr.write(
+                        f"[mind-nerve] ingest lint: {source_path}: {warning} "
+                        f"-- indexing name-only\n"
+                    )
+                return embed_text
         except OSError:
             pass
     if item.get("kind") == "tool" and item.get("url"):
@@ -669,6 +788,7 @@ def _route_native(
                 score=float(top_scores_q16[pos]) / 65536.0,
                 source_repo=str(meta.get("source_repo", "")),
                 url=meta.get("url"),
+                source_path=meta.get("source_path") or None,
             )
         )
 
@@ -753,6 +873,7 @@ def _route_pytorch(
                 score=float(scores[int(i)]),
                 source_repo=str(meta.get("source_repo", "")),
                 url=meta.get("url"),
+                source_path=meta.get("source_path") or None,
             )
         )
 

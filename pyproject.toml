@@ -32,7 +32,7 @@ classifiers = [
 ]
 dependencies = [
     "numpy>=1.24",
-    "sentence-transformers>=3.0",
+    "sentence-transformers>=5.7.0",
     "torch>=2.0",
     "huggingface_hub>=0.20",
     "cryptography>=48.0.0",

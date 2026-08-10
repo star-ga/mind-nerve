@@ -4,6 +4,62 @@ All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](htt
 
 ## [Unreleased]
 
+### Feat — CLI integrations: per-prompt routing hook (reachable hub without the announce cost)
+
+A hub of ~1,380 skills symlinked into a CLI's skills directory is bulk-announced
+into every session. Measured on the STARGA hub: 1,374 indexable `SKILL.md` files,
+380,446 bytes of name + description, **≈95k tokens per announce, per CLI, per
+session**. The new `integrations/` subsystem makes a hub of that size *reachable*
+without it being *announced*, in three parts — all three are needed, each alone
+leaves a real gap.
+
+- **Structural** (`installer/src/skills_dir.ts`). The CLI's skills directory
+  becomes a real directory holding only `mind-nerve-router`, dropping announce
+  from ≈95k to ≈2k tokens. Without it the hub is announced in full.
+- **Automatic** (`hook/mind-nerve-hook`). A `UserPromptSubmit` hook queries the
+  routing daemon over its UNIX socket per prompt, projects the relevant skills,
+  and injects a ranked route table carrying absolute `SKILL.md` paths. Without
+  it the router is announced but nothing routes, and the model has to guess.
+- **Hygiene** (`installer/src/hygiene.ts`, `installer/src/npy.ts`). Dead and
+  renamed routes are pruned from `route_table.jsonl` **and** its row-aligned
+  `route_table.npy` together. Pruning one without the other leaves the embedding
+  matrix off by a row, silently mis-scoring every route after the deletion.
+
+**Score floor is a backstop, not the primary filter.** `MIND_NERVE_MIN_SCORE`
+defaults to `0.40`; the intent gate (which rejects harness-shaped and contentless
+turns before embedding) does the real work. An earlier n=78 calibration argued
+for `0.476`, but it built its positives from each route's own indexed text with
+the name stripped — a near self-match that upper-bounds the score and
+manufactures a separation gap real queries do not have. Measured against
+hand-written paraphrases, three of six rank-1-**correct** hits fall below `0.476`,
+including `diagnose` at `0.456`. The cost of `0.40` is recorded rather than
+hidden: two of five observed noise cases (`yeet` 0.45, `check-work` 0.44) survive
+this gate and are caught downstream. Both populations are pinned in
+`test/hook_gates.test.ts` so any recalibration starts from evidence.
+
+### Fix — route identity: `.system` name-shadowing, and `source_path` on every surface
+
+Four `.system/` hub entries shadow real skills by name — `plugin-creator`,
+`openai-docs`, `skill-creator` and `imagegen` each exist as both
+`.system/<name>/SKILL.md` and `<name>/SKILL.md`. Projection symlinks are keyed on
+name, so whichever row the router happened to return silently overwrote the
+other. `.system` is now excluded at **ingest** rather than at projection, so the
+ambiguity cannot reach any consumer.
+
+`Route` gains an optional `source_path`, so route identity can be compared on
+`(name, source_path)` instead of name alone and a future collision is visible
+rather than silent. A shared `daemon_client` resolves routes through one path for
+the socket, MCP and CLI surfaces, with a parity test asserting they cannot drift.
+
+### Docs — catalog v1.0 is tamper-evident, not signed
+
+The dataset card and model card both described `route_table.jsonl` v1.0 as "frozen
+and signed". The `manifest.sig` HMAC is a placeholder pending an operator
+signature with the real root key, so the accurate claim is **tamper-evident**:
+the freeze is reproducible and hash-anchored (`SHA256SUMS` + manifest), but not
+signed. Also corrects the documented `MIND_NERVE_MIN_SCORE` default (README said
+`0.35` while the hook shipped `0.40`) and the ROADMAP hub count (~1300 → ~1,374).
+
 ### Feat — cross-platform: Windows + macOS + Linux universal router (v0.3.0b9)
 
 mind-nerve now runs as the universal skill-router on Windows, macOS and Linux,

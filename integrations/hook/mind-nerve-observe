@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+"""mind-nerve read-observer — the second half of the feedback loop.
+
+Fired on PostToolUse (file-read tools). Records whether a SKILL.md that the
+router actually projected was subsequently READ by the model.
+
+WHY: the router logged what it injected, but nothing logged what got USED, so
+no change to ranking, thresholds or gates could be measured, and there was no
+labelled data to calibrate against. Injected-vs-read is the ground truth that
+turns "the routes look plausible" into a number.
+
+Writes one JSONL line per matched read to the same telemetry file the router
+appends its decisions to; a downstream join on `generation` pairs each
+`route_decision` with the `skill_read` events that followed it.
+
+Fail-open and silent: any error prints `{}` and exits 0. This hook must never
+be able to block a tool call.
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+_HOME = os.path.expanduser("~")
+TELEMETRY_PATH = Path(
+    os.environ.get(
+        "MIND_NERVE_TELEMETRY", os.path.join(_HOME, ".mind-nerve", "telemetry.jsonl")
+    )
+)
+PROJECTED_DIR = Path(os.environ.get("MIND_NERVE_PROJECTED_DIR", ""))
+SOURCE_DIR = Path(
+    os.environ.get("MIND_NERVE_SOURCE_DIR", os.path.join(_HOME, ".agents", "skills-hub"))
+)
+
+READ_TOOLS = {"read", "readfile", "view", "cat", "openfile"}
+
+
+def emit_and_exit() -> None:
+    print("{}")
+    raise SystemExit(0)
+
+
+def find_path(obj: object, depth: int = 0) -> str:
+    """Pull a file path out of the varied PostToolUse payload shapes."""
+    if depth > 4 or not isinstance(obj, dict):
+        return ""
+    for k in ("file_path", "filePath", "path", "absolute_path", "target_file"):
+        v = obj.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    for k in ("tool_input", "toolInput", "input", "params", "arguments", "args"):
+        inner = obj.get(k)
+        if isinstance(inner, dict):
+            got = find_path(inner, depth + 1)
+            if got:
+                return got
+    return ""
+
+
+def current_generation() -> tuple[str, set[str]]:
+    """(generation key, projected skill names) for the live projection."""
+    try:
+        if PROJECTED_DIR.is_symlink():
+            target = Path(os.readlink(PROJECTED_DIR))
+            gen = target.name
+        else:
+            target, gen = PROJECTED_DIR, ""
+        names = {
+            c.name
+            for c in target.iterdir()
+            if c.is_dir() or c.is_symlink()
+        }
+        return gen, names
+    except Exception:
+        return "", set()
+
+
+def main() -> None:
+    try:
+        raw = sys.stdin.read()
+        data = json.loads(raw) if raw.strip() else {}
+    except Exception:
+        emit_and_exit()
+        return
+    if not isinstance(data, dict):
+        emit_and_exit()
+        return
+
+    tool = str(
+        data.get("tool_name") or data.get("toolName") or data.get("tool") or ""
+    ).lower().replace("_", "")
+    if tool and tool not in READ_TOOLS:
+        emit_and_exit()
+        return
+
+    path = find_path(data)
+    if not path or not path.endswith("SKILL.md"):
+        emit_and_exit()
+        return
+
+    # Which skill is this? The hub layout is <hub>/<name>/SKILL.md.
+    name = Path(path).parent.name
+    gen, projected = current_generation()
+    in_hub = str(SOURCE_DIR) in path or str(PROJECTED_DIR) in path
+
+    try:
+        TELEMETRY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with TELEMETRY_PATH.open("a") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "v": 1,
+                        "ts": time.time(),
+                        "event": "skill_read",
+                        "name": name,
+                        "generation": gen,
+                        # The measurement that matters: was this skill one the
+                        # router put in front of the model, or did the model
+                        # find it some other way?
+                        "was_projected": name in projected,
+                        "in_hub": bool(in_hub),
+                    }
+                )
+                + "\n"
+            )
+    except Exception:
+        pass
+    emit_and_exit()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception:
+        print("{}")
+        sys.exit(0)

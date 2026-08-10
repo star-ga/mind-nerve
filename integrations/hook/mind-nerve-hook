@@ -1,0 +1,1107 @@
+#!/usr/bin/env python3
+"""mind-nerve auto-router — ONE CLI-agnostic hook.
+
+Fired on UserPromptSubmit / SessionStart by any CLI that speaks the
+Claude-compatible hook protocol (claude, codex, gemini, grok, kimi, qwen).
+
+Pipeline:
+  0. INTENT GATE (before any embedding). Evaluate only the newest USER turn,
+     with injected system prompts / tool output / notification blobs stripped,
+     and skip routing entirely for text that is not a request. See
+     `intent_gate` — this is the load-bearing filter, NOT the score threshold.
+  1. Query the mind-nerve-routed daemon over a UNIX socket.
+     (NOT the MCP process's own runtime — see mind_nerve/daemon_client.py for
+      why the two must not be separate catalogs.)
+  2. DEDUP routes by name across `source_repo` — the catalog carries the same
+     skill under "starga" and "local"; without this, a raw top-5 is
+     effectively a top-3 distinct. Also drops `.system/` hub internals.
+  3. THRESHOLD on score (MIND_NERVE_MIN_SCORE). Recalibrated — see below.
+  4. (No margin gate: a Lowe's-ratio gate was specified, measured, and dropped
+     — see APPLY_RATIO_GATE. The ratio is logged, never enforced.)
+  5. PROJECT the surviving top-K hub skills as symlinks into the CLI's skills
+     dir, so the CLI's skill announce stays ~2k chars instead of ~460k. The
+     projection is a generation directory keyed by the hash of the route set,
+     published by an atomic symlink flip; an unchanged set is zero work.
+  6. INJECT `additionalContext` with the ranked routes, their ABSOLUTE
+     SKILL.md / agent .md paths, and a mandatory-use instruction.
+  7. LOG one telemetry line per decision so any of the above is measurable.
+
+Fail-open is absolute: ANY error prints `{}` and exits 0. A broken router must
+never block a prompt.
+
+Configuration (all optional, all env):
+  MIND_NERVE_SOCKET          UNIX socket of mind-nerve-routed
+  MIND_NERVE_SOURCE_DIR      skills hub root
+  MIND_NERVE_PROJECTED_DIR   per-CLI skills dir to rewrite
+  MIND_NERVE_AGENT_DIRS      ':'-separated dirs of agent .md files
+  MIND_NERVE_TOP_K           routes to inject/project after dedup (default 8)
+  MIND_NERVE_MIN_SCORE       score floor (default 0.40, measured)
+  MIND_NERVE_MIN_CONTENT_WORDS  intent-gate word floor (default 3)
+  MIND_NERVE_INTENT_GATE     '0' disables the intent gate (default on)
+  MIND_NERVE_PROJECT_MODE    'symlink' (default) | 'dir'
+  MIND_NERVE_KEEP_GENERATIONS how many generation dirs to retain (default 3)
+  MIND_NERVE_CORE_SKILLS     ','-separated always-projected skills
+  MIND_NERVE_SOCKET_TIMEOUT  seconds (default 2.0)
+  MIND_NERVE_LOG             JSONL log path
+  MIND_NERVE_TELEMETRY       JSONL telemetry path
+  MIND_NERVE_OVERFETCH       raw K requested from the daemon (default 80)
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import secrets
+import shutil
+import socket
+import sys
+import time
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+ROUTER_NAME = "mind-nerve-router"
+_HOME = os.path.expanduser("~")
+
+
+def _default_socket() -> str:
+    """XDG runtime socket when the runtime dir exists, else a /tmp fallback."""
+    uid = os.getuid()
+    xdg = f"/run/user/{uid}/mind-nerve.sock"
+    if os.path.isdir(os.path.dirname(xdg)):
+        return xdg
+    return f"/tmp/mind-nerve-{uid}.sock"
+
+
+def _env_float(key: str, default: float) -> float:
+    try:
+        return float(os.environ[key])
+    except (KeyError, TypeError, ValueError):
+        return default
+
+
+def _env_int(key: str, default: int) -> int:
+    try:
+        return int(os.environ[key])
+    except (KeyError, TypeError, ValueError):
+        return default
+
+
+def _env_list(key: str, default: str, sep: str) -> list[str]:
+    raw = os.environ.get(key, default)
+    return [p.strip() for p in raw.split(sep) if p.strip()]
+
+
+def _env_flag(key: str, default: bool) -> bool:
+    raw = os.environ.get(key)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+SOCKET_PATH = os.environ.get("MIND_NERVE_SOCKET", _default_socket())
+SOURCE_DIR = Path(
+    os.environ.get("MIND_NERVE_SOURCE_DIR", os.path.join(_HOME, ".agents", "skills-hub"))
+)
+PROJECTED_DIR = Path(os.environ.get("MIND_NERVE_PROJECTED_DIR", ""))
+AGENT_DIRS = [
+    Path(p)
+    for p in _env_list(
+        "MIND_NERVE_AGENT_DIRS",
+        os.pathsep.join(
+            (
+                os.path.join(_HOME, ".claude", "agents"),
+                os.path.join(_HOME, ".agents", "agents"),
+            )
+        ),
+        os.pathsep,
+    )
+]
+TOP_K = _env_int("MIND_NERVE_TOP_K", 8)
+# Overfetch: dedup across source_repo collapses ~half the rows, and the score
+# floor drops most of the rest. Ask the daemon for far more than TOP_K so a
+# real hit is not lost to a duplicate occupying a slot.
+OVERFETCH = _env_int("MIND_NERVE_OVERFETCH", 80)
+
+# ===========================================================================
+# RANKING CONSTANTS — the numbers that decide what gets injected.
+#
+# They live HERE, together, on purpose: recalibration must be a one-line diff,
+# not archaeology across the file. Do NOT make either adaptive or per-query.
+# One constant recalibrated offline is debuggable; a moving threshold is not —
+# you could never tell whether a bad route came from the ranker or from the
+# threshold in force that turn.
+# ===========================================================================
+
+# --- Absolute score floor --------------------------------------------------
+# CALIBRATED, n=78 (60 positives = frontmatter trigger sentences with the skill
+# name stripped; 18 negatives = real non-intent prompts from the hook log),
+# ranked by the live daemon on the 1437-row table:
+#     positives  top1  p05 0.741  p50 0.912  p95 0.959   (rank-1 correct 58/60)
+#     negatives  top1  p50 0.375  p95 0.476  max 0.617
+# The distributions DO NOT overlap on this set: positives bottom out at 0.741,
+# noise tops out at 0.617 — a clean gap of 0.124. The noise p95, 0.476, retains
+# 100% of positives.
+#
+# Retrieval quality was measured at 97% rank-1 correct, so a future reader
+# knows the GATE was the defect, not the ranker.
+#
+# The previous 0.35 admitted the ENTIRE noise band 0.35-0.617, which is exactly
+# where every bad injection observed in production sat: apple-reminders 0.380,
+# yeet 0.450, grill-me 0.398, building-patch-tuesday 0.376, check-work 0.440.
+#
+# !! KNOWN TENSION, recorded rather than hidden !!
+# The 60 positives above are each route's OWN indexed text with the name
+# stripped — a near self-match, which is an upper bound on score. A separate
+# run on 20 hand-written REALISTIC PARAPHRASES (queries not lifted from the
+# index) scored far lower: min 0.315, p25 0.427, p50 0.464, max 0.779, and at
+# 0.476 only 45% of them survive. Concretely, the paraphrase
+# "my build is throwing an error and I need to find the root cause" routes to
+# `diagnose` at 0.458 — correct, rank 1, and BELOW this floor. Whether 0.476 is
+# right therefore depends on which population real prompts resemble. Both
+# measurements are pinned in test/hook_gates.test.ts so the trade-off stays
+# visible and a future recalibration starts from evidence, not from scratch.
+#
+# RESOLVED 2026-08-08 -> 0.40. The question above ("which population do real
+# prompts resemble?") was settled by measurement: they resemble the PARAPHRASES.
+# Six hand-written queries, every top-1 CORRECT, scored on the live daemon:
+#     0.732 cloudflare-deploy   0.709 media-grab   0.530 mind
+#     0.456 diagnose            0.450 arch-mind    0.428 git-workflow
+# THREE OF SIX fall below 0.476 -- including `diagnose`, the case cited as proof
+# the description re-embed worked. Live telemetry agreed: 6 of 13 real routing
+# decisions rejected ALL 56-59 candidates.
+#
+# WHY 0.476 WAS WRONG: the n=78 calibration built its positives by taking each
+# route's own indexed text and stripping the name -- a NEAR SELF-MATCH, which
+# upper-bounds the score (p05 0.741). That population does not occur in
+# production. It manufactured an apparent 0.124 separation gap that realistic
+# queries do not have (paraphrase p50 0.464 vs noise max 0.617 -- heavy overlap).
+# The threshold is therefore a BACKSTOP, not the primary filter; the intent gate
+# (which rejects harness-shaped and contentless turns before embedding) does the
+# real work. That was the original prediction and the flawed calibration briefly
+# appeared to refute it.
+MIN_SCORE = _env_float("MIND_NERVE_MIN_SCORE", 0.40)
+
+# --- Relative margin gate: MEASURED AND REJECTED ---------------------------
+# A Lowe's-ratio gate (reject when top2/top1 > cut) was specified, then dropped
+# on evidence. Over the same n=78 calibration:
+#     positives  ratio  p50 0.782  p95 1.000
+#     negatives  ratio  p50 0.973  p05 0.857
+# The bands overlap almost completely, so ANY cutoff rejects a large slice of
+# CORRECT routes. An earlier cut of 0.85 looked perfect on n=7 and does not
+# survive n=78. This is precisely the margin-gate-versus-near-duplicates
+# conflict that was predicted: legitimate near-ties are COMMON here, not rare.
+#
+# The ratio is still COMPUTED and LOGGED to telemetry — it is potentially
+# useful signal for a future calibration — but it never gates anything.
+# Absolute score separates; the ratio does not.
+APPLY_RATIO_GATE = False
+
+INTENT_GATE_ON = _env_flag("MIND_NERVE_INTENT_GATE", True)
+MIN_CONTENT_WORDS = _env_int("MIND_NERVE_MIN_CONTENT_WORDS", 3)
+PROJECT_MODE = os.environ.get("MIND_NERVE_PROJECT_MODE", "symlink").strip().lower()
+KEEP_GENERATIONS = max(1, _env_int("MIND_NERVE_KEEP_GENERATIONS", 3))
+SOCKET_TIMEOUT = _env_float("MIND_NERVE_SOCKET_TIMEOUT", 2.0)
+CORE_ALWAYS_ON = tuple(
+    _env_list("MIND_NERVE_CORE_SKILLS", ROUTER_NAME, ",")
+) or (ROUTER_NAME,)
+LOG_PATH = Path(
+    os.environ.get("MIND_NERVE_LOG", os.path.join(_HOME, ".mind-nerve", "hook.log"))
+)
+TELEMETRY_PATH = Path(
+    os.environ.get(
+        "MIND_NERVE_TELEMETRY", os.path.join(_HOME, ".mind-nerve", "telemetry.jsonl")
+    )
+)
+
+_slug_re = re.compile(r"[^a-z0-9]+")
+
+PROMPT_EVENTS = {
+    "userpromptsubmit",
+    "user_prompt_submit",
+    "beforesubmitprompt",
+    "before_submit_prompt",
+}
+
+
+# ---------------------------------------------------------------------------
+# Plumbing
+# ---------------------------------------------------------------------------
+
+
+def log(record: dict) -> None:
+    """Best-effort JSONL log. Never raises."""
+    try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        record["ts"] = time.time()
+        with LOG_PATH.open("a") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception:
+        pass
+
+
+def telemetry(record: dict) -> None:
+    """Append one routing-decision line. Local file, no network. Never raises.
+
+    Nothing previously recorded what was injected versus what was actually
+    used, so no change to the router could be measured and there was no
+    labelled data to calibrate against. This is that record; the companion
+    `mind-nerve-observe` hook appends the `skill_read` half.
+    """
+    try:
+        TELEMETRY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        record.setdefault("ts", time.time())
+        record.setdefault("v", 1)
+        with TELEMETRY_PATH.open("a") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception:
+        pass
+
+
+def query_digest(text: str) -> str:
+    """Short stable digest. The prompt itself is never written to telemetry."""
+    return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def read_stdin() -> dict:
+    try:
+        raw = sys.stdin.read()
+    except Exception:
+        return {}
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        # Malformed JSON on stdin is a fail-open case, not a crash.
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def prompt_from(data: dict, depth: int = 0) -> str:
+    """Extract the user prompt across the CLIs' differing stdin shapes."""
+    if depth > 3:
+        return ""
+    for k in ("prompt", "user_prompt", "userPrompt", "message", "text"):
+        v = data.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    for k in ("input", "payload"):
+        inner = data.get(k)
+        if isinstance(inner, dict):
+            p = prompt_from(inner, depth + 1)
+            if p:
+                return p
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# Intent gate — runs BEFORE the encoder
+# ---------------------------------------------------------------------------
+#
+# The hook used to embed whatever arrived on stdin. Observed live: it routed on
+# an injected system prompt ("You are a personal assistant running inside
+# OpenClaw...") and a two-word reply ("all 3") triggered a full projection.
+# Those score 0.39-0.46 — INSIDE the range real hits occupy — so no score
+# threshold can reject them. They have to be rejected on SHAPE, before they are
+# ever encoded.
+
+# Harness / non-user text. Matched against the raw newest turn.
+_HARNESS_PATTERNS = (
+    re.compile(r"^\s*You are\s", re.I),
+    re.compile(r"^\s*##+\s*Tooling", re.I),
+    re.compile(r"^\s*<(system|environment|task)[-_ ]", re.I),
+    re.compile(r'Background command\s+".*?"\s+completed', re.I),
+    re.compile(r"\[SYSTEM NOTIFICATION", re.I),
+    re.compile(r"^\s*<system-reminder>", re.I),
+    re.compile(r"^\s*Caveat: The messages below", re.I),
+    re.compile(r"^\s*\[Request interrupted", re.I),
+    re.compile(r"^\s*Your task is to (read|summari)", re.I),
+)
+
+# Bare acknowledgements and continuations: real user text, zero intent.
+_ACK_RE = re.compile(
+    r"^\s*(?:"
+    r"y|n|k|ok|okay|yes|no|yep|yeah|nope|sure|thanks|thank you|ty|"
+    r"proceed|continue|go|go on|go ahead|next|more|again|"
+    r"do it|please do|sounds good|looks good|lgtm|nice|cool|great|perfect|"
+    r"right|correct|exactly|indeed|hmm|hm|huh|oh|ah|wow|"
+    r"all\s+\d+|both|either|that one|this one|the first|the second|"
+    r"stop|wait|hold on|nvm|never mind"
+    r")"
+    r"[\s.!?,]*$",
+    re.I,
+)
+
+# Blocks that are transcript/tool payload rather than a request.
+_TOOL_OUTPUT_RE = re.compile(
+    r"^\s*(?:"
+    r"\{[\s\S]*\}|\[[\s\S]*\]|"          # a bare JSON blob
+    r"(?:PASS|FAIL|OK|ERROR|WARN)\b[\s\S]*|"
+    r"(?:\d+ (?:passed|failed|tests?|files? changed))[\s\S]*"
+    r")\s*$"
+)
+
+_STOPWORDS = frozenset(
+    """a an the this that these those and or but if then else so than as at by for from in into of on
+    to with without is are was were be been being am do does did doing have has had having i me my we
+    our you your it its they them their he she his her there here what which who whom whose when where
+    why how all any both each few more most other some such no nor not only own same too very can will
+    just should now please ok okay yeah yes thanks""".split()
+)
+
+# A request almost always carries one of these. Presence of an action verb is
+# what separates a short-but-real request ("fix the build") from a short
+# non-request ("the build"). Deliberately generous: a false ALLOW costs one
+# routing call, a false SKIP costs a missed skill.
+_ACTION_VERBS = frozenset(
+    """add adapt analyse analyze apply audit automate benchmark bootstrap break build bump check clean
+    compare compile configure connect convert create debug decode decompile deploy design detect
+    diagnose diff document draft dump enable encrypt evaluate examine execute explain explore export
+    extract find fix format generate get grep handle harden help implement import improve init inspect
+    install integrate investigate lint list load lower make measure migrate mock modify monitor move
+    optimise optimize package parse patch perform pick plan port probe profile prove publish pull push
+    query read rebase refactor release remove rename render repair replace report research restore
+    review rewrite run scaffold scan schedule search set setup ship show simplify solve sort speed
+    split start stop stub summarise summarize sweep switch sync test trace track train translate
+    trigger tune undo update upgrade upload validate verify wire write
+    broken breaking crash crashes crashing fail fails failing failed error errors throwing throws
+    slow slower regression regressed leak leaks hang hangs stuck wrong incorrect""".split()
+)
+
+
+def newest_user_turn(text: str) -> str:
+    """Reduce a possibly-composite stdin payload to the newest USER turn.
+
+    CLIs hand the hook whatever they have: sometimes the bare prompt,
+    sometimes the prompt with a system preamble, an appended
+    <system-reminder>, or a pasted tool result. Routing on the whole blob
+    routes on the preamble, which is how a system prompt ended up choosing
+    skills. Keep the last block that still looks like something a person
+    typed.
+    """
+    if not text:
+        return ""
+    cleaned = text
+    # Drop wrapped injected blocks wholesale (they are never the request).
+    cleaned = re.sub(
+        r"<system-reminder>[\s\S]*?</system-reminder>", " ", cleaned, flags=re.I
+    )
+    cleaned = re.sub(
+        r"<(task-notification|command-name|local-command-stdout)>[\s\S]*?"
+        r"</\1>",
+        " ",
+        cleaned,
+        flags=re.I,
+    )
+    cleaned = re.sub(r"```[\s\S]*?```", " ", cleaned)
+
+    blocks = [b.strip() for b in re.split(r"\n\s*\n", cleaned) if b.strip()]
+    if not blocks:
+        return cleaned.strip()
+
+    for block in reversed(blocks):
+        if any(p.search(block) for p in _HARNESS_PATTERNS):
+            continue
+        if _TOOL_OUTPUT_RE.match(block) and len(block) > 40:
+            continue
+        return block
+    # Everything looked like harness text — hand back the last block and let
+    # the shape checks below reject it, rather than silently routing block 0.
+    return blocks[-1]
+
+
+def content_words(text: str) -> list[str]:
+    words = re.findall(r"[A-Za-z][A-Za-z0-9_.\-]*", text.lower())
+    return [w for w in words if w not in _STOPWORDS and len(w) > 1]
+
+
+def has_action_verb(text: str) -> bool:
+    words = set(re.findall(r"[a-z]+", text.lower()))
+    return bool(words & _ACTION_VERBS)
+
+
+def intent_gate(raw: str) -> tuple[bool, str, str]:
+    """Decide whether *raw* is a routable request.
+
+    Returns ``(should_route, reason, evaluated_text)``. ``reason`` names the
+    rule that fired so telemetry can show which shape is doing the filtering.
+    """
+    turn = newest_user_turn(raw)
+    if not INTENT_GATE_ON:
+        return True, "gate_disabled", turn
+    if not turn:
+        return False, "empty", turn
+    if any(p.search(turn) for p in _HARNESS_PATTERNS):
+        return False, "harness_shape", turn
+    if _ACK_RE.match(turn):
+        return False, "bare_ack", turn
+    if not re.search(r"[A-Za-z]", turn):
+        return False, "no_letters", turn
+    words = content_words(turn)
+    if len(words) < MIN_CONTENT_WORDS and not has_action_verb(turn):
+        return False, "too_short_no_verb", turn
+    if _TOOL_OUTPUT_RE.match(turn) and len(turn) > 40:
+        return False, "tool_output", turn
+    return True, "ok", turn
+
+
+# ---------------------------------------------------------------------------
+# Hub listing
+# ---------------------------------------------------------------------------
+
+
+def list_source_skills() -> dict[str, Path]:
+    """name -> resolved skill dir, for every hub entry holding a SKILL.md.
+
+    Dot-directories are skipped, which excludes `.system/` — the hub's own
+    internals. That exclusion matters beyond tidiness: `.system/` shadows four
+    real hub skills by name (plugin-creator, openai-docs, skill-creator,
+    imagegen all exist BOTH as `.system/<name>/SKILL.md` and `<name>/SKILL.md`),
+    and a projection keyed on name alone silently picked one of the two.
+    """
+    skills: dict[str, Path] = {}
+    if not SOURCE_DIR.is_dir():
+        return skills
+    try:
+        children = list(SOURCE_DIR.iterdir())
+    except Exception:
+        return skills
+    for child in children:
+        if child.name.startswith("."):
+            continue
+        try:
+            if not (child / "SKILL.md").is_file():
+                continue
+            skills[child.name] = child.resolve() if child.is_symlink() else child
+        except Exception:
+            continue
+    return skills
+
+
+def is_system_route(r: dict) -> bool:
+    """True for a catalog row that points into the hub's `.system/` internals."""
+    sp = str(r.get("source_path") or "")
+    return "/.system/" in sp or sp.startswith(".system/")
+
+
+def query_daemon(prompt: str, k: int) -> list[dict] | None:
+    """Ask mind-nerve-routed for routes. None means 'pass through silently'."""
+    if not prompt or not os.path.exists(SOCKET_PATH):
+        return None
+    s = None
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(SOCKET_TIMEOUT)
+        s.connect(SOCKET_PATH)
+        s.sendall((json.dumps({"prompt": prompt, "top_k": k}) + "\n").encode())
+        s.shutdown(socket.SHUT_WR)
+        buf = b""
+        while True:
+            chunk = s.recv(8192)
+            if not chunk:
+                break
+            buf += chunk
+            if len(buf) > 1_000_000:
+                break
+        reply = json.loads(buf.decode("utf-8", errors="replace"))
+    except Exception as e:
+        log({"event": "socket_err", "err": str(e)})
+        return None
+    finally:
+        if s is not None:
+            try:
+                s.close()
+            except Exception:
+                pass
+    if not isinstance(reply, dict):
+        log({"event": "daemon_bad_shape"})
+        return None
+    if "error" in reply:
+        log({"event": "daemon_err", "err": reply["error"]})
+        return None
+    routes = reply.get("routes")
+    return list(routes) if isinstance(routes, list) else []
+
+
+# ---------------------------------------------------------------------------
+# Resolution: route name -> hub skill or agent .md
+# ---------------------------------------------------------------------------
+
+
+def slug(name: str) -> str:
+    return _slug_re.sub("-", name.lower()).strip("-")
+
+
+def resolve_name(name: str, source: dict[str, Path]) -> str | None:
+    if not name:
+        return None
+    if name in source:
+        return name
+    s = slug(name)
+    if s in source:
+        return s
+    for src_name in source:
+        if slug(src_name) == s:
+            return src_name
+    return None
+
+
+def skill_path(name: str, source: dict[str, Path]) -> str | None:
+    match = resolve_name(name, source)
+    return str(source[match] / "SKILL.md") if match else None
+
+
+def agent_path(name: str) -> str | None:
+    if not name:
+        return None
+    candidates = [name, slug(name), name.replace("_", "-")]
+    for root in AGENT_DIRS:
+        if not root.is_dir():
+            continue
+        for c in candidates:
+            for fn in (f"{c}.md", f"{c}.yaml", f"{c}.yml"):
+                p = root / fn
+                if p.is_file():
+                    return str(p)
+        try:
+            lower = {f.name.lower(): f for f in root.iterdir() if f.is_file()}
+        except Exception:
+            continue
+        for c in candidates:
+            hit = lower.get(f"{c}.md".lower()) or lower.get(f"{c}.yaml".lower())
+            if hit:
+                return str(hit)
+    return None
+
+
+def classify_route(name: str, source: dict[str, Path]) -> tuple[str, str | None]:
+    """(kind, absolute path) where kind is skill | agent | unknown."""
+    sp = skill_path(name, source)
+    if sp:
+        return "skill", sp
+    ap = agent_path(name)
+    if ap:
+        return "agent", ap
+    return "unknown", None
+
+
+# ---------------------------------------------------------------------------
+# Ranking: dedup across source_repo, then apply the gates
+# ---------------------------------------------------------------------------
+
+
+def route_score(r: dict) -> float:
+    try:
+        return float(r.get("score"))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def dedup_routes(routes: list[dict], source: dict[str, Path]) -> list[dict]:
+    """Collapse duplicates that differ only by `source_repo`.
+
+    The route table carries the same skill under "starga" and "local"; a raw
+    top-5 is effectively a top-3 distinct. Identity is the resolved hub name
+    when the route resolves, else the slug — so `Deploying-X` and `deploying-x`
+    collapse too. Daemon order is preserved and the best-scoring row wins.
+
+    Rows pointing into `.system/` are dropped here rather than deduped: they
+    are hub internals that shadow real skills of the same name.
+    """
+    out: list[dict] = []
+    seen: dict[str, int] = {}
+    for r in routes:
+        name = str(r.get("name") or "").strip()
+        if not name or is_system_route(r):
+            continue
+        kind, path = classify_route(name, source)
+        resolved = resolve_name(name, source)
+        identity = resolved or slug(name)
+        enriched = dict(r)
+        enriched["name"] = name
+        enriched["kind"] = kind
+        enriched["path"] = path
+        enriched["score_f"] = route_score(r)
+
+        prev_idx = seen.get(identity)
+        if prev_idx is None:
+            seen[identity] = len(out)
+            out.append(enriched)
+        elif enriched["score_f"] > out[prev_idx]["score_f"]:
+            # Same skill under a different source_repo scored higher — keep the
+            # better row in the position the first occurrence already earned.
+            out[prev_idx] = enriched
+    return out
+
+
+def apply_threshold(routes: list[dict], min_score: float) -> list[dict]:
+    """Drop routes below the score floor. Sub-threshold rows are noise."""
+    return [r for r in routes if r.get("score_f", 0.0) >= min_score]
+
+
+def top2_ratio(routes: list[dict]) -> float | None:
+    """score(runner-up) / score(leader) over ALREADY-DEDUPED routes.
+
+    Computed for telemetry ONLY — see APPLY_RATIO_GATE for why this never
+    gates. Deduping first matters even for a logged value: near-duplicate
+    skills drive the raw top2/top1 to ~1.0 for reasons that have nothing to do
+    with confidence, so an un-deduped ratio would be measuring the catalog's
+    redundancy rather than the ranker's certainty.
+    """
+    if len(routes) < 2:
+        return None
+    top = routes[0].get("score_f", 0.0)
+    if top <= 0:
+        return None
+    return round(routes[1].get("score_f", 0.0) / top, 4)
+
+
+# ---------------------------------------------------------------------------
+# Projection
+# ---------------------------------------------------------------------------
+
+
+def _router_body_candidates() -> list[Path]:
+    return [
+        Path(__file__).resolve().parent / "assets" / "mind-nerve-router.SKILL.md",
+        PROJECTED_DIR / ROUTER_NAME / "SKILL.md",
+        SOURCE_DIR / ROUTER_NAME / "SKILL.md",
+    ]
+
+
+ROUTER_FALLBACK = (
+    "---\n"
+    "name: mind-nerve-router\n"
+    "description: Route intents to hub skills via mind-nerve; Read the winning SKILL.md.\n"
+    "---\n\n"
+    "# mind-nerve-router\n\n"
+    "Follow the injected auto-route context. Read the highest-ranked SKILL.md path\n"
+    "and follow it. Do not list or dump the hub.\n"
+)
+
+
+def generation_key(selected: list[tuple[str, Path]]) -> str:
+    """Stable hash of the projected route SET (names + resolved targets).
+
+    Order-sensitive on purpose: the projection's rank order is part of what the
+    model sees. Same set in the same order -> same key -> zero work.
+    """
+    h = hashlib.sha256()
+    for name, src in selected:
+        h.update(name.encode("utf-8", "replace"))
+        h.update(b"\0")
+        h.update(str(src).encode("utf-8", "replace"))
+        h.update(b"\n")
+    return h.hexdigest()[:16]
+
+
+def _gen_root() -> Path:
+    return PROJECTED_DIR.parent / ".mind-nerve-gen"
+
+
+def _populate_generation(gen_dir: Path, selected: list[tuple[str, Path]]) -> None:
+    """Fill a fresh generation dir. Caller guarantees it does not exist."""
+    gen_dir.mkdir(parents=True)
+
+    # Router skill body is always present — the projection is replaced every
+    # turn, so it cannot be left to survive on its own.
+    rdir = gen_dir / ROUTER_NAME
+    rdir.mkdir(exist_ok=True)
+    copied = False
+    for rc in _router_body_candidates():
+        try:
+            if rc.is_file():
+                shutil.copy2(rc, rdir / "SKILL.md")
+                copied = True
+                break
+        except Exception:
+            continue
+    if not copied:
+        (rdir / "SKILL.md").write_text(ROUTER_FALLBACK)
+
+    # Collision-safe by construction: the destination name is claimed once.
+    # Two hub entries can slug-collide (and `.system/` used to shadow four real
+    # skills outright); first writer wins and the loser is skipped rather than
+    # silently overwriting the winner's link.
+    claimed: set[str] = {ROUTER_NAME}
+    for name, src in selected:
+        if name in claimed:
+            continue
+        dest = gen_dir / name
+        if dest.exists() or dest.is_symlink():
+            continue
+        try:
+            dest.symlink_to(src)
+            claimed.add(name)
+        except Exception:
+            pass
+
+    (gen_dir / "README.md").write_text(
+        "# mind-nerve projected skills\n\n"
+        "Auto-projected top-K hub skills for the current prompt. The full hub is at\n"
+        f"`{SOURCE_DIR}` and is deliberately NOT announced.\n\n"
+        "Do not list the hub. Read only the SKILL.md paths in the injected route table.\n"
+    )
+
+
+def _gc_generations(keep: str) -> None:
+    """Retain the newest few generations; drop the rest.
+
+    Only ever removes directories under our own `.mind-nerve-gen` root, and
+    only ones whose name is a 16-hex generation key — never a user directory.
+    """
+    root = _gen_root()
+    try:
+        entries = [
+            d
+            for d in root.iterdir()
+            if d.is_dir()
+            and not d.is_symlink()
+            and re.fullmatch(r"[0-9a-f]{16}", d.name)
+            and d.name != keep
+        ]
+    except Exception:
+        return
+    entries.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+    for stale in entries[KEEP_GENERATIONS - 1 :]:
+        shutil.rmtree(stale, ignore_errors=True)
+
+
+def write_projection(selected: list[tuple[str, Path]]) -> int:
+    """Publish *selected* as the CLI's skills dir. Returns entry count, or -1.
+
+    symlink mode (default): build `.mind-nerve-gen/<key>/`, then flip
+    PROJECTED_DIR to point at it with an atomic rename over a temp symlink.
+    Interruption at any point leaves either the previous generation or the new
+    one — never a half-populated skills dir. An unchanged route set resolves to
+    the same key and costs one readlink: zero writes, no churn.
+
+    dir mode: the previous behaviour (build a sibling temp dir, two renames)
+    for any CLI that cannot follow a symlinked skills directory.
+    """
+    if str(PROJECTED_DIR) in ("", "."):
+        return -1
+    if PROJECT_MODE == "dir":
+        return _write_projection_dir(selected)
+
+    key = generation_key(selected)
+    gen_root = _gen_root()
+    gen_dir = gen_root / key
+    try:
+        gen_root.mkdir(parents=True, exist_ok=True)
+
+        # Zero-work path: already published and intact.
+        if PROJECTED_DIR.is_symlink():
+            try:
+                if os.readlink(PROJECTED_DIR) == str(gen_dir) and gen_dir.is_dir():
+                    return sum(
+                        1 for c in gen_dir.iterdir() if c.is_dir() or c.is_symlink()
+                    )
+            except OSError:
+                pass
+
+        if not gen_dir.is_dir():
+            staging = gen_root / f".build.{secrets.token_hex(4)}"
+            _populate_generation(staging, selected)
+            try:
+                os.rename(staging, gen_dir)
+            except OSError:
+                # Another hook process published this key first — same content
+                # by construction (the key IS the content); drop our copy.
+                shutil.rmtree(staging, ignore_errors=True)
+
+        # A real directory sitting where the symlink belongs is the pre-upgrade
+        # layout (or a CLI that recreated it). NEVER rm -rf it: rename it aside
+        # so the previous state is always recoverable.
+        if PROJECTED_DIR.is_dir() and not PROJECTED_DIR.is_symlink():
+            backup = PROJECTED_DIR.parent / (
+                f".{PROJECTED_DIR.name}.pre-mind-nerve."
+                f"{time.strftime('%Y%m%d-%H%M%S')}.{secrets.token_hex(2)}"
+            )
+            os.rename(PROJECTED_DIR, backup)
+            log({"event": "projection_dir_backed_up", "backup": str(backup)})
+
+        tmp_link = PROJECTED_DIR.parent / f".mind-nerve-link.{secrets.token_hex(4)}"
+        os.symlink(gen_dir, tmp_link)
+        os.rename(tmp_link, PROJECTED_DIR)  # atomic publish
+
+        _gc_generations(key)
+        return sum(1 for c in gen_dir.iterdir() if c.is_dir() or c.is_symlink())
+    except Exception as e:
+        log({"event": "projection_fail", "err": str(e), "mode": "symlink"})
+        return -1
+
+
+def _write_projection_dir(selected: list[tuple[str, Path]]) -> int:
+    """Real-directory projection (MIND_NERVE_PROJECT_MODE=dir)."""
+    parent = PROJECTED_DIR.parent
+    tmp = parent / f".mind-nerve-skills.tmp.{secrets.token_hex(4)}"
+    old = parent / f".mind-nerve-skills.old.{secrets.token_hex(4)}"
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+        _populate_generation(tmp, selected)
+
+        existed = PROJECTED_DIR.exists() or PROJECTED_DIR.is_symlink()
+        if existed:
+            os.rename(PROJECTED_DIR, old)
+        os.rename(tmp, PROJECTED_DIR)
+
+        if existed:
+            if old.is_symlink():
+                old.unlink()
+            else:
+                shutil.rmtree(old, ignore_errors=True)
+
+        return sum(
+            1 for c in PROJECTED_DIR.iterdir() if c.is_dir() or c.is_symlink()
+        )
+    except Exception as e:
+        log({"event": "projection_fail", "err": str(e), "mode": "dir"})
+        shutil.rmtree(tmp, ignore_errors=True)
+        return -1
+
+
+def select_for_projection(
+    routes: list[dict], source: dict[str, Path]
+) -> list[tuple[str, Path]]:
+    """Core skills first, then the above-threshold skill routes in rank order."""
+    selected: list[tuple[str, Path]] = []
+    seen: set[str] = set()
+    for name in CORE_ALWAYS_ON:
+        m = resolve_name(name, source)
+        if m and m not in seen:
+            seen.add(m)
+            selected.append((m, source[m]))
+    for r in routes:
+        if r.get("kind") != "skill":
+            continue
+        m = resolve_name(str(r["name"]), source)
+        if m and m not in seen:
+            seen.add(m)
+            selected.append((m, source[m]))
+    return selected
+
+
+# ---------------------------------------------------------------------------
+# Context injection
+# ---------------------------------------------------------------------------
+
+NO_MATCH_CONTEXT = (
+    "## mind-nerve auto-route (injected)\n\n"
+    "**No strong skill match — proceed without one.**\n\n"
+    "The router found nothing above the confidence floor "
+    "(MIND_NERVE_MIN_SCORE={min_score:.2f}) for this prompt. Weak matches were\n"
+    "suppressed on purpose: below the floor the catalog returns unrelated skills,\n"
+    "and acting on them is worse than having none.\n\n"
+    "Use your own judgement and the built-in tools. If you believe a specialised\n"
+    "procedure exists, re-route with a sharper query via `mind_nerve_route`.\n"
+    "Hub (do NOT list it): `{hub}`\n"
+)
+
+
+def build_context(routes: list[dict], projected: int, min_score: float) -> str:
+    if not routes:
+        return NO_MATCH_CONTEXT.format(min_score=min_score, hub=SOURCE_DIR)
+
+    lines = [
+        "## mind-nerve auto-route (injected — do not skip)",
+        "",
+        "Hub skills are NOT bulk-listed. Use ONLY the ranked routes below.",
+        "MANDATORY for non-trivial work:",
+        "1. Prefer the highest-ranked **skill** with a SKILL.md path — read it, then follow it.",
+        "2. If the top hits are **agents**, spawn that subagent type (or read the agent .md).",
+        "3. Do not dump the hub. Do not invent skill/agent bodies from memory.",
+        "",
+        f"Hub: `{SOURCE_DIR}`  |  Projected skills this turn: {projected}  "
+        f"|  Score floor: {min_score:.2f}",
+        "",
+        "| rank | name | kind | score | path |",
+        "|-----:|------|------|------:|------|",
+    ]
+    skill_n = agent_n = 0
+    for i, r in enumerate(routes, 1):
+        kind = str(r.get("kind") or "unknown")
+        if kind == "skill":
+            skill_n += 1
+        elif kind == "agent":
+            agent_n += 1
+        path = r.get("path")
+        path_s = f"`{path}`" if path else "_(unresolved)_"
+        lines.append(
+            f"| {i} | `{r.get('name')}` | {kind} | {r.get('score_f', 0.0):.3f} | {path_s} |"
+        )
+    lines += [
+        "",
+        f"Resolved: {skill_n} skill(s), {agent_n} agent(s).",
+        "",
+        "### Tool discipline (token save)",
+        "- Skills/agents: the routes above only; load one body.",
+        "- MCP: search for a tool, then call it — do not list every MCP tool.",
+        "- Re-rank only if these are wrong: call `mind_nerve_route` with a sharper query.",
+        "- Built-in tools (read, grep, shell, ...) are always available.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def emit(event_name: str, context: str | None) -> None:
+    """Emit the Claude-compatible hook reply that all six CLIs understand."""
+    if not context:
+        print("{}")
+        return
+    hook_event = (
+        "UserPromptSubmit"
+        if event_name.lower() in PROMPT_EVENTS
+        else (event_name or "UserPromptSubmit")
+    )
+    print(
+        json.dumps(
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": hook_event,
+                    "additionalContext": context,
+                }
+            }
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+SESSION_START_CONTEXT = (
+    "## mind-nerve ready\n\n"
+    "Hub: `{hub}` — deliberately NOT auto-listed ({n} skills would cost ~115k tokens).\n"
+    "Relevant routes are injected automatically on every prompt. Use the\n"
+    "`mind-nerve-router` skill, or read the absolute SKILL.md paths as they arrive.\n"
+)
+
+
+def main() -> None:
+    t0 = time.time()
+    data = read_stdin()
+    event = str(
+        data.get("hookEventName")
+        or data.get("hook_event_name")
+        or data.get("event")
+        or "UserPromptSubmit"
+    )
+    raw_prompt = prompt_from(data)
+    source = list_source_skills()
+
+    if not source:
+        log({"event": "no_source", "dir": str(SOURCE_DIR)})
+        emit(event, None)
+        return
+
+    # SessionStart (or any event without a prompt): seed the projection with the
+    # core set only, and say so. No routing without a query.
+    if not raw_prompt:
+        selected = select_for_projection([], source)
+        n = write_projection(selected) if selected else 0
+        log({"event": "session_start", "projected": n})
+        emit(event, SESSION_START_CONTEXT.format(hub=SOURCE_DIR, n=len(source)))
+        return
+
+    should_route, reason, prompt = intent_gate(raw_prompt)
+    if not should_route:
+        # Emit nothing and touch nothing. The previous projection stays exactly
+        # as it was, which is the correct state: the user did not ask for
+        # anything new, so the skills from their actual last request remain.
+        log({"event": "intent_skip", "reason": reason, "prompt_head": raw_prompt[:80]})
+        telemetry(
+            {
+                "event": "route_decision",
+                "decision": "skip",
+                "reason": reason,
+                "query_sha": query_digest(raw_prompt),
+                "query_len": len(raw_prompt),
+                "cli_event": event,
+                "ms": int((time.time() - t0) * 1000),
+            }
+        )
+        print("{}")
+        return
+
+    routes = query_daemon(prompt, OVERFETCH)
+    if routes is None:
+        # Daemon absent / timed out / malformed — pass through untouched.
+        log({"event": "passthrough", "prompt_head": prompt[:80]})
+        telemetry(
+            {
+                "event": "route_decision",
+                "decision": "passthrough",
+                "reason": "daemon_unavailable",
+                "query_sha": query_digest(raw_prompt),
+                "cli_event": event,
+                "ms": int((time.time() - t0) * 1000),
+            }
+        )
+        emit(event, None)
+        return
+
+    deduped = dedup_routes(routes, source)
+    thresholded = apply_threshold(deduped, MIN_SCORE)
+    kept = thresholded[:TOP_K]
+    ratio = top2_ratio(deduped)
+
+    selected = select_for_projection(kept, source)
+    n = write_projection(selected)
+    ctx = build_context(kept, n if n > 0 else len(selected), MIN_SCORE)
+
+    log(
+        {
+            "event": "auto_routed",
+            "raw": len(routes),
+            "deduped": len(deduped),
+            "kept": len(kept),
+            "projected": n,
+            "top": [r.get("name") for r in kept[:5]],
+            "prompt_head": prompt[:100],
+            "ms": int((time.time() - t0) * 1000),
+        }
+    )
+    telemetry(
+        {
+            "event": "route_decision",
+            "decision": "routed" if kept else "no_match",
+            "reason": reason,
+            "query_sha": query_digest(raw_prompt),
+            "query_len": len(raw_prompt),
+            "evaluated_len": len(prompt),
+            "cli_event": event,
+            "min_score": MIN_SCORE,
+            "top2_ratio": ratio,
+            "raw": len(routes),
+            "deduped": len(deduped),
+            "thresholded": len(thresholded),
+            "kept": len(kept),
+            "projected": n,
+            "generation": generation_key(selected),
+            "top": [
+                {
+                    "name": r.get("name"),
+                    "score": round(r.get("score_f", 0.0), 4),
+                    "kind": r.get("kind"),
+                    "path": r.get("path"),
+                }
+                for r in kept[:TOP_K]
+            ],
+            "ms": int((time.time() - t0) * 1000),
+        }
+    )
+    emit(event, ctx)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:  # noqa: BLE001 — fail-open is the contract
+        log({"event": "fatal", "err": str(e)})
+        print("{}")
+        sys.exit(0)

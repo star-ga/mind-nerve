@@ -5,10 +5,15 @@ import path from "node:path";
 import { type AgentSpec } from "./registry.js";
 import { restoreLatestBackup } from "./backup.js";
 import { removeInstructionBlock } from "./instruction_block.js";
+import { unwireClient, type UnwireResult } from "./wire.js";
 import { InstallerError } from "./errors.js";
 
 export interface UninstallOptions {
   workspace?: string;
+  /** Home directory override (tests). */
+  homeDir?: string;
+  /** Skip skill-surface unwiring (hook + skills dir). Default: unwire. */
+  skipUnwire?: boolean;
 }
 
 export interface UninstallResult {
@@ -16,6 +21,8 @@ export interface UninstallResult {
   readonly restoredPaths: readonly string[];
   readonly removedBlocks: readonly string[];
   readonly changed: boolean;
+  /** Skill-surface unwiring result, or null when not applicable. */
+  readonly unwire: UnwireResult | null;
 }
 
 /**
@@ -81,11 +88,25 @@ export async function uninstallClient(
     }
   }
 
+  // -------------------------------------------------------------------------
+  // Unwire the skill surface: hook registration, wrapper, skills directory.
+  // Restores the hub symlink when that is what was there before install.
+  // -------------------------------------------------------------------------
+  let unwire: UnwireResult | null = null;
+  if (opts.skipUnwire !== true && spec.skillSurface !== null) {
+    unwire = await unwireClient(
+      spec,
+      opts.homeDir !== undefined ? { homeDir: opts.homeDir } : {},
+    );
+    if (unwire !== null && unwire.changed) changed = true;
+  }
+
   return {
     clientName: spec.name,
     restoredPaths,
     removedBlocks,
     changed,
+    unwire,
   };
 }
 

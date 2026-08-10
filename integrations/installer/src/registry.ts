@@ -27,6 +27,40 @@ export type McpFmt =
   | "mcp-toml-vibe"
   | null;
 
+/**
+ * How a client serialises its hook registration.
+ *
+ * All six skill-surface CLIs speak the Claude-compatible hook protocol
+ * (`UserPromptSubmit` / `SessionStart`, JSON on stdin, `hookSpecificOutput`
+ * with `additionalContext` on stdout) — they differ only in whether the
+ * registration lives in a JSON settings file or a TOML config file.
+ */
+export type HookWireFmt = "json-hooks" | "toml-hooks";
+
+/**
+ * The skill-announce surface of a CLI: where its skills directory lives, and
+ * how the generic mind-nerve hook gets registered.
+ *
+ * Present only for clients that announce a skills directory into the model
+ * context. Everything here was confirmed on disk — see `verified`.
+ */
+export interface SkillSurface {
+  /** The CLI's skills directory. This is what gets announced to the model. */
+  readonly skillsDir: string;
+  /** Where the generic hook script is installed for this CLI. */
+  readonly hookScriptPath: string;
+  /** Config file the hook registration is merged into. */
+  readonly hookConfigPath: string;
+  /** Serialisation format of that config file. */
+  readonly hookWireFmt: HookWireFmt;
+  /** Hook events to register the router on. */
+  readonly hookEvents: readonly string[];
+  /** Per-invocation hook timeout in seconds. */
+  readonly hookTimeoutSecs: number;
+  /** How this shape was verified on disk — kept honest, not guessed. */
+  readonly verified: string;
+}
+
 export interface AgentSpec {
   /** Canonical client identifier — must be unique across registry. */
   readonly name: string;
@@ -59,10 +93,40 @@ export interface AgentSpec {
    * aider, copilot, cody, qodo, cline, roo). Null when not applicable.
    */
   readonly instructionFilePath: string | null;
+  /**
+   * Skill-announce surface + hook wiring. Null for clients that do not
+   * announce a skills directory.
+   */
+  readonly skillSurface: SkillSurface | null;
 }
 
 function h(): string {
   return os.homedir();
+}
+
+/** Both hook events every skill-surface CLI is wired on. */
+const HOOK_EVENTS: readonly string[] = ["UserPromptSubmit", "SessionStart"];
+
+/**
+ * Builds a SkillSurface from the parts that actually differ per CLI.
+ * `hookTimeoutSecs` of 8 matches the live, working Grok wiring.
+ */
+function surface(args: {
+  readonly skillsDir: string;
+  readonly hookScriptPath: string;
+  readonly hookConfigPath: string;
+  readonly hookWireFmt: HookWireFmt;
+  readonly verified: string;
+}): SkillSurface {
+  return {
+    skillsDir: args.skillsDir,
+    hookScriptPath: args.hookScriptPath,
+    hookConfigPath: args.hookConfigPath,
+    hookWireFmt: args.hookWireFmt,
+    hookEvents: HOOK_EVENTS,
+    hookTimeoutSecs: 8,
+    verified: args.verified,
+  };
 }
 
 /**
@@ -99,6 +163,15 @@ export const AGENT_REGISTRY: ReadonlyMap<string, AgentSpec> = new Map<
       alwaysOffer: false,
       projectionDir: projDir("claude-code"),
       instructionFilePath: null,
+      skillSurface: surface({
+        skillsDir: path.join(h(), ".claude", "skills"),
+        hookScriptPath: path.join(h(), ".claude", "hooks", "mind-nerve-hook"),
+        hookConfigPath: path.join(h(), ".claude", "settings.json"),
+        hookWireFmt: "json-hooks",
+        verified:
+          "~/.claude/settings.json read live (hooks.SessionStart/.Stop present); " +
+          "~/.claude/hooks/ exists; ~/.claude/skills is a real dir (2 entries).",
+      }),
     },
   ],
   [
@@ -115,6 +188,16 @@ export const AGENT_REGISTRY: ReadonlyMap<string, AgentSpec> = new Map<
       alwaysOffer: false,
       projectionDir: null,
       instructionFilePath: null,
+      skillSurface: surface({
+        skillsDir: path.join(h(), ".codex", "skills"),
+        hookScriptPath: path.join(h(), ".codex", "hooks", "mind-nerve-hook"),
+        hookConfigPath: path.join(h(), ".codex", "config.toml"),
+        hookWireFmt: "toml-hooks",
+        verified:
+          "~/.codex/config.toml read live (skills.config array present); " +
+          "~/.codex/skills is a real dir (2 entries); native codex binary " +
+          "contains UserPromptSubmit x9, SessionStart x36, SKILL.md x101.",
+      }),
     },
   ],
   [
@@ -131,6 +214,7 @@ export const AGENT_REGISTRY: ReadonlyMap<string, AgentSpec> = new Map<
       alwaysOffer: false,
       projectionDir: null,
       instructionFilePath: null,
+      skillSurface: null,
     },
   ],
   [
@@ -147,6 +231,95 @@ export const AGENT_REGISTRY: ReadonlyMap<string, AgentSpec> = new Map<
       alwaysOffer: false,
       projectionDir: null,
       instructionFilePath: null,
+      skillSurface: surface({
+        skillsDir: path.join(h(), ".gemini", "skills"),
+        hookScriptPath: path.join(h(), ".gemini", "hooks", "mind-nerve-hook"),
+        hookConfigPath: path.join(h(), ".gemini", "settings.json"),
+        hookWireFmt: "json-hooks",
+        verified:
+          "~/.gemini/settings.json read live; ~/.gemini/skills is a real dir " +
+          "(2 entries); gemini-cli bundle maps UserPromptSubmit -> BeforeAgent " +
+          "and ships SKILL.md support (SessionStart in 18 chunks).",
+      }),
+    },
+  ],
+  [
+    "grok",
+    {
+      name: "grok",
+      description: "xAI Grok CLI",
+      configFmt: "toml-vibe",
+      configPath: path.join(h(), ".grok", "config.toml"),
+      mcpPath: path.join(h(), ".grok", "config.toml"),
+      mcpFmt: "mcp-toml-vibe",
+      detectPaths: [path.join(h(), ".grok")],
+      detectBinaries: ["grok"],
+      alwaysOffer: false,
+      projectionDir: null,
+      instructionFilePath: null,
+      skillSurface: surface({
+        skillsDir: path.join(h(), ".grok", "skills"),
+        hookScriptPath: path.join(h(), ".grok", "hooks", "mind-nerve-hook"),
+        hookConfigPath: path.join(h(), ".grok", "config.toml"),
+        hookWireFmt: "toml-hooks",
+        verified:
+          "~/.grok/config.toml read live: [[hooks.UserPromptSubmit]] and " +
+          "[[hooks.SessionStart]] already wired to ~/.grok/hooks/, timeout 8. " +
+          "This is the working reference implementation.",
+      }),
+    },
+  ],
+  [
+    "kimi",
+    {
+      name: "kimi",
+      description: "Moonshot Kimi Code CLI",
+      configFmt: "toml-vibe",
+      configPath: path.join(h(), ".kimi-code", "config.toml"),
+      mcpPath: path.join(h(), ".kimi-code", "config.toml"),
+      mcpFmt: "mcp-toml-vibe",
+      detectPaths: [path.join(h(), ".kimi-code")],
+      detectBinaries: ["kimi"],
+      alwaysOffer: false,
+      projectionDir: null,
+      instructionFilePath: null,
+      skillSurface: surface({
+        skillsDir: path.join(h(), ".kimi-code", "skills"),
+        hookScriptPath: path.join(h(), ".kimi-code", "hooks", "mind-nerve-hook"),
+        hookConfigPath: path.join(h(), ".kimi-code", "config.toml"),
+        hookWireFmt: "toml-hooks",
+        verified:
+          "~/.kimi-code/config.toml read live (extra_skill_dirs = []); " +
+          "~/.kimi-code/skills is a real dir (2 entries); kimi binary contains " +
+          "UserPromptSubmit x23, SessionStart x69, extra_skill_dirs x7, " +
+          "SKILL.md x30. Exact TOML hook table shape NOT confirmed — see README.",
+      }),
+    },
+  ],
+  [
+    "qwen",
+    {
+      name: "qwen",
+      description: "Alibaba Qwen Code CLI",
+      configFmt: "json-gemini",
+      configPath: path.join(h(), ".qwen", "settings.json"),
+      mcpPath: path.join(h(), ".qwen", "settings.json"),
+      mcpFmt: "mcp-json-servers",
+      detectPaths: [path.join(h(), ".qwen")],
+      detectBinaries: ["qwen"],
+      alwaysOffer: false,
+      projectionDir: null,
+      instructionFilePath: null,
+      skillSurface: surface({
+        skillsDir: path.join(h(), ".qwen", "skills"),
+        hookScriptPath: path.join(h(), ".qwen", "hooks", "mind-nerve-hook"),
+        hookConfigPath: path.join(h(), ".qwen", "settings.json"),
+        hookWireFmt: "json-hooks",
+        verified:
+          "~/.qwen/settings.json read live; ~/.qwen/skills is a real dir " +
+          "(2 entries); qwen-code 0.21.7 chunks contain hasHooksForEvent" +
+          '("UserPromptSubmit") + createHookOutput — Claude-compatible.',
+      }),
     },
   ],
   [
@@ -167,6 +340,7 @@ export const AGENT_REGISTRY: ReadonlyMap<string, AgentSpec> = new Map<
       alwaysOffer: false,
       projectionDir: null,
       instructionFilePath: ".cursorrules",
+      skillSurface: null,
     },
   ],
   [
@@ -192,6 +366,7 @@ export const AGENT_REGISTRY: ReadonlyMap<string, AgentSpec> = new Map<
       alwaysOffer: false,
       projectionDir: null,
       instructionFilePath: ".windsurfrules",
+      skillSurface: null,
     },
   ],
   [
@@ -208,6 +383,7 @@ export const AGENT_REGISTRY: ReadonlyMap<string, AgentSpec> = new Map<
       alwaysOffer: false,
       projectionDir: null,
       instructionFilePath: null,
+      skillSurface: null,
     },
   ],
   [
@@ -236,6 +412,7 @@ export const AGENT_REGISTRY: ReadonlyMap<string, AgentSpec> = new Map<
       alwaysOffer: false,
       projectionDir: null,
       instructionFilePath: ".clinerules",
+      skillSurface: null,
     },
   ],
   [
@@ -264,6 +441,7 @@ export const AGENT_REGISTRY: ReadonlyMap<string, AgentSpec> = new Map<
       alwaysOffer: false,
       projectionDir: null,
       instructionFilePath: path.join(".roo", "system-prompt.md"),
+      skillSurface: null,
     },
   ],
   [
@@ -283,6 +461,7 @@ export const AGENT_REGISTRY: ReadonlyMap<string, AgentSpec> = new Map<
       alwaysOffer: false,
       projectionDir: null,
       instructionFilePath: null,
+      skillSurface: null,
     },
   ],
   [
@@ -299,6 +478,7 @@ export const AGENT_REGISTRY: ReadonlyMap<string, AgentSpec> = new Map<
       alwaysOffer: false,
       projectionDir: null,
       instructionFilePath: null,
+      skillSurface: null,
     },
   ],
   [
@@ -315,6 +495,7 @@ export const AGENT_REGISTRY: ReadonlyMap<string, AgentSpec> = new Map<
       alwaysOffer: false,
       projectionDir: null,
       instructionFilePath: null,
+      skillSurface: null,
     },
   ],
   [
@@ -331,6 +512,7 @@ export const AGENT_REGISTRY: ReadonlyMap<string, AgentSpec> = new Map<
       alwaysOffer: false,
       projectionDir: null,
       instructionFilePath: null,
+      skillSurface: null,
     },
   ],
   [
@@ -347,6 +529,7 @@ export const AGENT_REGISTRY: ReadonlyMap<string, AgentSpec> = new Map<
       alwaysOffer: false,
       projectionDir: null,
       instructionFilePath: ".aider.conf.yml",
+      skillSurface: null,
     },
   ],
   [
@@ -363,6 +546,7 @@ export const AGENT_REGISTRY: ReadonlyMap<string, AgentSpec> = new Map<
       alwaysOffer: true,
       projectionDir: null,
       instructionFilePath: path.join(".github", "copilot-instructions.md"),
+      skillSurface: null,
     },
   ],
   [
@@ -379,6 +563,7 @@ export const AGENT_REGISTRY: ReadonlyMap<string, AgentSpec> = new Map<
       alwaysOffer: false,
       projectionDir: null,
       instructionFilePath: path.join(".cody", "config.json"),
+      skillSurface: null,
     },
   ],
   [
@@ -395,6 +580,7 @@ export const AGENT_REGISTRY: ReadonlyMap<string, AgentSpec> = new Map<
       alwaysOffer: false,
       projectionDir: null,
       instructionFilePath: path.join(".codium", "ai-rules.md"),
+      skillSurface: null,
     },
   ],
 ]);

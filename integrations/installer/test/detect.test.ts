@@ -17,6 +17,7 @@ function makeSpec(overrides: Partial<AgentSpec> = {}): AgentSpec {
     alwaysOffer: false,
     projectionDir: null,
     instructionFilePath: null,
+    skillSurface: null,
     ...overrides,
   };
 }

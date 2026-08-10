@@ -14,6 +14,7 @@ import {
   isTomlMcpFmt,
 } from "./mcp_rewire.js";
 import { appendInstructionBlock, BLOCK_MARKER } from "./instruction_block.js";
+import { wireClient, type WireOptions, type WireResult } from "./wire.js";
 import { InstallerError } from "./errors.js";
 
 export interface InstallOptions {
@@ -31,6 +32,12 @@ export interface InstallOptions {
    * projection. Only relevant for clients with projectionDir != null.
    */
   sharedProjectionDir?: string;
+  /**
+   * When present, also performs skill-surface wiring for clients that have one:
+   * the router-only skills directory (Part 1) and the automatic hook (Part 2).
+   * Omit to install the MCP surface only.
+   */
+  wire?: WireOptions;
   /** Suppress backup creation. Used in tests only. */
   _skipBackup?: boolean;
 }
@@ -44,6 +51,8 @@ export interface InstallResult {
   readonly changed: boolean;
   /** true if a previous install was detected and no changes were made. */
   readonly idempotentNoop: boolean;
+  /** Skill-surface wiring result, or null when not requested / not applicable. */
+  readonly wire: WireResult | null;
 }
 
 /**
@@ -161,6 +170,7 @@ export async function installClient(
       backedUp,
       changed,
       idempotentNoop: !changed,
+      wire: null,
     };
   }
 
@@ -196,6 +206,22 @@ export async function installClient(
     effectiveConfigPath = configPath;
   }
 
+  // -------------------------------------------------------------------------
+  // Step 5: Skill-surface wiring — router-only skills dir + automatic hook.
+  // -------------------------------------------------------------------------
+  let wire: WireResult | null = null;
+  if (opts.wire !== undefined && spec.skillSurface !== null) {
+    const wireOpts: WireOptions =
+      opts._skipBackup === true
+        ? { ...opts.wire, _skipBackup: true }
+        : opts.wire;
+    wire = await wireClient(spec, wireOpts);
+    if (wire !== null) {
+      for (const b of wire.backedUp) backedUp.push(b);
+      if (wire.changed) changed = true;
+    }
+  }
+
   return {
     clientName: spec.name,
     configPath: effectiveConfigPath,
@@ -204,6 +230,7 @@ export async function installClient(
     backedUp,
     changed,
     idempotentNoop: !changed,
+    wire,
   };
 }
 

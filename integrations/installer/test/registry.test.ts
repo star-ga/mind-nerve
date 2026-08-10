@@ -1,7 +1,27 @@
 // mind-nerve installer — Copyright 2026 STARGA Inc. Apache-2.0.
 
 import { describe, it, expect } from "vitest";
+import os from "node:os";
+import path from "node:path";
 import { AGENT_REGISTRY, ALL_CLIENT_NAMES, requireSpec } from "../src/registry.js";
+
+/** Total clients in the registry: the original 17 + grok, kimi, qwen. */
+const TOTAL_CLIENTS = 20;
+
+/**
+ * The six CLIs that announce a skills directory, with the shapes verified on
+ * disk. Each entry is `[client, skillsDir, hookConfigPath, hookWireFmt]`.
+ */
+const SKILL_SURFACE_CLIS = [
+  ["claude-code", ".claude/skills", ".claude/settings.json", "json-hooks"],
+  ["codex", ".codex/skills", ".codex/config.toml", "toml-hooks"],
+  ["gemini", ".gemini/skills", ".gemini/settings.json", "json-hooks"],
+  ["grok", ".grok/skills", ".grok/config.toml", "toml-hooks"],
+  ["kimi", ".kimi-code/skills", ".kimi-code/config.toml", "toml-hooks"],
+  ["qwen", ".qwen/skills", ".qwen/settings.json", "json-hooks"],
+] as const;
+
+const home = os.homedir();
 
 const VALID_CONFIG_FMTS = new Set([
   "json-claude-hooks",
@@ -27,8 +47,8 @@ const VALID_MCP_FMTS = new Set([
 ]);
 
 describe("AGENT_REGISTRY", () => {
-  it("contains exactly 17 clients", () => {
-    expect(AGENT_REGISTRY.size).toBe(17);
+  it("contains exactly 20 clients", () => {
+    expect(AGENT_REGISTRY.size).toBe(TOTAL_CLIENTS);
   });
 
   it("has no duplicate names", () => {
@@ -41,7 +61,7 @@ describe("AGENT_REGISTRY", () => {
 
   it("ALL_CLIENT_NAMES matches registry keys in order", () => {
     expect(ALL_CLIENT_NAMES).toEqual([...AGENT_REGISTRY.keys()]);
-    expect(ALL_CLIENT_NAMES.length).toBe(17);
+    expect(ALL_CLIENT_NAMES.length).toBe(TOTAL_CLIENTS);
   });
 
   it("each spec has a valid configFmt", () => {
@@ -145,6 +165,100 @@ describe("AGENT_REGISTRY", () => {
     for (const name of nonWsClients) {
       const spec = AGENT_REGISTRY.get(name);
       expect(spec?.instructionFilePath, `${name} should have instructionFilePath=null`).toBeNull();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Skill surfaces — the six CLIs whose shapes were verified on disk.
+// ---------------------------------------------------------------------------
+
+describe("AGENT_REGISTRY skill surfaces", () => {
+  it("covers exactly the six skill-surface CLIs", () => {
+    const withSurface = [...AGENT_REGISTRY.values()]
+      .filter((s) => s.skillSurface !== null)
+      .map((s) => s.name)
+      .sort();
+    expect(withSurface).toEqual(
+      SKILL_SURFACE_CLIS.map(([n]) => n)
+        .slice()
+        .sort(),
+    );
+  });
+
+  for (const [name, skillsRel, configRel, fmt] of SKILL_SURFACE_CLIS) {
+    describe(name, () => {
+      const spec = AGENT_REGISTRY.get(name);
+
+      it("is registered", () => {
+        expect(spec, `${name} missing from registry`).toBeDefined();
+        expect(spec!.skillSurface).not.toBeNull();
+      });
+
+      it("points at the verified skills directory", () => {
+        expect(spec!.skillSurface!.skillsDir).toBe(path.join(home, skillsRel));
+      });
+
+      it("points at the verified hook config file", () => {
+        expect(spec!.skillSurface!.hookConfigPath).toBe(
+          path.join(home, configRel),
+        );
+      });
+
+      it("uses the verified hook wire format", () => {
+        expect(spec!.skillSurface!.hookWireFmt).toBe(fmt);
+      });
+
+      it("registers on UserPromptSubmit and SessionStart", () => {
+        expect([...spec!.skillSurface!.hookEvents]).toEqual([
+          "UserPromptSubmit",
+          "SessionStart",
+        ]);
+      });
+
+      it("installs its hook wrapper under the CLI's own directory", () => {
+        const { hookScriptPath, hookConfigPath } = spec!.skillSurface!;
+        expect(hookScriptPath).toContain("mind-nerve-hook");
+        // The wrapper must live inside the same CLI dir as its config, so
+        // uninstalling one client never touches another's files.
+        expect(hookScriptPath.startsWith(path.dirname(hookConfigPath))).toBe(
+          true,
+        );
+      });
+
+      it("carries a non-empty on-disk verification note", () => {
+        expect(spec!.skillSurface!.verified.length).toBeGreaterThan(20);
+      });
+
+      it("has a positive hook timeout", () => {
+        expect(spec!.skillSurface!.hookTimeoutSecs).toBeGreaterThan(0);
+      });
+    });
+  }
+
+  it("gives every skill-surface client a distinct skills dir", () => {
+    const dirs = [...AGENT_REGISTRY.values()]
+      .filter((s) => s.skillSurface !== null)
+      .map((s) => s.skillSurface!.skillsDir);
+    expect(new Set(dirs).size).toBe(dirs.length);
+  });
+
+  it("never points a skills dir at the hub itself", () => {
+    for (const spec of AGENT_REGISTRY.values()) {
+      if (spec.skillSurface === null) continue;
+      expect(spec.skillSurface.skillsDir).not.toContain("skills-hub");
+    }
+  });
+
+  it("leaves non-skill clients without a surface", () => {
+    const noSurface = ["vibe", "cursor", "windsurf", "continue", "cline",
+      "roo", "zed", "openclaw", "nanoclaw", "nemoclaw", "aider", "copilot",
+      "cody", "qodo"];
+    for (const name of noSurface) {
+      expect(
+        AGENT_REGISTRY.get(name)?.skillSurface,
+        `${name} should have skillSurface=null`,
+      ).toBeNull();
     }
   });
 });

@@ -121,9 +121,7 @@ def test_native_absent_falls_back_to_pytorch(
     assert "pure-Python" in captured.err
 
 
-def test_route_works_with_native_disabled(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_route_works_with_native_disabled(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """route() must dispatch on instance type and return correct top-K."""
     import mind_nerve.inference as inf_mod
 

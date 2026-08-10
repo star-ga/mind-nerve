@@ -59,6 +59,7 @@ SENTINELS = frozenset(
 VALID_CATEGORIES = {"eval", "long", "adversarial"}
 EXPECTED_CATEGORY_COUNTS = {"eval": 600, "long": 200, "adversarial": 200}
 
+
 def _candidate_runtime_dir() -> Path | None:
     """Production-preferred runtime dir if it already exists locally.
 
@@ -788,9 +789,7 @@ class TestNativeGate:
         assert ref.get("records"), "reference has no records"
         assert "input_fingerprint" in ref, "reference missing input_fingerprint"
 
-    def test_native_hashes_are_real_when_weights_present(
-        self, native_hashes_small: dict
-    ) -> None:
+    def test_native_hashes_are_real_when_weights_present(self, native_hashes_small: dict) -> None:
         """(gate a) With the encoder-weights blob present, EVERY native hash must
         be a real 64-char hex SHA-256 — never a BACKEND_STUB_NOT_BUILT sentinel.
 
@@ -808,9 +807,7 @@ class TestNativeGate:
                     f"acceptable stub"
                 )
                 assert (
-                    isinstance(h, str)
-                    and len(h) == 64
-                    and all(c in "0123456789abcdef" for c in h)
+                    isinstance(h, str) and len(h) == 64 and all(c in "0123456789abcdef" for c in h)
                 ), f"native hash for {rec['id']!r}.{key} is not real 64-hex: {h!r}"
 
     def test_native_reproduces_reference(self, native_hashes_small: dict) -> None:
@@ -883,12 +880,8 @@ class TestNativeGate:
         mismatches: list[str] = []
         for rec in records:
             ref_rec = ref_by_id[rec["id"]]
-            if (
-                rec["hashes"] != ref_rec["hashes"]
-                or rec["topk_indices"] != ref_rec["topk_indices"]
-            ):
+            if rec["hashes"] != ref_rec["hashes"] or rec["topk_indices"] != ref_rec["topk_indices"]:
                 mismatches.append(rec["id"])
         assert not mismatches, (
-            f"{len(mismatches)} queries drifted from the pinned reference: "
-            f"{mismatches[:10]}"
+            f"{len(mismatches)} queries drifted from the pinned reference: {mismatches[:10]}"
         )

@@ -217,9 +217,7 @@ class TestPrecomputeUsesRichText:
         from mind_nerve.inference import build_embedding_text, parse_tags
 
         assert body  # the fixture body is still what makes desc != name
-        rich_text, warning = build_embedding_text(
-            "ml-pipeline-workflow", desc, parse_tags(fm)
-        )
+        rich_text, warning = build_embedding_text("ml-pipeline-workflow", desc, parse_tags(fm))
         assert warning is None
         rich_emb = model.encode([rich_text])
 

@@ -178,7 +178,9 @@ def _http_get(url: str, headers: dict[str, str] | None = None) -> bytes:
     hdrs = {"User-Agent": "mind-nerve-acquire/1"}
     hdrs.update(headers or {})
     req = urllib.request.Request(url, headers=hdrs)
-    with urllib.request.urlopen(req, timeout=NETWORK_TIMEOUT) as resp:  # noqa: S310
+    # nosec B310: url scheme is allowlisted https-only before this call
+    # (registry candidates refuse file:/http:; regression-tested).
+    with urllib.request.urlopen(req, timeout=NETWORK_TIMEOUT) as resp:  # noqa: S310  # nosec B310
         # Read cap must cover the largest legitimate payload — the 25 MB
         # quarantine byte cap, not the smaller JSON-API cap — or a valid
         # 16-25 MB tarball arrives truncated and fails to extract.
@@ -612,7 +614,10 @@ def _fetch_tarball(url: str, dest: Path, max_bytes: int, max_files: int, http_ge
                             f"uncompressed size cap exceeded ({uncompressed} > {max_bytes} bytes)"
                         )
             kwargs = {"filter": _TAR_FILTER} if _TAR_FILTER is not None else {}
-            tf.extractall(dest, members=members, **kwargs)
+            # nosec B202: members are pre-validated by _check_member_safe
+            # (dotdot/drive-qualified/absolute refused) and _skipped_member;
+            # tarfile data_filter is applied whenever the runtime offers it.
+            tf.extractall(dest, members=members, **kwargs)  # nosec B202
     except tarfile.TarError as e:
         raise FetchError(f"not a readable tarball: {e}") from e
     except KeyError as e:

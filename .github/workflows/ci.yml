@@ -315,7 +315,17 @@ jobs:
           clang --version | head -1
       - name: Build mindc
         working-directory: mind-compiler
-        run: cargo build --release --features "std-surface cross-module-imports mlir-build" --bin mindc
+        run: cargo build --release --features "std-surface cross-module-imports mlir-build" --bin mindc --lib
+      # mindc build links against the per-backend runtime library
+      # (~/.mind/lib/libmind_cpu_linux-x64.so; MIND_LIB_DIR overrides).
+      # The `mind` crate's cdylib IS that runtime — install the freshly
+      # built one (validated locally: full gate incl. native-ELF e2e leg
+      # passes with this lib).
+      - name: Install MIND cpu runtime library
+        working-directory: mind-compiler
+        run: |
+          mkdir -p "$HOME/.mind/lib"
+          cp target/release/liblibmind.so "$HOME/.mind/lib/libmind_cpu_linux-x64.so"
       # Fail-closed gate: project-mode compile of all 17 kernel-tree
       # modules + the 5-test LUT bit-identity smoke. The script never
       # trusts exit codes alone — it rejects error-severity diagnostics,

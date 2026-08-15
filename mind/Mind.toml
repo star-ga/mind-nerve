@@ -1,0 +1,53 @@
+# mind/Mind.toml — project manifest for the Q16.16 kernel/LUT/export tree.
+#
+# WHY THIS FILE EXISTS (mindc 0.10.2 port, 2026-08-10 audit D1):
+# mindc 0.10.2 resolves cross-module imports (`import luts.sqrt_q16;`)
+# ONLY in project mode: the project loader parses every declared source
+# into a whole-project module table and the type-checker's fn-body
+# name-resolution (mind#23) consults it. The historical CI loop ran
+# single-file `mindc $f --emit-ir`, which has an EMPTY module table by
+# design and therefore cannot resolve any user-module call — it passed
+# under v0.4.4 only because fn bodies were not name-checked at all.
+#
+# `[targets.cpu].sources` must list every module EXPLICITLY: without a
+# declared sources list the loader walks only the ENTRY FILE'S PARENT
+# DIRECTORY (exports/), which would drop luts/ and kernels/ from the
+# module table and silently re-break cross-module resolution.
+#
+# Gate: `bash tests/mindc_gate.sh` (fail-closed; see that script).
+
+[package]
+name    = "mind-nerve-kernels"
+version = "0.1.0-alpha.2"
+authors = ["STARGA, Inc. <info@star.ga>"]
+license = "Apache-2.0"
+description = "Q16.16 encoder kernels, LUTs, and C-ABI export surface (CI-gated tree)"
+
+[build]
+# The export façade transitively exercises every kernel and LUT module.
+entry = "exports/c_abi.mind"
+
+[targets.cpu]
+backend = "cpu"
+# Explicit, sorted-by-tree module list. ALL 17 CI-gated files. Adding a
+# module to mind/{luts,kernels,exports}/ without listing it here means
+# the module table never sees it — the gate fails closed in that case.
+sources = [
+    "exports/c_abi.mind",
+    "kernels/batched_matmul_q16.mind",
+    "kernels/embedding_q16.mind",
+    "kernels/encode.mind",
+    "kernels/gelu_q16.mind",
+    "kernels/l2_norm_q16.mind",
+    "kernels/layernorm_q16.mind",
+    "kernels/matmul_blas.mind",
+    "kernels/matmul_q16.mind",
+    "kernels/sliding_window.mind",
+    "kernels/topk_q16.mind",
+    "luts/exp_q16.mind",
+    "luts/recip_q32.mind",
+    "luts/rsqrt_q16.mind",
+    "luts/softmax_q16.mind",
+    "luts/sqrt_q16.mind",
+    "luts/tanh_q16.mind",
+]

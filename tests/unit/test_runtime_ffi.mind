@@ -1,0 +1,41 @@
+// tests/unit/test_runtime_ffi.mind — host-ABI contract suite for
+// src/runtime_ffi.mind (wave 3, 2026-08-12).
+//
+// The extern bodies themselves are NOT executed under `mindc test` (no
+// host shim in the test interpreter; they resolve at .so link time — the
+// same mechanism as the mind/ tree's `__mind_nerve_lut_*` shims). What IS
+// gated here: the status-code pins and the pure status logic every caller
+// relies on. Runs through `mindc test` on a merged image
+// (src/runtime_ffi.mind + this file), driven by tests/mindc_gate.sh leg 9
+// with an exact-count assertion — a "running 0 tests" output FAILS the
+// gate.
+
+#[test]
+fn test_rt_status_codes_pinned() {
+    // The host side of the ABI matches these values; changing one is an
+    // ABI break, not an implementation detail.
+    assert RT_OK == 0, "RT_OK is 0";
+    assert RT_ERR_IO == -1, "RT_ERR_IO is -1";
+    assert RT_ERR_UNSUPPORTED == -2, "RT_ERR_UNSUPPORTED is -2";
+}
+
+#[test]
+fn test_rt_is_err_classifies_sign() {
+    assert rt_is_err(-1) == 1, "negative is error";
+    assert rt_is_err(-2) == 1, "any negative is error";
+    assert rt_is_err(-9223372036854775807) == 1, "large negative is error";
+    assert rt_is_err(0) == 0, "zero is success";
+    assert rt_is_err(1) == 0, "positive is success";
+    assert rt_is_err(212) == 0, "byte counts are success";
+}
+
+#[test]
+fn test_rt_read_complete_requires_exact_size() {
+    // A read is complete iff bytes_read == probed size and non-negative.
+    assert rt_read_complete(212, 212) == 1, "exact size is complete";
+    assert rt_read_complete(0, 0) == 1, "empty file is complete";
+    assert rt_read_complete(100, 212) == 0, "short read is incomplete";
+    assert rt_read_complete(212, 100) == 0, "over read is impossible -> treated incomplete";
+    assert rt_read_complete(-1, 212) == 0, "error is never complete";
+    assert rt_read_complete(-1, -1) == 0, "error probe is never complete";
+}

@@ -18,12 +18,16 @@
 //   Per token i: variance accumulation j = 0..H-1 ascending.
 //   Per token i: normalize + affine j = 0..H-1 ascending.
 //
-// No f32. No while. LUT import: luts.sqrt_q16 (resolved at link time via A1.1).
+// No f32. No while. LUT import: luts.rsqrt_q16 (the rsqrt_q16 wrapper;
+// its table + Newton step live in luts.sqrt_q16, resolved at link time
+// via A1.1).
 //
 // Cross-substrate identity: ascending-index accumulation, same clamp
 // at variance = 0. rsqrt from LUT is bit-identical across substrates.
 
 import std.vec;
+import luts.rsqrt_q16;
+// layernorm_row_h calls rsqrt_q16_newton directly (handle-explicit path).
 import luts.sqrt_q16;
 
 // ---------------------------------------------------------------------------
@@ -135,6 +139,26 @@ pub fn layernorm_row(x: i64, out: i64, gamma: i64, beta: i64, i: i64, H: i64) ->
     let var_q16: i64 = row_var(x, i, H, mean);
     // rsqrt from A1.1 LUT: rsqrt_q16 takes Q16.16 variance, returns Q16.16.
     let rsqrt_val: i64 = rsqrt_q16(var_q16);
+    norm_write_j(x, out, gamma, beta, i, H, mean, rsqrt_val, 0)
+}
+
+// ---------------------------------------------------------------------------
+// Handle-explicit single-row variant (pure-MIND callers).
+//
+// layernorm_row_h is layernorm_row with the rsqrt LUT handle THREADED
+// EXPLICITLY instead of read from the C-side cache
+// (__mind_nerve_lut_rsqrt_h via luts.rsqrt_q16's single-arg wrapper).
+// Numerics are identical by construction: row_var clamps the variance to
+// >= 1 (var_clamp_min), so the wrapper's x <= 0 sentinel branch is
+// unreachable, and both paths converge on the same rsqrt_q16_newton call.
+// Exists for callers that run without the C runtime (the src/ pure-MIND
+// front-end, the mindc-test interpreter). Pinned by
+// tests/unit/test_q16_16.mind::test_layernorm_matches_identity_affine.
+// ---------------------------------------------------------------------------
+pub fn layernorm_row_h(rsqrt_h: i64, x: i64, out: i64, gamma: i64, beta: i64, i: i64, H: i64) -> i64 {
+    let mean: i64 = row_mean(x, i, H);
+    let var_q16: i64 = row_var(x, i, H, mean);
+    let rsqrt_val: i64 = rsqrt_q16_newton(rsqrt_h, var_q16);
     norm_write_j(x, out, gamma, beta, i, H, mean, rsqrt_val, 0)
 }
 

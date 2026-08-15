@@ -1,102 +1,165 @@
-// Host-runtime foreign function interface.
+// Host-runtime foreign function interface. Ported to the mindc 0.10.2
+// dialect 2026-08-12 (wave 3 of the pure-MIND migration; the dormant
+// pre-port source is preserved at src/dormant/runtime_ffi.mind).
 //
-// Every external dependency mind-nerve has on the surrounding mind-runtime
-// is declared here as `extern fn`. Pure-MIND modules call into this module
-// rather than scattering `extern` declarations across the source tree,
-// so the host contract is in a single, auditable place.
+// Every external dependency mind-nerve has on the surrounding host runtime
+// is declared here. Pure-MIND modules call into this module rather than
+// scattering `extern` declarations across the source tree, so the host
+// contract is in a single, auditable place. A backend that cannot fulfil a
+// given extern MUST refuse to link that target — a silent stub would break
+// the audit chain.
 //
-// mind-runtime is responsible for resolving each extern at link time. A
-// backend that cannot fulfil a given extern (e.g. WebGPU has no stdin)
-// MUST refuse to compile that target — silent fallback to a stub would
-// break the audit chain.
+// ABI REDESIGN (0.10.2) — the load-bearing decision of this file.
 //
-// SYNTAX
+// The dormant surface returned byte slices (`[u8]`, `[u8; 32]`) from
+// externs, which no shipped mindc can express. The 0.10.2 extern form is
+// `extern "C" { unsafe fn ...; }` over C-ABI scalars and raw pointers, so
+// the contract is rebuilt on POINTER+LENGTH OUT-PARAMS:
 //
-// `extern fn` is the same surface 512-mind uses for HSM + crypto host
-// primitives (see 512-mind/src/nexus_key.mind, key_management.mind).
-// mindc 0.2.4+ lowers extern fns to symbol references; mind-runtime
-// resolves them with native shims.
+//   1. OWNERSHIP: every buffer is allocated by the MIND caller
+//      (__mind_alloc) and freed by the MIND caller (__mind_free). The host
+//      NEVER allocates and NEVER frees. There is no ownership transfer
+//      across the boundary, ever.
+//   2. OUT-PARAMS: variable-length results are written by the host into a
+//      caller buffer of caller-stated capacity; the i64 return value
+//      carries the actual byte count (>= 0) or a negative status.
+//   3. SIZE PROBE: for files (unknown length a priori) the caller first
+//      calls __mind_nerve_rt_file_size, allocates exactly, then reads. No
+//      truncation-by-cap ambiguity: a read result equal to cap is complete
+//      iff cap == size from the probe.
+//   4. STATUS: 0 or positive = success (meaning per call); negative =
+//      error (RT_ERR_IO generic, RT_ERR_UNSUPPORTED backend cannot fulfil).
+//      Errors are VALUES, never silent empty buffers — the dormant
+//      "zero-length means error" convention conflated EOF with failure.
+//   5. NO CALLBACKS, NO VARARGS, NO FLOATS: i64/void only. Pointers pass
+//      as i64 (address of the first byte, one byte per offset).
+//
+// Symbol resolution: mindc 0.10.2 warns E2024 for `__mind_nerve_rt_*`
+// callees (outside its intrinsic table) and the symbols are resolved at
+// .so link time against the host runtime — the same mechanism the CI-gated
+// mind/ tree uses for its `__mind_nerve_lut_*` / `__mind_nerve_blas_*`
+// shims (see tests/mindc_gate.sh leg 1). The extern "C" block below pins
+// the names + signatures the host must provide.
 //
 // DETERMINISM
 //
 // extern fns are NOT bit-identical by definition (they read OS state).
 // Inference paths that touch externs (timestamp_ms, stderr error frames)
-// route the result into the envelope WRAPPER (timestamp_ms field) or into
-// stderr, never into the `result_hash` preimage. The route_id ordering
-// remains bit-identical across runs and architectures regardless of
-// what monotonic_steady_ns returns.
+// route the result into the envelope WRAPPER or stderr, never into the
+// result_hash preimage. The route_id ordering remains bit-identical
+// regardless of what monotonic time returns.
 //
-// PHASE 1 RUNTIME CONTRACT (mind-runtime ≥ 0.2.4 provides):
+// PHASE 1 HOST CONTRACT (the host runtime provides):
 //
-//   - clock_gettime(CLOCK_MONOTONIC_RAW)  -> monotonic_steady_ns
-//   - read(0, buf, n)                     -> read_stdin
-//   - write(1, buf, n)                    -> write_stdout
-//   - write(2, buf, n)                    -> write_stderr
-//   - read(open(path, O_RDONLY), ...)     -> read_file
-//   - getrandom(buf, 16, GRND_NONBLOCK)   -> os_entropy_16
-//   - exit(code)                          -> exit
+//   monotonic_ns   clock_gettime(CLOCK_MONOTONIC_RAW) / mach_continuous_time / QPC
+//   read_stdin     read(0, buf, cap)
+//   write_stdout   write(1, buf, len)
+//   write_stderr   write(2, buf, len)
+//   file_size      fstat(open(path, O_RDONLY))         (probe)
+//   read_file      read(open(path, O_RDONLY), buf, cap)
+//   os_entropy     getrandom(buf, len, GRND_NONBLOCK) / arc4random_buf / BCryptGenRandom
+//   exit           exit(code) after flushing stdout + stderr
+
+// Status codes (negative = error). Positive/zero returns are per-call
+// success values (byte counts, sizes, timestamps).
+pub const RT_OK: i64 = 0;
+pub const RT_ERR_IO: i64 = -1;
+pub const RT_ERR_UNSUPPORTED: i64 = -2;
+
+extern "C" {
+    // Monotonic, non-decreasing nanoseconds since an implementation-defined
+    // epoch (typically boot). Process suspend/resume transparent; operator
+    // clock adjustments (settimeofday, NTP step) do NOT affect it.
+    unsafe fn __mind_nerve_rt_monotonic_ns() -> i64;
+
+    // Read up to `cap` bytes from fd 0 into `buf`. Returns bytes read
+    // (0 = EOF), or RT_ERR_IO. EOF or `cap` ends the read.
+    unsafe fn __mind_nerve_rt_read_stdin(buf: i64, cap: i64) -> i64;
+
+    // Write `len` bytes from `buf` to fd 1 / fd 2. Returns bytes written
+    // (partial writes surfaced), or RT_ERR_IO.
+    unsafe fn __mind_nerve_rt_write_stdout(buf: i64, len: i64) -> i64;
+    unsafe fn __mind_nerve_rt_write_stderr(buf: i64, len: i64) -> i64;
+
+    // Size probe: returns the byte size of the file at `path` (UTF-8 path
+    // bytes, `path_len` long — no NUL termination crosses this ABI), or
+    // RT_ERR_IO. Callers probe, allocate exactly, then read.
+    unsafe fn __mind_nerve_rt_file_size(path: i64, path_len: i64) -> i64;
+
+    // Read up to `cap` bytes of the file at `path` into `buf`. Returns
+    // bytes read, or RT_ERR_IO. mind-nerve never writes to the filesystem
+    // in Phase 1 — no write_file primitive exists by design.
+    unsafe fn __mind_nerve_rt_read_file(path: i64, path_len: i64, buf: i64, cap: i64) -> i64;
+
+    // Write `len` bytes of cryptographic-quality host entropy into `buf`.
+    // Returns RT_OK, or RT_ERR_UNSUPPORTED on a backend without an RNG —
+    // callers then fall back to the chain_log test-fixture constructor
+    // (chain_log_new_with_id), never to a weak in-process seed.
+    unsafe fn __mind_nerve_rt_os_entropy(buf: i64, len: i64) -> i64;
+
+    // Terminate the process with `code`. The host flushes stdout + stderr
+    // first. Does not return in practice; the i64 return exists only to
+    // keep the C-ABI shape uniform.
+    unsafe fn __mind_nerve_rt_exit(code: i64) -> i64;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Thin wrappers (the only call sites pure-MIND modules may use)
+// ─────────────────────────────────────────────────────────────────────────────
 //
-// Backends listed in Mind.toml [bit-identity] backends-phase1 MUST resolve
-// all of the above. WebGPU (Phase 2) currently lacks stdin/stdout/fs and
-// will need an alternative I/O strategy before its bit-identity gate lands.
+// These add the audit-documented status discipline over the raw externs.
+// None of them are executed under `mindc test` (no host shim in the test
+// interpreter) — the executing coverage for the pure status logic is in
+// tests/unit/test_runtime_ffi.mind; the extern bodies themselves are
+// exercised by the host integration harness, not the unit gate.
 
-module runtime_ffi {
+pub fn rt_monotonic_ns() -> i64 {
+    return __mind_nerve_rt_monotonic_ns();
+}
 
-    // ----- Time -----------------------------------------------------------
+pub fn rt_read_stdin(buf: i64, cap: i64) -> i64 {
+    return __mind_nerve_rt_read_stdin(buf, cap);
+}
 
-    // Monotonic, non-decreasing nanosecond timer.
-    //   Linux:   clock_gettime(CLOCK_MONOTONIC_RAW)
-    //   Darwin:  mach_continuous_time() with mach_timebase_info scaling
-    //   Windows: QueryPerformanceCounter() with QueryPerformanceFrequency scaling
-    //
-    // Process suspend / resume are transparent. Operator clock adjustments
-    // (settimeofday, NTP step) do NOT affect this counter. Returns ns
-    // since an implementation-defined epoch (typically boot).
-    extern fn monotonic_steady_ns() -> i64
+pub fn rt_write_stdout(buf: i64, len: i64) -> i64 {
+    return __mind_nerve_rt_write_stdout(buf, len);
+}
 
-    // ----- Standard I/O ---------------------------------------------------
+pub fn rt_write_stderr(buf: i64, len: i64) -> i64 {
+    return __mind_nerve_rt_write_stderr(buf, len);
+}
 
-    // Read up to `max_bytes` bytes from fd 0 (stdin) into a fresh byte
-    // buffer. Returns the actual bytes read. EOF or `max_bytes` ends the
-    // read. Errors return an empty buffer; callers check length to detect.
-    extern fn read_stdin(max_bytes: usize) -> [u8]
+pub fn rt_file_size(path: i64, path_len: i64) -> i64 {
+    return __mind_nerve_rt_file_size(path, path_len);
+}
 
-    // Write `bytes` to fd 1 (stdout). Returns count written; partial
-    // writes are surfaced. mindc inserts a flush after the call.
-    extern fn write_stdout(bytes: [u8]) -> usize
+pub fn rt_read_file(path: i64, path_len: i64, buf: i64, cap: i64) -> i64 {
+    return __mind_nerve_rt_read_file(path, path_len, buf, cap);
+}
 
-    // Write `bytes` to fd 2 (stderr). Same semantics as write_stdout.
-    extern fn write_stderr(bytes: [u8]) -> usize
+pub fn rt_os_entropy(buf: i64, len: i64) -> i64 {
+    return __mind_nerve_rt_os_entropy(buf, len);
+}
 
-    // ----- File system (read-only) ----------------------------------------
+pub fn rt_exit(code: i64) -> i64 {
+    return __mind_nerve_rt_exit(code);
+}
 
-    // Read the file at `path` (UTF-8 path bytes) into a fresh byte buffer.
-    // Used by src/loader.mind for catalog + weights file loading.
-    //
-    // On error (file not found, permission denied, I/O error) returns a
-    // zero-length buffer. Callers must check the length against an
-    // expected minimum (e.g. >= header size) to detect failures.
-    //
-    // No write_file primitive is exposed — mind-nerve never writes to the
-    // filesystem in Phase 1.
-    extern fn read_file(path: [u8]) -> [u8]
+// ─────────────────────────────────────────────────────────────────────────────
+// Pure status logic (executed by the unit gate)
+// ─────────────────────────────────────────────────────────────────────────────
 
-    // ----- Entropy --------------------------------------------------------
+// A return value is an error iff it is negative. Every status this ABI
+// defines is negative; every success value is >= 0.
+pub fn rt_is_err(rc: i64) -> i64 {
+    if rc < 0 { return 1; }
+    0
+}
 
-    // Read 16 bytes of cryptographic-quality entropy from the host RNG.
-    //   Linux:   getrandom(buf, 16, GRND_NONBLOCK)
-    //   Darwin:  arc4random_buf(buf, 16)
-    //   Windows: BCryptGenRandom(NULL, buf, 16, BCRYPT_USE_SYSTEM_PREFERRED_RNG)
-    //
-    // Used by src/chain_log.mind to seed session_id at session start.
-    // On a backend without an RNG (test-only), the runtime SHOULD return
-    // [0u8; 16] and rely on the test fixture entry
-    // `chain_log::new_session_with_id` to inject a deterministic value.
-    extern fn os_entropy_16() -> [u8; 32]
-
-    // ----- Process exit ---------------------------------------------------
-
-    // Terminate the process with the given exit code. No return.
-    // The runtime SHOULD flush stdout + stderr before exiting.
-    extern fn exit(code: i32) -> i32
+// A read/probe result is COMPLETE iff it is non-negative and equals the
+// probed size (no silent truncation by capacity).
+pub fn rt_read_complete(bytes_read: i64, probed_size: i64) -> i64 {
+    if bytes_read < 0 { return 0; }
+    if bytes_read == probed_size { return 1; }
+    0
 }

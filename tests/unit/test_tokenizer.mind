@@ -1,280 +1,363 @@
-// BPE 32k tokenizer contract — Phase 1.2.
+// tests/unit/test_tokenizer.mind — BPE 32k tokenizer contract suite for
+// src/tokenizer.mind. Audit T-1 (tokenizer determinism), T-2 (hash binding).
 //
-// Targets:
-//   - src/tokenizer.mind :: tokenize_bpe   (encode contract + error surface)
-//   - src/tokenizer.mind :: tokenizer_hash (placeholder hash stability)
+// Ported to mindc 0.10.2 (wave 2, 2026-08-12) from
+// tests/unit/dormant/test_tokenizer.mind. Runs through `mindc test` on a
+// merged image (src/lib.mind + src/sha256.mind + src/tokenizer.mind + this
+// file), driven by tests/mindc_gate.sh leg 7 with an exact-count
+// assertion — a "running 0 tests" output FAILS the gate.
 //
-// The merge table under test is the 32-entry placeholder defined in
-// `src/tokenizer.mind`. Real 32k merges land with the first reference
-// checkpoint; the determinism contract these tests exercise is invariant
-// across that transition (only the specific token-id outputs change).
+// ORACLE PROVENANCE: the tokenizer_hash digest and the two multi-merge
+// encodings were computed 2026-08-12 against CPython hashlib + a reference
+// Python implementation of the lowest-rank-applicable BPE encode over the
+// 32-entry placeholder table:
+//   tokenizer_hash      85bbfe5265c2b684a3560313ffbc15833cf4bc20f6140db66d099fa789ec622c
+//   " the at"           -> [256, 258, 257, 116]
+//   "llssee"            -> [272, 273, 274]
 //
-// Determinism: every assertion is over u32 / [u8; 32] equality. No
-// floating-point, no platform-dependent ordering.
+// ABI: input bytes at one byte per offset; output tokens are i64 lanes
+// (8-byte stride); tokenize_bpe returns the token count or a negative
+// TOKENIZE_ERR_* code.
 
-use crate::mind_nerve::MAX_REQUEST_TOKENS;
-use crate::mind_nerve::VOCAB_SIZE;
-use crate::mind_nerve::tokenizer::{
-    tokenize_bpe,
-    tokenizer_hash,
-    TokenizeError,
-    BPE_BASE_VOCAB,
-    BPE_TOTAL_VOCAB,
-    BPE_MERGE_COUNT,
-};
+// ── helpers (tk_ prefix) ────────────────────────────────────────────────────
 
-// ---------------------------------------------------------------------------
-// Section 1 — Vocabulary parameter parity
-// ---------------------------------------------------------------------------
+fn tk_digest_word(out: i64, w: i64) -> i64 {
+    let b0: i64 = __mind_load_i8(out + w * 4) & 255;
+    let b1: i64 = __mind_load_i8(out + w * 4 + 1) & 255;
+    let b2: i64 = __mind_load_i8(out + w * 4 + 2) & 255;
+    let b3: i64 = __mind_load_i8(out + w * 4 + 3) & 255;
+    b0 * 16777216 + b1 * 65536 + b2 * 256 + b3
+}
+
+// Fill `dst` with `n` copies of byte `c`.
+fn tk_fill(dst: i64, n: i64, c: i64) -> i64 {
+    let mut i: i64 = 0;
+    while i < n {
+        __mind_store_i8(dst + i, c);
+        i = i + 1;
+    }
+    0
+}
+
+// ── Section 1: vocabulary parameter parity ──────────────────────────────────
 
 #[test]
 fn test_bpe_base_vocab_is_byte_range() {
-    // Property: byte-level base occupies exactly the byte range 0..255.
-    // Any drift here breaks the OOV-free guarantee.
-    assert_eq!(BPE_BASE_VOCAB, 256_u32);
+    assert BPE_BASE_VOCAB == 256, "byte-level base occupies 0..255";
 }
 
 #[test]
 fn test_bpe_total_vocab_matches_global_vocab_size() {
-    // Property: the tokenizer's view of total vocabulary size matches the
-    // global `VOCAB_SIZE` constant from `lib.mind`. The two constants live
-    // in different modules so the model surface and tokenizer surface can
-    // be audited independently — but they MUST agree byte-for-byte.
-    assert_eq!(BPE_TOTAL_VOCAB, VOCAB_SIZE);
-    assert_eq!(BPE_TOTAL_VOCAB, 32768_u32);
+    assert BPE_TOTAL_VOCAB == VOCAB_SIZE, "tokenizer vocab == lib VOCAB_SIZE";
+    assert BPE_TOTAL_VOCAB == 32768, "total vocab is 32k";
 }
 
 #[test]
 fn test_bpe_merge_count_placeholder_size() {
-    // Property: the placeholder ships exactly 32 merges. When the real
-    // 32k table lands this assertion is the canary that flags the
-    // transition — bump it to (BPE_TOTAL_VOCAB - BPE_BASE_VOCAB) = 32512.
-    assert_eq!(BPE_MERGE_COUNT, 32_u32);
+    // Canary for the placeholder -> real-merges transition: bump to
+    // BPE_TOTAL_VOCAB - BPE_BASE_VOCAB = 32512 when the real table lands.
+    assert BPE_MERGE_COUNT == 32, "placeholder ships exactly 32 merges";
 }
 
-// ---------------------------------------------------------------------------
-// Section 2 — Error surface
-// ---------------------------------------------------------------------------
+// ── Section 2: error surface ────────────────────────────────────────────────
 
 #[test]
 fn test_tokenize_empty_input_rejected() {
-    // Property: empty bytes -> InputEmpty. The tokenizer refuses empty
-    // input explicitly so callers cannot accidentally hash an empty
-    // preimage into request_hash.
-    let empty: [u8] = [];
-    let got = tokenize_bpe(empty.as_slice());
-    match got {
-        Err(TokenizeError::InputEmpty) => {},
-        _ => panic!("expected InputEmpty"),
-    }
+    let input: i64 = __mind_alloc(1);
+    let out: i64 = __mind_alloc(8);
+    let rc: i64 = tokenize_bpe(input, 0, out);
+    assert rc == TOKENIZE_ERR_EMPTY, "empty input rejected";
+    __mind_free(out);
+    __mind_free(input);
 }
 
 #[test]
 fn test_tokenize_too_long_rejected() {
-    // Property: input longer than MAX_REQUEST_TOKENS bytes is rejected
-    // before any merge work happens. Byte-level init produces one token
-    // per byte, so 1025 bytes -> 1025 initial tokens -> TooLong.
-    let n: usize = (MAX_REQUEST_TOKENS as usize) + 1;
-    let mut over: [u8] = [];
-    let mut i: usize = 0;
-    while i < n {
-        over.push(0x41_u8);   // 'A' — no merge rule applies to repeated 'A'
-        i = i + 1;
-    }
-    let got = tokenize_bpe(over.as_slice());
-    match got {
-        Err(TokenizeError::TooLong) => {},
-        _ => panic!("expected TooLong"),
-    }
+    // 1025 bytes > MAX_REQUEST_TOKENS: byte-level init would already exceed
+    // the cap, so rejection precedes any merge work.
+    let input: i64 = __mind_alloc(MAX_REQUEST_TOKENS + 1);
+    tk_fill(input, MAX_REQUEST_TOKENS + 1, 65);
+    let out: i64 = __mind_alloc(8);
+    let rc: i64 = tokenize_bpe(input, MAX_REQUEST_TOKENS + 1, out);
+    assert rc == TOKENIZE_ERR_TOO_LONG, "over-cap input rejected";
+    __mind_free(out);
+    __mind_free(input);
 }
 
 #[test]
 fn test_tokenize_exact_cap_accepted() {
-    // Property: input of exactly MAX_REQUEST_TOKENS bytes whose tokens
-    // do not collide with any merge rule passes through unchanged. 'A'
-    // (0x41) appears nowhere in the placeholder merge table, so the
-    // tokenizer never collapses any adjacent pair.
-    let n: usize = MAX_REQUEST_TOKENS as usize;
-    let mut at_cap: [u8] = [];
-    let mut i: usize = 0;
-    while i < n {
-        at_cap.push(0x41_u8);
-        i = i + 1;
-    }
-    let got = tokenize_bpe(at_cap.as_slice()).expect("at-cap input should succeed");
-    assert_eq!(got.len(), n);
+    // Exactly MAX_REQUEST_TOKENS bytes of 'A' (no rule applies) pass
+    // through unchanged.
+    let input: i64 = __mind_alloc(MAX_REQUEST_TOKENS);
+    tk_fill(input, MAX_REQUEST_TOKENS, 65);
+    let out: i64 = __mind_alloc(MAX_REQUEST_TOKENS * 8);
+    let n: i64 = tokenize_bpe(input, MAX_REQUEST_TOKENS, out);
+    assert n == MAX_REQUEST_TOKENS, "at-cap input accepted, identity output";
+    assert __mind_load_i64(out) == 65, "first token is 'A'";
+    assert __mind_load_i64(out + (MAX_REQUEST_TOKENS - 1) * 8) == 65, "last token is 'A'";
+    __mind_free(out);
+    __mind_free(input);
 }
 
-// ---------------------------------------------------------------------------
-// Section 3 — Encode behaviour
-// ---------------------------------------------------------------------------
+// ── Section 3: encode behaviour ─────────────────────────────────────────────
 
 #[test]
 fn test_tokenize_single_ascii_byte_is_identity() {
-    // Property: a single byte produces a single token whose id equals
-    // the byte value. The merge loop has nothing to do on a 1-token
-    // sequence (no adjacent pair exists).
-    let one: [u8] = [0x41_u8];   // 'A'
-    let got = tokenize_bpe(one.as_slice()).expect("single byte should succeed");
-    assert_eq!(got.len(), 1);
-    assert_eq!(got[0], 0x41_u32);
+    let input: i64 = __mind_alloc(1);
+    __mind_store_i8(input, 65);
+    let out: i64 = __mind_alloc(8);
+    let n: i64 = tokenize_bpe(input, 1, out);
+    assert n == 1, "single byte -> single token";
+    assert __mind_load_i64(out) == 65, "token id equals byte value";
+    __mind_free(out);
+    __mind_free(input);
 }
 
 #[test]
 fn test_tokenize_no_merge_applies_is_byte_identity() {
-    // Property: when no placeholder merge rule applies, the output is
-    // exactly the byte stream cast to u32. 'A' (0x41) and 'B' (0x42)
-    // both appear in no rule.
-    let input: [u8] = [0x41_u8, 0x42_u8, 0x41_u8, 0x42_u8];
-    let got = tokenize_bpe(input.as_slice()).expect("AB-only should succeed");
-    assert_eq!(got.len(), 4);
-    assert_eq!(got[0], 0x41_u32);
-    assert_eq!(got[1], 0x42_u32);
-    assert_eq!(got[2], 0x41_u32);
-    assert_eq!(got[3], 0x42_u32);
+    // 'A' (65) and 'B' (66) appear in no rule.
+    let input: i64 = __mind_alloc(4);
+    __mind_store_i8(input + 0, 65);
+    __mind_store_i8(input + 1, 66);
+    __mind_store_i8(input + 2, 65);
+    __mind_store_i8(input + 3, 66);
+    let out: i64 = __mind_alloc(32);
+    let n: i64 = tokenize_bpe(input, 4, out);
+    assert n == 4, "no merge -> identity length";
+    assert __mind_load_i64(out + 0) == 65, "token 0";
+    assert __mind_load_i64(out + 8) == 66, "token 1";
+    assert __mind_load_i64(out + 16) == 65, "token 2";
+    assert __mind_load_i64(out + 24) == 66, "token 3";
+    __mind_free(out);
+    __mind_free(input);
 }
 
 #[test]
 fn test_tokenize_repeated_double_letter_merges() {
-    // Property: "ll" (0x6C 0x6C) is at placeholder rank 16, learned id
-    // 256+16 = 272. Encoding "ll" must collapse both bytes into a
-    // single learned token.
-    let input: [u8] = [0x6C_u8, 0x6C_u8];   // "ll"
-    let got = tokenize_bpe(input.as_slice()).expect("'ll' should succeed");
-    assert_eq!(got.len(), 1);
-    assert_eq!(got[0], 272_u32);
+    // "ll" is rank 16 -> learned id 272.
+    let input: i64 = __mind_alloc(2);
+    __mind_store_i8(input + 0, 108);
+    __mind_store_i8(input + 1, 108);
+    let out: i64 = __mind_alloc(16);
+    let n: i64 = tokenize_bpe(input, 2, out);
+    assert n == 1, "ll collapses to one token";
+    assert __mind_load_i64(out) == 272, "ll -> 272";
+    __mind_free(out);
+    __mind_free(input);
 }
 
 #[test]
 fn test_tokenize_two_independent_merges() {
-    // Property: "llss" has two non-overlapping merges — "ll" (rank 16,
-    // id 272) and "ss" (rank 17, id 273). Both must fire; the final
-    // token stream is [272, 273].
-    //
-    // The encode order matters for the audit: BPE applies the
-    // lowest-rank merge first (here "ll" at rank 16, then "ss" at
-    // rank 17). The output is invariant to that order because the
-    // pairs do not overlap, but the determinism contract requires the
-    // specific scan order — this test pins it.
-    let input: [u8] = [0x6C_u8, 0x6C_u8, 0x73_u8, 0x73_u8];   // "llss"
-    let got = tokenize_bpe(input.as_slice()).expect("'llss' should succeed");
-    assert_eq!(got.len(), 2);
-    assert_eq!(got[0], 272_u32);
-    assert_eq!(got[1], 273_u32);
+    // "llss": "ll" (rank 16 -> 272) fires before "ss" (rank 17 -> 273);
+    // the pairs do not overlap so the output is order-invariant, but the
+    // determinism contract pins the scan order.
+    let input: i64 = __mind_alloc(4);
+    __mind_store_i8(input + 0, 108);
+    __mind_store_i8(input + 1, 108);
+    __mind_store_i8(input + 2, 115);
+    __mind_store_i8(input + 3, 115);
+    let out: i64 = __mind_alloc(32);
+    let n: i64 = tokenize_bpe(input, 4, out);
+    assert n == 2, "llss -> two tokens";
+    assert __mind_load_i64(out) == 272, "ll -> 272";
+    assert __mind_load_i64(out + 8) == 273, "ss -> 273";
+    __mind_free(out);
+    __mind_free(input);
 }
 
 #[test]
 fn test_tokenize_leftmost_position_wins_for_same_merge() {
-    // Property: when the same merge rule applies at multiple positions,
-    // the leftmost position fires first. "lllll" (5 'l' bytes) — the
-    // "ll" rule (rank 16, id 272) applies at positions 0, 1, 2, 3.
-    // Leftmost-first iteration: collapse (0,1) -> [272, l, l, l]; then
-    // the rule no longer matches at position 0 (272 != 0x6C); leftmost
-    // remaining match is (1,2) on the original-coordinate residue,
-    // i.e., the first 'l' pair in [l, l, l]; collapse to
-    // [272, 272, l]; then no more matches. Final length = 3.
-    let input: [u8] = [0x6C_u8, 0x6C_u8, 0x6C_u8, 0x6C_u8, 0x6C_u8];   // "lllll"
-    let got = tokenize_bpe(input.as_slice()).expect("'lllll' should succeed");
-    assert_eq!(got.len(), 3);
-    assert_eq!(got[0], 272_u32);
-    assert_eq!(got[1], 272_u32);
-    assert_eq!(got[2], 0x6C_u32);
+    // "lllll": collapse (0,1) -> [272, l, l, l]; leftmost remaining match
+    // is the residue's first pair -> [272, 272, l]; fixpoint. Length 3.
+    let input: i64 = __mind_alloc(5);
+    tk_fill(input, 5, 108);
+    let out: i64 = __mind_alloc(40);
+    let n: i64 = tokenize_bpe(input, 5, out);
+    assert n == 3, "lllll -> three tokens";
+    assert __mind_load_i64(out + 0) == 272, "token 0 = 272";
+    assert __mind_load_i64(out + 8) == 272, "token 1 = 272";
+    assert __mind_load_i64(out + 16) == 108, "token 2 = 'l'";
+    __mind_free(out);
+    __mind_free(input);
+}
+
+#[test]
+fn test_tokenize_mixed_sentence_pinned() {
+    // " the at" exercises ranks 0, 1, 2 across restarts. Reference-Python
+    // verified 2026-08-12: [256, 258, 257, 116].
+    let input: i64 = __mind_alloc(7);
+    __mind_store_i8(input + 0, 32);
+    __mind_store_i8(input + 1, 116);
+    __mind_store_i8(input + 2, 104);
+    __mind_store_i8(input + 3, 101);
+    __mind_store_i8(input + 4, 32);
+    __mind_store_i8(input + 5, 97);
+    __mind_store_i8(input + 6, 116);
+    let out: i64 = __mind_alloc(56);
+    let n: i64 = tokenize_bpe(input, 7, out);
+    assert n == 4, "four tokens";
+    assert __mind_load_i64(out + 0) == 256, "' t' -> 256";
+    assert __mind_load_i64(out + 8) == 258, "'he' -> 258";
+    assert __mind_load_i64(out + 16) == 257, "' a' -> 257";
+    assert __mind_load_i64(out + 24) == 116, "trailing 't'";
+    __mind_free(out);
+    __mind_free(input);
+}
+
+#[test]
+fn test_tokenize_llssee_pinned() {
+    // "llssee": [272, 273, 274] — reference-Python verified 2026-08-12.
+    let input: i64 = __mind_alloc(6);
+    __mind_store_i8(input + 0, 108);
+    __mind_store_i8(input + 1, 108);
+    __mind_store_i8(input + 2, 115);
+    __mind_store_i8(input + 3, 115);
+    __mind_store_i8(input + 4, 101);
+    __mind_store_i8(input + 5, 101);
+    let out: i64 = __mind_alloc(48);
+    let n: i64 = tokenize_bpe(input, 6, out);
+    assert n == 3, "three tokens";
+    assert __mind_load_i64(out + 0) == 272, "ll -> 272";
+    assert __mind_load_i64(out + 8) == 273, "ss -> 273";
+    assert __mind_load_i64(out + 16) == 274, "ee -> 274";
+    __mind_free(out);
+    __mind_free(input);
 }
 
 #[test]
 fn test_tokenize_output_length_within_cap() {
-    // Property: every successful tokenize_bpe output has length
-    // ≤ MAX_REQUEST_TOKENS. Test a mix of merge-friendly and
-    // merge-hostile inputs.
-    let inputs: [[u8]; 3] = [
-        [0x41_u8, 0x42_u8, 0x43_u8],                                       // "ABC"
-        [0x6C_u8, 0x6C_u8, 0x73_u8, 0x73_u8, 0x65_u8, 0x65_u8],            // "llssee"
-        [0x20_u8, 0x74_u8, 0x68_u8, 0x65_u8, 0x20_u8, 0x61_u8, 0x74_u8],   // " the at"
-    ];
-    let mut i: usize = 0;
-    while i < 3 {
-        let got = tokenize_bpe(inputs[i].as_slice()).expect("non-empty input should succeed");
-        assert!(got.len() <= (MAX_REQUEST_TOKENS as usize));
-        assert!(got.len() >= 1);
-        i = i + 1;
-    }
+    // Mix of merge-friendly and merge-hostile inputs: every successful
+    // output has 1 <= len <= MAX_REQUEST_TOKENS.
+    let abc: i64 = __mind_alloc(3);
+    __mind_store_i8(abc + 0, 65);
+    __mind_store_i8(abc + 1, 66);
+    __mind_store_i8(abc + 2, 67);
+    let llssee: i64 = __mind_alloc(6);
+    __mind_store_i8(llssee + 0, 108);
+    __mind_store_i8(llssee + 1, 108);
+    __mind_store_i8(llssee + 2, 115);
+    __mind_store_i8(llssee + 3, 115);
+    __mind_store_i8(llssee + 4, 101);
+    __mind_store_i8(llssee + 5, 101);
+    let sent: i64 = __mind_alloc(7);
+    __mind_store_i8(sent + 0, 32);
+    __mind_store_i8(sent + 1, 116);
+    __mind_store_i8(sent + 2, 104);
+    __mind_store_i8(sent + 3, 101);
+    __mind_store_i8(sent + 4, 32);
+    __mind_store_i8(sent + 5, 97);
+    __mind_store_i8(sent + 6, 116);
+    let out: i64 = __mind_alloc(64);
+
+    let n1: i64 = tokenize_bpe(abc, 3, out);
+    assert n1 >= 1, "abc len >= 1";
+    assert n1 <= MAX_REQUEST_TOKENS, "abc len within cap";
+    let n2: i64 = tokenize_bpe(llssee, 6, out);
+    assert n2 >= 1, "llssee len >= 1";
+    assert n2 <= MAX_REQUEST_TOKENS, "llssee len within cap";
+    let n3: i64 = tokenize_bpe(sent, 7, out);
+    assert n3 >= 1, "sent len >= 1";
+    assert n3 <= MAX_REQUEST_TOKENS, "sent len within cap";
+    __mind_free(out);
+    __mind_free(sent);
+    __mind_free(llssee);
+    __mind_free(abc);
 }
 
-// ---------------------------------------------------------------------------
-// Section 4 — Determinism
-// ---------------------------------------------------------------------------
+// ── Section 4: determinism ──────────────────────────────────────────────────
 
 #[test]
 fn test_tokenize_deterministic_across_calls() {
-    // Property: tokenize_bpe is a pure function of its input. Running it
-    // twice on the same input MUST produce byte-identical output. This is
-    // the core bit-identity contract that makes the tokenizer safe to
-    // hash into request_hash in the envelope.
-    let input: [u8] = [
-        0x20_u8, 0x74_u8, 0x68_u8, 0x65_u8,   // " the"
-        0x20_u8, 0x61_u8, 0x74_u8,            // " at"
-        0x6C_u8, 0x6C_u8,                     // "ll"
-    ];
-    let a = tokenize_bpe(input.as_slice()).expect("first call should succeed");
-    let b = tokenize_bpe(input.as_slice()).expect("second call should succeed");
-    assert_eq!(a.len(), b.len());
-    let mut i: usize = 0;
-    while i < a.len() {
-        assert_eq!(a[i], b[i]);
+    // " the" + " at" + "ll": two calls must produce byte-identical output —
+    // the property that makes the token stream safe to hash into
+    // request_hash.
+    let input: i64 = __mind_alloc(9);
+    __mind_store_i8(input + 0, 32);
+    __mind_store_i8(input + 1, 116);
+    __mind_store_i8(input + 2, 104);
+    __mind_store_i8(input + 3, 101);
+    __mind_store_i8(input + 4, 32);
+    __mind_store_i8(input + 5, 97);
+    __mind_store_i8(input + 6, 116);
+    __mind_store_i8(input + 7, 108);
+    __mind_store_i8(input + 8, 108);
+    let a: i64 = __mind_alloc(72);
+    let b: i64 = __mind_alloc(72);
+
+    let na: i64 = tokenize_bpe(input, 9, a);
+    let nb: i64 = tokenize_bpe(input, 9, b);
+    assert na == nb, "same length across calls";
+    let mut i: i64 = 0;
+    while i < na {
+        assert __mind_load_i64(a + i * 8) == __mind_load_i64(b + i * 8), "bit-identical tokens across calls";
         i = i + 1;
     }
+    __mind_free(b);
+    __mind_free(a);
+    __mind_free(input);
 }
 
 #[test]
 fn test_tokenize_distinct_inputs_distinct_outputs() {
-    // Property: different inputs that exercise different merge rules
-    // must NOT collapse to the same output. Defence against a bug where
-    // the splice path overwrites with a constant id.
-    let in_a: [u8] = [0x6C_u8, 0x6C_u8];                       // "ll" -> [272]
-    let in_b: [u8] = [0x73_u8, 0x73_u8];                       // "ss" -> [273]
-    let a = tokenize_bpe(in_a.as_slice()).expect("a should succeed");
-    let b = tokenize_bpe(in_b.as_slice()).expect("b should succeed");
-    assert_eq!(a.len(), 1);
-    assert_eq!(b.len(), 1);
-    assert!(a[0] != b[0]);
+    // "ll" -> [272], "ss" -> [273]: different merge rules must not collapse
+    // to the same id (defence against a constant-splice regression).
+    let in_a: i64 = __mind_alloc(2);
+    __mind_store_i8(in_a + 0, 108);
+    __mind_store_i8(in_a + 1, 108);
+    let in_b: i64 = __mind_alloc(2);
+    __mind_store_i8(in_b + 0, 115);
+    __mind_store_i8(in_b + 1, 115);
+    let out_a: i64 = __mind_alloc(16);
+    let out_b: i64 = __mind_alloc(16);
+
+    let na: i64 = tokenize_bpe(in_a, 2, out_a);
+    let nb: i64 = tokenize_bpe(in_b, 2, out_b);
+    assert na == 1, "a collapses to one token";
+    assert nb == 1, "b collapses to one token";
+    assert __mind_load_i64(out_a) != __mind_load_i64(out_b), "distinct rules yield distinct ids";
+    __mind_free(out_b);
+    __mind_free(out_a);
+    __mind_free(in_b);
+    __mind_free(in_a);
 }
 
-// ---------------------------------------------------------------------------
-// Section 5 — tokenizer_hash
-// ---------------------------------------------------------------------------
+// ── Section 5: tokenizer_hash ───────────────────────────────────────────────
 
 #[test]
-fn test_tokenizer_hash_is_32_bytes() {
-    // Property: tokenizer_hash returns a [u8; 32] value. This is the
-    // type-level contract for ModelWeights.tokenizer_hash.
-    let h: [u8; 32] = tokenizer_hash();
-    let _len_check: usize = 32;
-    // Touch every byte so a stub returning a zero-length array would
-    // crash compilation rather than silently pass.
-    let mut sum: u32 = 0_u32;
-    let mut i: usize = 0;
-    while i < 32 {
-        sum = sum + (h[i] as u32);
-        i = i + 1;
-    }
-    // The placeholder preimage is 12 + 8*32 = 268 bytes; SHA-256 of any
-    // non-empty preimage is overwhelmingly unlikely to be all-zero. Treat
-    // an all-zero result as a regression to the stub state.
-    assert!(sum > 0_u32);
+fn test_tokenizer_hash_oracle() {
+    // Pinned against CPython hashlib over the canonical serialization
+    // (u32-LE header + u32-LE merge pairs, 268 bytes), computed 2026-08-12:
+    // 85bbfe5265c2b684a3560313ffbc15833cf4bc20f6140db66d099fa789ec622c.
+    // Subsumes the dormant is-32-bytes / non-zero checks: a stub or a
+    // serialization drift breaks the digest.
+    let h: i64 = __mind_alloc(32);
+    tokenizer_hash(h);
+    let mut rc: i64 = 0;
+    if tk_digest_word(h, 0) != 2243690066 { rc = 1; }
+    if tk_digest_word(h, 1) != 1707259524 { rc = 2; }
+    if tk_digest_word(h, 2) != 2740323091 { rc = 3; }
+    if tk_digest_word(h, 3) != 4290516355 { rc = 4; }
+    if tk_digest_word(h, 4) != 1022671904 { rc = 5; }
+    if tk_digest_word(h, 5) != 4128509366 { rc = 6; }
+    if tk_digest_word(h, 6) != 1829347239 { rc = 7; }
+    if tk_digest_word(h, 7) != 2313970220 { rc = 8; }
+    assert rc == 0, "tokenizer_hash matches the hashlib-verified oracle";
+    __mind_free(h);
 }
 
 #[test]
 fn test_tokenizer_hash_is_stable_across_calls() {
-    // Property: tokenizer_hash is pure of its constant inputs and must
-    // return the byte-identical value on every call. NOTE — the specific
-    // byte pattern is NOT stable across Phase 1.2 commits (see
-    // src/tokenizer.mind header). This test pins the within-build
-    // stability, not the cross-build stability.
-    let h1: [u8; 32] = tokenizer_hash();
-    let h2: [u8; 32] = tokenizer_hash();
-    let mut i: usize = 0;
+    // Within-build stability (the cross-build pattern changes when the real
+    // merge table lands — see src/tokenizer.mind header).
+    let h1: i64 = __mind_alloc(32);
+    let h2: i64 = __mind_alloc(32);
+    tokenizer_hash(h1);
+    tokenizer_hash(h2);
+    let mut i: i64 = 0;
     while i < 32 {
-        assert_eq!(h1[i], h2[i]);
+        assert __mind_load_i8(h1 + i) == __mind_load_i8(h2 + i), "hash stable across calls";
         i = i + 1;
     }
+    __mind_free(h2);
+    __mind_free(h1);
 }

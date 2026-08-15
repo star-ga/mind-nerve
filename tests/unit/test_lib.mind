@@ -1,0 +1,116 @@
+// tests/unit/test_lib.mind — const-hub pin suite for src/lib.mind.
+//
+// New with the wave-1 port (2026-08-11): the dormant tree carried no
+// lib.mind unit test (tests/unit/dormant/test_manifest_export.mind targets
+// loader.mind, wave 4). These consts are bound into `model_hash`, so every
+// value is pinned exactly — any edit trips this suite.
+//
+// Runs through `mindc test` on a merged image (src/lib.mind + this file),
+// driven by tests/mindc_gate.sh leg 5 with an exact-count assertion — a
+// "running 0 tests" output FAILS the gate.
+//
+// Oracle: the values are the dormant src/dormant/lib.mind literals
+// themselves (architecture constants, not computed quantities); the derived
+// relations (HEAD_DIM * HEADS == HIDDEN, OVERLAP == SIZE - STRIDE,
+// MATRYOSHKA_COARSE_DIM == ROUTE_EMBEDDING_DIM) are asserted as identities.
+
+#[test]
+fn test_encoder_arch_consts() {
+    assert ENCODER_LAYERS == 2, "layers";
+    assert ENCODER_HIDDEN == 256, "hidden";
+    assert ENCODER_HEADS == 4, "heads";
+    assert ENCODER_HEAD_DIM == 64, "head_dim";
+    assert ENCODER_HEAD_DIM * ENCODER_HEADS == ENCODER_HIDDEN, "head_dim * heads == hidden";
+}
+
+#[test]
+fn test_attn_window_consts() {
+    assert ATTN_WINDOW_SIZE == 256, "window size";
+    assert ATTN_WINDOW_STRIDE == 192, "window stride";
+    assert ATTN_WINDOW_OVERLAP == 64, "window overlap";
+    assert ATTN_WINDOW_SIZE - ATTN_WINDOW_STRIDE == ATTN_WINDOW_OVERLAP, "overlap identity";
+}
+
+#[test]
+fn test_adaptive_stride_consts() {
+    assert ADAPTIVE_STRIDE_ENABLED == 0, "adaptive stride default-off";
+    assert ATTN_WINDOW_STRIDE_COMPACT == 192, "compact stride";
+    assert ATTN_WINDOW_STRIDE_LONG == 128, "long stride";
+}
+
+#[test]
+fn test_vocab_and_caps() {
+    assert VOCAB_SIZE == 32768, "vocab";
+    assert MAX_REQUEST_TOKENS == 1024, "wire cap";
+    assert ROUTE_EMBEDDING_DIM == 256, "route dim";
+    assert ROUTE_EMBEDDING_DIM == ENCODER_HIDDEN, "route dim tied to hidden";
+    assert DEFAULT_TOP_K == 5, "default top-k";
+    assert MAX_TOP_K == 64, "max top-k";
+}
+
+#[test]
+fn test_weight_storage_consts() {
+    assert WEIGHT_BITS == 8, "int8 weights";
+    assert ACTIVATION_BITS == 32, "q16.16 activations in i32 range";
+}
+
+#[test]
+fn test_attestation_consts() {
+    assert ATTESTATION_BYTES == 212, "envelope v2 packed bytes";
+    assert ATTESTATION_VERSION == 2, "envelope version";
+    assert NUMERICS_WIRE_VERSION == 2, "numerics wire version";
+}
+
+#[test]
+fn test_entry_kind_consts() {
+    assert ENTRY_KIND_INFERENCE == 1, "inference kind";
+    assert ENTRY_KIND_MODEL_LOAD == 2, "model_load kind";
+    assert ENTRY_KIND_CATALOG_LOAD == 3, "catalog_load kind";
+}
+
+#[test]
+fn test_arch_consts() {
+    assert ARCH_X86_64 == 1, "x86_64";
+    assert ARCH_AARCH64 == 2, "aarch64";
+    assert ARCH_CUDA == 3, "cuda";
+}
+
+#[test]
+fn test_chain_reset_consts() {
+    assert CHAIN_RESET_CONTINUATION == 0, "continuation";
+    assert CHAIN_RESET_MODEL_SWAP == 1, "model swap";
+    assert CHAIN_RESET_CATALOG_CHANGED == 2, "catalog changed";
+    assert CHAIN_RESET_CLOCK_RESET == 3, "clock reset";
+}
+
+#[test]
+fn test_backwards_soft_switches() {
+    assert MATRYOSHKA_COARSE_DIM == 256, "coarse dim == full dim (cascade disabled)";
+    assert MATRYOSHKA_COARSE_DIM == ROUTE_EMBEDDING_DIM, "coarse dim tied to route dim";
+    assert K_COARSE_MULTIPLIER == 1, "shortlist == full route set";
+    assert COSINE_SCORING_ENABLED == 0, "cosine scoring default-off";
+    assert ATTN_ALIBI_ENABLED == 0, "alibi default-off";
+    assert QUERY_PREFIX_LEN == 0, "query prefix default-off";
+    assert MODEL_HASH_BIND_ENABLED == 0, "hash-bind legacy default";
+}
+
+#[test]
+fn test_alibi_slopes() {
+    // Press et al. geometric ladder 2^-2, 2^-4, 2^-6, 2^-8 in Q16.16.
+    assert ATTN_ALIBI_SLOPES[0] == 16384, "slope head 0 (1/4)";
+    assert ATTN_ALIBI_SLOPES[1] == 4096, "slope head 1 (1/16)";
+    assert ATTN_ALIBI_SLOPES[2] == 1024, "slope head 2 (1/64)";
+    assert ATTN_ALIBI_SLOPES[3] == 256, "slope head 3 (1/256)";
+}
+
+#[test]
+fn test_query_prefix_tokens() {
+    assert QUERY_PREFIX_TOKENS[0] == 0, "slot 0";
+    assert QUERY_PREFIX_TOKENS[1] == 0, "slot 1";
+    assert QUERY_PREFIX_TOKENS[2] == 0, "slot 2";
+    assert QUERY_PREFIX_TOKENS[3] == 0, "slot 3";
+    assert QUERY_PREFIX_TOKENS[4] == 0, "slot 4";
+    assert QUERY_PREFIX_TOKENS[5] == 0, "slot 5";
+    assert QUERY_PREFIX_TOKENS[6] == 0, "slot 6";
+    assert QUERY_PREFIX_TOKENS[7] == 0, "slot 7";
+}

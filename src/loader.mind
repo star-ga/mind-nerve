@@ -1,1536 +1,999 @@
-// Loader: on-disk catalog (.cat) + weights (.weights) readers.
+// Loader: on-disk catalog (.cat) + weights (.weights) readers, plus the
+// per-tensor manifest and model-hash machinery. Ported to the mindc 0.10.2
+// dialect 2026-08-12 (wave 4 of the pure-MIND migration; the dormant
+// pre-port source is preserved at src/dormant/loader.mind).
 //
 // Audit anchors: A3 (catalog uniqueness), S-5 (catalog binding), MH-1
 // (model_hash discipline), W-1 (INT8 weight storage with Q16.16 scales).
 //
-// =============================================================================
-// FILE FORMATS
-// =============================================================================
+// FILE FORMATS are unchanged from the dormant source (both little-endian,
+// 4-byte magic + u16 version + u16 reserved; reserved MUST be zero on
+// read). See src/dormant/loader.mind's header for the byte-level layouts.
 //
-// Both formats are little-endian for every multi-byte integer, self-describing
-// via a 4-byte magic + 2-byte version + 2-byte reserved header. Reserved bytes
-// MUST be zero on read (defence against silent format extension).
-//
-// ----- CATALOG FILE FORMAT (.cat) --------------------------------------------
-//
-//   offset                          size                            field
-//   0                               4                               magic = "MNC1"
-//                                                                   (0x4D 0x4E 0x43 0x31)
-//   4                               2                               version u16 LE = 1
-//   6                               2                               reserved = 0
-//   8                               4                               num_routes u32 LE
-//                                                                   (1..=65535)
-//   12                              4                               embedding_dim u32 LE
-//                                                                   (MUST equal
-//                                                                    ROUTE_EMBEDDING_DIM)
-//   16                              32                              catalog_hash [u8; 32]
-//                                                                   (= SHA-256 of
-//                                                                    canonical(route_ids,
-//                                                                              embeddings)).
-//                                                                   Loader recomputes
-//                                                                   and refuses on
-//                                                                   mismatch.
-//   48                              num_routes * 32                 route_ids
-//                                                                   (raw SHA-256 each,
-//                                                                    sorted ascending
-//                                                                    by raw lex)
-//   48 + 32*num_routes              num_routes * embedding_dim * 4  embeddings
-//                                                                   (Q16.16 i32 LE,
-//                                                                    row-major, in the
-//                                                                    same row order as
-//                                                                    route_ids)
-//   trailing                        4                               external_id_table_offset
-//                                                                   (u32 LE, absolute
-//                                                                    offset from start
-//                                                                    of file; equals
-//                                                                    48 + 36*num_routes
-//                                                                    + embedding_bytes)
-//   external_id_table_offset        num_routes * (2 + L_i)          external_id_table
-//                                                                   (per row: u16 LE
-//                                                                    external_id_len
-//                                                                    followed by L_i
-//                                                                    UTF-8 bytes; no NUL
-//                                                                    terminator). Order
-//                                                                    parallel to
-//                                                                    route_ids.
-//
-//   Catalog hash preimage (canonical, computed left-to-right):
-//
-//     for i in 0..num_routes:
-//         emit u32-LE length = 32
-//         emit route_ids[i]                          (32 bytes)
-//         emit u32-LE length = embedding_dim * 4
-//         emit embeddings[i, :] as i32-LE row        (embedding_dim*4 bytes)
-//
-//     catalog_hash = SHA-256(preimage)
-//
-//   This preimage is uniquely determined by the on-disk bytes; the loader
-//   replays it as the integrity check.
-//
-//   Total catalog file size (1..=N routes, ROUTE_EMBEDDING_DIM = 256):
-//
-//     48                              fixed header + catalog_hash
-//     + N * 32                        route_ids
-//     + N * 256 * 4                   embeddings (1024 bytes per row)
-//     + 4                             external_id_table_offset
-//     + sum_i (2 + external_id_len_i) external_id_table
-//
-//   Worst case for N = 65535 and external_id_len = 64 bytes each:
-//     48 + 65535*(32 + 1024 + 2 + 64) + 4 ≈ 73.5 MB. Well under any
-//     reasonable budget for a one-shot CLI startup load.
-//
-// ----- WEIGHTS FILE FORMAT (.weights) ----------------------------------------
-//
-//   offset    size                                       field
-//   0         4                                          magic = "MNW1"
-//                                                        (0x4D 0x4E 0x57 0x31)
-//   4         2                                          version u16 LE ∈ {1, 2}
-//                                                        v1 = per-output-channel scales
-//                                                        v2 = RFC-001 group-wise scales
-//                                                             (GROUP_SIZE = 32; one Q16.16
-//                                                             scale per (oc, group) pair)
-//   6         2                                          reserved = 0
-//   8         32                                         model_hash [u8; 32]
-//                                                        (SHA-256 of manifest, opaque
-//                                                         to loader — pinned into
-//                                                         envelope.model_hash)
-//   40        32                                         tokenizer_hash [u8; 32]
-//   72        4                                          encoder_layers u32 LE
-//                                                        (MUST equal ENCODER_LAYERS)
-//   76        4                                          encoder_hidden u32 LE
-//                                                        (MUST equal ENCODER_HIDDEN)
-//
-//   (per-layer block, repeated encoder_layers times; size depends on
-//    version. SCALES_BYTES_PER_MATRIX is H*4 in v1, H*(H/GROUP_SIZE)*4
-//    in v2):
-//
-//       H*H bytes               wq             (INT8, row-major, output channel × input)
-//       H*H bytes               wk             (INT8)
-//       H*H bytes               wv             (INT8)
-//       H*H bytes               wo             (INT8)
-//       SCALES_BYTES_PER_MATRIX wq_scales      (Q16.16 i32 LE)
-//       SCALES_BYTES_PER_MATRIX wk_scales
-//       SCALES_BYTES_PER_MATRIX wv_scales
-//       SCALES_BYTES_PER_MATRIX wo_scales
-//       H*4 bytes               ln_gain        (Q16.16 i32 LE)
-//       H*4 bytes               ln_bias        (Q16.16 i32 LE)
-//       H*4 bytes               residual_gate  (Q16.16 i32 LE)
-//
-//   (after all layers):
-//
-//       H*4 bytes                final_ln_gain   (Q16.16 i32 LE)
-//       H*4 bytes                final_ln_bias   (Q16.16 i32 LE)
-//       VOCAB_SIZE * H * 4 bytes token_embedding (Q16.16 i32 LE, row-major)
-//
-//   Total at ENCODER_LAYERS=2, H=256, VOCAB=32768:
-//     80                                                    header
-//     + 2 * (4*256*256 + 4*256*4 + 3*256*4)                 per-layer blocks
-//       = 2 * (262144 + 4096 + 3072)
-//       = 2 * 269312 = 538624                               (0.51 MiB)
-//     + 2*256*4                                             final norms (2048)
-//     + 32768*256*4                                         token embedding
-//                                                            (33,554,432 = 32 MiB)
-//     = 80 + 538624 + 2048 + 33554432
-//     = 34,095,184 bytes  (~32.5 MiB)
-//
-//   The token embedding dominates the file size; that is by design — INT8
-//   quantization of the matmul weights is what brings the layer blocks under
-//   1 MiB combined while leaving the embedding table in Q16.16 for the lookup
-//   path.
-//
-// =============================================================================
-// DEQUANTIZATION ON LOAD
-// =============================================================================
-//
-// `model::EncoderLayerWeights` declares Q16.16 tensors for wq/wk/wv/wo (see
-// src/model.mind §"Weight containers"). The on-disk format stores them as
-// INT8 + per-output-channel Q16.16 scales — the spec/architecture.md §"Weight
-// storage discipline" contract. The loader bridges by **dequantizing at load**:
-//
-//   weights[layer].wq[oc, ic] = q16_mul_int8(wq_int8[oc, ic], wq_scales[oc])
-//
-// where q16_mul_int8 is the saturating-MAC primitive (see q16_16.mind):
-//
-//   product_i64 = (int8 as i64) * (scale_i32 as i64)
-//   q16         = sat_i32((product_i64 + (1 << 15)) >> 16)   // round-half-to-even
-//
-// The per-channel scale is therefore "absorbed" into the stored Q16.16 weight
-// matrix. This is bit-identical because:
-//   - INT8 weight bytes are deterministic in the file.
-//   - Q16.16 scales are i32 LE in the file.
-//   - q16_mul (saturating, round-half-to-even) is bit-identical across backends
-//     by mindc's lint E_NERVE_003.
-//
-// Memory footprint trade-off: dequantized Q16.16 occupies 4× the bytes of
-// INT8 on the heap (4*H^2 vs H^2 per matrix). At H=256 / L=2 that is 1.0 MiB
-// dequantized vs 0.26 MiB packed — both negligible against the 32 MiB token
-// embedding table. The runtime MAC remains Q16.16 × Q16.16 → Q16.16 against
-// the pre-dequantized matrix; the on-disk INT8 form is a storage discipline,
-// not a runtime numerics discipline. (Phase 2 may push INT8 into the runtime
-// MAC; that change re-defines EncoderLayerWeights and bumps the model_hash.)
-//
-// =============================================================================
-// IDEMPOTENCE + DETERMINISM
-// =============================================================================
-//
-// `load_catalog` and `load_weights` are pure functions of the file bytes:
-//   bytes -> Result<struct, LoaderError>
-//
-// Same bytes => same struct => same downstream model_hash + catalog_hash.
-// Annotated `@[determinism(BitIdentical)]` on every public surface.
-//
-// No allocation beyond the returned struct: parser intermediates are
-// stack-bounded (e.g., per-row INT8 dequantization buffers) and dropped
-// before the function returns.
+// PORT NOTES (0.10.2 reality):
+//   - Result<..., LoaderError> becomes the signed LD_ERR_* return
+//     convention below; gate ORDER is preserved exactly from the dormant
+//     parsers.
+//   - RouteCatalog becomes a 5-slot handle table (LOADER_CAT_* below):
+//     [num_routes, ids (n*32 bytes), embeddings (n*256 i64 lanes),
+//      route_prior (n i64 lanes), hash (32 bytes)]. All buffers are freshly
+//     allocated by the parser; the caller owns them.
+//   - ModelWeights becomes the 18-slot model weight table (src/model.mind
+//     MODEL_WTAB_*), freshly allocated + dequantized by the parser;
+//     model_hash / tokenizer_hash are written to caller out-buffers.
+//   - load_* read files through the wave-3 runtime_ffi probe-then-read
+//     ABI; parse_* operate on in-memory bytes so tests never touch the
+//     filesystem.
+//   - DEQUANTIZATION FORMULA PRESERVED VERBATIM, ANOMALY FLAGGED: the
+//     dormant computes (int8 * scale_q16 + 2^15) >> 16. With a Q16.16
+//     scale the mathematically expected Q16.16 product is int8 * scale
+//     WITHOUT the >>16 (the int8 carries no fractional bits). As written,
+//     the formula returns values 2^16-fold smaller. The dormant tree never
+//     executed, so there is no behavioural baseline to preserve — the port
+//     keeps the formula exactly as written (changing it is a model-format
+//     decision for the reference-checkpoint pipeline, not a port decision)
+//     and tests/unit/test_loader.mind pins the AS-WRITTEN behaviour.
+//   - build_tensor_manifest hashes the full 32 MiB embedding table; that
+//     path is gated by `mindc check` here and exercised at integration
+//     time (the unit gate pins the component machinery — neuron hashes,
+//     preimage aggregate, JSON export — against CPython hashlib oracles
+//     on small fixtures).
 
-use crate::mind_nerve::{
-    Q16_16,
-    ENCODER_LAYERS,
-    ENCODER_HIDDEN,
-    ENCODER_HEADS,
-    ATTN_WINDOW_SIZE,
-    ATTN_WINDOW_STRIDE,
-    VOCAB_SIZE,
-    MAX_REQUEST_TOKENS,
-    ROUTE_EMBEDDING_DIM,
-    Q16_FRAC_BITS,
-    WEIGHT_BITS,
-    ACTIVATION_BITS,
-    NUMERICS_WIRE_VERSION,
-    MODEL_HASH_BIND_ENABLED,
-    MATRYOSHKA_COARSE_DIM,
-    K_COARSE_MULTIPLIER,
-    COSINE_SCORING_ENABLED,
-    ATTN_ALIBI_ENABLED,
-    ATTN_ALIBI_SLOPES,
-    QUERY_PREFIX_LEN,
-    QUERY_PREFIX_TOKENS,
-};
-use crate::mind_nerve::inference::{
-    RouteCatalog,
-    ModelWeights,
-    RouteId,
-};
-use crate::mind_nerve::model::{
-    EncoderWeights,
-    EncoderLayerWeights,
-    HEAD_MASK_BYTES,
-};
-use crate::mind_nerve::sha256::sha256;
-use crate::mind_nerve::runtime_ffi::read_file as fs_read_raw;
+import src.lib;
+import src.sha256;
+import src.runtime_ffi;
+import src.model;
 
-// ---------------------------------------------------------------------------
-// Public error surface
-// ---------------------------------------------------------------------------
+// LoaderError, flattened to negative return codes.
+pub const LD_OK:               i64 = 0;
+pub const LD_ERR_IO:           i64 = -1;
+pub const LD_ERR_BAD_MAGIC:    i64 = -2;
+pub const LD_ERR_VERSION:      i64 = -3;
+pub const LD_ERR_RESERVED:     i64 = -4;
+pub const LD_ERR_SHAPE:        i64 = -5;
+pub const LD_ERR_HASH:         i64 = -6;
+pub const LD_ERR_DUP_ROUTE:    i64 = -7;
+pub const LD_ERR_TRUNCATED:    i64 = -8;
+pub const LD_ERR_UTF8:         i64 = -9;
 
-pub enum LoaderError {
-    // Filesystem read failed (file missing, permission denied, etc).
-    IoError,
+// RFC-001 group size for v2 group-wise scales (power of two; the group
+// index is a single right-shift on every backend).
+pub const GROUP_SIZE: i64 = 32;
 
-    // First 4 bytes did not match the expected magic
-    // ("MNC1" for catalog, "MNW1" for weights).
-    BadMagic,
+// Catalog handle slot layout (single source of truth).
+pub const LOADER_CAT_SLOTS: i64 = 5;
+pub const LOADER_CAT_N:     i64 = 0;
+pub const LOADER_CAT_IDS:   i64 = 1;
+pub const LOADER_CAT_EMB:   i64 = 2;
+pub const LOADER_CAT_PRIOR: i64 = 3;
+pub const LOADER_CAT_HASH:  i64 = 4;
 
-    // version field is 0 or > 1. Phase 1 ships v1 only; future versions
-    // will be accepted by future loader builds.
-    UnsupportedVersion,
+// Manifest entry record: 5 i64 lanes per entry —
+// [name_addr, name_len, rows, cols, hash_addr].
+pub const LOADER_MANIFEST_ENTRY_LANES: i64 = 5;
+// Entry count of the full model manifest: 2 final-norm + 7 per layer + 1
+// embedding.
+pub const LOADER_MANIFEST_ENTRIES: i64 = 17;
 
-    // Any reserved byte read non-zero. Defence against silent format
-    // extension by upstream producers.
-    ReservedByteNonZero,
+// ─────────────────────────────────────────────────────────────────────────────
+// Byte readers / writers (little-endian; two's-complement sign handling)
+// ─────────────────────────────────────────────────────────────────────────────
 
-    // Declared shape (embedding_dim / encoder_layers / encoder_hidden)
-    // does not match the compile-time constants the inference path was
-    // built against. Refuse rather than silently truncate or pad.
-    ShapeMismatch,
-
-    // catalog_hash field stored in the file does not match the SHA-256
-    // recomputed from the on-disk route_ids + embeddings. Means either
-    // the file was tampered with, or the producer used a different
-    // canonical hash function.
-    HashMismatch,
-
-    // Two routes share the same RouteId. UniqueRouteCatalog forbids
-    // duplicate ids (audit A3 — silent routing ambiguity is unacceptable).
-    UniqueRouteViolation,
-
-    // File ended before the expected end of a section. Either a truncated
-    // file or an over-declared num_routes / encoder_layers.
-    TruncatedFile,
-
-    // external_id field contained bytes that are not valid UTF-8.
-    // External ids appear in operator-facing tooling; non-UTF-8 would
-    // corrupt the catalog manifest.
-    InvalidUtf8,
+fn ld_u16(b: i64, off: i64) -> i64 {
+    return (__mind_load_i8(b + off) & 255) + (__mind_load_i8(b + off + 1) & 255) * 256;
 }
 
-// ---------------------------------------------------------------------------
-// Magic constants
-// ---------------------------------------------------------------------------
-
-const MNC1_MAGIC: [u8; 4] = [0x4Du8, 0x4Eu8, 0x43u8, 0x31u8]; // "MNC1"
-const MNW1_MAGIC: [u8; 4] = [0x4Du8, 0x4Eu8, 0x57u8, 0x31u8]; // "MNW1"
-
-// Catalog file version range. v1 = embeddings only, no prior column (the
-// original 2026 layout); v2 = RFC-002 log-frequency prior column trailing
-// the embeddings (one Q16.16 prior per route). The loader accepts both
-// formats; v1 remains the default and produces byte-identical inference
-// behaviour to today because the v1 prior implicitly defaults to all
-// zeros (the additive identity for the prior add step in `inference`).
-// A v2 reference catalog requires the offline catalog-builder pipeline
-// to emit the empirical-Bayes-shrunken `log(1 + freq_r)` column — see
-// RFC-002 §"Adoption plan" for the per-route formula.
-const CATALOG_VERSION_V1: u16 = 1;
-const CATALOG_VERSION_V2: u16 = 2;
-
-// Weights file version range. v1 = per-output-channel INT8 scales (the
-// original 2026 layout); v2 = group-wise INT8 scales per RFC-001
-// (groups of GROUP_SIZE input channels share one Q16.16 scale). The
-// loader accepts both formats; v1 remains the default and produces
-// byte-identical dequantized output to today's reference checkpoint.
-// A v2 reference checkpoint requires the offline training pipeline to
-// emit `[H, H/GROUP_SIZE]` scale tensors instead of `[H]` — coordinated
-// separately (ROADMAP Phase 1 deferred item #3).
-const WEIGHTS_VERSION_V1: u16 = 1;
-const WEIGHTS_VERSION_V2: u16 = 2;
-
-// RFC-001 (AWQ-style group-wise INT8 quantization, MLSys 2024 /
-// arxiv:2306.00978): input channels are partitioned into contiguous
-// groups of GROUP_SIZE columns; each (output_channel, group) pair
-// carries its own Q16.16 scale. ENCODER_HIDDEN = 256 and
-// GROUP_SIZE = 32 yields 8 groups per output channel. The group index
-// for input channel `ic` is `ic / GROUP_SIZE` (a single right-shift
-// when GROUP_SIZE is a power of two — bit-identical on every backend).
-// Compile-time pinned here so cross-backend lowering sees the same
-// value without a Mind.toml round-trip.
-pub const GROUP_SIZE: usize = 32;
-
-const CATALOG_HEADER_BYTES: usize = 48;  // magic(4)+ver(2)+rsv(2)+nroutes(4)+edim(4)+hash(32)
-const WEIGHTS_HEADER_BYTES: usize = 80;  // magic(4)+ver(2)+rsv(2)+model_hash(32)
-                                         //  + tokenizer_hash(32) + enc_layers(4) + enc_hidden(4)
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
-// load_catalog / load_weights — public entry points.
-//
-// Determinism note: the public functions are annotated BitIdentical even
-// though they depend on a host filesystem primitive whose extern signature
-// is NotBitIdentical (the host I/O layer is not bit-identical by definition).
-// The annotation refers to the *parser semantics* — for any concrete byte
-// stream returned by the host, the parser produces identical output bytes
-// on every backend. The runtime FFI surface is the only nondeterministic
-// link in the chain; once the bytes are in memory, every downstream
-// computation is bit-identical.
-//
-// `runtime_ffi::read_file` returns a zero-length buffer on any I/O error.
-// That length-0 path falls through to parse_*'s `bytes.len() < HEADER_BYTES`
-// guard, which returns `TruncatedFile`. We promote that specific path to
-// `IoError` so operators get an actionable distinction between "file
-// missing / unreadable" and "file present but truncated / corrupt."
-
-@[determinism(BitIdentical)]
-pub fn load_catalog(path: &[u8]) -> Result<RouteCatalog, LoaderError> {
-    let bytes: [u8] = fs_read_raw(path);
-    if bytes.len() == 0 {
-        return Err(LoaderError::IoError);
-    }
-    parse_catalog(&bytes)
+fn ld_u32(b: i64, off: i64) -> i64 {
+    return (__mind_load_i8(b + off) & 255)
+        + (__mind_load_i8(b + off + 1) & 255) * 256
+        + (__mind_load_i8(b + off + 2) & 255) * 65536
+        + (__mind_load_i8(b + off + 3) & 255) * 16777216;
 }
 
-@[determinism(BitIdentical)]
-pub fn load_weights(path: &[u8]) -> Result<ModelWeights, LoaderError> {
-    let bytes: [u8] = fs_read_raw(path);
-    if bytes.len() == 0 {
-        return Err(LoaderError::IoError);
-    }
-    parse_weights(&bytes)
+// i32 LE with sign extension to i64.
+fn ld_i32(b: i64, off: i64) -> i64 {
+    let u: i64 = ld_u32(b, off);
+    if u >= 2147483648 { return u - 4294967296; }
+    return u;
 }
 
-// ---------------------------------------------------------------------------
-// In-memory parsers (separated from fs_read so tests can construct fixtures
-// without touching the filesystem).
-// ---------------------------------------------------------------------------
+fn ld_store_u32(buf: i64, off: i64, v: i64) -> i64 {
+    __mind_store_i8(buf + off + 0, v & 255);
+    __mind_store_i8(buf + off + 1, (v >> 8) & 255);
+    __mind_store_i8(buf + off + 2, (v >> 16) & 255);
+    __mind_store_i8(buf + off + 3, (v >> 24) & 255);
+    0
+}
 
-@[determinism(BitIdentical)]
-pub fn parse_catalog(bytes: &[u8]) -> Result<RouteCatalog, LoaderError> {
-    // (1) Header.
-    if bytes.len() < CATALOG_HEADER_BYTES {
-        return Err(LoaderError::TruncatedFile);
+// Constant-time 32-byte equality.
+fn ld_hash_eq(a: i64, b: i64) -> i64 {
+    let mut diff: i64 = 0;
+    let mut i: i64 = 0;
+    while i < 32 {
+        diff = diff | (__mind_load_i8(a + i) ^ __mind_load_i8(b + i));
+        i = i + 1;
     }
+    if diff == 0 { return 1; }
+    0
+}
 
-    if !magic_eq(bytes, MNC1_MAGIC) {
-        return Err(LoaderError::BadMagic);
-    }
+// ─────────────────────────────────────────────────────────────────────────────
+// UTF-8 validation (RFC 3629 strictest form: no overlong, no surrogates).
+// Window [off, off+len) inside the `len`-bounded buffer. No allocation.
+// ─────────────────────────────────────────────────────────────────────────────
 
-    let version: u16 = read_u16_le(bytes, 4);
-    if version != CATALOG_VERSION_V1 && version != CATALOG_VERSION_V2 {
-        return Err(LoaderError::UnsupportedVersion);
-    }
-    // RFC-002 log-frequency prior column when v2. v1 keeps the original
-    // embeddings-only layout and `inference::preselect_pre_tokenized`
-    // observes an implicit zero prior — byte-identical to today's
-    // reference catalog. v2 catalogs carry an explicit Q16.16 prior
-    // per route, parsed below.
-    let has_prior: bool = (version == CATALOG_VERSION_V2);
-
-    let reserved: u16 = read_u16_le(bytes, 6);
-    if reserved != 0u16 {
-        return Err(LoaderError::ReservedByteNonZero);
-    }
-
-    let num_routes:    u32 = read_u32_le(bytes, 8);
-    let embedding_dim: u32 = read_u32_le(bytes, 12);
-
-    if embedding_dim != ROUTE_EMBEDDING_DIM {
-        return Err(LoaderError::ShapeMismatch);
-    }
-
-    // Stored catalog_hash for later verification.
-    let mut stored_hash: [u8; 32] = [0u8; 32];
-    let mut h: usize = 0;
-    while h < 32 {
-        stored_hash[h] = bytes[16 + h];
-        h = h + 1;
-    }
-
-    let n: usize    = num_routes as usize;
-    let edim: usize = embedding_dim as usize;
-
-    // (2) route_ids section.
-    let route_ids_offset: usize = CATALOG_HEADER_BYTES;
-    let route_ids_bytes:  usize = n * 32usize;
-    let route_ids_end:    usize = route_ids_offset + route_ids_bytes;
-    if bytes.len() < route_ids_end {
-        return Err(LoaderError::TruncatedFile);
-    }
-
-    let mut route_ids: [RouteId] = [];
-    let mut i: usize = 0;
-    while i < n {
-        let mut rid: RouteId = [0u8; 32];
-        let mut b: usize = 0;
-        while b < 32 {
-            rid[b] = bytes[route_ids_offset + i * 32 + b];
-            b = b + 1;
+pub fn ld_utf8_valid(bytes: i64, off: i64, len: i64, total: i64) -> i64 {
+    let end: i64 = off + len;
+    if end > total { return 0; }
+    let mut i: i64 = off;
+    while i < end {
+        let b0: i64 = __mind_load_i8(bytes + i) & 255;
+        if b0 <= 127 {
+            i = i + 1;
+        } else if b0 & 224 == 192 {
+            if b0 < 194 { return 0; }
+            if i + 2 > end { return 0; }
+            if __mind_load_i8(bytes + i + 1) & 192 != 128 { return 0; }
+            i = i + 2;
+        } else if b0 & 240 == 224 {
+            if i + 3 > end { return 0; }
+            let b1: i64 = __mind_load_i8(bytes + i + 1) & 255;
+            let b2: i64 = __mind_load_i8(bytes + i + 2) & 255;
+            if b1 & 192 != 128 { return 0; }
+            if b2 & 192 != 128 { return 0; }
+            if b0 == 224 { if b1 < 160 { return 0; } }
+            if b0 == 237 { if b1 >= 160 { return 0; } }
+            i = i + 3;
+        } else if b0 & 248 == 240 {
+            if b0 > 244 { return 0; }
+            if i + 4 > end { return 0; }
+            let b1: i64 = __mind_load_i8(bytes + i + 1) & 255;
+            let b2: i64 = __mind_load_i8(bytes + i + 2) & 255;
+            let b3: i64 = __mind_load_i8(bytes + i + 3) & 255;
+            if b1 & 192 != 128 { return 0; }
+            if b2 & 192 != 128 { return 0; }
+            if b3 & 192 != 128 { return 0; }
+            if b0 == 240 { if b1 < 144 { return 0; } }
+            if b0 == 244 { if b1 >= 144 { return 0; } }
+            i = i + 4;
+        } else {
+            return 0;
         }
-        route_ids.push(rid);
+    }
+    1
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INT8 → Q16.16 dequantization (FORMULA PRESERVED VERBATIM — see the
+// PORT NOTES anomaly flag in the header). out is h*h i64 lanes; the scales
+// section layout depends on groupwise (v1: one scale per output channel;
+// v2: one per (output channel, GROUP_SIZE group)).
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub fn ld_dequantize_matrix(bytes: i64, int8_off: i64, scales_off: i64,
+                            h: i64, groupwise: i64, out: i64) -> i64 {
+    let groups_per_row: i64 = h / GROUP_SIZE;
+    let mut oc: i64 = 0;
+    while oc < h {
+        let mut ic: i64 = 0;
+        while ic < h {
+            let mut scale: i64 = 0;
+            if groupwise == 1 {
+                scale = ld_i32(bytes, scales_off + (oc * groups_per_row + ic / GROUP_SIZE) * 4);
+            } else {
+                scale = ld_i32(bytes, scales_off + oc * 4);
+            }
+            let mut w: i64 = __mind_load_i8(bytes + int8_off + oc * h + ic) & 255;
+            if w >= 128 { w = w - 256; }
+            let product: i64 = w * scale;
+            let rounded: i64 = (product + 32768) >> 16;
+            let mut clamped: i64 = rounded;
+            if rounded > 2147483647 { clamped = 2147483647; }
+            if rounded < -2147483648 { clamped = -2147483648; }
+            __mind_store_i64(out + (oc * h + ic) * 8, clamped);
+            ic = ic + 1;
+        }
+        oc = oc + 1;
+    }
+    0
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// parse_catalog — the .cat reader. On LD_OK, fills the 5-slot catalog
+// handle table at `cat` with freshly-allocated buffers.
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub fn loader_parse_catalog(bytes: i64, len: i64, cat: i64) -> i64 {
+    if len < 48 { return LD_ERR_TRUNCATED; }
+    if __mind_load_i8(bytes + 0) != 77 { return LD_ERR_BAD_MAGIC; }
+    if __mind_load_i8(bytes + 1) != 78 { return LD_ERR_BAD_MAGIC; }
+    if __mind_load_i8(bytes + 2) != 67 { return LD_ERR_BAD_MAGIC; }
+    if __mind_load_i8(bytes + 3) != 49 { return LD_ERR_BAD_MAGIC; }
+
+    let version: i64 = ld_u16(bytes, 4);
+    if version != 1 { if version != 2 { return LD_ERR_VERSION; } }
+    let has_prior: i64 = if version == 2 { 1 } else { 0 };
+
+    if ld_u16(bytes, 6) != 0 { return LD_ERR_RESERVED; }
+
+    let num_routes: i64 = ld_u32(bytes, 8);
+    let embedding_dim: i64 = ld_u32(bytes, 12);
+    if embedding_dim != ROUTE_EMBEDDING_DIM { return LD_ERR_SHAPE; }
+
+    // route_ids section.
+    let ids_off: i64 = 48;
+    let ids_end: i64 = ids_off + num_routes * 32;
+    if len < ids_end { return LD_ERR_TRUNCATED; }
+
+    let ids: i64 = __mind_alloc(num_routes * 32);
+    let mut i: i64 = 0;
+    while i < num_routes * 32 {
+        __mind_store_i8(ids + i, __mind_load_i8(bytes + ids_off + i));
         i = i + 1;
     }
 
-    // (3) Uniqueness check. O(n^2) over a hashed key set is fine — catalog
-    //     load is one-shot, not a hot path. First-duplicate-wins reporting:
-    //     scan in input order; the first index `i` whose RouteId was already
-    //     seen at some j < i triggers the error.
-    let mut p: usize = 0;
-    while p < n {
-        let mut q: usize = 0;
+    // Uniqueness (audit A3): first-duplicate-wins over (p, q < p) ascending.
+    let mut p: i64 = 0;
+    while p < num_routes {
+        let mut q: i64 = 0;
         while q < p {
-            if route_id_eq(route_ids[p], route_ids[q]) {
-                return Err(LoaderError::UniqueRouteViolation);
+            if ld_hash_eq(ids + p * 32, ids + q * 32) == 1 {
+                __mind_free(ids);
+                return LD_ERR_DUP_ROUTE;
             }
             q = q + 1;
         }
         p = p + 1;
     }
 
-    // (4) Embeddings section (row-major, parallel order to route_ids).
-    let embeddings_offset: usize = route_ids_end;
-    let embeddings_bytes:  usize = n * edim * 4usize;
-    let embeddings_end:    usize = embeddings_offset + embeddings_bytes;
-    if bytes.len() < embeddings_end {
-        return Err(LoaderError::TruncatedFile);
+    // Embeddings section (row-major i32 LE → i64 lanes).
+    let emb_off: i64 = ids_end;
+    let emb_bytes: i64 = num_routes * embedding_dim * 4;
+    let emb_end: i64 = emb_off + emb_bytes;
+    if len < emb_end {
+        __mind_free(ids);
+        return LD_ERR_TRUNCATED;
+    }
+    let emb: i64 = __mind_alloc(num_routes * embedding_dim * 8);
+    let mut e: i64 = 0;
+    while e < num_routes * embedding_dim {
+        __mind_store_i64(emb + e * 8, ld_i32(bytes, emb_off + e * 4));
+        e = e + 1;
     }
 
-    let mut embeddings: tensor<Q16_16, [n, edim]> = [[0_i32; edim]; n];
-    let mut r: usize = 0;
-    while r < n {
-        let row_offset: usize = embeddings_offset + r * edim * 4usize;
-        let mut c: usize = 0;
-        while c < edim {
-            embeddings[r][c] = read_i32_le(bytes, row_offset + c * 4usize);
-            c = c + 1;
-        }
-        r = r + 1;
+    // RFC-002 route-prior block (v2 only; v1 implicit zeros).
+    let prior_off: i64 = emb_end;
+    let prior_bytes: i64 = if has_prior == 1 { num_routes * 4 } else { 0 };
+    let prior_end: i64 = prior_off + prior_bytes;
+    if len < prior_end {
+        __mind_free(emb);
+        __mind_free(ids);
+        return LD_ERR_TRUNCATED;
+    }
+    let prior: i64 = __mind_alloc(num_routes * 8);
+    i = 0;
+    while i < num_routes {
+        let mut pv: i64 = 0;
+        if has_prior == 1 { pv = ld_i32(bytes, prior_off + i * 4); }
+        __mind_store_i64(prior + i * 8, pv);
+        i = i + 1;
     }
 
-    // (4b) Route-prior section (RFC-002, v2 only). For v1 catalogs the
-    //      prior defaults to all zeros (additive identity) so the
-    //      inference path's prior-add step is a no-op. For v2 the block
-    //      is `num_routes * 4` bytes of Q16.16 i32-LE values immediately
-    //      following the embeddings.
-    let prior_bytes: usize = if has_prior { n * 4usize } else { 0usize };
-    let prior_offset: usize = embeddings_end;
-    let prior_end:    usize = prior_offset + prior_bytes;
-    if bytes.len() < prior_end {
-        return Err(LoaderError::TruncatedFile);
-    }
-    let mut route_prior: tensor<Q16_16, [n]> = [0_i32; n];
-    if has_prior {
-        let mut pr: usize = 0;
-        while pr < n {
-            route_prior[pr] = read_i32_le(bytes, prior_offset + pr * 4usize);
-            pr = pr + 1;
+    // Canonical catalog hash: per route, u32-LE 32 || id || u32-LE
+    // (edim*4) || embedding row bytes (|| u32-LE 4 || prior bytes when v2).
+    // The preimage is rebuilt from the FILE bytes (not the decoded lanes)
+    // so the check binds exactly what was on disk.
+    let per_route: i64 = 4 + 32 + 4 + embedding_dim * 4 + (if has_prior == 1 { 8 } else { 0 });
+    let preimage: i64 = __mind_alloc(num_routes * per_route);
+    let mut w: i64 = 0;
+    let mut s: i64 = 0;
+    while s < num_routes {
+        ld_store_u32(preimage, w, 32);
+        w = w + 4;
+        i = 0;
+        while i < 32 {
+            __mind_store_i8(preimage + w, __mind_load_i8(ids + s * 32 + i));
+            w = w + 1;
+            i = i + 1;
         }
-    }
-
-    // (5) Recompute canonical catalog hash and compare against stored.
-    //     Preimage: per route (sorted file-order, which is canonical ascending
-    //     by the producer's contract):
-    //       u32-LE 32 || route_id (32 bytes)
-    //       u32-LE (edim*4) || embedding row as i32-LE (edim*4 bytes)
-    //
-    //     We compute the SHA-256 incrementally over a single allocation. The
-    //     buffer is per-route; we accumulate via sha256_update through a
-    //     local helper that mirrors src/sha256.mind's one-shot interface.
-    let mut preimage: [u8] = [];
-    let mut s: usize = 0;
-    while s < n {
-        // u32-LE length prefix = 32 for the route_id
-        preimage.push(32u8);
-        preimage.push(0u8);
-        preimage.push(0u8);
-        preimage.push(0u8);
-        let mut b2: usize = 0;
-        while b2 < 32 {
-            preimage.push(route_ids[s][b2]);
-            b2 = b2 + 1;
+        ld_store_u32(preimage, w, embedding_dim * 4);
+        w = w + 4;
+        i = 0;
+        while i < embedding_dim * 4 {
+            __mind_store_i8(preimage + w, __mind_load_i8(bytes + emb_off + s * embedding_dim * 4 + i));
+            w = w + 1;
+            i = i + 1;
         }
-        // u32-LE length prefix = edim*4 for the embedding row
-        let row_bytes: u32 = (edim * 4usize) as u32;
-        preimage.push(( row_bytes        & 0xFFu32) as u8);
-        preimage.push(((row_bytes >> 8 ) & 0xFFu32) as u8);
-        preimage.push(((row_bytes >> 16) & 0xFFu32) as u8);
-        preimage.push(((row_bytes >> 24) & 0xFFu32) as u8);
-        let mut c2: usize = 0;
-        while c2 < edim {
-            let v: i32 = embeddings[s][c2];
-            preimage.push(( v        & 0xFFi32) as u8);
-            preimage.push(((v >> 8 ) & 0xFFi32) as u8);
-            preimage.push(((v >> 16) & 0xFFi32) as u8);
-            preimage.push(((v >> 24) & 0xFFi32) as u8);
-            c2 = c2 + 1;
-        }
-        // RFC-002 prior column (v2 only). The hash absorbs the prior bytes
-        // alongside the embedding row, preserving the existing self-
-        // describing length-prefix discipline: u32-LE length=4 followed by
-        // the Q16.16 i32-LE prior value. v1 catalogs skip this block so
-        // their canonical hash is byte-identical to today.
-        if has_prior {
-            preimage.push(4u8);
-            preimage.push(0u8);
-            preimage.push(0u8);
-            preimage.push(0u8);
-            let p: i32 = route_prior[s];
-            preimage.push(( p        & 0xFFi32) as u8);
-            preimage.push(((p >> 8 ) & 0xFFi32) as u8);
-            preimage.push(((p >> 16) & 0xFFi32) as u8);
-            preimage.push(((p >> 24) & 0xFFi32) as u8);
+        if has_prior == 1 {
+            ld_store_u32(preimage, w, 4);
+            w = w + 4;
+            i = 0;
+            while i < 4 {
+                __mind_store_i8(preimage + w, __mind_load_i8(bytes + prior_off + s * 4 + i));
+                w = w + 1;
+                i = i + 1;
+            }
         }
         s = s + 1;
     }
-    let recomputed: [u8; 32] = sha256(preimage.as_slice());
-    if !hash_eq_32(stored_hash, recomputed) {
-        return Err(LoaderError::HashMismatch);
+    let recomputed: i64 = __mind_alloc(32);
+    mn_sha256(preimage, num_routes * per_route, recomputed);
+    __mind_free(preimage);
+    if ld_hash_eq(bytes + 16, recomputed) == 0 {
+        __mind_free(recomputed);
+        __mind_free(prior);
+        __mind_free(emb);
+        __mind_free(ids);
+        return LD_ERR_HASH;
     }
 
-    // (6) Validate the external_id_table trailer. We do NOT carry external
-    //     ids into the runtime RouteCatalog (the inference path only ever
-    //     references RouteId), but we MUST validate the trailer to detect
-    //     truncated files and InvalidUtf8 — operator-facing tooling reads
-    //     the trailer to recover the external string for each route_id.
-    //
-    //     The trailer-offset field lives at the very end of the file
-    //     (last 4 bytes). After we read it we walk the table and assert
-    //     that each entry is a u16-LE length followed by that many UTF-8
-    //     bytes, with the total walk landing exactly at the offset of the
-    //     trailer-offset field itself (= bytes.len() - 4).
-    if bytes.len() < prior_end + 4usize {
-        return Err(LoaderError::TruncatedFile);
+    // External-id trailer: validate structure + UTF-8, retain nothing.
+    if len < prior_end + 4 {
+        __mind_free(recomputed);
+        __mind_free(prior);
+        __mind_free(emb);
+        __mind_free(ids);
+        return LD_ERR_TRUNCATED;
     }
-    let trailer_offset_field: usize = bytes.len() - 4usize;
-    let trailer_offset: u32 = read_u32_le(bytes, trailer_offset_field);
-    let trailer_off_usz: usize = trailer_offset as usize;
-
-    // Trailer offset MUST point to the start of the external_id_table,
-    // which immediately follows the embeddings section (v1) or the
-    // route_prior block (v2, RFC-002). `prior_end` collapses to
-    // `embeddings_end` when has_prior is false.
-    if trailer_off_usz != prior_end {
-        return Err(LoaderError::TruncatedFile);
+    let trailer_field: i64 = len - 4;
+    let trailer_off: i64 = ld_u32(bytes, trailer_field);
+    if trailer_off != prior_end {
+        __mind_free(recomputed);
+        __mind_free(prior);
+        __mind_free(emb);
+        __mind_free(ids);
+        return LD_ERR_TRUNCATED;
     }
-
-    let mut cursor: usize = trailer_off_usz;
-    let mut k: usize = 0;
-    while k < n {
-        if cursor + 2usize > trailer_offset_field {
-            return Err(LoaderError::TruncatedFile);
+    let mut cursor: i64 = trailer_off;
+    let mut k: i64 = 0;
+    let mut bad: i64 = 0;
+    while k < num_routes {
+        if bad == 0 {
+            if cursor + 2 > trailer_field {
+                bad = LD_ERR_TRUNCATED;
+            } else {
+                let l: i64 = ld_u16(bytes, cursor);
+                cursor = cursor + 2;
+                if cursor + l > trailer_field {
+                    bad = LD_ERR_TRUNCATED;
+                } else {
+                    if ld_utf8_valid(bytes, cursor, l, len) == 0 {
+                        bad = LD_ERR_UTF8;
+                    }
+                    cursor = cursor + l;
+                }
+            }
         }
-        let l: u16 = read_u16_le(bytes, cursor);
-        cursor = cursor + 2usize;
-        let len: usize = l as usize;
-        if cursor + len > trailer_offset_field {
-            return Err(LoaderError::TruncatedFile);
-        }
-        // UTF-8 validation. We do not retain the string — only verify it.
-        if !is_valid_utf8(bytes, cursor, len) {
-            return Err(LoaderError::InvalidUtf8);
-        }
-        cursor = cursor + len;
         k = k + 1;
     }
-    if cursor != trailer_offset_field {
-        // Either the table over-ran or under-ran the declared boundary —
-        // both are file-integrity failures.
-        return Err(LoaderError::TruncatedFile);
+    if bad == 0 { if cursor != trailer_field { bad = LD_ERR_TRUNCATED; } }
+    if bad != 0 {
+        __mind_free(recomputed);
+        __mind_free(prior);
+        __mind_free(emb);
+        __mind_free(ids);
+        return bad;
     }
 
-    Ok(RouteCatalog {
-        ids:         route_ids,
-        embeddings:  embeddings,
-        route_prior: route_prior,
-        hash:        recomputed,
-    })
+    __mind_store_i64(cat + LOADER_CAT_N * 8, num_routes);
+    __mind_store_i64(cat + LOADER_CAT_IDS * 8, ids);
+    __mind_store_i64(cat + LOADER_CAT_EMB * 8, emb);
+    __mind_store_i64(cat + LOADER_CAT_PRIOR * 8, prior);
+    __mind_store_i64(cat + LOADER_CAT_HASH * 8, recomputed);
+    LD_OK
 }
 
-// ---------------------------------------------------------------------------
-// Per-neuron manifest + manifest_export — Tier 3 item #9
-//
-// Each named weight tensor in the model carries a `neuron_hash: [u8; 32]` —
-// the SHA-256 of its Q16.16 byte layout (little-endian i32 per element,
-// row-major for matrices) as it exists in memory **after** dequantization.
-// The hashes are accumulated into a manifest preimage that is then itself
-// SHA-256'd; that digest supersedes the legacy opaque model_hash field for
-// any consumer that needs per-tensor traceability.
-//
-// Design invariants:
-//   D1. The preimage is canonical and deterministic: tensor names are emitted
-//       in a fixed alphabetical sort order; each entry is length-prefixed.
-//   D2. Reordering tensors in the preimage (e.g. different sort order) MUST
-//       yield a different manifest hash — upheld by the alphabetical sort and
-//       the sequential XOR-chain embedding.
-//   D3. Adding a tensor appends to the preimage (backward incompatible, new
-//       hash), never inserts mid-sequence.
-//   D4. All hashes are SHA-256 (NOT Poseidon — Poseidon is reserved for the
-//       future ZK upgrade in mind-runtime's MAB crate).
-//
-// The manifest JSON produced by `manifest_export` is a deterministic UTF-8
-// document. The keys within each tensor object are fixed-order as emitted by
-// the implementation (no dict-iteration ordering). The aggregate field is the
-// SHA-256 of the internal preimage bytes, hex-encoded.
-//
-// Cross-binding with MindLLM:
-//   The manifest aggregate hash feeds into the MindLLM handshake spec defined
-//   in `integrations/mindllm_attestation.mind`. An external verifier needs
-//   only this public document plus the handshake spec to validate the binding
-//   — no STARGA-internal toolchain required.
+// ─────────────────────────────────────────────────────────────────────────────
+// parse_weights — the .weights reader. On LD_OK, fills the 18-slot model
+// weight table (src/model.mind) with freshly-allocated dequantized buffers
+// and writes model_hash / tokenizer_hash to the out-buffers.
+// ─────────────────────────────────────────────────────────────────────────────
 
-// TensorManifestEntry — one row in the per-tensor manifest.
-pub struct TensorManifestEntry {
-    // Human-readable tensor name, ASCII, sorted alphabetically in the manifest.
-    // Examples: "encoder.layer0.wq", "encoder.layer1.wo", "token_embedding".
-    name:        [u8],           // UTF-8 bytes, no NUL terminator
-    // Shape as [rows, cols]; vectors are stored as [len, 1] for uniformity.
-    rows:        u32,
-    cols:        u32,
-    // SHA-256 of the Q16.16 byte layout (i32 LE per element, row-major).
-    neuron_hash: [u8; 32],
-}
+pub fn loader_parse_weights(bytes: i64, len: i64, wtab: i64,
+                            model_hash_out: i64, tokenizer_hash_out: i64) -> i64 {
+    if len < 80 { return LD_ERR_TRUNCATED; }
+    if __mind_load_i8(bytes + 0) != 77 { return LD_ERR_BAD_MAGIC; }
+    if __mind_load_i8(bytes + 1) != 78 { return LD_ERR_BAD_MAGIC; }
+    if __mind_load_i8(bytes + 2) != 87 { return LD_ERR_BAD_MAGIC; }
+    if __mind_load_i8(bytes + 3) != 49 { return LD_ERR_BAD_MAGIC; }
 
-// TensorManifest — the full per-tensor commitment returned to callers and
-// used as the basis for the manifest_export JSON document.
-pub struct TensorManifest {
-    // Entries, sorted ascending by `name` bytes (ASCII lexicographic order).
-    entries: [TensorManifestEntry],
-    // SHA-256 of the canonical preimage over all entries.
-    // Preimage construction: see `build_manifest_preimage` below.
-    aggregate: [u8; 32],
-}
+    let version: i64 = ld_u16(bytes, 4);
+    if version != 1 { if version != 2 { return LD_ERR_VERSION; } }
+    let groupwise: i64 = if version == 2 { 1 } else { 0 };
 
-// ---------------------------------------------------------------------------
-// build_manifest_preimage — canonical byte sequence over tensor entries
-//
-// Wire format (entries MUST be in sorted-by-name order before calling):
-//
-//   magic:       4 bytes  "MNPM" (0x4D 0x4E 0x50 0x4D)
-//   entry_count: 4 bytes  u32 LE
-//
-//   per entry:
-//     name_len:    4 bytes  u32 LE (byte length of name)
-//     name_bytes:  name_len bytes  (ASCII tensor name)
-//     rows:        4 bytes  u32 LE
-//     cols:        4 bytes  u32 LE
-//     neuron_hash: 32 bytes [u8; 32]
-//
-// The aggregate is SHA-256(preimage). Determinism proof: the only
-// non-trivial step is the sort; once sorted the preimage is a pure
-// function of the name/rows/cols/neuron_hash tuples.
+    if ld_u16(bytes, 6) != 0 { return LD_ERR_RESERVED; }
 
-@[determinism(BitIdentical)]
-fn build_manifest_preimage(entries: &[TensorManifestEntry]) -> [u8] {
-    let mut p: [u8] = [];
-
-    // Magic.
-    p.push(0x4Du8); p.push(0x4Eu8); p.push(0x50u8); p.push(0x4Du8);
-
-    // Entry count.
-    let n: u32 = entries.len() as u32;
-    p.push(( n        & 0xFFu32) as u8);
-    p.push(((n >> 8 ) & 0xFFu32) as u8);
-    p.push(((n >> 16) & 0xFFu32) as u8);
-    p.push(((n >> 24) & 0xFFu32) as u8);
-
-    let mut i: usize = 0;
-    while i < entries.len() {
-        let e: &TensorManifestEntry = &entries[i];
-
-        // name_len + name_bytes.
-        let nl: u32 = e.name.len() as u32;
-        p.push(( nl        & 0xFFu32) as u8);
-        p.push(((nl >> 8 ) & 0xFFu32) as u8);
-        p.push(((nl >> 16) & 0xFFu32) as u8);
-        p.push(((nl >> 24) & 0xFFu32) as u8);
-        let mut b: usize = 0;
-        while b < e.name.len() {
-            p.push(e.name[b]);
-            b = b + 1;
-        }
-
-        // rows, cols.
-        p.push(( e.rows        & 0xFFu32) as u8);
-        p.push(((e.rows >> 8 ) & 0xFFu32) as u8);
-        p.push(((e.rows >> 16) & 0xFFu32) as u8);
-        p.push(((e.rows >> 24) & 0xFFu32) as u8);
-        p.push(( e.cols        & 0xFFu32) as u8);
-        p.push(((e.cols >> 8 ) & 0xFFu32) as u8);
-        p.push(((e.cols >> 16) & 0xFFu32) as u8);
-        p.push(((e.cols >> 24) & 0xFFu32) as u8);
-
-        // neuron_hash.
-        let mut h: usize = 0;
-        while h < 32 {
-            p.push(e.neuron_hash[h]);
-            h = h + 1;
-        }
-
+    let mut i: i64 = 0;
+    while i < 32 {
+        __mind_store_i8(model_hash_out + i, __mind_load_i8(bytes + 8 + i));
+        __mind_store_i8(tokenizer_hash_out + i, __mind_load_i8(bytes + 40 + i));
         i = i + 1;
     }
 
-    p
-}
-
-// ---------------------------------------------------------------------------
-// neuron_hash_of_matrix — SHA-256 of a Q16.16 matrix in row-major i32-LE layout
-
-@[determinism(BitIdentical)]
-fn neuron_hash_of_matrix(
-    mat: &tensor<Q16_16, [?, ?]>,
-    rows: usize,
-    cols: usize,
-) -> [u8; 32] {
-    let mut bytes: [u8] = [];
-    let mut r: usize = 0;
-    while r < rows {
-        let mut c: usize = 0;
-        while c < cols {
-            let v: i32 = mat[r][c];
-            bytes.push(( v        & 0xFFi32) as u8);
-            bytes.push(((v >> 8 ) & 0xFFi32) as u8);
-            bytes.push(((v >> 16) & 0xFFi32) as u8);
-            bytes.push(((v >> 24) & 0xFFi32) as u8);
-            c = c + 1;
-        }
-        r = r + 1;
-    }
-    sha256(bytes.as_slice())
-}
-
-@[determinism(BitIdentical)]
-fn neuron_hash_of_vector(
-    vec: &tensor<Q16_16, [?]>,
-    len: usize,
-) -> [u8; 32] {
-    let mut bytes: [u8] = [];
-    let mut i: usize = 0;
-    while i < len {
-        let v: i32 = vec[i];
-        bytes.push(( v        & 0xFFi32) as u8);
-        bytes.push(((v >> 8 ) & 0xFFi32) as u8);
-        bytes.push(((v >> 16) & 0xFFi32) as u8);
-        bytes.push(((v >> 24) & 0xFFi32) as u8);
-        i = i + 1;
-    }
-    sha256(bytes.as_slice())
-}
-
-// ---------------------------------------------------------------------------
-// build_tensor_manifest — construct TensorManifest from parsed ModelWeights.
-//
-// Tensor naming convention (alphabetical sort is the canonical order):
-//   "encoder.final_ln_bias"
-//   "encoder.final_ln_gain"
-//   "encoder.layer{i}.ln_bias"       (i = 0-indexed layer index, decimal)
-//   "encoder.layer{i}.ln_gain"
-//   "encoder.layer{i}.residual_gate"
-//   "encoder.layer{i}.wk"
-//   "encoder.layer{i}.wq"
-//   "encoder.layer{i}.wv"
-//   "encoder.layer{i}.wo"
-//   "token_embedding"
-//
-// The alphabetical constraint: "encoder.final_ln_*" < "encoder.layer0.*"
-// < ... < "token_embedding". Producers MUST maintain this sort order
-// when emitting; the manifest verifier checks the sort.
-
-@[determinism(BitIdentical)]
-pub fn build_tensor_manifest(weights: &ModelWeights) -> TensorManifest {
-    let h: usize = ENCODER_HIDDEN as usize;
-    let l: usize = ENCODER_LAYERS as usize;
-    let v: usize = VOCAB_SIZE as usize;
-
-    let mut entries: [TensorManifestEntry] = [];
-
-    // Alphabetical order: encoder.final_ln_bias, encoder.final_ln_gain first.
-    entries.push(TensorManifestEntry {
-        name:        b"encoder.final_ln_bias",
-        rows:        h as u32,
-        cols:        1u32,
-        neuron_hash: neuron_hash_of_vector(&weights.encoder.final_ln_bias, h),
-    });
-    entries.push(TensorManifestEntry {
-        name:        b"encoder.final_ln_gain",
-        rows:        h as u32,
-        cols:        1u32,
-        neuron_hash: neuron_hash_of_vector(&weights.encoder.final_ln_gain, h),
-    });
-
-    // Per-layer entries: encoder.layer{i}.{field} in alphabetical field order.
-    let mut li: usize = 0;
-    while li < l {
-        let layer: &EncoderLayerWeights = &weights.encoder.layers[li];
-
-        // Build the decimal layer-index suffix. Two digits max (ENCODER_LAYERS <= 99).
-        // Name pattern: "encoder.layer" + digits + "." + field.
-        // The sort is stable because layer indices are zero-padded to two digits.
-        let prefix: [u8] = make_layer_prefix(li);
-
-        entries.push(TensorManifestEntry {
-            name:        concat_bytes(&prefix, b"ln_bias"),
-            rows:        h as u32,
-            cols:        1u32,
-            neuron_hash: neuron_hash_of_vector(&layer.ln_bias, h),
-        });
-        entries.push(TensorManifestEntry {
-            name:        concat_bytes(&prefix, b"ln_gain"),
-            rows:        h as u32,
-            cols:        1u32,
-            neuron_hash: neuron_hash_of_vector(&layer.ln_gain, h),
-        });
-        entries.push(TensorManifestEntry {
-            name:        concat_bytes(&prefix, b"residual_gate"),
-            rows:        h as u32,
-            cols:        1u32,
-            neuron_hash: neuron_hash_of_vector(&layer.residual_gate, h),
-        });
-        entries.push(TensorManifestEntry {
-            name:        concat_bytes(&prefix, b"wk"),
-            rows:        h as u32,
-            cols:        h as u32,
-            neuron_hash: neuron_hash_of_matrix(&layer.wk, h, h),
-        });
-        entries.push(TensorManifestEntry {
-            name:        concat_bytes(&prefix, b"wq"),
-            rows:        h as u32,
-            cols:        h as u32,
-            neuron_hash: neuron_hash_of_matrix(&layer.wq, h, h),
-        });
-        entries.push(TensorManifestEntry {
-            name:        concat_bytes(&prefix, b"wv"),
-            rows:        h as u32,
-            cols:        h as u32,
-            neuron_hash: neuron_hash_of_matrix(&layer.wv, h, h),
-        });
-        entries.push(TensorManifestEntry {
-            name:        concat_bytes(&prefix, b"wo"),
-            rows:        h as u32,
-            cols:        h as u32,
-            neuron_hash: neuron_hash_of_matrix(&layer.wo, h, h),
-        });
-
-        li = li + 1;
+    // Audit F1: architecture-constant hash binding (default off).
+    if MODEL_HASH_BIND_ENABLED == 1 {
+        let recomputed: i64 = __mind_alloc(32);
+        loader_compute_model_hash(recomputed);
+        let ok: i64 = ld_hash_eq(bytes + 8, recomputed);
+        __mind_free(recomputed);
+        if ok == 0 { return LD_ERR_HASH; }
     }
 
-    // token_embedding — last alphabetically.
-    entries.push(TensorManifestEntry {
-        name:        b"token_embedding",
-        rows:        v as u32,
-        cols:        h as u32,
-        neuron_hash: neuron_hash_of_matrix(&weights.encoder.token_embedding, v, h),
-    });
+    let encoder_layers: i64 = ld_u32(bytes, 72);
+    let encoder_hidden: i64 = ld_u32(bytes, 76);
+    if encoder_layers != ENCODER_LAYERS { return LD_ERR_SHAPE; }
+    if encoder_hidden != ENCODER_HIDDEN { return LD_ERR_SHAPE; }
 
-    let preimage: [u8] = build_manifest_preimage(&entries);
-    let aggregate: [u8; 32] = sha256(preimage.as_slice());
+    let h: i64 = ENCODER_HIDDEN;
+    let scales_per_matrix: i64 = if groupwise == 1 { h * (h / GROUP_SIZE) * 4 } else { h * 4 };
+    let per_layer: i64 = 4 * h * h + 4 * scales_per_matrix + 3 * h * 4;
 
-    TensorManifest { entries, aggregate }
-}
+    let layers_off: i64 = 80;
+    let layers_end: i64 = layers_off + ENCODER_LAYERS * per_layer;
+    let final_off: i64 = layers_end;
+    let emb_off: i64 = final_off + 2 * h * 4;
+    let emb_end: i64 = emb_off + VOCAB_SIZE * h * 4;
+    if len < emb_end { return LD_ERR_TRUNCATED; }
 
-// ---------------------------------------------------------------------------
-// manifest_export — emit a deterministic JSON document from a TensorManifest.
-//
-// The output format is:
-//
-//   {
-//     "version": 1,
-//     "tensors": [
-//       {
-//         "name": "<tensor_name>",
-//         "shape": [<rows>, <cols>],
-//         "neuron_hash": "<64-hex-chars>"
-//       },
-//       ...
-//     ],
-//     "aggregate": "<64-hex-chars>"
-//   }
-//
-// Rules:
-//   - No trailing comma after the last element in any array or object.
-//   - No whitespace beyond the single space after each `:` and `,`.
-//   - All hex strings are lowercase.
-//   - Tensor array is in the same order as TensorManifest::entries (already
-//     alphabetically sorted by `build_tensor_manifest`).
-//   - Output is UTF-8, no BOM, no trailing newline.
-//
-// The hex encoding and JSON construction are pure functions; the output is
-// byte-identical on every backend for the same TensorManifest input.
+    let mut layer_i: i64 = 0;
+    while layer_i < ENCODER_LAYERS {
+        let loff: i64 = layers_off + layer_i * per_layer;
+        let scales_base: i64 = loff + 4 * h * h;
+        let norm_base: i64 = scales_base + 4 * scales_per_matrix;
 
-@[determinism(BitIdentical)]
-pub fn manifest_export(manifest: &TensorManifest) -> [u8] {
-    let mut out: [u8] = [];
+        let wq: i64 = __mind_alloc(h * h * 8);
+        ld_dequantize_matrix(bytes, loff, scales_base, h, groupwise, wq);
+        let wk: i64 = __mind_alloc(h * h * 8);
+        ld_dequantize_matrix(bytes, loff + h * h, scales_base + scales_per_matrix, h, groupwise, wk);
+        let wv: i64 = __mind_alloc(h * h * 8);
+        ld_dequantize_matrix(bytes, loff + 2 * h * h, scales_base + 2 * scales_per_matrix, h, groupwise, wv);
+        let wo: i64 = __mind_alloc(h * h * 8);
+        ld_dequantize_matrix(bytes, loff + 3 * h * h, scales_base + 3 * scales_per_matrix, h, groupwise, wo);
 
-    // Helpers: push a literal ASCII byte sequence.
-    fn push_str(s: &[u8], o: &mut [u8]) {
-        let mut i: usize = 0;
-        while i < s.len() { o.push(s[i]); i = i + 1; }
-    }
-
-    // Push a u32 as decimal ASCII (no leading zeros, except "0" itself).
-    fn push_decimal_u32(mut v: u32, o: &mut [u8]) {
-        if v == 0u32 {
-            o.push(0x30u8); // '0'
-            return;
-        }
-        let mut buf: [u8; 10] = [0u8; 10]; // max 10 digits for u32
-        let mut n: usize = 0;
-        while v > 0u32 {
-            buf[n] = 0x30u8 + (v % 10u32) as u8;
-            v = v / 10u32;
-            n = n + 1;
-        }
-        // buf holds digits in reverse order; emit reversed.
-        let mut d: usize = n;
-        while d > 0usize {
-            o.push(buf[d - 1]);
-            d = d - 1;
-        }
-    }
-
-    // Push a 32-byte hash as 64 lowercase hex chars.
-    fn push_hex(h: &[u8; 32], o: &mut [u8]) {
-        let hex: [u8; 16] = [
-            0x30u8, 0x31u8, 0x32u8, 0x33u8, 0x34u8, 0x35u8, 0x36u8, 0x37u8,
-            0x38u8, 0x39u8, 0x61u8, 0x62u8, 0x63u8, 0x64u8, 0x65u8, 0x66u8,
-        ];
-        let mut i: usize = 0;
-        while i < 32 {
-            o.push(hex[(h[i] >> 4) as usize]);
-            o.push(hex[(h[i] & 0x0Fu8) as usize]);
-            i = i + 1;
-        }
-    }
-
-    // Open root object.
-    push_str(b"{\"version\": 1, \"tensors\": [", &mut out);
-
-    let mut ti: usize = 0;
-    while ti < manifest.entries.len() {
-        let e: &TensorManifestEntry = &manifest.entries[ti];
-
-        push_str(b"{\"name\": \"", &mut out);
-        push_str(&e.name, &mut out);
-        push_str(b"\", \"shape\": [", &mut out);
-        push_decimal_u32(e.rows, &mut out);
-        push_str(b", ", &mut out);
-        push_decimal_u32(e.cols, &mut out);
-        push_str(b"], \"neuron_hash\": \"", &mut out);
-        push_hex(&e.neuron_hash, &mut out);
-        push_str(b"\"}", &mut out);
-
-        if ti + 1 < manifest.entries.len() {
-            push_str(b", ", &mut out);
-        }
-        ti = ti + 1;
-    }
-
-    push_str(b"], \"aggregate\": \"", &mut out);
-    push_hex(&manifest.aggregate, &mut out);
-    push_str(b"\"}", &mut out);
-
-    out
-}
-
-// ---------------------------------------------------------------------------
-// Local string helpers for tensor name construction
-
-// Return "encoder.layer" + zero-padded two-digit index + "." as bytes.
-// e.g. layer 0  -> b"encoder.layer00."
-//      layer 12 -> b"encoder.layer12."
-// The two-digit zero-padding keeps alphabetical and numeric sort identical
-// for ENCODER_LAYERS <= 99, which the spec enforces.
-@[determinism(BitIdentical)]
-fn make_layer_prefix(idx: usize) -> [u8] {
-    let mut p: [u8] = [];
-    let mut i: usize = 0;
-    let prefix_bytes: [u8] = b"encoder.layer";
-    while i < prefix_bytes.len() { p.push(prefix_bytes[i]); i = i + 1; }
-    // Two-digit zero-padded decimal.
-    p.push(0x30u8 + ((idx / 10) % 10) as u8);
-    p.push(0x30u8 + (idx % 10)        as u8);
-    p.push(0x2Eu8); // '.'
-    p
-}
-
-// Concatenate two byte slices.
-@[determinism(BitIdentical)]
-fn concat_bytes(a: &[u8], b: &[u8]) -> [u8] {
-    let mut out: [u8] = [];
-    let mut i: usize = 0;
-    while i < a.len() { out.push(a[i]); i = i + 1; }
-    let mut j: usize = 0;
-    while j < b.len() { out.push(b[j]); j = j + 1; }
-    out
-}
-
-// ---------------------------------------------------------------------------
-// compute_model_hash — audit follow-up F1 (2026-05-14)
-//
-// SHA-256 over a canonical byte preimage built from the compile-time
-// constants that fully describe the inference architecture and every
-// backwards-soft RFC switch landed in the autoresearch IMPLEMENT phase.
-//
-// Two invariants:
-//   1. Producers (the offline catalog-builder pipeline) compute the same
-//      preimage with the same constant values and write the resulting
-//      digest into the weights file's `model_hash` field at offset 8.
-//   2. Consumers (parse_weights, when MODEL_HASH_BIND_ENABLED == 1)
-//      recompute it and reject with HashMismatch on disagreement.
-//
-// Wire format of the preimage (every field is little-endian, lengths in
-// bytes after each tag's u32 length-prefix where applicable):
-//
-//   tag       length     payload
-//   ---       ------     -------
-//   "MNMH"    4          magic
-//   u32       4          ENCODER_LAYERS
-//   u32       4          ENCODER_HIDDEN
-//   u32       4          ENCODER_HEADS
-//   u32       4          ATTN_WINDOW_SIZE
-//   u32       4          ATTN_WINDOW_STRIDE
-//   u32       4          VOCAB_SIZE
-//   u32       4          MAX_REQUEST_TOKENS
-//   u32       4          ROUTE_EMBEDDING_DIM
-//   u8        1          WEIGHT_BITS
-//   u8        1          ACTIVATION_BITS
-//   u8        1          NUMERICS_WIRE_VERSION
-//   u8        1          Q16_FRAC_BITS as u8
-//
-//   u32       4          MATRYOSHKA_COARSE_DIM
-//   u32       4          K_COARSE_MULTIPLIER
-//   u32       4          COSINE_SCORING_ENABLED
-//   u32       4          ATTN_ALIBI_ENABLED
-//   ENCODER_HEADS * 4    ATTN_ALIBI_SLOPES (Q16.16 i32-LE, ascending head)
-//   u32       4          QUERY_PREFIX_LEN
-//   8 * 4     32         QUERY_PREFIX_TOKENS (u32-LE, ascending slot)
-//
-// Constants from `encoder_kernels` and elsewhere that affect runtime
-// behaviour are folded into the preimage at the call site by importing
-// them through `model::HEAD_MASK_BYTES` (already exported) and
-// `encoder_kernels::*` follow-up exports as those are added.
-//
-// The preimage is self-describing: each field's byte width is fixed,
-// so a future addition (e.g. RFC-015 group-quant scale dtype) appends
-// at the bottom of the layout above with a corresponding `MNMH` magic
-// version bump, never reorders or rewrites earlier fields.
-
-@[determinism(BitIdentical)]
-pub fn compute_model_hash() -> [u8; 32] {
-    let mut preimage: Vec<u8> = Vec::new();
-
-    // Magic.
-    preimage.push(0x4Du8); preimage.push(0x4Eu8);
-    preimage.push(0x4Du8); preimage.push(0x48u8);
-
-    // Helper: push a u32 little-endian.
-    fn push_u32_le(v: u32, p: &mut Vec<u8>) {
-        p.push(( v        & 0xFFu32) as u8);
-        p.push(((v >> 8 ) & 0xFFu32) as u8);
-        p.push(((v >> 16) & 0xFFu32) as u8);
-        p.push(((v >> 24) & 0xFFu32) as u8);
-    }
-    // Helper: push a Q16.16 (i32) little-endian.
-    fn push_i32_le(v: i32, p: &mut Vec<u8>) {
-        p.push(( v        & 0xFFi32) as u8);
-        p.push(((v >> 8 ) & 0xFFi32) as u8);
-        p.push(((v >> 16) & 0xFFi32) as u8);
-        p.push(((v >> 24) & 0xFFi32) as u8);
-    }
-
-    // Fixed architecture.
-    push_u32_le(ENCODER_LAYERS,       &mut preimage);
-    push_u32_le(ENCODER_HIDDEN,       &mut preimage);
-    push_u32_le(ENCODER_HEADS,        &mut preimage);
-    push_u32_le(ATTN_WINDOW_SIZE,     &mut preimage);
-    push_u32_le(ATTN_WINDOW_STRIDE,   &mut preimage);
-    push_u32_le(VOCAB_SIZE,           &mut preimage);
-    push_u32_le(MAX_REQUEST_TOKENS,   &mut preimage);
-    push_u32_le(ROUTE_EMBEDDING_DIM,  &mut preimage);
-    preimage.push(WEIGHT_BITS);
-    preimage.push(ACTIVATION_BITS);
-    preimage.push(NUMERICS_WIRE_VERSION);
-    preimage.push(Q16_FRAC_BITS as u8);
-
-    // RFC-008 — Matryoshka coarse-to-fine scoring.
-    push_u32_le(MATRYOSHKA_COARSE_DIM, &mut preimage);
-    push_u32_le(K_COARSE_MULTIPLIER,   &mut preimage);
-
-    // RFC-010 — Cosine scoring head.
-    push_u32_le(COSINE_SCORING_ENABLED, &mut preimage);
-
-    // RFC-011 — ALiBi attention bias.
-    push_u32_le(ATTN_ALIBI_ENABLED, &mut preimage);
-    let mut h_idx: usize = 0;
-    while h_idx < ENCODER_HEADS as usize {
-        push_i32_le(ATTN_ALIBI_SLOPES[h_idx], &mut preimage);
-        h_idx = h_idx + 1;
-    }
-
-    // RFC-012 — Query prefix.
-    push_u32_le(QUERY_PREFIX_LEN, &mut preimage);
-    let mut t_idx: usize = 0;
-    while t_idx < 8usize {
-        push_u32_le(QUERY_PREFIX_TOKENS[t_idx], &mut preimage);
-        t_idx = t_idx + 1;
-    }
-
-    sha256(preimage.as_slice())
-}
-
-@[determinism(BitIdentical)]
-pub fn parse_weights(bytes: &[u8]) -> Result<ModelWeights, LoaderError> {
-    // (1) Header.
-    if bytes.len() < WEIGHTS_HEADER_BYTES {
-        return Err(LoaderError::TruncatedFile);
-    }
-
-    if !magic_eq(bytes, MNW1_MAGIC) {
-        return Err(LoaderError::BadMagic);
-    }
-
-    let version: u16 = read_u16_le(bytes, 4);
-    if version != WEIGHTS_VERSION_V1 && version != WEIGHTS_VERSION_V2 {
-        return Err(LoaderError::UnsupportedVersion);
-    }
-    // RFC-001 group-wise scales when v2. v1 keeps the per-output-channel
-    // layout that today's reference checkpoint ships. Default is v1 so
-    // the binary stays byte-identical until a v2-trained checkpoint
-    // lands; the v2 path is dark code until that day.
-    let groupwise: bool = (version == WEIGHTS_VERSION_V2);
-
-    let reserved: u16 = read_u16_le(bytes, 6);
-    if reserved != 0u16 {
-        return Err(LoaderError::ReservedByteNonZero);
-    }
-
-    let mut model_hash:     [u8; 32] = [0u8; 32];
-    let mut tokenizer_hash: [u8; 32] = [0u8; 32];
-    let mut h: usize = 0;
-    while h < 32 {
-        model_hash[h]     = bytes[8  + h];
-        tokenizer_hash[h] = bytes[40 + h];
-        h = h + 1;
-    }
-
-    // Audit follow-up F1: when MODEL_HASH_BIND_ENABLED == 1, recompute
-    // the architecture-constant SHA-256 and reject the bundle if the
-    // producer's model_hash field disagrees. Under the default `= 0` the
-    // check is dead and the legacy opaque-bytes path is preserved.
-    if MODEL_HASH_BIND_ENABLED == 1u32 {
-        let recomputed: [u8; 32] = compute_model_hash();
-        if !hash_eq_32(model_hash, recomputed) {
-            return Err(LoaderError::HashMismatch);
-        }
-    }
-
-    let encoder_layers: u32 = read_u32_le(bytes, 72);
-    let encoder_hidden: u32 = read_u32_le(bytes, 76);
-
-    if encoder_layers != ENCODER_LAYERS {
-        return Err(LoaderError::ShapeMismatch);
-    }
-    if encoder_hidden != ENCODER_HIDDEN {
-        return Err(LoaderError::ShapeMismatch);
-    }
-
-    let h_usz: usize = encoder_hidden as usize;
-    let l_usz: usize = encoder_layers as usize;
-    let v_usz: usize = VOCAB_SIZE as usize;
-
-    // (2) Per-layer blocks.
-    // v1: one Q16.16 scale per output channel  -> H * 4 bytes per matrix.
-    // v2: one Q16.16 scale per (output channel, group of GROUP_SIZE input
-    //     channels)                            -> H * (H/GROUP_SIZE) * 4
-    //                                            bytes per matrix.
-    // ENCODER_HIDDEN = 256, GROUP_SIZE = 32 => 8 groups per row, 8x the v1
-    // scales footprint. The INT8 weight bytes themselves do not change.
-    let scales_per_matrix_bytes: usize = if groupwise {
-        h_usz * (h_usz / GROUP_SIZE) * 4usize
-    } else {
-        h_usz * 4usize
-    };
-    let per_layer_bytes: usize =
-          4usize * h_usz * h_usz             // wq/wk/wv/wo (INT8)
-        + 4usize * scales_per_matrix_bytes   // wq/wk/wv/wo scales (Q16.16 i32)
-        + 3usize * h_usz * 4usize;           // ln_gain, ln_bias, residual_gate
-
-    let layers_offset: usize = WEIGHTS_HEADER_BYTES;
-    let layers_end:    usize = layers_offset + l_usz * per_layer_bytes;
-
-    let final_ln_offset:        usize = layers_end;
-    let final_ln_bytes:         usize = 2usize * h_usz * 4usize;
-    let final_ln_end:           usize = final_ln_offset + final_ln_bytes;
-
-    let token_embedding_offset: usize = final_ln_end;
-    let token_embedding_bytes:  usize = v_usz * h_usz * 4usize;
-    let token_embedding_end:    usize = token_embedding_offset + token_embedding_bytes;
-
-    if bytes.len() < token_embedding_end {
-        return Err(LoaderError::TruncatedFile);
-    }
-
-    // Build layer array.
-    let mut layers: [EncoderLayerWeights; l_usz] =
-        [empty_layer_weights(); l_usz];
-
-    let mut layer_i: usize = 0;
-    while layer_i < l_usz {
-        let layer_off: usize = layers_offset + layer_i * per_layer_bytes;
-
-        // INT8 weight matrix offsets (within the layer block).
-        let wq_int8_off: usize = layer_off + 0usize         * h_usz * h_usz;
-        let wk_int8_off: usize = layer_off + 1usize         * h_usz * h_usz;
-        let wv_int8_off: usize = layer_off + 2usize         * h_usz * h_usz;
-        let wo_int8_off: usize = layer_off + 3usize         * h_usz * h_usz;
-
-        // Scale offsets follow all four INT8 matrices. The scales block
-        // stride depends on the weights-file version: see
-        // `scales_per_matrix_bytes` above.
-        let scales_base: usize = layer_off + 4usize * h_usz * h_usz;
-        let wq_scale_off: usize = scales_base + 0usize * scales_per_matrix_bytes;
-        let wk_scale_off: usize = scales_base + 1usize * scales_per_matrix_bytes;
-        let wv_scale_off: usize = scales_base + 2usize * scales_per_matrix_bytes;
-        let wo_scale_off: usize = scales_base + 3usize * scales_per_matrix_bytes;
-
-        // Norm + gate vectors follow the scales.
-        let norm_base: usize = scales_base + 4usize * scales_per_matrix_bytes;
-        let ln_gain_off:       usize = norm_base + 0usize * h_usz * 4usize;
-        let ln_bias_off:       usize = norm_base + 1usize * h_usz * 4usize;
-        let residual_gate_off: usize = norm_base + 2usize * h_usz * 4usize;
-
-        let wq = dequantize_matrix(bytes, wq_int8_off, wq_scale_off, h_usz, groupwise);
-        let wk = dequantize_matrix(bytes, wk_int8_off, wk_scale_off, h_usz, groupwise);
-        let wv = dequantize_matrix(bytes, wv_int8_off, wv_scale_off, h_usz, groupwise);
-        let wo = dequantize_matrix(bytes, wo_int8_off, wo_scale_off, h_usz, groupwise);
-
-        let mut ln_gain:       tensor<Q16_16, [h_usz]> = [0_i32; h_usz];
-        let mut ln_bias:       tensor<Q16_16, [h_usz]> = [0_i32; h_usz];
-        let mut residual_gate: tensor<Q16_16, [h_usz]> = [0_i32; h_usz];
-        let mut d: usize = 0;
-        while d < h_usz {
-            ln_gain[d]       = read_i32_le(bytes, ln_gain_off       + d * 4usize);
-            ln_bias[d]       = read_i32_le(bytes, ln_bias_off       + d * 4usize);
-            residual_gate[d] = read_i32_le(bytes, residual_gate_off + d * 4usize);
+        let ln_gain: i64 = __mind_alloc(h * 8);
+        let ln_bias: i64 = __mind_alloc(h * 8);
+        let gate: i64 = __mind_alloc(h * 8);
+        let mut d: i64 = 0;
+        while d < h {
+            __mind_store_i64(ln_gain + d * 8, ld_i32(bytes, norm_base + d * 4));
+            __mind_store_i64(ln_bias + d * 8, ld_i32(bytes, norm_base + h * 4 + d * 4));
+            __mind_store_i64(gate + d * 8, ld_i32(bytes, norm_base + 2 * h * 4 + d * 4));
             d = d + 1;
         }
 
-        layers[layer_i] = EncoderLayerWeights {
-            wq:            wq,
-            wk:            wk,
-            wv:            wv,
-            wo:            wo,
-            ln_gain:       ln_gain,
-            ln_bias:       ln_bias,
-            residual_gate: residual_gate,
-        };
+        let base: i64 = 1 + layer_i * 7;
+        __mind_store_i64(wtab + base * 8, wq);
+        __mind_store_i64(wtab + (base + 1) * 8, wk);
+        __mind_store_i64(wtab + (base + 2) * 8, wv);
+        __mind_store_i64(wtab + (base + 3) * 8, wo);
+        __mind_store_i64(wtab + (base + 4) * 8, ln_gain);
+        __mind_store_i64(wtab + (base + 5) * 8, ln_bias);
+        __mind_store_i64(wtab + (base + 6) * 8, gate);
         layer_i = layer_i + 1;
     }
 
-    // (3) Final layer-norm parameters.
-    let mut final_ln_gain: tensor<Q16_16, [h_usz]> = [0_i32; h_usz];
-    let mut final_ln_bias: tensor<Q16_16, [h_usz]> = [0_i32; h_usz];
-    let mut d2: usize = 0;
-    while d2 < h_usz {
-        final_ln_gain[d2] = read_i32_le(bytes, final_ln_offset                  + d2 * 4usize);
-        final_ln_bias[d2] = read_i32_le(bytes, final_ln_offset + h_usz * 4usize + d2 * 4usize);
+    let fg: i64 = __mind_alloc(h * 8);
+    let fb: i64 = __mind_alloc(h * 8);
+    let mut d2: i64 = 0;
+    while d2 < h {
+        __mind_store_i64(fg + d2 * 8, ld_i32(bytes, final_off + d2 * 4));
+        __mind_store_i64(fb + d2 * 8, ld_i32(bytes, final_off + h * 4 + d2 * 4));
         d2 = d2 + 1;
     }
+    __mind_store_i64(wtab + MODEL_WTAB_FINAL_GAIN * 8, fg);
+    __mind_store_i64(wtab + MODEL_WTAB_FINAL_BIAS * 8, fb);
 
-    // (4) Token embedding table.
-    let mut token_embedding: tensor<Q16_16, [v_usz, h_usz]> = [[0_i32; h_usz]; v_usz];
-    let mut row: usize = 0;
-    while row < v_usz {
-        let row_off: usize = token_embedding_offset + row * h_usz * 4usize;
-        let mut col: usize = 0;
-        while col < h_usz {
-            token_embedding[row][col] = read_i32_le(bytes, row_off + col * 4usize);
-            col = col + 1;
-        }
-        row = row + 1;
+    let emb: i64 = __mind_alloc(VOCAB_SIZE * h * 8);
+    let mut e2: i64 = 0;
+    while e2 < VOCAB_SIZE * h {
+        __mind_store_i64(emb + e2 * 8, ld_i32(bytes, emb_off + e2 * 4));
+        e2 = e2 + 1;
     }
+    __mind_store_i64(wtab + MODEL_WTAB_EMBEDDING * 8, emb);
 
-    Ok(ModelWeights {
-        encoder: EncoderWeights {
-            token_embedding: token_embedding,
-            layers:          layers,
-            final_ln_gain:   final_ln_gain,
-            final_ln_bias:   final_ln_bias,
-            // RFC-005: backwards-soft default — every head alive.
-            // v1/v2 weights files do not yet carry the saliency-ranked
-            // bitmask; populating `[0xFFu8; HEAD_MASK_BYTES]` makes
-            // `is_head_alive(...)` return true for every (layer_idx,
-            // head_i) pair, the `sliding_window_attention` per-head
-            // short-circuit never fires, and the attention output is
-            // byte-identical to the pre-RFC-005 path. A future v3
-            // weights file will carry the calibrated bitmask in the
-            // per-encoder header (RFC-005 §"Adoption plan") and the
-            // loader will read it from disk; until then the bitmask
-            // is built here.
-            head_mask:       [0xFFu8; HEAD_MASK_BYTES],
-        },
-        model_hash:     model_hash,
-        tokenizer_hash: tokenizer_hash,
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Local helpers
-// ---------------------------------------------------------------------------
-
-@[determinism(BitIdentical)]
-fn magic_eq(bytes: &[u8], expected: [u8; 4]) -> bool {
-    if bytes.len() < 4 {
-        return false;
+    // RFC-005: every head alive until a v3 weights file carries the
+    // calibrated bitmask.
+    let mask: i64 = __mind_alloc(HEAD_MASK_BYTES);
+    let mut mb: i64 = 0;
+    while mb < HEAD_MASK_BYTES {
+        __mind_store_i8(mask + mb, 255);
+        mb = mb + 1;
     }
-    bytes[0] == expected[0]
-        && bytes[1] == expected[1]
-        && bytes[2] == expected[2]
-        && bytes[3] == expected[3]
+    __mind_store_i64(wtab + MODEL_WTAB_HEAD_MASK * 8, mask);
+
+    LD_OK
 }
 
-@[determinism(BitIdentical)]
-fn read_u16_le(bytes: &[u8], offset: usize) -> u16 {
-    let b0: u16 =  bytes[offset    ] as u16;
-    let b1: u16 = (bytes[offset + 1] as u16) << 8;
-    b0 | b1
+// ─────────────────────────────────────────────────────────────────────────────
+// load_* — filesystem wrappers over the runtime_ffi probe-then-read ABI.
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub fn loader_load_catalog(path: i64, path_len: i64, cat: i64) -> i64 {
+    let size: i64 = rt_file_size(path, path_len);
+    if size < 0 { return LD_ERR_IO; }
+    let buf: i64 = __mind_alloc(size);
+    let got: i64 = rt_read_file(path, path_len, buf, size);
+    if got != size {
+        __mind_free(buf);
+        return LD_ERR_IO;
+    }
+    let rc: i64 = loader_parse_catalog(buf, size, cat);
+    __mind_free(buf);
+    rc
 }
 
-@[determinism(BitIdentical)]
-fn read_u32_le(bytes: &[u8], offset: usize) -> u32 {
-    let b0: u32 =  bytes[offset    ] as u32;
-    let b1: u32 = (bytes[offset + 1] as u32) << 8;
-    let b2: u32 = (bytes[offset + 2] as u32) << 16;
-    let b3: u32 = (bytes[offset + 3] as u32) << 24;
-    b0 | b1 | b2 | b3
+pub fn loader_load_weights(path: i64, path_len: i64, wtab: i64,
+                           model_hash_out: i64, tokenizer_hash_out: i64) -> i64 {
+    let size: i64 = rt_file_size(path, path_len);
+    if size < 0 { return LD_ERR_IO; }
+    let buf: i64 = __mind_alloc(size);
+    let got: i64 = rt_read_file(path, path_len, buf, size);
+    if got != size {
+        __mind_free(buf);
+        return LD_ERR_IO;
+    }
+    let rc: i64 = loader_parse_weights(buf, size, wtab, model_hash_out, tokenizer_hash_out);
+    __mind_free(buf);
+    rc
 }
 
-@[determinism(BitIdentical)]
-fn read_i32_le(bytes: &[u8], offset: usize) -> i32 {
-    // Read as u32 then reinterpret. Two's complement on the wire.
-    let u: u32 = read_u32_le(bytes, offset);
-    u as i32
+// ─────────────────────────────────────────────────────────────────────────────
+// compute_model_hash (audit F1) — SHA-256 over the canonical architecture-
+// constant preimage. Wire format per the dormant source; pinned against
+// CPython hashlib in tests/unit/test_loader.mind.
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub fn loader_compute_model_hash(out: i64) -> i64 {
+    let p: i64 = __mind_alloc(108);
+    __mind_store_i8(p + 0, 77);
+    __mind_store_i8(p + 1, 78);
+    __mind_store_i8(p + 2, 77);
+    __mind_store_i8(p + 3, 72);
+    ld_store_u32(p, 4, ENCODER_LAYERS);
+    ld_store_u32(p, 8, ENCODER_HIDDEN);
+    ld_store_u32(p, 12, ENCODER_HEADS);
+    ld_store_u32(p, 16, ATTN_WINDOW_SIZE);
+    ld_store_u32(p, 20, ATTN_WINDOW_STRIDE);
+    ld_store_u32(p, 24, VOCAB_SIZE);
+    ld_store_u32(p, 28, MAX_REQUEST_TOKENS);
+    ld_store_u32(p, 32, ROUTE_EMBEDDING_DIM);
+    __mind_store_i8(p + 36, WEIGHT_BITS);
+    __mind_store_i8(p + 37, ACTIVATION_BITS);
+    __mind_store_i8(p + 38, NUMERICS_WIRE_VERSION);
+    __mind_store_i8(p + 39, Q16_FRAC_BITS);
+    ld_store_u32(p, 40, MATRYOSHKA_COARSE_DIM);
+    ld_store_u32(p, 44, K_COARSE_MULTIPLIER);
+    ld_store_u32(p, 48, COSINE_SCORING_ENABLED);
+    ld_store_u32(p, 52, ATTN_ALIBI_ENABLED);
+    ld_store_u32(p, 56, ATTN_ALIBI_SLOPES[0]);
+    ld_store_u32(p, 60, ATTN_ALIBI_SLOPES[1]);
+    ld_store_u32(p, 64, ATTN_ALIBI_SLOPES[2]);
+    ld_store_u32(p, 68, ATTN_ALIBI_SLOPES[3]);
+    ld_store_u32(p, 72, QUERY_PREFIX_LEN);
+    let mut t: i64 = 0;
+    while t < 8 {
+        ld_store_u32(p, 76 + t * 4, QUERY_PREFIX_TOKENS[t]);
+        t = t + 1;
+    }
+    mn_sha256(p, 108, out);
+    __mind_free(p);
+    0
 }
 
-@[determinism(BitIdentical)]
-fn route_id_eq(a: RouteId, b: RouteId) -> bool {
-    let mut i: usize = 0;
-    while i < 32 {
-        if a[i] != b[i] { return false; }
+// ─────────────────────────────────────────────────────────────────────────────
+// Per-tensor manifest (Tier 3 item #9). Entries are 5-lane records
+// [name_addr, name_len, rows, cols, hash_addr], sorted ascending by name
+// (the producer's contract; alphabetical order is canonical).
+// ─────────────────────────────────────────────────────────────────────────────
+
+// SHA-256 of a Q16.16 buffer in row-major i32-LE layout. Matrices and
+// vectors share the one routine (row-major flattening is the layout).
+pub fn loader_neuron_hash(buf: i64, n_elems: i64, out: i64) -> i64 {
+    let bytes: i64 = __mind_alloc(n_elems * 4);
+    let mut i: i64 = 0;
+    while i < n_elems {
+        ld_store_u32(bytes, i * 4, __mind_load_i64(buf + i * 8));
         i = i + 1;
     }
-    true
+    mn_sha256(bytes, n_elems * 4, out);
+    __mind_free(bytes);
+    0
 }
 
-@[determinism(BitIdentical)]
-fn hash_eq_32(a: [u8; 32], b: [u8; 32]) -> bool {
-    // Constant-time over the 32 bytes (overkill for a public hash, but free
-    // and idiomatic — the same primitive guards MAC verification elsewhere).
-    let mut diff: u8 = 0;
-    let mut i: usize = 0;
-    while i < 32 {
-        diff = diff | (a[i] ^ b[i]);
+// Aggregate = SHA-256 of the canonical preimage over sorted entries:
+// "MNPM" || u32-LE count || per entry (u32-LE name_len || name ||
+// u32-LE rows || u32-LE cols || 32-byte neuron_hash).
+pub fn loader_manifest_aggregate(entries: i64, count: i64, out: i64) -> i64 {
+    // Preimage length: 8 + count * (4 + name_len + 8 + 32).
+    let mut total: i64 = 8;
+    let mut i: i64 = 0;
+    while i < count {
+        total = total + 44 + __mind_load_i64(entries + (i * LOADER_MANIFEST_ENTRY_LANES + 1) * 8);
         i = i + 1;
     }
-    diff == 0u8
-}
-
-// Construct a stub EncoderLayerWeights filled with zeros — only used during
-// the initial fixed-size array build before overwriting each slot in the
-// layer loop. Never escapes this module.
-@[determinism(BitIdentical)]
-fn empty_layer_weights() -> EncoderLayerWeights {
-    let h: usize = ENCODER_HIDDEN as usize;
-    EncoderLayerWeights {
-        wq:            [[0_i32; h]; h],
-        wk:            [[0_i32; h]; h],
-        wv:            [[0_i32; h]; h],
-        wo:            [[0_i32; h]; h],
-        ln_gain:       [0_i32; h],
-        ln_bias:       [0_i32; h],
-        residual_gate: [0_i32; h],
-    }
-}
-
-// Dequantize a single H×H INT8 matrix to Q16.16. The scales section
-// layout depends on `groupwise`:
-//
-//   groupwise == false (v1):
-//     One Q16.16 scale per output channel, packed as `H` i32 LE values.
-//     Address: `scales_off + oc * 4`.
-//
-//   groupwise == true (v2, RFC-001):
-//     One Q16.16 scale per (output channel, input-channel group), packed
-//     as `H * (H/GROUP_SIZE)` i32 LE values in row-major (oc outer,
-//     group inner) order. The group index for input channel `ic` is
-//     `ic / GROUP_SIZE`. Address:
-//       scales_off + (oc * (H/GROUP_SIZE) + (ic / GROUP_SIZE)) * 4
-//
-// Computation per element:
-//   product_i64 = (int8 as i64) * (scale_i32 as i64)        // up to 39 bits
-//   q16         = sat_i32((product_i64 + (1 << 15)) >> 16)  // round-half-to-even
-//
-// Reduction order is pinned by row-major (oc, ic) iteration. The
-// group-index integer division `ic / GROUP_SIZE` lowers to a single
-// right-shift on every backend (GROUP_SIZE is a power of two), which
-// is the bit-identity anchor for v2. q16 fits in i32 because
-// |int8| <= 127 and |scale_i32| <= 2^31-1; after the >>16 shift the
-// result is bounded by sat_i32 — saturating clamp on overflow.
-@[determinism(BitIdentical)]
-fn dequantize_matrix(
-    bytes:      &[u8],
-    int8_off:   usize,
-    scales_off: usize,
-    h:          usize,
-    groupwise:  bool,
-) -> tensor<Q16_16, [h, h]> {
-    let mut out: tensor<Q16_16, [h, h]> = [[0_i32; h]; h];
-    let groups_per_row: usize = h / GROUP_SIZE;
-
-    let mut oc: usize = 0;
-    while oc < h {
-        let mut ic: usize = 0;
-        while ic < h {
-            // Resolve the scale address for this (oc, ic) pair. In v1 the
-            // address is invariant across `ic` and mindc hoists the load
-            // out of the inner loop; in v2 the address changes every
-            // GROUP_SIZE columns (8 distinct scales per row at H=256).
-            let scale: i32 = if groupwise {
-                let group: usize = ic / GROUP_SIZE;
-                read_i32_le(
-                    bytes,
-                    scales_off + (oc * groups_per_row + group) * 4usize,
-                )
-            } else {
-                read_i32_le(bytes, scales_off + oc * 4usize)
-            };
-
-            // Read INT8 weight as signed byte.
-            let raw: u8   = bytes[int8_off + oc * h + ic];
-            let w_i8: i8  = raw as i8;
-
-            // Saturating fixed-point multiply with round-half-to-even shift.
-            let product: i64 = (w_i8 as i64) * (scale as i64);
-            // Round-half-to-even adjustment for the >>16 shift. Adding
-            // 1<<15 before an arithmetic right shift gives round-to-nearest;
-            // pinned mindc lowering then resolves the tie-to-even case
-            // through the q16_mul primitive (see spec/numerics.md §4).
-            let rounded: i64 = (product + (1i64 << (Q16_FRAC_BITS - 1))) >> Q16_FRAC_BITS;
-
-            // Saturate to i32 range.
-            let clamped: i32 =
-                if rounded >  (2147483647i64)        { 2147483647_i32        }
-                else if rounded < (-2147483648i64)   { -2147483648_i32       }
-                else                                 { rounded as i32        };
-
-            out[oc][ic] = clamped;
-            ic = ic + 1;
+    let p: i64 = __mind_alloc(total);
+    __mind_store_i8(p + 0, 77);
+    __mind_store_i8(p + 1, 78);
+    __mind_store_i8(p + 2, 80);
+    __mind_store_i8(p + 3, 77);
+    ld_store_u32(p, 4, count);
+    let mut w: i64 = 8;
+    i = 0;
+    while i < count {
+        let base: i64 = entries + i * LOADER_MANIFEST_ENTRY_LANES * 8;
+        let name: i64 = __mind_load_i64(base);
+        let nlen: i64 = __mind_load_i64(base + 8);
+        ld_store_u32(p, w, nlen);
+        w = w + 4;
+        let mut b: i64 = 0;
+        while b < nlen {
+            __mind_store_i8(p + w, __mind_load_i8(name + b));
+            w = w + 1;
+            b = b + 1;
         }
-        oc = oc + 1;
+        ld_store_u32(p, w, __mind_load_i64(base + 16));
+        w = w + 4;
+        ld_store_u32(p, w, __mind_load_i64(base + 24));
+        w = w + 4;
+        b = 0;
+        while b < 32 {
+            __mind_store_i8(p + w, __mind_load_i8(__mind_load_i64(base + 32) + b));
+            w = w + 1;
+            b = b + 1;
+        }
+        i = i + 1;
     }
-    out
+    mn_sha256(p, total, out);
+    __mind_free(p);
+    0
 }
 
-// UTF-8 validation over a byte slice window [offset, offset+len).
-// Implements the canonical state machine from RFC 3629 with the strictest
-// (no overlong, no surrogate) interpretation. Does NOT allocate.
-@[determinism(BitIdentical)]
-fn is_valid_utf8(bytes: &[u8], offset: usize, len: usize) -> bool {
-    let end: usize = offset + len;
-    if end > bytes.len() { return false; }
+// manifest_export — deterministic JSON document (no trailing commas,
+// single space after ':' and ',', lowercase hex, UTF-8, no BOM, no
+// trailing newline). Writes to `out` (capacity `cap`); returns the byte
+// length, or LD_ERR_TRUNCATED if cap is insufficient.
+pub fn loader_manifest_export(entries: i64, count: i64, aggregate: i64,
+                              out: i64, cap: i64) -> i64 {
+    let mut w: i64 = 0;
 
-    let mut i: usize = offset;
-    while i < end {
-        let b0: u8 = bytes[i];
+    // Local writers advance w; every write is bounds-checked against cap.
+    // (fn-local closures do not exist in 0.10.2 — the emission is inline.)
+    // Header: {"version": 1, "tensors": [
+    let header: [i64; 26] = [123, 34, 118, 101, 114, 115, 105, 111, 110, 34, 58, 32, 49, 44, 32, 34, 116, 101, 110, 115, 111, 114, 115, 34, 58, 32];
+    let mut i: i64 = 0;
+    while i < 26 {
+        if w >= cap { return LD_ERR_TRUNCATED; }
+        __mind_store_i8(out + w, header[i]);
+        w = w + 1;
+        i = i + 1;
+    }
+    if w >= cap { return LD_ERR_TRUNCATED; }
+    __mind_store_i8(out + w, 91);
+    w = w + 1;
 
-        if b0 <= 0x7Fu8 {
-            // 1-byte ASCII.
-            i = i + 1;
-        } else if (b0 & 0xE0u8) == 0xC0u8 {
-            // 2-byte sequence: 110xxxxx 10xxxxxx
-            // Overlong check: b0 must be >= 0xC2.
-            if b0 < 0xC2u8 { return false; }
-            if i + 2 > end { return false; }
-            let b1: u8 = bytes[i + 1];
-            if (b1 & 0xC0u8) != 0x80u8 { return false; }
-            i = i + 2;
-        } else if (b0 & 0xF0u8) == 0xE0u8 {
-            // 3-byte: 1110xxxx 10xxxxxx 10xxxxxx
-            if i + 3 > end { return false; }
-            let b1: u8 = bytes[i + 1];
-            let b2: u8 = bytes[i + 2];
-            if (b1 & 0xC0u8) != 0x80u8 { return false; }
-            if (b2 & 0xC0u8) != 0x80u8 { return false; }
-            // Overlong (U+0000..U+07FF): b0=0xE0 requires b1 >= 0xA0.
-            if b0 == 0xE0u8 && b1 < 0xA0u8 { return false; }
-            // Surrogate (U+D800..U+DFFF): b0=0xED forbids b1 >= 0xA0.
-            if b0 == 0xEDu8 && b1 >= 0xA0u8 { return false; }
-            i = i + 3;
-        } else if (b0 & 0xF8u8) == 0xF0u8 {
-            // 4-byte: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
-            if b0 > 0xF4u8 { return false; }
-            if i + 4 > end { return false; }
-            let b1: u8 = bytes[i + 1];
-            let b2: u8 = bytes[i + 2];
-            let b3: u8 = bytes[i + 3];
-            if (b1 & 0xC0u8) != 0x80u8 { return false; }
-            if (b2 & 0xC0u8) != 0x80u8 { return false; }
-            if (b3 & 0xC0u8) != 0x80u8 { return false; }
-            // Overlong (U+0000..U+FFFF): b0=0xF0 requires b1 >= 0x90.
-            if b0 == 0xF0u8 && b1 < 0x90u8 { return false; }
-            // Out of range (>U+10FFFF): b0=0xF4 forbids b1 >= 0x90.
-            if b0 == 0xF4u8 && b1 >= 0x90u8 { return false; }
-            i = i + 4;
+    i = 0;
+    while i < count {
+        let base: i64 = entries + i * LOADER_MANIFEST_ENTRY_LANES * 8;
+        let name: i64 = __mind_load_i64(base);
+        let nlen: i64 = __mind_load_i64(base + 8);
+        // {"name": "
+        let pre: [i64; 10] = [123, 34, 110, 97, 109, 101, 34, 58, 32, 34];
+        let mut j: i64 = 0;
+        while j < 10 {
+            if w >= cap { return LD_ERR_TRUNCATED; }
+            __mind_store_i8(out + w, pre[j]);
+            w = w + 1;
+            j = j + 1;
+        }
+        j = 0;
+        while j < nlen {
+            if w >= cap { return LD_ERR_TRUNCATED; }
+            __mind_store_i8(out + w, __mind_load_i8(name + j));
+            w = w + 1;
+            j = j + 1;
+        }
+        // ", "shape": [
+        let mid: [i64; 13] = [34, 44, 32, 34, 115, 104, 97, 112, 101, 34, 58, 32, 91];
+        j = 0;
+        while j < 13 {
+            if w >= cap { return LD_ERR_TRUNCATED; }
+            __mind_store_i8(out + w, mid[j]);
+            w = w + 1;
+            j = j + 1;
+        }
+        // rows decimal
+        let rows: i64 = __mind_load_i64(base + 16);
+        if rows == 0 {
+            if w >= cap { return LD_ERR_TRUNCATED; }
+            __mind_store_i8(out + w, 48);
+            w = w + 1;
         } else {
-            return false;
+            let digits: i64 = __mind_alloc(20);
+            let mut nd: i64 = 0;
+            let mut v: i64 = rows;
+            while v > 0 {
+                __mind_store_i8(digits + nd, 48 + v % 10);
+                v = v / 10;
+                nd = nd + 1;
+            }
+            while nd > 0 {
+                nd = nd - 1;
+                if w >= cap { return LD_ERR_TRUNCATED; }
+                __mind_store_i8(out + w, __mind_load_i8(digits + nd));
+                w = w + 1;
+            }
+            __mind_free(digits);
         }
+        // ", "
+        if w >= cap { return LD_ERR_TRUNCATED; }
+        __mind_store_i8(out + w, 44);
+        w = w + 1;
+        if w >= cap { return LD_ERR_TRUNCATED; }
+        __mind_store_i8(out + w, 32);
+        w = w + 1;
+        // cols decimal
+        let cols: i64 = __mind_load_i64(base + 24);
+        if cols == 0 {
+            if w >= cap { return LD_ERR_TRUNCATED; }
+            __mind_store_i8(out + w, 48);
+            w = w + 1;
+        } else {
+            let digits2: i64 = __mind_alloc(20);
+            let mut nd2: i64 = 0;
+            let mut v2: i64 = cols;
+            while v2 > 0 {
+                __mind_store_i8(digits2 + nd2, 48 + v2 % 10);
+                v2 = v2 / 10;
+                nd2 = nd2 + 1;
+            }
+            while nd2 > 0 {
+                nd2 = nd2 - 1;
+                if w >= cap { return LD_ERR_TRUNCATED; }
+                __mind_store_i8(out + w, __mind_load_i8(digits2 + nd2));
+                w = w + 1;
+            }
+            __mind_free(digits2);
+        }
+        // ], "neuron_hash": "
+        let mid2: [i64; 19] = [93, 44, 32, 34, 110, 101, 117, 114, 111, 110, 95, 104, 97, 115, 104, 34, 58, 32, 34];
+        j = 0;
+        while j < 19 {
+            if w >= cap { return LD_ERR_TRUNCATED; }
+            __mind_store_i8(out + w, mid2[j]);
+            w = w + 1;
+            j = j + 1;
+        }
+        // 64 lowercase hex chars of the 32-byte hash
+        let hex: [i64; 16] = [48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 97, 98, 99, 100, 101, 102];
+        let haddr: i64 = __mind_load_i64(base + 32);
+        j = 0;
+        while j < 32 {
+            let hb: i64 = __mind_load_i8(haddr + j) & 255;
+            if w >= cap { return LD_ERR_TRUNCATED; }
+            __mind_store_i8(out + w, hex[hb >> 4]);
+            w = w + 1;
+            if w >= cap { return LD_ERR_TRUNCATED; }
+            __mind_store_i8(out + w, hex[hb & 15]);
+            w = w + 1;
+            j = j + 1;
+        }
+        // "}
+        if w >= cap { return LD_ERR_TRUNCATED; }
+        __mind_store_i8(out + w, 34);
+        w = w + 1;
+        if w >= cap { return LD_ERR_TRUNCATED; }
+        __mind_store_i8(out + w, 125);
+        w = w + 1;
+        // ", " between entries
+        if i + 1 < count {
+            if w >= cap { return LD_ERR_TRUNCATED; }
+            __mind_store_i8(out + w, 44);
+            w = w + 1;
+            if w >= cap { return LD_ERR_TRUNCATED; }
+            __mind_store_i8(out + w, 32);
+            w = w + 1;
+        }
+        i = i + 1;
     }
-    true
+
+    // ], "aggregate": "
+    let tail: [i64; 17] = [93, 44, 32, 34, 97, 103, 103, 114, 101, 103, 97, 116, 101, 34, 58, 32, 34];
+    i = 0;
+    while i < 17 {
+        if w >= cap { return LD_ERR_TRUNCATED; }
+        __mind_store_i8(out + w, tail[i]);
+        w = w + 1;
+        i = i + 1;
+    }
+    let hex2: [i64; 16] = [48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 97, 98, 99, 100, 101, 102];
+    i = 0;
+    while i < 32 {
+        let hb2: i64 = __mind_load_i8(aggregate + i) & 255;
+        if w >= cap { return LD_ERR_TRUNCATED; }
+        __mind_store_i8(out + w, hex2[hb2 >> 4]);
+        w = w + 1;
+        if w >= cap { return LD_ERR_TRUNCATED; }
+        __mind_store_i8(out + w, hex2[hb2 & 15]);
+        w = w + 1;
+        i = i + 1;
+    }
+    // "}
+    if w >= cap { return LD_ERR_TRUNCATED; }
+    __mind_store_i8(out + w, 34);
+    w = w + 1;
+    if w >= cap { return LD_ERR_TRUNCATED; }
+    __mind_store_i8(out + w, 125);
+    w = w + 1;
+
+    w
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// build_tensor_manifest — the full 17-entry manifest over a model weight
+// table. Name buffers are freshly allocated; the caller owns `entries`
+// (17 * 5 lanes) and every name/hash buffer it references. NOTE: hashes
+// the full 32 MiB embedding — integration-path cost, not a unit-gate
+// resident (see header).
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Write "encoder.layer" + two zero-padded decimal digits + "." into buf;
+// returns the length (16).
+fn ld_layer_prefix(buf: i64, idx: i64) -> i64 {
+    let pre: [i64; 13] = [101, 110, 99, 111, 100, 101, 114, 46, 108, 97, 121, 101, 114];
+    let mut i: i64 = 0;
+    while i < 13 {
+        __mind_store_i8(buf + i, pre[i]);
+        i = i + 1;
+    }
+    __mind_store_i8(buf + 13, 48 + (idx / 10) % 10);
+    __mind_store_i8(buf + 14, 48 + idx % 10);
+    __mind_store_i8(buf + 15, 46);
+    16
+}
+
+// Write a literal suffix after a prefix; returns total length.
+fn ld_name2(buf: i64, prefix_len: i64, suffix: i64, suffix_len: i64) -> i64 {
+    let mut i: i64 = 0;
+    while i < suffix_len {
+        __mind_store_i8(buf + prefix_len + i, __mind_load_i8(suffix + i));
+        i = i + 1;
+    }
+    prefix_len + suffix_len
+}
+
+pub fn loader_build_tensor_manifest(wtab: i64, entries: i64, aggregate: i64) -> i64 {
+    let h: i64 = ENCODER_HIDDEN;
+    let mut slot: i64 = 0;
+
+    // encoder.final_ln_bias / encoder.final_ln_gain (alphabetically first).
+    let nb: i64 = __mind_alloc(21);
+    let s_nb: [i64; 21] = [101, 110, 99, 111, 100, 101, 114, 46, 102, 105, 110, 97, 108, 95, 108, 110, 95, 98, 105, 97, 115];
+    let mut i: i64 = 0;
+    while i < 21 { __mind_store_i8(nb + i, s_nb[i]); i = i + 1; }
+    let ng: i64 = __mind_alloc(21);
+    let s_ng: [i64; 21] = [101, 110, 99, 111, 100, 101, 114, 46, 102, 105, 110, 97, 108, 95, 108, 110, 95, 103, 97, 105, 110];
+    i = 0;
+    while i < 21 { __mind_store_i8(ng + i, s_ng[i]); i = i + 1; }
+
+    let hb: i64 = __mind_alloc(32);
+    loader_neuron_hash(__mind_load_i64(wtab + MODEL_WTAB_FINAL_BIAS * 8), h, hb);
+    __mind_store_i64(entries + 0, nb);
+    __mind_store_i64(entries + 8, 21);
+    __mind_store_i64(entries + 16, h);
+    __mind_store_i64(entries + 24, 1);
+    __mind_store_i64(entries + 32, hb);
+    slot = 1;
+
+    let hg: i64 = __mind_alloc(32);
+    loader_neuron_hash(__mind_load_i64(wtab + MODEL_WTAB_FINAL_GAIN * 8), h, hg);
+    __mind_store_i64(entries + 40, ng);
+    __mind_store_i64(entries + 48, 21);
+    __mind_store_i64(entries + 56, h);
+    __mind_store_i64(entries + 64, 1);
+    __mind_store_i64(entries + 72, hg);
+    slot = 2;
+
+    // Per-layer entries in alphabetical field order:
+    // ln_bias, ln_gain, residual_gate, wk, wq, wv, wo.
+    let sfx_bias: [i64; 7] = [108, 110, 95, 98, 105, 97, 115];
+    let sfx_gain: [i64; 7] = [108, 110, 95, 103, 97, 105, 110];
+    let sfx_gate: [i64; 13] = [114, 101, 115, 105, 100, 117, 97, 108, 95, 103, 97, 116, 101];
+    let sfx_wk: [i64; 2] = [119, 107];
+    let sfx_wq: [i64; 2] = [119, 113];
+    let sfx_wv: [i64; 2] = [119, 118];
+    let sfx_wo: [i64; 2] = [119, 111];
+
+    let mut layer: i64 = 0;
+    while layer < ENCODER_LAYERS {
+        let wbase: i64 = 1 + layer * 7;
+        // ln_bias
+        let name: i64 = __mind_alloc(32);
+        let pl: i64 = ld_layer_prefix(name, layer);
+        let tmp: i64 = __mind_alloc(16);
+        i = 0;
+        while i < 7 { __mind_store_i8(tmp + i, sfx_bias[i]); i = i + 1; }
+        let nl: i64 = ld_name2(name, pl, tmp, 7);
+        let hh: i64 = __mind_alloc(32);
+        loader_neuron_hash(__mind_load_i64(wtab + (wbase + 5) * 8), h, hh);
+        let ebase: i64 = entries + slot * LOADER_MANIFEST_ENTRY_LANES * 8;
+        __mind_store_i64(ebase + 0, name);
+        __mind_store_i64(ebase + 8, nl);
+        __mind_store_i64(ebase + 16, h);
+        __mind_store_i64(ebase + 24, 1);
+        __mind_store_i64(ebase + 32, hh);
+        slot = slot + 1;
+        // ln_gain
+        i = 0;
+        while i < 7 { __mind_store_i8(tmp + i, sfx_gain[i]); i = i + 1; }
+        let name2: i64 = __mind_alloc(32);
+        let pl2: i64 = ld_layer_prefix(name2, layer);
+        let nl2: i64 = ld_name2(name2, pl2, tmp, 7);
+        let hh2: i64 = __mind_alloc(32);
+        loader_neuron_hash(__mind_load_i64(wtab + (wbase + 4) * 8), h, hh2);
+        let ebase2: i64 = entries + slot * LOADER_MANIFEST_ENTRY_LANES * 8;
+        __mind_store_i64(ebase2 + 0, name2);
+        __mind_store_i64(ebase2 + 8, nl2);
+        __mind_store_i64(ebase2 + 16, h);
+        __mind_store_i64(ebase2 + 24, 1);
+        __mind_store_i64(ebase2 + 32, hh2);
+        slot = slot + 1;
+        // residual_gate
+        i = 0;
+        while i < 13 { __mind_store_i8(tmp + i, sfx_gate[i]); i = i + 1; }
+        let name3: i64 = __mind_alloc(32);
+        let pl3: i64 = ld_layer_prefix(name3, layer);
+        let nl3: i64 = ld_name2(name3, pl3, tmp, 13);
+        let hh3: i64 = __mind_alloc(32);
+        loader_neuron_hash(__mind_load_i64(wtab + (wbase + 6) * 8), h, hh3);
+        let ebase3: i64 = entries + slot * LOADER_MANIFEST_ENTRY_LANES * 8;
+        __mind_store_i64(ebase3 + 0, name3);
+        __mind_store_i64(ebase3 + 8, nl3);
+        __mind_store_i64(ebase3 + 16, h);
+        __mind_store_i64(ebase3 + 24, 1);
+        __mind_store_i64(ebase3 + 32, hh3);
+        slot = slot + 1;
+        // wk, wq, wv, wo (matrices)
+        let mut m: i64 = 0;
+        while m < 4 {
+            let sfx_len: i64 = 2;
+            i = 0;
+            if m == 0 { while i < sfx_len { __mind_store_i8(tmp + i, sfx_wk[i]); i = i + 1; } }
+            if m == 1 { while i < sfx_len { __mind_store_i8(tmp + i, sfx_wq[i]); i = i + 1; } }
+            if m == 2 { while i < sfx_len { __mind_store_i8(tmp + i, sfx_wv[i]); i = i + 1; } }
+            if m == 3 { while i < sfx_len { __mind_store_i8(tmp + i, sfx_wo[i]); i = i + 1; } }
+            let name4: i64 = __mind_alloc(32);
+            let pl4: i64 = ld_layer_prefix(name4, layer);
+            let nl4: i64 = ld_name2(name4, pl4, tmp, sfx_len);
+            let hh4: i64 = __mind_alloc(32);
+            loader_neuron_hash(__mind_load_i64(wtab + (wbase + 1 + m) * 8), h * h, hh4);
+            let ebase4: i64 = entries + slot * LOADER_MANIFEST_ENTRY_LANES * 8;
+            __mind_store_i64(ebase4 + 0, name4);
+            __mind_store_i64(ebase4 + 8, nl4);
+            __mind_store_i64(ebase4 + 16, h);
+            __mind_store_i64(ebase4 + 24, h);
+            __mind_store_i64(ebase4 + 32, hh4);
+            slot = slot + 1;
+            m = m + 1;
+        }
+        __mind_free(tmp);
+        layer = layer + 1;
+    }
+
+    // token_embedding (alphabetically last).
+    let te: i64 = __mind_alloc(15);
+    let s_te: [i64; 15] = [116, 111, 107, 101, 110, 95, 101, 109, 98, 101, 100, 100, 105, 110, 103];
+    i = 0;
+    while i < 15 { __mind_store_i8(te + i, s_te[i]); i = i + 1; }
+    let ht: i64 = __mind_alloc(32);
+    loader_neuron_hash(__mind_load_i64(wtab + MODEL_WTAB_EMBEDDING * 8), VOCAB_SIZE * h, ht);
+    let ebase5: i64 = entries + slot * LOADER_MANIFEST_ENTRY_LANES * 8;
+    __mind_store_i64(ebase5 + 0, te);
+    __mind_store_i64(ebase5 + 8, 15);
+    __mind_store_i64(ebase5 + 16, VOCAB_SIZE);
+    __mind_store_i64(ebase5 + 24, h);
+    __mind_store_i64(ebase5 + 32, ht);
+    slot = slot + 1;
+
+    loader_manifest_aggregate(entries, slot, aggregate);
+    0
 }

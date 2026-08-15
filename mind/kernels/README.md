@@ -91,22 +91,24 @@ winning window for any token t (used by the A1.4 bit-identity harness).
 
 ## Build
 
-Requires mindc v0.4.4 with `std-surface` and `cross-module-imports` features:
+Requires mindc v0.10.2 (`std-surface` is default). The canonical gate is
+project-mode — single-file `--emit-ir` runs with an empty project table by
+design and cannot resolve sibling modules:
+
+```bash
+bash <mind-nerve>/tests/mindc_gate.sh
+```
+
+That compiles all 17 `mind/{luts,kernels,exports}` modules via
+`mindc build --emit=object` against `mind/Mind.toml` and runs the LUT smoke
+tests through `mindc test`, failing closed on 0-tests-run or on
+runtime-fallback warnings.
+
+Full shared-library build:
 
 ```
-cd <mind-checkout>
-cargo run --features "std-surface cross-module-imports" \
-    --bin mindc -- <mind-nerve>/mind/kernels/<file>.mind --emit-ir
-```
-
-Full shared-library build (after A1.1 lands):
-
-```
-cd <mind-checkout>
-cargo run --features "std-surface cross-module-imports mlir-build" \
-    --bin mindc -- <mind-nerve>/mind/kernels/encode.mind \
-    --emit-shared <mind-nerve>/python/mind_nerve/_native/libmind_nerve_encoder.so \
-    --target=x86_64-unknown-linux-gnu
+mindc build --emit=shared   # via mind/Mind.toml; output staged by
+                            # tools/build_native_encoder.sh
 ```
 
 ## Phase A1.2 Status

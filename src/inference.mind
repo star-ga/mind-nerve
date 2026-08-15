@@ -1,548 +1,343 @@
-// Inference: tokenization, forward pass, top-K extraction with deterministic
-// tie-breaking, attestation envelope emission.
+// Inference: tokenization, forward pass, top-K extraction with
+// deterministic tie-breaking, attestation envelope emission. Ported to the
+// mindc 0.10.2 dialect 2026-08-12 (wave 4 of the pure-MIND migration; the
+// dormant pre-port source is preserved at src/dormant/inference.mind).
 //
-// Top-K extraction, canonical result hashing, RouteCatalog/RouteId/TopK
-// types and the UniqueRouteCatalog uniqueness invariant live in
-// `src/top_k.mind`. This module re-exports them at the `inference` path
-// so the public stability surface (and the existing test imports in
-// `tests/unit/test_top_k.mind`) remain at
-// `crate::mind_nerve::inference::{extract_top_k, RouteCatalog, ...}`.
-
-use crate::mind_nerve::{
-    Q16_16,
-    MIN_Q16_16,
-    MAX_TOP_K,
-    DEFAULT_TOP_K,
-    MAX_REQUEST_TOKENS,
-    ROUTE_EMBEDDING_DIM,
-    MATRYOSHKA_COARSE_DIM,
-    K_COARSE_MULTIPLIER,
-    QUERY_PREFIX_TOKENS,
-    QUERY_PREFIX_LEN,
-    COSINE_SCORING_ENABLED,
-    ATTESTATION_VERSION,
-    ATTESTATION_BYTES,
-    NUMERICS_WIRE_VERSION,
-    ENTRY_KIND_INFERENCE,
-    ARCH_X86_64,
-};
-use crate::mind_nerve::model;
-use crate::mind_nerve::evidence;
-use crate::mind_nerve::clock;
-use crate::mind_nerve::chain_log;
-use crate::mind_nerve::chain_log::ChainLog;
-use crate::mind_nerve::tokenizer;
-use crate::mind_nerve::sha256::sha256 as sha256_impl;
-// RFC-002: route-prior elementwise add before top-K extraction.
-use crate::mind_nerve::q16_16::q16_add;
-use crate::mind_nerve::top_k::{
-    self,
-    RouteId            as TopKRouteId,
-    RouteCatalog       as TopKRouteCatalog,
-    UniqueRouteCatalog as TopKUniqueRouteCatalog,
-    TopK               as TopKResult,
-    CatalogError       as TopKCatalogError,
-};
-
-// ---------------------------------------------------------------------------
-// Re-exports — keep the public surface stable at the inference module path.
-// ---------------------------------------------------------------------------
-
-pub type RouteId            = TopKRouteId;
-pub type RouteCatalog       = TopKRouteCatalog;
-pub type UniqueRouteCatalog = TopKUniqueRouteCatalog;
-pub type TopK               = TopKResult;
-pub type CatalogError       = TopKCatalogError;
-
-@[determinism(BitIdentical)]
-pub fn extract_top_k(
-    logits:  tensor<Q16_16, [batch, num_routes]>,
-    catalog: RouteCatalog,
-    k:       u32,
-) -> TopK {
-    top_k::extract_top_k(logits, catalog, k)
-}
-
-// Canonical SHA-256 over a TopK result. Direct re-export of the
-// implementation in src/top_k.mind — no local stub. The implementation
-// is the single source of truth for the 40-byte-per-entry preimage layout.
-@[determinism(BitIdentical)]
-pub fn canonical_result_hash(result: TopK) -> [u8; 32] {
-    top_k::canonical_result_hash(result)
-}
-
-// Re-export the SHA-256 primitive at the `inference` module path so the
-// existing call-sites in this file (and the `tests/unit/test_sha256.mind`
-// import `crate::mind_nerve::inference::sha256`) keep resolving without
-// change. The implementation lives in `src/sha256.mind`.
-@[determinism(BitIdentical)]
-pub fn sha256(bytes: &[u8]) -> [u8; 32] {
-    sha256_impl(bytes)
-}
-
-// ---------------------------------------------------------------------------
-// Request / PreselectResult / ModelWeights / InferenceError
-// ---------------------------------------------------------------------------
-
-pub struct Request {
-    pub bytes:          [u8],
-    pub catalog_hash:   [u8; 32],
-    pub k:              u32,
-
-    // Optional. When `Some(hash)`, mind-nerve refuses to run if
-    // `weights.model_hash != hash` and returns
-    // `InferenceError::ModelMismatch`. Lets the caller pin the exact
-    // model checkpoint the request was authored against — protects
-    // against silent model swaps between catalog distribution and
-    // inference. `None` disables the check (Phase 1 default; clients
-    // that care about strict pinning opt in by setting it).
-    pub expected_model_hash: Option<[u8; 32]>,
-}
-
-pub struct PreselectResult {
-    pub route_ids:      [RouteId; ?],   // length == request.k (saturated at num_routes)
-    pub scores:         [Q16_16;  ?],   // length matches route_ids
-    pub envelope:       [u8; ATTESTATION_BYTES as usize], // packed v2, 212 bytes
-}
-
-pub struct ModelWeights {
-    pub encoder:        model::EncoderWeights,
-    pub model_hash:     [u8; 32],
-    pub tokenizer_hash: [u8; 32],
-}
-
-// Closed set of forward-path failure modes. Every public entry point in
-// this module returns `Result<PreselectResult, InferenceError>`; callers
-// pattern-match against this enum and do not need to inspect the inner
-// VerificationError surface of `evidence::emit_inference`.
-pub enum InferenceError {
-    // k == 0 or k > MAX_TOP_K. Tracks evidence::VerificationError::InvalidK
-    // at the wire layer, but `preselect` rejects out-of-range k before any
-    // forward compute so the envelope builder never sees a bad k.
-    InvalidK,
-
-    // Post-tokenization token count exceeds MAX_REQUEST_TOKENS. The wire
-    // handshake is supposed to refuse oversized requests before they reach
-    // the preselect entry point; this is a defence-in-depth check.
-    RequestTooLong,
-
-    // catalog.ids.len() == 0. Empty catalogs are valid at the type level
-    // (UniqueRouteCatalog::new accepts the empty input) but a preselect on
-    // an empty catalog has no meaningful top-K to emit. Distinguishing this
-    // from "k > num_routes" matters because the latter is silently
-    // saturated; an empty catalog is a configuration error.
-    EmptyCatalog,
-
-    // The loaded ModelWeights.model_hash does not match the caller-supplied
-    // expected model hash carried alongside the catalog (catalogs are
-    // produced against a specific model checkpoint). Mismatch means scores
-    // would be computed against weights that were not used to embed the
-    // routes — every downstream attestation would be honest about the
-    // mismatch but the top-K result would be semantically garbage. Refuse.
-    ModelMismatch,
-
-    // evidence::emit_inference returned a VerificationError. Should be
-    // unreachable in practice because preselect pre-validates k/architecture,
-    // but we surface it explicitly rather than panic.
-    EnvelopeBuildFailed,
-}
-
-// ---------------------------------------------------------------------------
-// Tokenizer contract — Phase 1.2 stub.
-// ---------------------------------------------------------------------------
+// Composes: tokenize_bpe -> model_encoder -> mean_pool -> scoring head
+// -> extract_top_k -> canonical_result_hash -> evidence_emit_inference,
+// with the ChainLog threaded so every envelope's chain_prev is the previous
+// envelope's chain_curr.
 //
-// Produces a `[u32]` of length ≤ MAX_REQUEST_TOKENS. If the input would
-// exceed the cap, callers receive `InferenceError::RequestTooLong` from
-// `preselect`; the tokenizer itself never truncates silently.
-//
-// Phase 1.2 — BPE 32k tokenizer lives in `src/tokenizer.mind`. The current
-// merge table is a 32-entry placeholder; the real 32k merges arrive with
-// the first reference checkpoint and replace BPE_MERGES wholesale. See
-// src/tokenizer.mind §"PHASE 1.2 STATUS" for the follow-up flag.
-//
-// `tokenizer::tokenize_bpe` returns `Result<[u32], TokenizeError>`. This
-// thin local wrapper maps the tokenizer error surface onto the inference
-// `InferenceError` enum so the `preselect` body keeps a single error
-// type. `InputEmpty` is treated as a malformed request and surfaces as
-// `InvalidK` (the wire-handshake-level "this request cannot run"
-// discriminant); `TooLong` maps to `RequestTooLong` 1:1.
-@[determinism(BitIdentical)]
-fn tokenize_bpe(bytes: &[u8]) -> Result<[u32], InferenceError> {
-    match tokenizer::tokenize_bpe(bytes) {
-        Ok(toks) => Ok(toks),
-        Err(tokenizer::TokenizeError::InputEmpty) => Err(InferenceError::InvalidK),
-        Err(tokenizer::TokenizeError::TooLong)    => Err(InferenceError::RequestTooLong),
-    }
-}
+// PORT NOTES (0.10.2 reality):
+//   - NO RE-EXPORT WRAPPERS. The dormant module re-exported
+//     extract_top_k / canonical_result_hash / sha256 / the top_k types at
+//     the inference path. Under the merged-image discipline every fn name
+//     is global, so wrappers would collide with the real definitions;
+//     callers use src/top_k.mind / src/sha256.mind directly. The public
+//     surface ADDED here is infer_preselect / infer_preselect_pre_tokenized
+//     / infer_preselect_pre_tokenized_stateless.
+//   - Request/PreselectResult/ModelWeights structs become handle
+//     conventions: the catalog is the loader's 5-slot table, the weights
+//     are the 18-slot model weight table plus two 32-byte hash buffers,
+//     results land in caller-allocated out buffers. Result<...,
+//     InferenceError> becomes the signed INF_ERR_* return convention
+//     below; on success the return value is the number of top-K entries
+//     written (>= 1).
+//   - Option<[u8; 32]> expected_model_hash becomes (expected_mh,
+//     has_expected): the pin check runs iff has_expected == 1.
+//   - CLOCK DECISION (wave-3 settled): timestamp_ms is a PARAMETER. The
+//     dormant read the clock inside preselect via a cfg probe; the port
+//     keeps inference pure — the caller picks clock_host_now_ms(),
+//     clock_counter_next(state), or clock_now_ms_with_injection(v) per
+//     the src/clock.mind contract. RFC-012 note preserved: request_hash
+//     records the USER-SUPPLIED tokens, not the prefix-prepended sequence.
+//   - exp_h / rsqrt_h (the pinned LUT handles) are explicit parameters,
+//     matching src/model.mind.
 
-// ---------------------------------------------------------------------------
-// preselect — full pipeline (bytes -> envelope).
-// ---------------------------------------------------------------------------
-//
-// The public top-level entry point. Composes:
-//
-//   tokenize_bpe -> encoder -> mean_pool_seq -> score_against_routes
-//                -> extract_top_k -> canonical_result_hash
-//                -> evidence::emit_inference
-//
-// Returns `Err(InferenceError)` on any validation failure; never panics.
-// Phase 1 callers that already hold tokens (e.g., CLI binary, integration
-// tests) should use `preselect_pre_tokenized` to skip tokenization.
-@[determinism(BitIdentical)]
-pub fn preselect(
-    request: Request,
-    catalog: RouteCatalog,
-    weights: ModelWeights,
-    log:     &mut ChainLog,
-) -> Result<PreselectResult, InferenceError>
-{
-    // (1) k range gate. Same MIN/MAX policy as evidence::emit().
-    if request.k == 0 || request.k > MAX_TOP_K {
-        return Err(InferenceError::InvalidK);
-    }
+import src.lib;
+import src.q16_16;
+import src.sha256;
+import src.top_k;
+import src.tokenizer;
+import src.model;
+import src.evidence;
+import src.chain_log;
+import src.loader;
 
-    // (2) Empty-catalog gate (audit: distinguish from k > num_routes).
-    if catalog.ids.len() == 0 {
-        return Err(InferenceError::EmptyCatalog);
-    }
+// InferenceError, flattened to negative return codes.
+pub const INF_ERR_INVALID_K:       i64 = -1;
+pub const INF_ERR_TOO_LONG:        i64 = -2;
+pub const INF_ERR_EMPTY_CATALOG:   i64 = -3;
+pub const INF_ERR_MODEL_MISMATCH:  i64 = -4;
+pub const INF_ERR_ENVELOPE:        i64 = -5;
 
-    // (3) Strict model-hash pinning. When the caller asserts the exact
-    //     checkpoint the request was authored against, refuse to run
-    //     against a different loaded model. Protects against silent
-    //     model swaps between catalog distribution and inference.
-    if let Some(expected) = request.expected_model_hash {
-        if !hash_eq_32(expected, weights.model_hash) {
-            return Err(InferenceError::ModelMismatch);
-        }
-    }
-
-    // (4) Tokenize. Phase 1.2 — delegates to `tokenizer::tokenize_bpe`
-    //     via the local `tokenize_bpe` wrapper, which maps the tokenizer
-    //     error surface onto `InferenceError`. The tokenizer enforces
-    //     `bytes.len() > 0` and `tokens.len() ≤ MAX_REQUEST_TOKENS`; the
-    //     re-check below is defence-in-depth — it stays as a stable
-    //     contract for any replacement tokenizer implementation.
-    let tokens: [u32] = match tokenize_bpe(request.bytes.as_slice()) {
-        Ok(toks) => toks,
-        Err(err) => return Err(err),
-    };
-    if tokens.len() > (MAX_REQUEST_TOKENS as usize) {
-        return Err(InferenceError::RequestTooLong);
-    }
-
-    // Delegate to the pre-tokenized entry point for the forward path.
-    preselect_pre_tokenized(&tokens, &catalog, &weights, request.k, log)
-}
-
-// ---------------------------------------------------------------------------
-// preselect_pre_tokenized — forward path on pre-tokenized input.
-// ---------------------------------------------------------------------------
-//
-// Entry point used by the CLI binary and tests until BPE 32k lands
-// (Phase 1.2). Accepts token IDs directly, runs the encoder + scoring head,
-// and emits a fully-formed attestation envelope.
-//
-// The forward path is: encoder -> mean_pool_seq -> score_against_routes
-// -> extract_top_k -> canonical_result_hash -> evidence::emit_inference.
-// Each stage is `@[determinism(BitIdentical)]` with pinned reduction order
-// where applicable; the whole pipeline is bit-identical across runs and
-// architectures supported by ARCH_X86_64 / AARCH64 / CUDA in Phase 1.
-@[determinism(BitIdentical)]
-pub fn preselect_pre_tokenized(
-    tokens:  &[u32],
-    catalog: &RouteCatalog,
-    weights: &ModelWeights,
-    k:       u32,
-    log:     &mut ChainLog,
-) -> Result<PreselectResult, InferenceError>
-{
-    // (1) k range gate.
-    if k == 0 || k > MAX_TOP_K {
-        return Err(InferenceError::InvalidK);
-    }
-
-    // (1a) RFC-012: Asymmetric query/passage prefix conditioning.
-    //      When `QUERY_PREFIX_LEN > 0`, prepend the first QUERY_PREFIX_LEN
-    //      entries of QUERY_PREFIX_TOKENS to the user-supplied token stream
-    //      before any downstream gate. The encoder sees the asymmetric
-    //      query-side conditioning prefix, paired with route embeddings
-    //      that the offline catalog-builder produced with the matching
-    //      `"passage: "` prefix on the catalog side. With the backwards-
-    //      soft default `QUERY_PREFIX_LEN = 0` the compile-time predicate
-    //      is statically false, the prepend branch is dead code, mindc
-    //      constant-folds the dispatch back to the direct user-supplied
-    //      tokens slice, and the binary stays byte-identical to today
-    //      until a calibrated reference checkpoint binds a non-zero
-    //      QUERY_PREFIX_LEN into `model_hash`.
-    //
-    //      Important: the `request_hash` field continues to record
-    //      SHA-256 of the user-supplied byte / token stream — NOT the
-    //      prefix-prepended sequence. That preserves the envelope's
-    //      "honest record of what the caller asked" contract; the
-    //      prefix-prepended sequence is implied by (request_hash,
-    //      model_hash) for any replay verifier.
-    //
-    //      The pre-prepend `tokens.len() > MAX_REQUEST_TOKENS` check is
-    //      kept as a fast-fail before any allocation; the post-prepend
-    //      check below catches the boundary case where the user supplied
-    //      a slice of length `MAX_REQUEST_TOKENS - QUERY_PREFIX_LEN + 1`
-    //      that would silently overflow the cap.
-    if tokens.len() > (MAX_REQUEST_TOKENS as usize) {
-        return Err(InferenceError::RequestTooLong);
-    }
-    let prefix_len: usize = QUERY_PREFIX_LEN as usize;
-    let total_len:  usize = prefix_len + tokens.len();
-    if total_len > (MAX_REQUEST_TOKENS as usize) {
-        return Err(InferenceError::RequestTooLong);
-    }
-    let effective_tokens: [u32] = if QUERY_PREFIX_LEN > 0u32 {
-        let mut concat: [u32] = [];
-        let mut pp: usize = 0;
-        while pp < prefix_len {
-            concat.push(QUERY_PREFIX_TOKENS[pp]);
-            pp = pp + 1;
-        }
-        let mut tt: usize = 0;
-        while tt < tokens.len() {
-            concat.push(tokens[tt]);
-            tt = tt + 1;
-        }
-        concat
-    } else {
-        tokens.to_owned()
-    };
-
-    // (2) Token-cap gate (post-prepend, defence-in-depth). The wire
-    //     handshake should have rejected oversize requests already; the
-    //     check above already gated against the user-supplied slice
-    //     exceeding the cap, and the post-prepend gate further above
-    //     gated against the prefix pushing the sequence past the cap.
-    //     This is the canonical cap check that callers downstream rely on.
-    if effective_tokens.len() > (MAX_REQUEST_TOKENS as usize) {
-        return Err(InferenceError::RequestTooLong);
-    }
-
-    // (3) Empty-catalog gate (see InferenceError::EmptyCatalog).
-    let num_routes: usize = catalog.ids.len();
-    if num_routes == 0 {
-        return Err(InferenceError::EmptyCatalog);
-    }
-
-    // (4) Forward pass — encoder -> mean pool -> direct scoring head.
-    //     batch == 1: wrap the flat token slice into a [1, n] tensor view
-    //     so the model.mind signatures (which carry the batch axis on the
-    //     public surface for Phase 2 compatibility) stay typed.
-    let token_ids: tensor<u32, [1, effective_tokens.len()]> = [effective_tokens.clone()];
-    let enc_out             = model::encoder(token_ids, weights.encoder);
-    let pooled_query_raw    = model::mean_pool_seq(enc_out);
-
-    // (4a-pre) RFC-010: L2-normalize the pooled query for the cosine-
-    //          similarity scoring head. Route embeddings are pre-
-    //          normalized offline by the catalog-builder pipeline so
-    //          the route side carries zero hot-path cost. The resulting
-    //          score `<query / ||query||, route / ||route||>` is the
-    //          cosine of the angle between them, bounded in
-    //          `[-ONE_Q16_16, ONE_Q16_16]` within `q16_rsqrt` LUT
-    //          truncation tolerance. RFC-002's per-route log-frequency
-    //          prior (added below in step 4b) calibrates against this
-    //          bounded cosine range when the catalog-builder ships a
-    //          cosine-trained .cat file. With the backwards-soft
-    //          default `COSINE_SCORING_ENABLED = 0` the compile-time
-    //          predicate is statically false, the L2-normalize branch
-    //          is dead code, mindc constant-folds the dispatch to the
-    //          raw `mean_pool_seq` output, and the binary stays byte-
-    //          identical to today until a cosine-objective-trained
-    //          reference checkpoint (paired with a pre-normalized route
-    //          catalog) binds `COSINE_SCORING_ENABLED = 1` into
-    //          `model_hash`.
-    let pooled_query = if COSINE_SCORING_ENABLED == 1u32 {
-        model::l2_normalize_pooled(pooled_query_raw)
-    } else {
-        pooled_query_raw
-    };
-
-    // (4a) RFC-008: Matryoshka coarse-to-fine cascade. When the
-    //      backwards-soft default `MATRYOSHKA_COARSE_DIM ==
-    //      ROUTE_EMBEDDING_DIM` is in force, the const-resolvable guard
-    //      below is statically false and mindc dead-code-eliminates the
-    //      cascade branch entirely — the binary stays byte-identical to
-    //      today's single-pass `score_against_routes` path. With
-    //      calibrated constants bound into `model_hash` via the model
-    //      manifest (typical Phase 2 production values:
-    //      `MATRYOSHKA_COARSE_DIM = 64`, `K_COARSE_MULTIPLIER = 4`), the
-    //      cascade activates:
-    //        (i)   coarse pass scores every route over the first
-    //              MATRYOSHKA_COARSE_DIM dimensions (3.95× fewer MACs
-    //              than the full-rank dot at the Phase 1 catalog ceiling),
-    //        (ii)  `extract_top_k_mask` produces a flat `[u8]` shortlist
-    //              of length `num_routes` selecting the top-(K_COARSE_MULTIPLIER
-    //              * k) candidates under the same pinned bounded-heap
-    //              algorithm as the final top-K,
-    //        (iii) the fine pass rescores only the shortlisted routes over
-    //              the full ROUTE_EMBEDDING_DIM dimensions; non-shortlisted
-    //              routes saturate to MIN_Q16_16 so they cannot beat any
-    //              shortlisted route in the downstream `extract_top_k`.
-    //      RFC-002's per-route prior is added to the fine-pass logits
-    //      below regardless of which branch produced them, so the prior
-    //      composes cleanly with the cascade.
-    let mut logits = if MATRYOSHKA_COARSE_DIM < ROUTE_EMBEDDING_DIM {
-        let coarse_logits = model::score_against_routes_prefix(
-            pooled_query, catalog.embeddings, MATRYOSHKA_COARSE_DIM,
-        );
-        // Shortlist size: K_COARSE_MULTIPLIER * k, saturated at num_routes.
-        let k_coarse_raw: u32 = K_COARSE_MULTIPLIER * k;
-        let k_coarse: u32 =
-            if (k_coarse_raw as usize) > num_routes { num_routes as u32 } else { k_coarse_raw };
-        let mask: [u8] = top_k::extract_top_k_mask(coarse_logits, *catalog, k_coarse);
-        model::score_against_routes_masked(
-            pooled_query, catalog.embeddings, mask.as_slice(), MIN_Q16_16,
-        )
-    } else {
-        model::score_against_routes(pooled_query, catalog.embeddings)
-    };
-
-    // (4b) RFC-002: add the per-route log-frequency catalog co-occurrence
-    //      prior elementwise to the logits BEFORE top-K extraction. The
-    //      prior is a Q16.16 column carried in `catalog.route_prior`,
-    //      shipped by the offline catalog-builder pipeline when the .cat
-    //      file is v2. For v1 catalogs the prior is the all-zero vector
-    //      (additive identity) so this loop is a no-op and the resulting
-    //      logits remain byte-identical to the pre-RFC-002 path. The
-    //      reduction site is pinned by ascending r; the operation is a
-    //      single saturating `q16_add` per route (≤ 10K iterations at the
-    //      Phase 1 catalog ceiling — well under 0.1% of the 30 ms p95
-    //      budget).
-    let mut pr: usize = 0;
-    while pr < num_routes {
-        logits[0][pr] = q16_add(logits[0][pr], catalog.route_prior[pr]);
-        pr = pr + 1;
-    }
-
-    // (5) Deterministic top-K with SHA-256 (route_id) tie-break.
-    //     extract_top_k saturates at num_routes when k > num_routes, so
-    //     the returned `result.ids.len()` may be < k.
-    let result: TopK = extract_top_k(logits, *catalog, k);
-
-    // (6) Canonical preimage hashes for the attestation envelope.
-    //     - request_hash is SHA-256(raw token-id bytes). Tokens are u32 LE,
-    //       4 bytes each, in ascending position order. This is bit-identical
-    //       across architectures because the on-wire token byte layout is
-    //       pinned by the tokenizer manifest (Phase 1.2); for now the test
-    //       suite supplies tokens directly and we hash the raw u32 sequence.
-    //     - result_hash is canonical_result_hash(result) (40 bytes per
-    //       top-K entry; see src/top_k.mind §"canonical_result_hash").
-    let request_hash: [u8; 32] = request_hash_from_tokens(tokens);
-    let result_hash:  [u8; 32] = canonical_result_hash(result);
-
-    // (7) Envelope construction. chain_prev is the previous envelope's
-    //     chain_curr, threaded through the session-scoped ChainLog. The
-    //     first envelope in a session sees `chain_prev = zeros32` by
-    //     construction (ChainLog::new_session initialises
-    //     `last_chain_curr` to the zero hash); subsequent envelopes see
-    //     SHA-256 of the previous envelope's 212-byte serialized form.
-    //     This closes the Phase 1.3 "chain-of-one" gap and makes
-    //     `evidence::verify_chain` meaningful end-to-end.
-    //
-    //     timestamp_ms comes from the monotonic clock provider in
-    //     src/clock.mind. On backends without a host monotonic clock
-    //     (WebGPU), it falls through to a per-inference counter; either
-    //     way the value is strictly non-decreasing within a process.
-    let chain_prev:   [u8; 32] = chain_log::chain_prev_for_next(log);
-    let timestamp_ms: i64      = clock::monotonic_now_ms();
-    let envelope_bytes = match evidence::emit_inference(
-        weights.model_hash,
-        weights.tokenizer_hash,
-        catalog.hash,
-        request_hash,
-        result_hash,
-        chain_prev,                             // = log.last_chain_curr
-        timestamp_ms,
-        ARCH_X86_64,                            // architecture (Phase 2: runtime)
-        k,
-        NUMERICS_WIRE_VERSION as u16,
-    ) {
-        Ok(bytes) => bytes,
-        Err(_)    => return Err(InferenceError::EnvelopeBuildFailed),
-    };
-
-    // (8) Advance the chain log. After this call, log.last_chain_curr
-    //     equals SHA-256(envelope_bytes), which becomes the chain_prev
-    //     of the NEXT envelope minted from this session.
-    let _ = chain_log::append(log, &envelope_bytes);
-
-    Ok(PreselectResult {
-        route_ids: result.ids,
-        scores:    result.scores,
-        envelope:  envelope_bytes,
-    })
-}
-
-// ---------------------------------------------------------------------------
-// preselect_pre_tokenized_stateless — backwards-compatible ephemeral-log
-// variant for callers that do not (yet) carry a session-scoped ChainLog.
-// ---------------------------------------------------------------------------
-//
-// Every call constructs a fresh ChainLog, runs the forward path, and
-// drops the log. The emitted envelope's `chain_prev` is therefore always
-// zeros32 — a chain-of-one. Use this from one-shot CLI invocations or
-// integration tests that don't care about cross-call chain continuity.
-// Production hosts that DO care MUST use `preselect_pre_tokenized` with
-// a long-lived ChainLog threaded across every inference in the session.
-//
-// The session_id is pinned to all-zero so the stateless variant does
-// not consume entropy (BitIdentical-compatible). For the few callers
-// that want a unique id even in stateless mode, build a ChainLog with
-// `chain_log::new_session()` and use the stateful entry point.
-@[determinism(BitIdentical)]
-pub fn preselect_pre_tokenized_stateless(
-    tokens:  &[u32],
-    catalog: &RouteCatalog,
-    weights: &ModelWeights,
-    k:       u32,
-) -> Result<PreselectResult, InferenceError>
-{
-    let mut ephemeral: ChainLog = chain_log::new_session_with_id([0u8; 16]);
-    preselect_pre_tokenized(tokens, catalog, weights, k, &mut ephemeral)
-}
-
-// ---------------------------------------------------------------------------
-// Local helpers
-// ---------------------------------------------------------------------------
-
-// SHA-256 over the raw u32-LE byte stream of a token-id sequence. Pinned
-// left-to-right serialization so the preimage is bit-identical across
-// architectures. Used as the envelope's `request_hash` field on the
-// pre-tokenized entry path; the full `preselect` path is expected to hash
-// `request.bytes` directly once BPE lands and ties the byte→token mapping
-// to a tokenizer manifest hash.
-@[determinism(BitIdentical)]
-fn request_hash_from_tokens(tokens: &[u32]) -> [u8; 32] {
-    let n: usize = tokens.len();
-    let mut buf: [u8] = [];
-    let mut i: usize = 0;
-    while i < n {
-        let t: u32 = tokens[i];
-        buf.push(( t         & 0xFFu32) as u8);
-        buf.push(((t >> 8 )  & 0xFFu32) as u8);
-        buf.push(((t >> 16)  & 0xFFu32) as u8);
-        buf.push(((t >> 24)  & 0xFFu32) as u8);
-        i = i + 1;
-    }
-    sha256(buf.as_slice())
-}
-
-// Constant-time 32-byte hash equality. Returns true iff all bytes match.
-// Constant-time discipline is overkill for hash-equality (the attacker
-// learns nothing about the hash from a timing side-channel they don't
-// already know), but writing it this way means the same primitive can
-// guard any future MAC verification without an audit revisit.
-@[determinism(BitIdentical)]
-fn hash_eq_32(a: [u8; 32], b: [u8; 32]) -> bool {
-    let mut diff: u8 = 0;
-    let mut i: usize = 0;
+// Constant-time 32-byte hash equality.
+fn inf_hash_eq(a: i64, b: i64) -> i64 {
+    let mut diff: i64 = 0;
+    let mut i: i64 = 0;
     while i < 32 {
-        diff = diff | (a[i] ^ b[i]);
+        diff = diff | (__mind_load_i8(a + i) ^ __mind_load_i8(b + i));
         i = i + 1;
     }
-    return diff == 0u8;
+    if diff == 0 { return 1; }
+    0
+}
+
+// SHA-256 over the raw u32-LE byte stream of a token-id sequence (i64
+// lanes in, 4 LE bytes per token), ascending position order. Envelope
+// request_hash on the pre-tokenized entry path.
+fn inf_request_hash_from_tokens(tokens: i64, n: i64, out: i64) -> i64 {
+    let buf: i64 = __mind_alloc(n * 4);
+    let mut i: i64 = 0;
+    while i < n {
+        let t: i64 = __mind_load_i64(tokens + i * 8);
+        __mind_store_i8(buf + i * 4 + 0, t & 255);
+        __mind_store_i8(buf + i * 4 + 1, (t >> 8) & 255);
+        __mind_store_i8(buf + i * 4 + 2, (t >> 16) & 255);
+        __mind_store_i8(buf + i * 4 + 3, (t >> 24) & 255);
+        i = i + 1;
+    }
+    mn_sha256(buf, n * 4, out);
+    __mind_free(buf);
+    0
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// infer_preselect_pre_tokenized — forward path on pre-tokenized input.
+//
+// tokens: n_tokens i64 lanes at `tokens`. cat: loader 5-slot catalog table.
+// wtab/mh/th: model weight table + model_hash/tokenizer_hash buffers.
+// timestamp_ms: caller-supplied clock value (see header). log: ChainLog
+// handle. On success (return > 0): out_ids receives n*32 bytes, out_scores
+// n i64 lanes, out_envelope the 212-byte attestation envelope; the return
+// value is n. Gate order preserved from the dormant source.
+//
+// STRUCTURAL NOTE (defensive 0.10.2 discipline): every binding in this
+// function is hoisted above the first heavy call, and cross-stage values
+// move through heap boxes (countbox/errbox). This was introduced while
+// chasing what presented as interpreter environment loss around heavy
+// callees; root-caused 2026-08-15 to an under-sized TEST FIXTURE buffer —
+// the 0.10.2 test interpreter performs no bounds checking on the memory
+// intrinsics, so OOB reads silently corrupt its evaluation state (repro:
+// mind-flow/target/repro-0.10.2/r11_oob_interpreter_corruption/). The
+// hoisted/heap discipline is retained: it is also what makes the function
+// robust under both the interpreter and the native path, and it documents
+// the exact state the pipeline carries. The computation is unchanged.
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub fn infer_preselect_pre_tokenized(tokens: i64, n_tokens: i64,
+                                     cat: i64, wtab: i64, mh: i64, th: i64,
+                                     k: i64, timestamp_ms: i64,
+                                     expected_mh: i64, has_expected: i64,
+                                     log: i64, exp_h: i64, rsqrt_h: i64,
+                                     out_ids: i64, out_scores: i64,
+                                     out_envelope: i64) -> i64 {
+    // (1) k range gate.
+    if k == 0 { return INF_ERR_INVALID_K; }
+    if k > MAX_TOP_K { return INF_ERR_INVALID_K; }
+
+    // (1a) Token-cap fast-fail.
+    if n_tokens > MAX_REQUEST_TOKENS { return INF_ERR_TOO_LONG; }
+    let total_len: i64 = QUERY_PREFIX_LEN + n_tokens;
+    if total_len > MAX_REQUEST_TOKENS { return INF_ERR_TOO_LONG; }
+
+    // ── hoisted bindings (see STRUCTURAL NOTE) ──
+    let num_routes: i64 = __mind_load_i64(cat + LOADER_CAT_N * 8);
+    let cat_emb: i64 = __mind_load_i64(cat + LOADER_CAT_EMB * 8);
+    let cat_ids: i64 = __mind_load_i64(cat + LOADER_CAT_IDS * 8);
+    let cat_prior: i64 = __mind_load_i64(cat + LOADER_CAT_PRIOR * 8);
+    let cat_hash: i64 = __mind_load_i64(cat + LOADER_CAT_HASH * 8);
+    let eff: i64 = __mind_alloc(total_len * 8);
+    let enc_out: i64 = __mind_alloc(total_len * ENCODER_HIDDEN * 8);
+    let pooled_raw: i64 = __mind_alloc(ENCODER_HIDDEN * 8);
+    let pooled: i64 = __mind_alloc(ENCODER_HIDDEN * 8);
+    let logits: i64 = __mind_alloc(num_routes * 8);
+    let coarse: i64 = __mind_alloc(num_routes * 8);
+    let mask: i64 = __mind_alloc(num_routes);
+    let request_hash: i64 = __mind_alloc(32);
+    let result_hash: i64 = __mind_alloc(32);
+    let prev: i64 = __mind_alloc(32);
+    let scratch: i64 = __mind_alloc(32);
+    let countbox: i64 = __mind_alloc(8);
+    let errbox: i64 = __mind_alloc(8);
+    let mut i: i64 = 0;
+
+    // RFC-012 query-prefix prepend (default QUERY_PREFIX_LEN = 0: no-op).
+    while i < QUERY_PREFIX_LEN {
+        __mind_store_i64(eff + i * 8, QUERY_PREFIX_TOKENS[i]);
+        i = i + 1;
+    }
+    i = 0;
+    while i < n_tokens {
+        __mind_store_i64(eff + (QUERY_PREFIX_LEN + i) * 8, __mind_load_i64(tokens + i * 8));
+        i = i + 1;
+    }
+
+    // (2) Empty-catalog gate.
+    if num_routes == 0 {
+        __mind_free(errbox);
+        __mind_free(countbox);
+        __mind_free(scratch);
+        __mind_free(prev);
+        __mind_free(result_hash);
+        __mind_free(request_hash);
+        __mind_free(mask);
+        __mind_free(coarse);
+        __mind_free(logits);
+        __mind_free(pooled);
+        __mind_free(pooled_raw);
+        __mind_free(enc_out);
+        __mind_free(eff);
+        return INF_ERR_EMPTY_CATALOG;
+    }
+
+    // NOTE: the model-hash pin lives only in infer_preselect, matching the
+    // dormant structure (preselect_pre_tokenized has no pin check — likely
+    // a dormant oversight; preserved for fidelity, flagged here).
+
+    // ── from here on: heap-only state transfer between stages ──
+
+    // (4) Forward pass: encoder -> mean pool (-> RFC-010 L2 normalize when
+    //     enabled) -> scoring head (-> RFC-008 Matryoshka cascade when
+    //     enabled).
+    model_encoder(eff, total_len, wtab, exp_h, rsqrt_h, enc_out);
+    __mind_free(eff);
+
+    model_mean_pool(enc_out, total_len, exp_h, pooled_raw);
+    __mind_free(enc_out);
+    if COSINE_SCORING_ENABLED == 1 {
+        model_l2_normalize_pooled(pooled_raw, rsqrt_h, pooled);
+    } else {
+        i = 0;
+        while i < ENCODER_HIDDEN {
+            __mind_store_i64(pooled + i * 8, __mind_load_i64(pooled_raw + i * 8));
+            i = i + 1;
+        }
+    }
+    __mind_free(pooled_raw);
+
+    if MATRYOSHKA_COARSE_DIM < ROUTE_EMBEDDING_DIM {
+        // Coarse pass + shortlist mask + fine pass. k_coarse is used only
+        // within this segment (no cross-segment env state).
+        model_score_against_routes_prefix(pooled, cat_emb, num_routes,
+                                          MATRYOSHKA_COARSE_DIM, coarse);
+        let mut k_coarse: i64 = K_COARSE_MULTIPLIER * k;
+        if k_coarse > num_routes { k_coarse = num_routes; }
+        extract_top_k_mask(coarse, cat_ids, num_routes, k_coarse, mask);
+        model_score_against_routes_masked(pooled, cat_emb, num_routes, mask,
+                                          num_routes, MIN_Q16_16, logits);
+    } else {
+        model_score_against_routes(pooled, cat_emb, num_routes, logits);
+    }
+    __mind_free(pooled);
+    __mind_free(mask);
+    __mind_free(coarse);
+
+    // (4b) RFC-002 route prior: elementwise saturating add, ascending r.
+    i = 0;
+    while i < num_routes {
+        __mind_store_i64(logits + i * 8,
+                         q16_add(__mind_load_i64(logits + i * 8),
+                                 __mind_load_i64(cat_prior + i * 8)));
+        i = i + 1;
+    }
+
+    // (5) Deterministic top-K (saturates at num_routes when k > num_routes).
+    //     The count crosses later stage boundaries, so it lives in heap.
+    __mind_store_i64(countbox, extract_top_k(logits, cat_ids, num_routes, k,
+                                             out_ids, out_scores));
+    __mind_free(logits);
+
+    // (6) Envelope preimage hashes. request_hash covers the USER-SUPPLIED
+    //     tokens (pre-prepend — the "honest record" contract).
+    inf_request_hash_from_tokens(tokens, n_tokens, request_hash);
+    canonical_result_hash(out_ids, out_scores, __mind_load_i64(countbox), result_hash);
+
+    // (7) Envelope construction, then (8) chain-log advance. chain_prev is
+    //     read BEFORE emit; append runs AFTER — reversing the order breaks
+    //     the chain.
+    chain_prev_for_next(log, prev);
+    __mind_store_i64(errbox, evidence_emit_inference(mh, th, cat_hash,
+                                                     request_hash, result_hash,
+                                                     prev, timestamp_ms,
+                                                     ARCH_X86_64, k,
+                                                     NUMERICS_WIRE_VERSION,
+                                                     out_envelope));
+    __mind_free(prev);
+    __mind_free(result_hash);
+    __mind_free(request_hash);
+    if __mind_load_i64(errbox) != EV_OK {
+        __mind_free(errbox);
+        __mind_free(countbox);
+        __mind_free(scratch);
+        return INF_ERR_ENVELOPE;
+    }
+
+    chain_log_append(log, out_envelope, ATTESTATION_BYTES, scratch);
+    __mind_free(scratch);
+    __mind_free(errbox);
+
+    let out_n: i64 = __mind_load_i64(countbox);
+    __mind_free(countbox);
+    out_n
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// infer_preselect — full pipeline (raw bytes -> envelope). Tokenizes first;
+// the tokenizer error surface maps onto InferenceError exactly as dormant
+// (InputEmpty -> InvalidK, TooLong -> RequestTooLong).
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub fn infer_preselect(bytes: i64, n_bytes: i64,
+                       cat: i64, wtab: i64, mh: i64, th: i64,
+                       k: i64, timestamp_ms: i64,
+                       expected_mh: i64, has_expected: i64,
+                       log: i64, exp_h: i64, rsqrt_h: i64,
+                       out_ids: i64, out_scores: i64,
+                       out_envelope: i64) -> i64 {
+    if k == 0 { return INF_ERR_INVALID_K; }
+    if k > MAX_TOP_K { return INF_ERR_INVALID_K; }
+    if __mind_load_i64(cat + LOADER_CAT_N * 8) == 0 { return INF_ERR_EMPTY_CATALOG; }
+    if has_expected == 1 {
+        if inf_hash_eq(expected_mh, mh) == 0 { return INF_ERR_MODEL_MISMATCH; }
+    }
+
+    // Hoisted bindings (same 0.10.2 interpreter discipline as
+    // infer_preselect_pre_tokenized — see its STRUCTURAL NOTE).
+    let tokens: i64 = __mind_alloc(MAX_REQUEST_TOKENS * 8);
+    let mut ntok: i64 = 0;
+    let mut rc: i64 = 0;
+
+    ntok = tokenize_bpe(bytes, n_bytes, tokens);
+    if ntok == TOKENIZE_ERR_EMPTY {
+        __mind_free(tokens);
+        return INF_ERR_INVALID_K;
+    }
+    if ntok == TOKENIZE_ERR_TOO_LONG {
+        __mind_free(tokens);
+        return INF_ERR_TOO_LONG;
+    }
+    if ntok > MAX_REQUEST_TOKENS {
+        __mind_free(tokens);
+        return INF_ERR_TOO_LONG;
+    }
+    rc = infer_preselect_pre_tokenized(tokens, ntok, cat, wtab, mh, th,
+                                       k, timestamp_ms, expected_mh,
+                                       has_expected, log, exp_h, rsqrt_h,
+                                       out_ids, out_scores, out_envelope);
+    __mind_free(tokens);
+    rc
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// infer_preselect_pre_tokenized_stateless — ephemeral-log variant. Every
+// call builds a fresh ChainLog with the all-zero session id (no entropy
+// consumed, BitIdentical-compatible), so the envelope's chain_prev is
+// always zeros32 — a chain-of-one. Production hosts that care about
+// cross-call chain continuity use infer_preselect_pre_tokenized with a
+// long-lived ChainLog.
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub fn infer_preselect_pre_tokenized_stateless(tokens: i64, n_tokens: i64,
+                                               cat: i64, wtab: i64, mh: i64, th: i64,
+                                               k: i64, timestamp_ms: i64,
+                                               expected_mh: i64, has_expected: i64,
+                                               exp_h: i64, rsqrt_h: i64,
+                                               out_ids: i64, out_scores: i64,
+                                               out_envelope: i64) -> i64 {
+    let zeros16: i64 = __mind_alloc(16);
+    let mut i: i64 = 0;
+    let mut rc: i64 = 0;
+    while i < 16 {
+        __mind_store_i8(zeros16 + i, 0);
+        i = i + 1;
+    }
+    let log: i64 = chain_log_new_with_id(zeros16);
+    __mind_free(zeros16);
+    rc = infer_preselect_pre_tokenized(tokens, n_tokens, cat, wtab, mh, th,
+                                       k, timestamp_ms, expected_mh,
+                                       has_expected, log, exp_h, rsqrt_h,
+                                       out_ids, out_scores, out_envelope);
+    chain_log_free(log);
+    rc
 }

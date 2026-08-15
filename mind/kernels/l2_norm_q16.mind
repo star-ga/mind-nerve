@@ -14,9 +14,10 @@
 //
 // Reduction order: j = 0..n-1 ascending (canonical, deterministic).
 //
-// No f32. No while. LUT import: luts.sqrt_q16 (rsqrt_q16).
+// No f32. No while. LUT import: luts.rsqrt_q16 (rsqrt_q16 wrapper; the
+// table + Newton step live in luts.sqrt_q16, re-exported through it).
 
-import luts.sqrt_q16;
+import luts.rsqrt_q16;
 
 // ---------------------------------------------------------------------------
 // Step 1: Sum of squares in Q32.32, tail-recursive over j.

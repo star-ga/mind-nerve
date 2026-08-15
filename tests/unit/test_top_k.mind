@@ -1,799 +1,1001 @@
-// extract_top_k determinism + UniqueRouteCatalog invariant. Audit A3 (catalog uniqueness), A6 (top-K bit-identity).
+// tests/unit/test_top_k.mind — determinism + uniqueness suite for
+// src/top_k.mind. Audit A3 (catalog uniqueness), A6 (top-K bit-identity).
 //
-// RED test file — all tests fail against Phase 0 stubs (unimplemented!()).
-// Targets:
-//   - src/inference.mind :: extract_top_k
-//   - src/inference.mind :: UniqueRouteCatalog  (typed wrapper, audit A3)
+// Ported to mindc 0.10.2 (wave 2, 2026-08-11) from
+// tests/unit/dormant/test_top_k.mind. The dormant file targeted
+// src/inference.mind's re-export; this suite tests src/top_k.mind directly
+// (inference.mind's re-export arrives in wave 4). Runs through `mindc test`
+// on a merged image (src/sha256.mind + src/top_k.mind + this file), driven
+// by tests/mindc_gate.sh leg 6 with an exact-count assertion — a
+// "running 0 tests" output FAILS the gate.
 //
-// Tie-break rule (from spec/architecture.md §"Top-K extraction"):
-//   Ties in Q16.16 score are broken by SHA-256(route_id) ascending.
-//   RouteId = SHA-256(external_string_id) — a 32-byte opaque handle.
-//   Comparison is lexicographic over raw SHA-256 bytes.
+// ORACLE PROVENANCE (done-gate d): the eight canonical-result-hash digests
+// are the dormant file's published 2026-05-13 values, RE-VERIFIED byte-for-
+// byte against CPython hashlib + the canonical serialization spec
+// (u32-LE len=32 || route_id || i32-LE score per entry) before embedding:
+//   basic k3      2255a0eabacda7217582a570d39d7f4ee5f359d8252417abce86fe5e3f6df42c
+//   k == n        20b61f31c994adb67941b42a8c5fedf53aec26cdec71d37edc9ba1abb86522ab
+//   single k1     dfb045eaca8d9b9b97546b180f2620b39f4a6c576fb01e903956e143e3f5aa7c
+//   tiebreak      34ecc49fe44d56a736e6acd6766f7381cacb8e845593be624fce91f2618f87fa
+//   all-tied k2   51ea94f034c83a64fe76d0d7512b3d36dab1f516d2ec60c63e2605d30fe575da
+//   100 runs      712b0abc728c6510421f273b1cacf10e504b5c0f8a6cd8a61334e9a5ee2898f2
+//   negative      32f8880454a3312615c33b4aadd6d4a279bff0992551dcbb23dd118c45d7ae98
+//   ulp k1        bc7a9280a6c70566f8b92c23f37373a1bb6c8273f9166fc7eeaba2a71d9a3013
+// Route ids are computed IN-TEST via mn_sha256 (route_id_of), exactly as the
+// dormant suite did — the hashing path stays under test.
 //
-// SHA-256 oracle values used in this file (verified 2026-05-13):
-//   SHA-256("apple")  = 3a7bd3e2360a3d29eea436fcfb7e44c735d117c42d1c1835420b6b9942dd4f1b
-//   SHA-256("zebra")  = 676cb75018edccf10fce6f376f2124e02c3293fa3fe8f953c75386198c714514
-//   SHA-256("banana") = b493d48364afe44d11c0165cf470a4164d1e2609911ef998be868d46ade3de4e
-//   SHA-256("a")      = ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb
-//   SHA-256("b")      = 3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d
-//   SHA-256("c")      = 2e7d2c03a9507ae265ecf5b5356885a53393a2029d241394997265a1a25aefc6
-//   SHA-256("d")      = 18ac3e7343f016890c510e93f935261169d9e3f565436429830faf0934f4f8e4
-//   SHA-256("e")      = 3f79bb7b435b05321651daefd374cdc681dc06faa65e374e38337b88ca046dea
+// NOTE (0.10.2 test-interpreter hazard, repro
+// mind-flow/target/repro-0.10.2/r9_test_assert_deferred.mind): `assert`
+// conditions are evaluated LAZILY — a condition that reads state mutated
+// later in the same test is mis-evaluated. Discipline in this file: any
+// assert whose read state is mutated afterwards (the 100-run loops) binds
+// the condition with `let` first, forcing eager evaluation.
 //
-// All-tied SHA-256 ascending order: d < c < b < e < a
-//
-// Canonical result serialization (for bit-identity oracle):
-//   SHA-256 of concat of, for each result entry in top-K order:
-//     little-endian u32 length prefix || route_id bytes (32) || i32 LE Q16.16 score
-//
-// Q16.16 encoding: integer value V encodes as (V << 16) in i32 (two's complement).
-//   Negative values follow two's complement; -1 encodes as -65536.
+// ABI: route-id buffers are n*32 bytes; scores are i64 lanes (8-byte
+// stride); masks are n bytes. q16(v) == v << 16.
 
-use crate::mind_nerve::inference::{
-    extract_top_k,
-    RouteCatalog,
-    UniqueRouteCatalog,
-    RouteId,
-    TopK,
-};
-// RFC-008 coarse shortlist mask. Not re-exported through `inference` (the
-// cascade calls it qualified as `top_k::extract_top_k_mask`), so §9's tests
-// take it from its defining module.
-use crate::mind_nerve::top_k::extract_top_k_mask;
-use crate::mind_nerve::Q16_16;
+// ── helpers (tt_ prefix) ────────────────────────────────────────────────────
 
-// ---------------------------------------------------------------------------
-// Helpers: construct RouteId and Q16.16 score values inline in tests.
-// ---------------------------------------------------------------------------
-
-// route_id_of: computes SHA-256 of an external string id to produce a RouteId.
-// In production this is done at catalog load time. Tests inline it for clarity.
-fn route_id_of(external_id: str) -> RouteId {
-    sha256(external_id.as_bytes())
-}
-
-// q16(v): encode integer v as a Q16.16 i32. Works for negative v.
-fn q16(v: i32) -> Q16_16 {
-    v << 16
-}
-
-// q16_raw(raw): identity wrapper — accepts an already-encoded i32 Q16.16 value.
-// Used for ULP boundary tests where raw representation matters.
-fn q16_raw(raw: i32) -> Q16_16 {
-    raw
-}
-
-// make_catalog: construct a plain RouteCatalog (not uniqueness-checked) from
-// parallel slices of external string ids and Q16.16 scores.
-// Used for extract_top_k tests that pre-validate the id uniqueness externally.
-fn make_catalog(ids: [str], scores: [Q16_16]) -> RouteCatalog {
-    let route_ids: [RouteId] = ids.map(|id| route_id_of(id));
-    // `scores` is shadowed by the embedding scoring head in production; in
-    // top-K unit tests we feed extract_top_k a precomputed logit vector
-    // directly, so this fixture only needs to populate the catalog's
-    // identity + structural fields. Embeddings and route_prior are
-    // zero-initialised (the RFC-002 backwards-soft additive identity).
-    let n = ids.len();
-    RouteCatalog {
-        ids:         route_ids,
-        embeddings:  tensor::zeros::<Q16_16, [n, ROUTE_EMBEDDING_DIM]>(),
-        route_prior: tensor::zeros::<Q16_16, [n]>(),
-        hash:        sha256(route_ids.as_bytes()),
+fn tt_id_eq(a: i64, b: i64) -> i64 {
+    let mut i: i64 = 0;
+    while i < 32 {
+        if __mind_load_i8(a + i) != __mind_load_i8(b + i) { return 0; }
+        i = i + 1;
     }
+    1
 }
 
-// ---------------------------------------------------------------------------
-// Section 1: Basic top-K extraction
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_top_k_basic_k3() {
-    // Catalog of 10 routes with descending integer scores; k=3 must return the
-    // top 3 in score-descending order with no ties so tie-break is not invoked.
-    let scores = [9,8,7,6,5,4,3,2,1,0].map(|v| q16(v));
-    let ids    = ["route_0","route_1","route_2","route_3","route_4",
-                  "route_5","route_6","route_7","route_8","route_9"];
-    let catalog = make_catalog(ids, scores);
-
-    let result: TopK = extract_top_k(scores_tensor(scores), catalog, 3);
-
-    assert_eq!(result.ids.len(), 3);
-    assert_eq!(result.ids[0], route_id_of("route_0"));
-    assert_eq!(result.ids[1], route_id_of("route_1"));
-    assert_eq!(result.ids[2], route_id_of("route_2"));
-    assert_eq!(result.scores[0], q16(9));
-    assert_eq!(result.scores[1], q16(8));
-    assert_eq!(result.scores[2], q16(7));
-
-    // Bit-identity oracle: canonical_result_hash for [route_0/9, route_1/8, route_2/7]
-    // Verified: 2255a0eabacda7217582a570d39d7f4ee5f359d8252417abce86fe5e3f6df42c
-    assert_eq!(canonical_result_hash(result),
-               b"PLACEHOLDER_HASH_BASIC_K3");
+// Hash the external id bytes into catalog slot i (route_id_of).
+fn tt_mkid(ids: i64, i: i64, sbuf: i64, slen: i64) -> i64 {
+    mn_sha256(sbuf, slen, ids + i * 32);
+    0
 }
 
-#[test]
-fn test_top_k_basic_k_equals_n() {
-    // k=N returns all routes in descending score order; verifies no off-by-one
-    // in the masked argmax loop when k exhausts the catalog.
-    let scores = [9,8,7,6,5,4,3,2,1,0].map(|v| q16(v));
-    let ids    = ["route_0","route_1","route_2","route_3","route_4",
-                  "route_5","route_6","route_7","route_8","route_9"];
-    let catalog = make_catalog(ids, scores);
+// Assert helper: returns 1 when out_ids slot `slot` equals SHA-256(sbuf).
+fn tt_slot_is(out_ids: i64, slot: i64, sbuf: i64, slen: i64) -> i64 {
+    let tmp: i64 = __mind_alloc(32);
+    mn_sha256(sbuf, slen, tmp);
+    let eq: i64 = tt_id_eq(out_ids + slot * 32, tmp);
+    __mind_free(tmp);
+    eq
+}
 
-    let result: TopK = extract_top_k(scores_tensor(scores), catalog, 10);
+fn tt_digest_word(out: i64, w: i64) -> i64 {
+    let b0: i64 = __mind_load_i8(out + w * 4) & 255;
+    let b1: i64 = __mind_load_i8(out + w * 4 + 1) & 255;
+    let b2: i64 = __mind_load_i8(out + w * 4 + 2) & 255;
+    let b3: i64 = __mind_load_i8(out + w * 4 + 3) & 255;
+    b0 * 16777216 + b1 * 65536 + b2 * 256 + b3
+}
 
-    assert_eq!(result.ids.len(), 10);
-    for i in 0..10 {
-        assert_eq!(result.ids[i], route_id_of(ids[i]));
-        assert_eq!(result.scores[i], q16(9 - i as i32));
+fn tt_check_hash(out: i64, w0: i64, w1: i64, w2: i64, w3: i64, w4: i64, w5: i64, w6: i64, w7: i64) -> i64 {
+    if tt_digest_word(out, 0) != w0 { return 1; }
+    if tt_digest_word(out, 1) != w1 { return 2; }
+    if tt_digest_word(out, 2) != w2 { return 3; }
+    if tt_digest_word(out, 3) != w3 { return 4; }
+    if tt_digest_word(out, 4) != w4 { return 5; }
+    if tt_digest_word(out, 5) != w5 { return 6; }
+    if tt_digest_word(out, 6) != w6 { return 7; }
+    if tt_digest_word(out, 7) != w7 { return 8; }
+    0
+}
+
+// External-id string builders (byte stores; return length).
+fn tt_str1(buf: i64, c: i64) -> i64 {
+    __mind_store_i8(buf, c);
+    1
+}
+fn tt_str_route(buf: i64, d: i64) -> i64 {
+    __mind_store_i8(buf + 0, 114);
+    __mind_store_i8(buf + 1, 111);
+    __mind_store_i8(buf + 2, 117);
+    __mind_store_i8(buf + 3, 116);
+    __mind_store_i8(buf + 4, 101);
+    __mind_store_i8(buf + 5, 95);
+    __mind_store_i8(buf + 6, 48 + d);
+    7
+}
+fn tt_str_negroute(buf: i64, d: i64) -> i64 {
+    __mind_store_i8(buf + 0, 110);
+    __mind_store_i8(buf + 1, 101);
+    __mind_store_i8(buf + 2, 103);
+    __mind_store_i8(buf + 3, 95);
+    __mind_store_i8(buf + 4, 114);
+    __mind_store_i8(buf + 5, 111);
+    __mind_store_i8(buf + 6, 117);
+    __mind_store_i8(buf + 7, 116);
+    __mind_store_i8(buf + 8, 101);
+    __mind_store_i8(buf + 9, 95);
+    __mind_store_i8(buf + 10, 48 + d);
+    11
+}
+fn tt_str_r(buf: i64, d: i64) -> i64 {
+    __mind_store_i8(buf + 0, 114);
+    __mind_store_i8(buf + 1, 48 + d);
+    2
+}
+fn tt_str_n(buf: i64, d: i64) -> i64 {
+    __mind_store_i8(buf + 0, 110);
+    __mind_store_i8(buf + 1, 48 + d);
+    2
+}
+fn tt_str_ulp(buf: i64, c: i64) -> i64 {
+    __mind_store_i8(buf + 0, 117);
+    __mind_store_i8(buf + 1, 108);
+    __mind_store_i8(buf + 2, 112);
+    __mind_store_i8(buf + 3, 95);
+    __mind_store_i8(buf + 4, 114);
+    __mind_store_i8(buf + 5, 111);
+    __mind_store_i8(buf + 6, 117);
+    __mind_store_i8(buf + 7, 116);
+    __mind_store_i8(buf + 8, 101);
+    __mind_store_i8(buf + 9, 95);
+    __mind_store_i8(buf + 10, c);
+    11
+}
+fn tt_str_apple(buf: i64) -> i64 {
+    __mind_store_i8(buf + 0, 97);
+    __mind_store_i8(buf + 1, 112);
+    __mind_store_i8(buf + 2, 112);
+    __mind_store_i8(buf + 3, 108);
+    __mind_store_i8(buf + 4, 101);
+    5
+}
+fn tt_str_zebra(buf: i64) -> i64 {
+    __mind_store_i8(buf + 0, 122);
+    __mind_store_i8(buf + 1, 101);
+    __mind_store_i8(buf + 2, 98);
+    __mind_store_i8(buf + 3, 114);
+    __mind_store_i8(buf + 4, 97);
+    5
+}
+fn tt_str_banana(buf: i64) -> i64 {
+    __mind_store_i8(buf + 0, 98);
+    __mind_store_i8(buf + 1, 97);
+    __mind_store_i8(buf + 2, 110);
+    __mind_store_i8(buf + 3, 97);
+    __mind_store_i8(buf + 4, 110);
+    __mind_store_i8(buf + 5, 97);
+    6
+}
+fn tt_str_solo(buf: i64) -> i64 {
+    __mind_store_i8(buf + 0, 115);
+    __mind_store_i8(buf + 1, 111);
+    __mind_store_i8(buf + 2, 108);
+    __mind_store_i8(buf + 3, 111);
+    4
+}
+
+// The standard 10-route fixture: ids route_0..route_9, scores 9..0 in Q16.16.
+fn tt_cat10(ids: i64, scores: i64, sbuf: i64) -> i64 {
+    let mut i: i64 = 0;
+    while i < 10 {
+        let len: i64 = tt_str_route(sbuf, i);
+        tt_mkid(ids, i, sbuf, len);
+        __mind_store_i64(scores + i * 8, (9 - i) * 65536);
+        i = i + 1;
     }
-
-    // Bit-identity oracle: 20b61f31c994adb67941b42a8c5fedf53aec26cdec71d37edc9ba1abb86522ab
-    assert_eq!(canonical_result_hash(result),
-               b"PLACEHOLDER_HASH_K_EQUALS_N");
+    0
 }
 
-#[test]
-fn test_top_k_k_zero() {
-    // k=0 returns an empty result without error.
-    // Per spec §"Functional contract": k default 5, max 64.
-    // k=0 is the "passthrough / no selection" sentinel; implementation must
-    // return an empty list, not panic or propagate InvalidK.
-    // NOTE: spec says preselect returns error(InvalidK) on k=0; extract_top_k
-    // is the inner function called after that guard, so it receives valid k.
-    // This tests extract_top_k directly with k=0; expected: empty TopK.
-    let scores  = [9,8,7].map(|v| q16(v));
-    let ids     = ["route_0","route_1","route_2"];
-    let catalog = make_catalog(ids, scores);
-
-    let result: TopK = extract_top_k(scores_tensor(scores), catalog, 0);
-
-    assert_eq!(result.ids.len(),    0);
-    assert_eq!(result.scores.len(), 0);
-}
-
-#[test]
-fn test_top_k_k_exceeds_n() {
-    // k > N: spec does not define this as an error at the extract_top_k level.
-    // Expected: return all N routes (no padding, no crash).
-    // Document: callers must clamp k ≤ |catalog| before calling, or tolerate
-    // that the returned slice length may be min(k, N).
-    let scores  = [9,8,7,6,5,4,3,2,1,0].map(|v| q16(v));
-    let ids     = ["route_0","route_1","route_2","route_3","route_4",
-                   "route_5","route_6","route_7","route_8","route_9"];
-    let catalog = make_catalog(ids, scores);
-
-    // k=15 over N=10 routes: must return all 10, no panic, no padding.
-    let result: TopK = extract_top_k(scores_tensor(scores), catalog, 15);
-
-    assert_eq!(result.ids.len(), 10);
-    assert_eq!(result.ids[0], route_id_of("route_0"));
-    assert_eq!(result.ids[9], route_id_of("route_9"));
-
-    // Bit-identity oracle: same as k_equals_n (all 10 returned in same order)
-    // 20b61f31c994adb67941b42a8c5fedf53aec26cdec71d37edc9ba1abb86522ab
-    assert_eq!(canonical_result_hash(result),
-               b"PLACEHOLDER_HASH_K_EXCEEDS_N");
-}
-
-#[test]
-fn test_top_k_single_route_k1() {
-    // Single-entry catalog, k=1: must return that one route.
-    let scores  = [q16(9)];
-    let ids     = ["route_0"];
-    let catalog = make_catalog(ids, scores);
-
-    let result: TopK = extract_top_k(scores_tensor(scores), catalog, 1);
-
-    assert_eq!(result.ids.len(), 1);
-    assert_eq!(result.ids[0],    route_id_of("route_0"));
-    assert_eq!(result.scores[0], q16(9));
-
-    // Bit-identity oracle: dfb045eaca8d9b9b97546b180f2620b39f4a6c576fb01e903956e143e3f5aa7c
-    assert_eq!(canonical_result_hash(result),
-               b"PLACEHOLDER_HASH_SINGLE_K1");
-}
-
-// ---------------------------------------------------------------------------
-// Section 2: Tie-break determinism
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_top_k_tiebreak_two_tied_one_clear() {
-    // scores=[5,5,4], route_ids=["zebra","apple","banana"], k=2.
-    //
-    // SHA-256 tie-break (ascending byte order):
-    //   SHA-256("apple")  = 3a7bd3e2... (lower)
-    //   SHA-256("zebra")  = 676cb750... (higher)
-    // => "apple" wins the tie, "zebra" is second, "banana" (score=4) is third.
-    // Expected top-2: [apple, zebra].
-    let scores  = [q16(5), q16(5), q16(4)];
-    let ids     = ["zebra", "apple", "banana"];
-    let catalog = make_catalog(ids, scores);
-
-    let result: TopK = extract_top_k(scores_tensor(scores), catalog, 2);
-
-    assert_eq!(result.ids.len(), 2);
-    assert_eq!(result.ids[0], route_id_of("apple"),
-               "apple must be first: SHA-256('apple') < SHA-256('zebra')");
-    assert_eq!(result.ids[1], route_id_of("zebra"),
-               "zebra must be second: higher SHA-256 loses tie-break");
-    assert_eq!(result.scores[0], q16(5));
-    assert_eq!(result.scores[1], q16(5));
-
-    // Bit-identity oracle: 34ecc49fe44d56a736e6acd6766f7381cacb8e845593be624fce91f2618f87fa
-    assert_eq!(canonical_result_hash(result),
-               b"PLACEHOLDER_HASH_TIEBREAK_TWO_TIED");
-}
-
-#[test]
-fn test_top_k_tiebreak_all_tied_k2() {
-    // All five routes have identical scores; k=2.
-    // SHA-256 ascending order of external IDs:
-    //   d (18ac3e...) < c (2e7d2c...) < b (3e23e8...) < e (3f79bb...) < a (ca978...)
-    // Expected top-2: [d, c].
-    let scores = [q16(3), q16(3), q16(3), q16(3), q16(3)];
-    let ids    = ["a", "b", "c", "d", "e"];
-    let catalog = make_catalog(ids, scores);
-
-    let result: TopK = extract_top_k(scores_tensor(scores), catalog, 2);
-
-    assert_eq!(result.ids.len(), 2);
-    assert_eq!(result.ids[0], route_id_of("d"),
-               "'d' must be first: SHA-256('d') is lowest among a-e");
-    assert_eq!(result.ids[1], route_id_of("c"),
-               "'c' must be second: SHA-256('c') is second-lowest among a-e");
-    assert_eq!(result.scores[0], q16(3));
-    assert_eq!(result.scores[1], q16(3));
-
-    // Bit-identity oracle: 51ea94f034c83a64fe76d0d7512b3d36dab1f516d2ec60c63e2605d30fe575da
-    assert_eq!(canonical_result_hash(result),
-               b"PLACEHOLDER_HASH_ALL_TIED_K2");
-}
-
-// ---------------------------------------------------------------------------
-// Section 3: Determinism across runs
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_top_k_determinism_100_runs() {
-    // Run the same (scores, catalog, k) through extract_top_k 100 times.
-    // Concatenate the raw route_id bytes of each result, SHA-256 the whole
-    // concatenation, compare to a single-run hash. Any ordering non-determinism
-    // between runs will corrupt the concatenated hash.
-    let scores  = [9,8,7,6,5,4,3,2,1,0].map(|v| q16(v));
-    let ids     = ["route_0","route_1","route_2","route_3","route_4",
-                   "route_5","route_6","route_7","route_8","route_9"];
-    let catalog = make_catalog(ids, scores);
-
-    // Single-run reference.
-    let ref_result: TopK = extract_top_k(scores_tensor(scores), catalog, 3);
-    let ref_ids = ref_result.ids.clone();
-
-    // 100-run accumulator.
-    let mut acc: [u8] = [];
-    for _ in 0..100 {
-        let r: TopK = extract_top_k(scores_tensor(scores), catalog, 3);
-        // Every run must produce the same route_ids as the reference.
-        assert_eq!(r.ids, ref_ids,
-                   "extract_top_k must be bit-identical across invocations");
-        for id in r.ids.iter() {
-            acc.extend_from_slice(id);
-        }
-    }
-
-    // Hash of 100 concatenated results.
-    // Pre-computed for ref=[route_0,route_1,route_2] × 100:
-    // 712b0abc728c6510421f273b1cacf10e504b5c0f8a6cd8a61334e9a5ee2898f2
-    let acc_hash = sha256(acc.as_slice());
-    assert_eq!(acc_hash, b"PLACEHOLDER_HASH_100_RUNS");
-}
-
-// ---------------------------------------------------------------------------
-// Section 4: UniqueRouteCatalog invariant — audit A3
-// ---------------------------------------------------------------------------
-//
-// Duplicate route_id is a catalog-validation error rejected at load time,
-// not a runtime degradation. UniqueRouteCatalog::new() returns Result and
-// must Err on duplicate ids, allowing callers to surface the error to the
-// operator before any inference runs. This prevents silent routing ambiguity.
-
-#[test]
-fn test_top_k_unique_catalog_rejects_duplicate() {
-    // Three external ids where "a" appears twice; construction must fail.
-    let result = UniqueRouteCatalog::new(
-        ["a", "b", "a"],
-        [q16(1), q16(2), q16(3)],
-    );
-
-    assert!(result.is_err(),
-            "UniqueRouteCatalog::new must return Err when route_ids contain duplicates");
-    match result.err().unwrap() {
-        CatalogError::DuplicateRouteId(id) => {
-            assert_eq!(id, route_id_of("a"),
-                       "error must identify the offending duplicate route_id");
-        }
-        other => panic!("expected DuplicateRouteId, got {:?}", other),
-    }
-}
-
-#[test]
-fn test_top_k_unique_catalog_allows_empty() {
-    // Empty catalog is valid; used by the k=0 / low-confidence passthrough path.
-    let result = UniqueRouteCatalog::new([], []);
-    assert!(result.is_ok(),
-            "UniqueRouteCatalog::new must accept empty catalog");
-}
-
-#[test]
-fn test_top_k_unique_catalog_allows_single() {
-    // Single-entry catalog has no possible duplicates.
-    let result = UniqueRouteCatalog::new(["a"], [q16(7)]);
-    assert!(result.is_ok(),
-            "UniqueRouteCatalog::new must accept single-entry catalog");
-}
-
-#[test]
-fn test_top_k_unique_catalog_allows_distinct_ids() {
-    // Five distinct ids: construction must succeed.
-    let result = UniqueRouteCatalog::new(
-        ["a", "b", "c", "d", "e"],
-        [q16(1), q16(2), q16(3), q16(4), q16(5)],
-    );
-    assert!(result.is_ok(),
-            "UniqueRouteCatalog::new must accept all-distinct route_ids");
-}
-
-#[test]
-fn test_top_k_unique_catalog_first_duplicate_reported() {
-    // When multiple pairs of duplicates exist, at least the first encountered
-    // must be reported. Callers should not assume exhaustive duplicate listing.
-    let result = UniqueRouteCatalog::new(
-        ["x", "y", "x", "z", "y"],
-        [q16(1), q16(2), q16(3), q16(4), q16(5)],
-    );
-    assert!(result.is_err());
-    // "x" appears at index 0 and 2 — first duplicate encountered.
-    let err = result.err().unwrap();
-    matches!(err, CatalogError::DuplicateRouteId(_));
-}
-
-// ---------------------------------------------------------------------------
-// Section 5: Bit-identity oracles
-// ---------------------------------------------------------------------------
-//
-// Each oracle below asserts the canonical_result_hash against a placeholder.
-// Replace each PLACEHOLDER_HASH_* with the actual hex after the first green run.
-// See: TODO(P1.1.10) at the bottom of this file.
-//
-// Canonical serialization (from spec/architecture.md §"Catalog hashing"):
-//   for each (route_id, score) in top-K order:
-//     emit little-endian u32(length=32) || route_id[32] || i32-LE Q16.16 score
-
-#[test]
-fn test_top_k_oracle_basic_k3() {
-    // Oracle: canonical_result_hash for [route_0/9, route_1/8, route_2/7].
-    // Verified value: 2255a0eabacda7217582a570d39d7f4ee5f359d8252417abce86fe5e3f6df42c
-    let scores  = [9,8,7,6,5,4,3,2,1,0].map(|v| q16(v));
-    let ids     = ["route_0","route_1","route_2","route_3","route_4",
-                   "route_5","route_6","route_7","route_8","route_9"];
-    let catalog = make_catalog(ids, scores);
-    let result  = extract_top_k(scores_tensor(scores), catalog, 3);
-    assert_eq!(canonical_result_hash(result), b"PLACEHOLDER_HASH_ORACLE_BASIC_K3");
-}
-
-#[test]
-fn test_top_k_oracle_tiebreak() {
-    // Oracle: canonical_result_hash for tie-break result [apple/5, zebra/5].
-    // Verified value: 34ecc49fe44d56a736e6acd6766f7381cacb8e845593be624fce91f2618f87fa
-    let scores  = [q16(5), q16(5), q16(4)];
-    let ids     = ["zebra", "apple", "banana"];
-    let catalog = make_catalog(ids, scores);
-    let result  = extract_top_k(scores_tensor(scores), catalog, 2);
-    assert_eq!(canonical_result_hash(result), b"PLACEHOLDER_HASH_ORACLE_TIEBREAK");
-}
-
-#[test]
-fn test_top_k_oracle_all_tied() {
-    // Oracle: canonical_result_hash for all-tied result [d/3, c/3].
-    // Verified value: 51ea94f034c83a64fe76d0d7512b3d36dab1f516d2ec60c63e2605d30fe575da
-    let scores  = [q16(3), q16(3), q16(3), q16(3), q16(3)];
-    let ids     = ["a", "b", "c", "d", "e"];
-    let catalog = make_catalog(ids, scores);
-    let result  = extract_top_k(scores_tensor(scores), catalog, 2);
-    assert_eq!(canonical_result_hash(result), b"PLACEHOLDER_HASH_ORACLE_ALL_TIED");
-}
-
-#[test]
-fn test_top_k_oracle_negative_scores() {
-    // Oracle: canonical_result_hash for negative-score result [neg_route_2/-1, neg_route_0/-3].
-    // Verified value: 32f8880454a3312615c33b4aadd6d4a279bff0992551dcbb23dd118c45d7ae98
-    let scores  = [q16(-3), q16(-5), q16(-1), q16(-4)];
-    let ids     = ["neg_route_0", "neg_route_1", "neg_route_2", "neg_route_3"];
-    let catalog = make_catalog(ids, scores);
-    let result  = extract_top_k(scores_tensor(scores), catalog, 2);
-    assert_eq!(canonical_result_hash(result), b"PLACEHOLDER_HASH_ORACLE_NEGATIVE");
-}
-
-// ---------------------------------------------------------------------------
-// Section 6: Empty catalog
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_top_k_empty_catalog_k5() {
-    // extract_top_k over an empty catalog with k=5 must return an empty result,
-    // not an error. This is the "low_confidence / passthrough" outcome at the
-    // integration layer — no routes scored, caller decides to fall through.
-    let catalog = make_catalog([], []);
-    let result: TopK = extract_top_k(scores_tensor([]), catalog, 5);
-    assert_eq!(result.ids.len(),    0,
-               "empty catalog must yield empty top-K, not an error");
-    assert_eq!(result.scores.len(), 0);
-}
-
-#[test]
-fn test_top_k_empty_catalog_k0() {
-    // k=0 on empty catalog: still empty result, still not an error.
-    let catalog = make_catalog([], []);
-    let result: TopK = extract_top_k(scores_tensor([]), catalog, 0);
-    assert_eq!(result.ids.len(), 0);
-}
-
-// ---------------------------------------------------------------------------
-// Section 7: Negative score handling
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_top_k_negative_scores_ordering() {
-    // Q16.16 scores can be negative (e.g. raw logits before softmax).
-    // scores=[-3,-5,-1,-4], k=2 must return the two LEAST-negative scores:
-    // [-1, -3] in that order. mind-nerve must not skip or clamp negative scores.
-    let scores  = [q16(-3), q16(-5), q16(-1), q16(-4)];
-    let ids     = ["neg_route_0", "neg_route_1", "neg_route_2", "neg_route_3"];
-    let catalog = make_catalog(ids, scores);
-
-    let result: TopK = extract_top_k(scores_tensor(scores), catalog, 2);
-
-    assert_eq!(result.ids.len(), 2);
-    assert_eq!(result.ids[0],    route_id_of("neg_route_2"),
-               "score -1 is highest; neg_route_2 must be first");
-    assert_eq!(result.ids[1],    route_id_of("neg_route_0"),
-               "score -3 is second-highest; neg_route_0 must be second");
-    assert_eq!(result.scores[0], q16(-1));
-    assert_eq!(result.scores[1], q16(-3));
-}
-
-#[test]
-fn test_top_k_all_negative_scores() {
-    // All-negative scenario: extract_top_k must still return the top k by
-    // descending Q16.16 score. No clamp-to-zero, no special-casing.
-    let scores  = [q16(-10), q16(-1), q16(-100), q16(-2)];
-    let ids     = ["n0", "n1", "n2", "n3"];
-    let catalog = make_catalog(ids, scores);
-
-    let result: TopK = extract_top_k(scores_tensor(scores), catalog, 3);
-
-    assert_eq!(result.ids.len(), 3);
-    assert_eq!(result.ids[0], route_id_of("n1"),   "score -1 is highest");
-    assert_eq!(result.ids[1], route_id_of("n3"),   "score -2 is second");
-    assert_eq!(result.ids[2], route_id_of("n0"),   "score -10 is third");
-}
-
-// ---------------------------------------------------------------------------
-// Section 8: Score precision boundary (ULP)
-// ---------------------------------------------------------------------------
-//
-// extract_top_k uses raw i32 comparison on Q16.16 scores — NOT float comparison
-// and NOT epsilon tolerance. Two scores that differ by exactly 1 ULP (1 in the
-// raw i32 representation) must be consistently ordered.
-
-#[test]
-fn test_top_k_ulp_precision_k1() {
-    // ulp_route_a: score = 131073  (2.0 + 1 ULP in Q16.16)
-    // ulp_route_b: score = 131072  (exactly 2.0 in Q16.16)
-    // k=1 must return ulp_route_a (higher raw i32).
-    //
-    // Contract: comparison is i32 exact, not float approximate.
-    // If implementation casts to f32 first, 131073 and 131072 may collapse to
-    // the same float (both round to 2.0000), causing non-determinism or wrong
-    // selection. The test enforces raw i32 ordering.
-    let score_a = q16_raw(131073);  // 2.0 + 1 ULP
-    let score_b = q16_raw(131072);  // exactly 2.0
-    let scores  = [score_a, score_b];
-    let ids     = ["ulp_route_a", "ulp_route_b"];
-    let catalog = make_catalog(ids, scores);
-
-    let result: TopK = extract_top_k(scores_tensor(scores), catalog, 1);
-
-    assert_eq!(result.ids.len(), 1);
-    assert_eq!(result.ids[0], route_id_of("ulp_route_a"),
-               "ulp_route_a (131073) must beat ulp_route_b (131072) by 1-ULP margin");
-    assert_eq!(result.scores[0], score_a);
-
-    // Bit-identity oracle: bc7a9280a6c70566f8b92c23f37373a1bb6c8273f9166fc7eeaba2a71d9a3013
-    assert_eq!(canonical_result_hash(result), b"PLACEHOLDER_HASH_ULP_K1");
-}
-
-#[test]
-fn test_top_k_ulp_equal_scores_tiebreak() {
-    // When two routes have the exact same raw i32 score, tie-break by
-    // SHA-256(route_id) ascending still applies even at ULP resolution.
-    // Both routes have score = 131072 (exactly 2.0 in Q16.16).
-    //
-    // SHA-256("ulp_route_a") = a7762b07...
-    // SHA-256("ulp_route_b") = 326d7832...
-    // 326d... < a776..., so ulp_route_b wins the tie-break.
-    let score = q16_raw(131072);
-    let scores = [score, score];
-    let ids    = ["ulp_route_a", "ulp_route_b"];
-    let catalog = make_catalog(ids, scores);
-
-    let result: TopK = extract_top_k(scores_tensor(scores), catalog, 1);
-
-    assert_eq!(result.ids.len(), 1);
-    assert_eq!(result.ids[0], route_id_of("ulp_route_b"),
-               "ulp_route_b wins tie-break: SHA-256('ulp_route_b') < SHA-256('ulp_route_a')");
-}
-
-// ---------------------------------------------------------------------------
-// Section 9: extract_top_k_mask (RFC-008 Matryoshka coarse shortlist)
-// ---------------------------------------------------------------------------
-//
-// The mask path selects the SAME set of routes as extract_top_k over the same
-// (logits, catalog, k) — it just reports them positionally instead of by
-// RouteId. Since the surviving entry's catalog index is carried through the
-// heap as an inert HeapEntry payload (never a comparator key), the mask must
-// be byte-identical to "flip the index of every id extract_top_k returns".
-// These tests pin exactly that equivalence, with the all-tied corpus as the
-// adversarial case: there, the route_id lex tie-break is the SOLE
-// discriminator, so any perturbation of the pinned order shows up as a
-// different mask.
-
-// mask_popcount: number of selected routes in a shortlist mask.
-fn mask_popcount(mask: [u8]) -> usize {
-    let mut c: usize = 0;
-    let mut i: usize = 0;
-    while i < mask.len() {
-        if mask[i] == 1u8 { c = c + 1; }
+fn tt_popcount(mask: i64, n: i64) -> i64 {
+    let mut c: i64 = 0;
+    let mut i: i64 = 0;
+    while i < n {
+        if __mind_load_i8(mask + i) == 1 { c = c + 1; }
         i = i + 1;
     }
     c
 }
 
-// index_of_route: position of `external_id` in the catalog fixture's id list.
-fn index_of_route(ids: [str], external_id: str) -> usize {
-    let mut i: usize = 0;
-    while i < ids.len() {
-        if ids[i] == external_id { return i; }
-        i = i + 1;
-    }
-    ids.len()  // not found — callers assert against a known-present id
+// ── Section 1: basic top-K extraction ───────────────────────────────────────
+
+#[test]
+fn test_top_k_basic_k3() {
+    let ids: i64 = __mind_alloc(320);
+    let scores: i64 = __mind_alloc(80);
+    let sbuf: i64 = __mind_alloc(16);
+    tt_cat10(ids, scores, sbuf);
+    let out_ids: i64 = __mind_alloc(96);
+    let out_scores: i64 = __mind_alloc(24);
+
+    let n: i64 = extract_top_k(scores, ids, 10, 3, out_ids, out_scores);
+    assert n == 3, "k=3 returns 3 entries";
+    assert tt_slot_is(out_ids, 0, sbuf, tt_str_route(sbuf, 0)) == 1, "route_0 first";
+    assert tt_slot_is(out_ids, 1, sbuf, tt_str_route(sbuf, 1)) == 1, "route_1 second";
+    assert tt_slot_is(out_ids, 2, sbuf, tt_str_route(sbuf, 2)) == 1, "route_2 third";
+    assert __mind_load_i64(out_scores + 0) == 589824, "score 9.0";
+    assert __mind_load_i64(out_scores + 8) == 524288, "score 8.0";
+    assert __mind_load_i64(out_scores + 16) == 458752, "score 7.0";
+
+    let h: i64 = __mind_alloc(32);
+    canonical_result_hash(out_ids, out_scores, n, h);
+    // Oracle 2255a0ea… (published 2026-05-13, re-verified vs hashlib).
+    let rc: i64 = tt_check_hash(h, 576037098, 3134039841, 1971496304, 3550314318, 3857930712, 623122347, 3464953438, 1064170540);
+    assert rc == 0, "canonical_result_hash basic k3 oracle";
+    __mind_free(h);
+    __mind_free(out_ids);
+    __mind_free(out_scores);
+    __mind_free(ids);
+    __mind_free(scores);
+    __mind_free(sbuf);
 }
 
 #[test]
-fn test_top_k_mask_basic_k3() {
-    // Descending scores, no ties: the top 3 are exactly indices 0,1,2.
-    let scores = [9,8,7,6,5,4,3,2,1,0].map(|v| q16(v));
-    let ids    = ["route_0","route_1","route_2","route_3","route_4",
-                  "route_5","route_6","route_7","route_8","route_9"];
-    let catalog = make_catalog(ids, scores);
+fn test_top_k_basic_k_equals_n() {
+    let ids: i64 = __mind_alloc(320);
+    let scores: i64 = __mind_alloc(80);
+    let sbuf: i64 = __mind_alloc(16);
+    tt_cat10(ids, scores, sbuf);
+    let out_ids: i64 = __mind_alloc(320);
+    let out_scores: i64 = __mind_alloc(80);
 
-    let mask: [u8] = extract_top_k_mask(scores_tensor(scores), catalog, 3);
-
-    assert_eq!(mask.len(), 10);
-    assert_eq!(mask_popcount(mask), 3);
-    assert_eq!(mask[0], 1u8);
-    assert_eq!(mask[1], 1u8);
-    assert_eq!(mask[2], 1u8);
-    for i in 3..10 {
-        assert_eq!(mask[i], 0u8, "route outside the top-3 must not be shortlisted");
+    let n: i64 = extract_top_k(scores, ids, 10, 10, out_ids, out_scores);
+    assert n == 10, "k=N returns all 10";
+    let mut i: i64 = 0;
+    while i < 10 {
+        assert tt_slot_is(out_ids, i, sbuf, tt_str_route(sbuf, i)) == 1, "route_i at position i";
+        assert __mind_load_i64(out_scores + i * 8) == (9 - i) * 65536, "descending scores";
+        i = i + 1;
     }
+
+    let h: i64 = __mind_alloc(32);
+    canonical_result_hash(out_ids, out_scores, n, h);
+    // Oracle 20b61f31…
+    let rc: i64 = tt_check_hash(h, 548806449, 3381964214, 2034349098, 2355097077, 988554957, 3966882686, 3701186987, 3093635755);
+    assert rc == 0, "canonical_result_hash k==N oracle";
+    __mind_free(h);
+    __mind_free(out_ids);
+    __mind_free(out_scores);
+    __mind_free(ids);
+    __mind_free(scores);
+    __mind_free(sbuf);
+}
+
+#[test]
+fn test_top_k_k_zero() {
+    let ids: i64 = __mind_alloc(96);
+    let scores: i64 = __mind_alloc(24);
+    let sbuf: i64 = __mind_alloc(16);
+    let mut i: i64 = 0;
+    while i < 3 {
+        let len: i64 = tt_str_route(sbuf, i);
+        tt_mkid(ids, i, sbuf, len);
+        __mind_store_i64(scores + i * 8, (9 - i) * 65536);
+        i = i + 1;
+    }
+    let out_ids: i64 = __mind_alloc(32);
+    let out_scores: i64 = __mind_alloc(8);
+    let n: i64 = extract_top_k(scores, ids, 3, 0, out_ids, out_scores);
+    assert n == 0, "k=0 returns empty result, not an error";
+    __mind_free(out_ids);
+    __mind_free(out_scores);
+    __mind_free(ids);
+    __mind_free(scores);
+    __mind_free(sbuf);
+}
+
+#[test]
+fn test_top_k_k_exceeds_n() {
+    let ids: i64 = __mind_alloc(320);
+    let scores: i64 = __mind_alloc(80);
+    let sbuf: i64 = __mind_alloc(16);
+    tt_cat10(ids, scores, sbuf);
+    let out_ids: i64 = __mind_alloc(320);
+    let out_scores: i64 = __mind_alloc(80);
+
+    let n: i64 = extract_top_k(scores, ids, 10, 15, out_ids, out_scores);
+    assert n == 10, "k>N saturates at N (all 10, no padding)";
+    assert tt_slot_is(out_ids, 0, sbuf, tt_str_route(sbuf, 0)) == 1, "route_0 first";
+    assert tt_slot_is(out_ids, 9, sbuf, tt_str_route(sbuf, 9)) == 1, "route_9 last";
+
+    let h: i64 = __mind_alloc(32);
+    canonical_result_hash(out_ids, out_scores, n, h);
+    // Same oracle as k==N: 20b61f31…
+    let rc: i64 = tt_check_hash(h, 548806449, 3381964214, 2034349098, 2355097077, 988554957, 3966882686, 3701186987, 3093635755);
+    assert rc == 0, "canonical_result_hash k>N oracle";
+    __mind_free(h);
+    __mind_free(out_ids);
+    __mind_free(out_scores);
+    __mind_free(ids);
+    __mind_free(scores);
+    __mind_free(sbuf);
+}
+
+#[test]
+fn test_top_k_single_route_k1() {
+    let ids: i64 = __mind_alloc(32);
+    let scores: i64 = __mind_alloc(8);
+    let sbuf: i64 = __mind_alloc(16);
+    let len: i64 = tt_str_route(sbuf, 0);
+    tt_mkid(ids, 0, sbuf, len);
+    __mind_store_i64(scores, 589824);
+    let out_ids: i64 = __mind_alloc(32);
+    let out_scores: i64 = __mind_alloc(8);
+
+    let n: i64 = extract_top_k(scores, ids, 1, 1, out_ids, out_scores);
+    assert n == 1, "single route returned";
+    assert tt_slot_is(out_ids, 0, sbuf, tt_str_route(sbuf, 0)) == 1, "route_0";
+    assert __mind_load_i64(out_scores) == 589824, "score 9.0";
+
+    let h: i64 = __mind_alloc(32);
+    canonical_result_hash(out_ids, out_scores, n, h);
+    // Oracle dfb045ea…
+    let rc: i64 = tt_check_hash(h, 3752871402, 3398278043, 2538892056, 254156979, 2672454743, 1873813136, 961995075, 3824527996);
+    assert rc == 0, "canonical_result_hash single k1 oracle";
+    __mind_free(h);
+    __mind_free(out_ids);
+    __mind_free(out_scores);
+    __mind_free(ids);
+    __mind_free(scores);
+    __mind_free(sbuf);
+}
+
+// ── Section 2: tie-break determinism ────────────────────────────────────────
+
+#[test]
+fn test_top_k_tiebreak_two_tied_one_clear() {
+    // scores [5,5,4] over ids [zebra, apple, banana], k=2.
+    // SHA-256("apple") = 3a7b… < SHA-256("zebra") = 676c… → apple wins.
+    let ids: i64 = __mind_alloc(96);
+    let scores: i64 = __mind_alloc(24);
+    let sbuf: i64 = __mind_alloc(16);
+    tt_mkid(ids, 0, sbuf, tt_str_zebra(sbuf));
+    tt_mkid(ids, 1, sbuf, tt_str_apple(sbuf));
+    tt_mkid(ids, 2, sbuf, tt_str_banana(sbuf));
+    __mind_store_i64(scores + 0, 327680);
+    __mind_store_i64(scores + 8, 327680);
+    __mind_store_i64(scores + 16, 262144);
+    let out_ids: i64 = __mind_alloc(64);
+    let out_scores: i64 = __mind_alloc(16);
+
+    let n: i64 = extract_top_k(scores, ids, 3, 2, out_ids, out_scores);
+    assert n == 2, "two entries";
+    assert tt_slot_is(out_ids, 0, sbuf, tt_str_apple(sbuf)) == 1, "apple wins the tie";
+    assert tt_slot_is(out_ids, 1, sbuf, tt_str_zebra(sbuf)) == 1, "zebra second";
+    assert __mind_load_i64(out_scores + 0) == 327680, "score 5.0";
+    assert __mind_load_i64(out_scores + 8) == 327680, "score 5.0";
+
+    let h: i64 = __mind_alloc(32);
+    canonical_result_hash(out_ids, out_scores, n, h);
+    // Oracle 34ecc49f…
+    let rc: i64 = tt_check_hash(h, 887932063, 3830273703, 921087190, 1987015553, 3402337924, 1435745890, 1338937842, 1636796410);
+    assert rc == 0, "canonical_result_hash tiebreak oracle";
+    __mind_free(h);
+    __mind_free(out_ids);
+    __mind_free(out_scores);
+    __mind_free(ids);
+    __mind_free(scores);
+    __mind_free(sbuf);
+}
+
+#[test]
+fn test_top_k_tiebreak_all_tied_k2() {
+    // All five tied; ascending SHA-256 order is d < c < b < e < a → [d, c].
+    let ids: i64 = __mind_alloc(160);
+    let scores: i64 = __mind_alloc(40);
+    let sbuf: i64 = __mind_alloc(16);
+    let mut i: i64 = 0;
+    while i < 5 {
+        tt_mkid(ids, i, sbuf, tt_str1(sbuf, 97 + i));
+        __mind_store_i64(scores + i * 8, 196608);
+        i = i + 1;
+    }
+    let out_ids: i64 = __mind_alloc(64);
+    let out_scores: i64 = __mind_alloc(16);
+
+    let n: i64 = extract_top_k(scores, ids, 5, 2, out_ids, out_scores);
+    assert n == 2, "two entries";
+    assert tt_slot_is(out_ids, 0, sbuf, tt_str1(sbuf, 100)) == 1, "d first (lowest sha)";
+    assert tt_slot_is(out_ids, 1, sbuf, tt_str1(sbuf, 99)) == 1, "c second";
+    assert __mind_load_i64(out_scores + 0) == 196608, "score 3.0";
+    assert __mind_load_i64(out_scores + 8) == 196608, "score 3.0";
+
+    let h: i64 = __mind_alloc(32);
+    canonical_result_hash(out_ids, out_scores, n, h);
+    // Oracle 51ea94f0…
+    let rc: i64 = tt_check_hash(h, 1374328048, 885537380, 4269199575, 1361788214, 3669095702, 3538706630, 1042679251, 266696154);
+    assert rc == 0, "canonical_result_hash all-tied oracle";
+    __mind_free(h);
+    __mind_free(out_ids);
+    __mind_free(out_scores);
+    __mind_free(ids);
+    __mind_free(scores);
+    __mind_free(sbuf);
+}
+
+// ── Section 3: determinism across runs ──────────────────────────────────────
+
+#[test]
+fn test_top_k_determinism_100_runs() {
+    // 100 invocations of the same (scores, catalog, k): every run must
+    // reproduce the reference ids bit-for-bit; the concatenated id bytes
+    // hash to the published 100-run oracle.
+    let ids: i64 = __mind_alloc(320);
+    let scores: i64 = __mind_alloc(80);
+    let sbuf: i64 = __mind_alloc(16);
+    tt_cat10(ids, scores, sbuf);
+    let ref_ids: i64 = __mind_alloc(96);
+    let ref_scores: i64 = __mind_alloc(24);
+    let rn: i64 = extract_top_k(scores, ids, 10, 3, ref_ids, ref_scores);
+    assert rn == 3, "reference run returns 3";
+
+    let acc: i64 = __mind_alloc(9600);
+    let out_ids: i64 = __mind_alloc(96);
+    let out_scores: i64 = __mind_alloc(24);
+    let mut run: i64 = 0;
+    while run < 100 {
+        let n: i64 = extract_top_k(scores, ids, 10, 3, out_ids, out_scores);
+        assert n == 3, "every run returns 3";
+        let mut e: i64 = 0;
+        while e < 3 {
+            let ids_eq: i64 = tt_id_eq(out_ids + e * 32, ref_ids + e * 32);
+            assert ids_eq == 1, "bit-identical ids across runs";
+            e = e + 1;
+        }
+        let mut b: i64 = 0;
+        while b < 96 {
+            __mind_store_i8(acc + run * 96 + b, __mind_load_i8(out_ids + b));
+            b = b + 1;
+        }
+        run = run + 1;
+    }
+
+    let h: i64 = __mind_alloc(32);
+    mn_sha256(acc, 9600, h);
+    // Oracle 712b0abc… (published 2026-05-13, re-verified vs hashlib 2026-08-11).
+    let rc: i64 = tt_check_hash(h, 1898646204, 1921803536, 1109337915, 481095950, 1347116047, 2322389158, 322234789, 3995638002);
+    assert rc == 0, "100-run concatenated hash oracle";
+    __mind_free(h);
+    __mind_free(acc);
+    __mind_free(out_ids);
+    __mind_free(out_scores);
+    __mind_free(ref_ids);
+    __mind_free(ref_scores);
+    __mind_free(ids);
+    __mind_free(scores);
+    __mind_free(sbuf);
+}
+
+// ── Section 4: catalog uniqueness (audit A3) ────────────────────────────────
+// catalog_check_unique returns 0 when all ids are distinct, else (i + 1)
+// where i is the first index whose route_id already appeared at some j < i.
+
+#[test]
+fn test_top_k_unique_catalog_rejects_duplicate() {
+    let ids: i64 = __mind_alloc(96);
+    let sbuf: i64 = __mind_alloc(16);
+    tt_mkid(ids, 0, sbuf, tt_str1(sbuf, 97));
+    tt_mkid(ids, 1, sbuf, tt_str1(sbuf, 98));
+    tt_mkid(ids, 2, sbuf, tt_str1(sbuf, 97));
+    let rc: i64 = catalog_check_unique(ids, 3);
+    assert rc == 3, "duplicate at index 2 reported as (i + 1)";
+    // The offending route_id is readable at ids + 2*32 and is SHA-256("a").
+    assert tt_slot_is(ids, 2, sbuf, tt_str1(sbuf, 97)) == 1, "error identifies the duplicate route_id";
+    __mind_free(ids);
+    __mind_free(sbuf);
+}
+
+#[test]
+fn test_top_k_unique_catalog_allows_empty() {
+    let ids: i64 = __mind_alloc(32);
+    assert catalog_check_unique(ids, 0) == 0, "empty catalog is valid";
+    // Empty catalog hash is SHA-256("") = e3b0c442…
+    let h: i64 = __mind_alloc(32);
+    canonical_catalog_hash(ids, 0, h);
+    let rc: i64 = tt_check_hash(h, 3820012610, 2566659092, 2600203464, 2574235940, 665731556, 1687917388, 2761267483, 2018687061);
+    assert rc == 0, "empty catalog hash is SHA-256 of the empty string";
+    __mind_free(h);
+    __mind_free(ids);
+}
+
+#[test]
+fn test_top_k_unique_catalog_allows_single() {
+    let ids: i64 = __mind_alloc(32);
+    let sbuf: i64 = __mind_alloc(16);
+    tt_mkid(ids, 0, sbuf, tt_str1(sbuf, 97));
+    assert catalog_check_unique(ids, 1) == 0, "single-entry catalog is valid";
+    __mind_free(ids);
+    __mind_free(sbuf);
+}
+
+#[test]
+fn test_top_k_unique_catalog_allows_distinct_ids() {
+    let ids: i64 = __mind_alloc(160);
+    let sbuf: i64 = __mind_alloc(16);
+    let mut i: i64 = 0;
+    while i < 5 {
+        tt_mkid(ids, i, sbuf, tt_str1(sbuf, 97 + i));
+        i = i + 1;
+    }
+    assert catalog_check_unique(ids, 5) == 0, "all-distinct catalog is valid";
+    __mind_free(ids);
+    __mind_free(sbuf);
+}
+
+#[test]
+fn test_top_k_unique_catalog_first_duplicate_reported() {
+    // [x, y, x, z, y]: the (i, j < i) ascending scan hits (2, 0) first.
+    let ids: i64 = __mind_alloc(160);
+    let sbuf: i64 = __mind_alloc(16);
+    tt_mkid(ids, 0, sbuf, tt_str1(sbuf, 120));
+    tt_mkid(ids, 1, sbuf, tt_str1(sbuf, 121));
+    tt_mkid(ids, 2, sbuf, tt_str1(sbuf, 120));
+    tt_mkid(ids, 3, sbuf, tt_str1(sbuf, 122));
+    tt_mkid(ids, 4, sbuf, tt_str1(sbuf, 121));
+    let rc: i64 = catalog_check_unique(ids, 5);
+    assert rc == 3, "first duplicate encountered is at index 2";
+    assert tt_slot_is(ids, 2, sbuf, tt_str1(sbuf, 120)) == 1, "reported duplicate is x";
+    __mind_free(ids);
+    __mind_free(sbuf);
+}
+
+// ── Section 6: empty catalog ────────────────────────────────────────────────
+
+#[test]
+fn test_top_k_empty_catalog_k5() {
+    let ids: i64 = __mind_alloc(32);
+    let scores: i64 = __mind_alloc(8);
+    let out_ids: i64 = __mind_alloc(32);
+    let out_scores: i64 = __mind_alloc(8);
+    let n: i64 = extract_top_k(scores, ids, 0, 5, out_ids, out_scores);
+    assert n == 0, "empty catalog yields empty top-K, not an error";
+    __mind_free(out_ids);
+    __mind_free(out_scores);
+    __mind_free(ids);
+    __mind_free(scores);
+}
+
+#[test]
+fn test_top_k_empty_catalog_k0() {
+    let ids: i64 = __mind_alloc(32);
+    let scores: i64 = __mind_alloc(8);
+    let out_ids: i64 = __mind_alloc(32);
+    let out_scores: i64 = __mind_alloc(8);
+    let n: i64 = extract_top_k(scores, ids, 0, 0, out_ids, out_scores);
+    assert n == 0, "k=0 on empty catalog is empty, not an error";
+    __mind_free(out_ids);
+    __mind_free(out_scores);
+    __mind_free(ids);
+    __mind_free(scores);
+}
+
+// ── Section 7: negative score handling ──────────────────────────────────────
+
+#[test]
+fn test_top_k_negative_scores_ordering() {
+    // scores [-3,-5,-1,-4] Q16.16, k=2 → the two least-negative: -1 then -3.
+    let ids: i64 = __mind_alloc(128);
+    let scores: i64 = __mind_alloc(32);
+    let sbuf: i64 = __mind_alloc(16);
+    let mut i: i64 = 0;
+    while i < 4 {
+        tt_mkid(ids, i, sbuf, tt_str_negroute(sbuf, i));
+        i = i + 1;
+    }
+    __mind_store_i64(scores + 0, -196608);
+    __mind_store_i64(scores + 8, -327680);
+    __mind_store_i64(scores + 16, -65536);
+    __mind_store_i64(scores + 24, -262144);
+    let out_ids: i64 = __mind_alloc(64);
+    let out_scores: i64 = __mind_alloc(16);
+
+    let n: i64 = extract_top_k(scores, ids, 4, 2, out_ids, out_scores);
+    assert n == 2, "two entries";
+    assert tt_slot_is(out_ids, 0, sbuf, tt_str_negroute(sbuf, 2)) == 1, "neg_route_2 (score -1) first";
+    assert tt_slot_is(out_ids, 1, sbuf, tt_str_negroute(sbuf, 0)) == 1, "neg_route_0 (score -3) second";
+    assert __mind_load_i64(out_scores + 0) == -65536, "score -1.0";
+    assert __mind_load_i64(out_scores + 8) == -196608, "score -3.0";
+
+    let h: i64 = __mind_alloc(32);
+    canonical_result_hash(out_ids, out_scores, n, h);
+    // Oracle 32f88804… (published 2026-05-13, re-verified vs hashlib 2026-08-11;
+    // i32-LE two's-complement score serialization).
+    let rc: i64 = tt_check_hash(h, 855148548, 1419981094, 365116234, 2916537506, 2042622105, 626121915, 601690508, 1171762840);
+    assert rc == 0, "canonical_result_hash negative oracle";
+    __mind_free(h);
+    __mind_free(out_ids);
+    __mind_free(out_scores);
+    __mind_free(ids);
+    __mind_free(scores);
+    __mind_free(sbuf);
+}
+
+#[test]
+fn test_top_k_all_negative_scores() {
+    // scores [-10,-1,-100,-2], k=3 → [n1, n3, n0]. No clamp-to-zero.
+    let ids: i64 = __mind_alloc(128);
+    let scores: i64 = __mind_alloc(32);
+    let sbuf: i64 = __mind_alloc(16);
+    let mut i: i64 = 0;
+    while i < 4 {
+        tt_mkid(ids, i, sbuf, tt_str_n(sbuf, i));
+        i = i + 1;
+    }
+    __mind_store_i64(scores + 0, -655360);
+    __mind_store_i64(scores + 8, -65536);
+    __mind_store_i64(scores + 16, -6553600);
+    __mind_store_i64(scores + 24, -131072);
+    let out_ids: i64 = __mind_alloc(96);
+    let out_scores: i64 = __mind_alloc(24);
+
+    let n: i64 = extract_top_k(scores, ids, 4, 3, out_ids, out_scores);
+    assert n == 3, "three entries";
+    assert tt_slot_is(out_ids, 0, sbuf, tt_str_n(sbuf, 1)) == 1, "n1 (score -1) first";
+    assert tt_slot_is(out_ids, 1, sbuf, tt_str_n(sbuf, 3)) == 1, "n3 (score -2) second";
+    assert tt_slot_is(out_ids, 2, sbuf, tt_str_n(sbuf, 0)) == 1, "n0 (score -10) third";
+    __mind_free(out_ids);
+    __mind_free(out_scores);
+    __mind_free(ids);
+    __mind_free(scores);
+    __mind_free(sbuf);
+}
+
+// ── Section 8: score precision boundary (ULP) ───────────────────────────────
+// Comparison is exact i64 on the raw Q16.16 value — never float, never
+// epsilon. A 1-ULP difference must order.
+
+#[test]
+fn test_top_k_ulp_precision_k1() {
+    // ulp_route_a = 131073 (2.0 + 1 ULP), ulp_route_b = 131072 (exactly 2.0).
+    let ids: i64 = __mind_alloc(64);
+    let scores: i64 = __mind_alloc(16);
+    let sbuf: i64 = __mind_alloc(16);
+    tt_mkid(ids, 0, sbuf, tt_str_ulp(sbuf, 97));
+    tt_mkid(ids, 1, sbuf, tt_str_ulp(sbuf, 98));
+    __mind_store_i64(scores + 0, 131073);
+    __mind_store_i64(scores + 8, 131072);
+    let out_ids: i64 = __mind_alloc(32);
+    let out_scores: i64 = __mind_alloc(8);
+
+    let n: i64 = extract_top_k(scores, ids, 2, 1, out_ids, out_scores);
+    assert n == 1, "one entry";
+    assert tt_slot_is(out_ids, 0, sbuf, tt_str_ulp(sbuf, 97)) == 1, "ulp_route_a wins by 1 ULP";
+    assert __mind_load_i64(out_scores) == 131073, "raw score preserved";
+
+    let h: i64 = __mind_alloc(32);
+    canonical_result_hash(out_ids, out_scores, n, h);
+    // Oracle bc7a9280… (published 2026-05-13, re-verified vs hashlib 2026-08-11).
+    let rc: i64 = tt_check_hash(h, 3162149504, 2798060902, 4172885027, 4084429729, 3144450675, 4178997191, 4004225703, 496644115);
+    assert rc == 0, "canonical_result_hash ulp k1 oracle";
+    __mind_free(h);
+    __mind_free(out_ids);
+    __mind_free(out_scores);
+    __mind_free(ids);
+    __mind_free(scores);
+    __mind_free(sbuf);
+}
+
+#[test]
+fn test_top_k_ulp_equal_scores_tiebreak() {
+    // Both 131072; SHA-256("ulp_route_b") = 326d… < SHA-256("ulp_route_a")
+    // = a776… → ulp_route_b wins.
+    let ids: i64 = __mind_alloc(64);
+    let scores: i64 = __mind_alloc(16);
+    let sbuf: i64 = __mind_alloc(16);
+    tt_mkid(ids, 0, sbuf, tt_str_ulp(sbuf, 97));
+    tt_mkid(ids, 1, sbuf, tt_str_ulp(sbuf, 98));
+    __mind_store_i64(scores + 0, 131072);
+    __mind_store_i64(scores + 8, 131072);
+    let out_ids: i64 = __mind_alloc(32);
+    let out_scores: i64 = __mind_alloc(8);
+
+    let n: i64 = extract_top_k(scores, ids, 2, 1, out_ids, out_scores);
+    assert n == 1, "one entry";
+    assert tt_slot_is(out_ids, 0, sbuf, tt_str_ulp(sbuf, 98)) == 1, "ulp_route_b wins the tie-break";
+    assert __mind_load_i64(out_scores) == 131072, "raw score preserved";
+    __mind_free(out_ids);
+    __mind_free(out_scores);
+    __mind_free(ids);
+    __mind_free(scores);
+    __mind_free(sbuf);
+}
+
+// ── Section 9: extract_top_k_mask (RFC-008 coarse shortlist) ────────────────
+// The mask selects the SAME set as extract_top_k, reported positionally.
+// The all-tied corpus is the adversarial case: the route_id lex tie-break
+// is the sole discriminator.
+
+#[test]
+fn test_top_k_mask_basic_k3() {
+    let ids: i64 = __mind_alloc(320);
+    let scores: i64 = __mind_alloc(80);
+    let sbuf: i64 = __mind_alloc(16);
+    tt_cat10(ids, scores, sbuf);
+    let mask: i64 = __mind_alloc(10);
+
+    extract_top_k_mask(scores, ids, 10, 3, mask);
+    assert tt_popcount(mask, 10) == 3, "popcount 3";
+    assert __mind_load_i8(mask + 0) == 1, "route_0 shortlisted";
+    assert __mind_load_i8(mask + 1) == 1, "route_1 shortlisted";
+    assert __mind_load_i8(mask + 2) == 1, "route_2 shortlisted";
+    let mut i: i64 = 3;
+    while i < 10 {
+        assert __mind_load_i8(mask + i) == 0, "outside top-3 not shortlisted";
+        i = i + 1;
+    }
+    __mind_free(mask);
+    __mind_free(ids);
+    __mind_free(scores);
+    __mind_free(sbuf);
 }
 
 #[test]
 fn test_top_k_mask_selects_by_score_not_position() {
-    // Scores are NOT monotone in index — the mask must follow the score
-    // ordering, not the catalog order. Highest three: idx 4 (9), idx 1 (7),
-    // idx 6 (6).
-    let scores = [1,7,0,3,9,2,6,4].map(|v| q16(v));
-    let ids    = ["r0","r1","r2","r3","r4","r5","r6","r7"];
-    let catalog = make_catalog(ids, scores);
+    // scores [1,7,0,3,9,2,6,4]: highest three are idx 4 (9), idx 1 (7),
+    // idx 6 (6) — the mask must follow score, not catalog position.
+    let ids: i64 = __mind_alloc(256);
+    let scores: i64 = __mind_alloc(64);
+    let sbuf: i64 = __mind_alloc(16);
+    let mut i: i64 = 0;
+    while i < 8 {
+        tt_mkid(ids, i, sbuf, tt_str_r(sbuf, i));
+        i = i + 1;
+    }
+    __mind_store_i64(scores + 0, 65536);
+    __mind_store_i64(scores + 8, 458752);
+    __mind_store_i64(scores + 16, 0);
+    __mind_store_i64(scores + 24, 196608);
+    __mind_store_i64(scores + 32, 589824);
+    __mind_store_i64(scores + 40, 131072);
+    __mind_store_i64(scores + 48, 393216);
+    __mind_store_i64(scores + 56, 262144);
+    let mask: i64 = __mind_alloc(8);
 
-    let mask: [u8] = extract_top_k_mask(scores_tensor(scores), catalog, 3);
-
-    assert_eq!(mask_popcount(mask), 3);
-    assert_eq!(mask[4], 1u8, "score 9 at index 4 must be shortlisted");
-    assert_eq!(mask[1], 1u8, "score 7 at index 1 must be shortlisted");
-    assert_eq!(mask[6], 1u8, "score 6 at index 6 must be shortlisted");
-    assert_eq!(mask[0], 0u8);
-    assert_eq!(mask[2], 0u8);
-    assert_eq!(mask[3], 0u8);
-    assert_eq!(mask[5], 0u8);
-    assert_eq!(mask[7], 0u8);
+    extract_top_k_mask(scores, ids, 8, 3, mask);
+    assert tt_popcount(mask, 8) == 3, "popcount 3";
+    assert __mind_load_i8(mask + 4) == 1, "score 9 at index 4 shortlisted";
+    assert __mind_load_i8(mask + 1) == 1, "score 7 at index 1 shortlisted";
+    assert __mind_load_i8(mask + 6) == 1, "score 6 at index 6 shortlisted";
+    assert __mind_load_i8(mask + 0) == 0, "index 0 not shortlisted";
+    assert __mind_load_i8(mask + 2) == 0, "index 2 not shortlisted";
+    assert __mind_load_i8(mask + 3) == 0, "index 3 not shortlisted";
+    assert __mind_load_i8(mask + 5) == 0, "index 5 not shortlisted";
+    assert __mind_load_i8(mask + 7) == 0, "index 7 not shortlisted";
+    __mind_free(mask);
+    __mind_free(ids);
+    __mind_free(scores);
+    __mind_free(sbuf);
 }
 
 #[test]
 fn test_top_k_mask_k_zero() {
-    // k == 0 -> all-zero mask, length preserved. No heap traversal.
-    let scores = [3,2,1].map(|v| q16(v));
-    let ids    = ["a","b","c"];
-    let catalog = make_catalog(ids, scores);
+    let ids: i64 = __mind_alloc(96);
+    let scores: i64 = __mind_alloc(24);
+    let sbuf: i64 = __mind_alloc(16);
+    let mut i: i64 = 0;
+    while i < 3 {
+        tt_mkid(ids, i, sbuf, tt_str1(sbuf, 97 + i));
+        __mind_store_i64(scores + i * 8, (3 - i) * 65536);
+        i = i + 1;
+    }
+    let mask: i64 = __mind_alloc(3);
 
-    let mask: [u8] = extract_top_k_mask(scores_tensor(scores), catalog, 0);
-
-    assert_eq!(mask.len(), 3);
-    assert_eq!(mask_popcount(mask), 0);
+    extract_top_k_mask(scores, ids, 3, 0, mask);
+    assert tt_popcount(mask, 3) == 0, "k=0 -> all-zero mask";
+    __mind_free(mask);
+    __mind_free(ids);
+    __mind_free(scores);
+    __mind_free(sbuf);
 }
 
 #[test]
 fn test_top_k_mask_empty_catalog() {
-    // Empty catalog -> empty mask, regardless of k.
-    let scores: [Q16_16] = [];
-    let ids:    [str]    = [];
-    let catalog = make_catalog(ids, scores);
-
-    let mask: [u8] = extract_top_k_mask(scores_tensor(scores), catalog, 5);
-
-    assert_eq!(mask.len(), 0);
+    let ids: i64 = __mind_alloc(32);
+    let scores: i64 = __mind_alloc(8);
+    let mask: i64 = __mind_alloc(1);
+    let rc: i64 = extract_top_k_mask(scores, ids, 0, 5, mask);
+    assert rc == 0, "empty catalog -> no mask writes, no error";
+    __mind_free(mask);
+    __mind_free(ids);
+    __mind_free(scores);
 }
 
 #[test]
 fn test_top_k_mask_k_equals_n_all_ones() {
-    // k == num_routes -> every route survives (short-circuit path).
-    let scores = [5,4,3,2].map(|v| q16(v));
-    let ids    = ["a","b","c","d"];
-    let catalog = make_catalog(ids, scores);
+    let ids: i64 = __mind_alloc(128);
+    let scores: i64 = __mind_alloc(32);
+    let sbuf: i64 = __mind_alloc(16);
+    let mut i: i64 = 0;
+    while i < 4 {
+        tt_mkid(ids, i, sbuf, tt_str1(sbuf, 97 + i));
+        __mind_store_i64(scores + i * 8, (5 - i) * 65536);
+        i = i + 1;
+    }
+    let mask: i64 = __mind_alloc(4);
 
-    let mask: [u8] = extract_top_k_mask(scores_tensor(scores), catalog, 4);
-
-    assert_eq!(mask.len(), 4);
-    assert_eq!(mask_popcount(mask), 4);
+    extract_top_k_mask(scores, ids, 4, 4, mask);
+    assert tt_popcount(mask, 4) == 4, "k == n -> every route survives";
+    __mind_free(mask);
+    __mind_free(ids);
+    __mind_free(scores);
+    __mind_free(sbuf);
 }
 
 #[test]
 fn test_top_k_mask_k_exceeds_n_saturates_all_ones() {
-    // k > num_routes saturates: all-ones, no out-of-bounds mask write.
-    let scores = [5,4,3].map(|v| q16(v));
-    let ids    = ["a","b","c"];
-    let catalog = make_catalog(ids, scores);
+    let ids: i64 = __mind_alloc(96);
+    let scores: i64 = __mind_alloc(24);
+    let sbuf: i64 = __mind_alloc(16);
+    let mut i: i64 = 0;
+    while i < 3 {
+        tt_mkid(ids, i, sbuf, tt_str1(sbuf, 97 + i));
+        __mind_store_i64(scores + i * 8, (5 - i) * 65536);
+        i = i + 1;
+    }
+    let mask: i64 = __mind_alloc(3);
 
-    let mask: [u8] = extract_top_k_mask(scores_tensor(scores), catalog, 99);
-
-    assert_eq!(mask.len(), 3);
-    assert_eq!(mask_popcount(mask), 3);
+    extract_top_k_mask(scores, ids, 3, 99, mask);
+    assert tt_popcount(mask, 3) == 3, "k > n saturates: all-ones, no OOB write";
+    __mind_free(mask);
+    __mind_free(ids);
+    __mind_free(scores);
+    __mind_free(sbuf);
 }
 
 #[test]
 fn test_top_k_mask_single_route_k1() {
-    let scores = [q16(42)];
-    let ids    = ["solo"];
-    let catalog = make_catalog(ids, scores);
+    let ids: i64 = __mind_alloc(32);
+    let scores: i64 = __mind_alloc(8);
+    let sbuf: i64 = __mind_alloc(16);
+    tt_mkid(ids, 0, sbuf, tt_str_solo(sbuf));
+    __mind_store_i64(scores, 2752512);
+    let mask: i64 = __mind_alloc(1);
 
-    let mask: [u8] = extract_top_k_mask(scores_tensor(scores), catalog, 1);
-
-    assert_eq!(mask.len(), 1);
-    assert_eq!(mask[0], 1u8);
+    extract_top_k_mask(scores, ids, 1, 1, mask);
+    assert __mind_load_i8(mask) == 1, "single route shortlisted";
+    __mind_free(mask);
+    __mind_free(ids);
+    __mind_free(scores);
+    __mind_free(sbuf);
 }
 
 #[test]
 fn test_top_k_mask_all_tied_tiebreak_by_route_id() {
-    // ALL scores identical -> the SHA-256 route_id lex tie-break is the only
-    // discriminator. All-tied ascending order (file header): d < c < b < e < a.
-    // k=2 must therefore shortlist exactly "d" and "c" — by their CATALOG
-    // POSITIONS, which is the thing index recovery has to get right.
-    //
-    // Catalog order below is deliberately NOT the tie-break order, so a mask
-    // that flipped the wrong positions (e.g. the first k indices) would fail.
-    let s = q16(7);
-    let scores = [s, s, s, s, s];
-    let ids    = ["a", "b", "c", "d", "e"];
-    let catalog = make_catalog(ids, scores);
+    // All scores q16(7); ascending SHA-256 order is d < c < b < e < a, so
+    // k=2 shortlists catalog positions 3 (d) and 2 (c) — NOT the first two
+    // indices.
+    let ids: i64 = __mind_alloc(160);
+    let scores: i64 = __mind_alloc(40);
+    let sbuf: i64 = __mind_alloc(16);
+    let mut i: i64 = 0;
+    while i < 5 {
+        tt_mkid(ids, i, sbuf, tt_str1(sbuf, 97 + i));
+        __mind_store_i64(scores + i * 8, 458752);
+        i = i + 1;
+    }
+    let mask: i64 = __mind_alloc(5);
 
-    let mask: [u8] = extract_top_k_mask(scores_tensor(scores), catalog, 2);
-
-    assert_eq!(mask_popcount(mask), 2);
-    assert_eq!(mask[index_of_route(ids, "d")], 1u8,
-               "d has the lowest SHA-256 and must win the all-tied tie-break");
-    assert_eq!(mask[index_of_route(ids, "c")], 1u8,
-               "c has the second-lowest SHA-256");
-    assert_eq!(mask[index_of_route(ids, "a")], 0u8,
-               "a has the highest SHA-256 and must lose the all-tied tie-break");
-    assert_eq!(mask[index_of_route(ids, "b")], 0u8);
-    assert_eq!(mask[index_of_route(ids, "e")], 0u8);
+    extract_top_k_mask(scores, ids, 5, 2, mask);
+    assert tt_popcount(mask, 5) == 2, "popcount 2";
+    assert __mind_load_i8(mask + 3) == 1, "d (lowest sha) shortlisted";
+    assert __mind_load_i8(mask + 2) == 1, "c (second-lowest sha) shortlisted";
+    assert __mind_load_i8(mask + 0) == 0, "a (highest sha) not shortlisted";
+    assert __mind_load_i8(mask + 1) == 0, "b not shortlisted";
+    assert __mind_load_i8(mask + 4) == 0, "e not shortlisted";
+    __mind_free(mask);
+    __mind_free(ids);
+    __mind_free(scores);
+    __mind_free(sbuf);
 }
 
 #[test]
 fn test_top_k_mask_tiebreak_two_tied_one_clear() {
-    // One clear winner + two tied runners-up. k=2 takes the clear winner and
-    // the tie-break winner of the tied pair.
-    // SHA-256("banana") = b493d483... , SHA-256("zebra") = 676cb750...
-    // 676c... < b493..., so "zebra" wins the tie against "banana".
-    let scores = [q16(9), q16(5), q16(5)];
-    let ids    = ["apple", "banana", "zebra"];
-    let catalog = make_catalog(ids, scores);
+    // apple 9, banana 5, zebra 5; SHA-256("zebra") = 676c… <
+    // SHA-256("banana") = b493… → mask positions 0 and 2.
+    let ids: i64 = __mind_alloc(96);
+    let scores: i64 = __mind_alloc(24);
+    let sbuf: i64 = __mind_alloc(16);
+    tt_mkid(ids, 0, sbuf, tt_str_apple(sbuf));
+    tt_mkid(ids, 1, sbuf, tt_str_banana(sbuf));
+    tt_mkid(ids, 2, sbuf, tt_str_zebra(sbuf));
+    __mind_store_i64(scores + 0, 589824);
+    __mind_store_i64(scores + 8, 327680);
+    __mind_store_i64(scores + 16, 327680);
+    let mask: i64 = __mind_alloc(3);
 
-    let mask: [u8] = extract_top_k_mask(scores_tensor(scores), catalog, 2);
-
-    assert_eq!(mask_popcount(mask), 2);
-    assert_eq!(mask[0], 1u8, "apple (score 9) is the clear winner");
-    assert_eq!(mask[2], 1u8, "zebra wins the 5-5 tie: SHA-256('zebra') < SHA-256('banana')");
-    assert_eq!(mask[1], 0u8, "banana loses the tie-break");
+    extract_top_k_mask(scores, ids, 3, 2, mask);
+    assert tt_popcount(mask, 3) == 2, "popcount 2";
+    assert __mind_load_i8(mask + 0) == 1, "apple (clear winner) shortlisted";
+    assert __mind_load_i8(mask + 2) == 1, "zebra wins the 5-5 tie";
+    assert __mind_load_i8(mask + 1) == 0, "banana loses the tie-break";
+    __mind_free(mask);
+    __mind_free(ids);
+    __mind_free(scores);
+    __mind_free(sbuf);
 }
 
 #[test]
 fn test_top_k_mask_agrees_with_extract_top_k() {
-    // THE EQUIVALENCE that index recovery must preserve: the set of routes
-    // the mask flips is exactly the set of RouteIds extract_top_k returns,
-    // at the same catalog positions. Carrying the index through the heap
-    // (rather than re-deriving it by scanning catalog.ids) may not change
-    // this for any input.
-    let scores = [4, 9, 1, 9, 7, 2, 7, 0].map(|v| q16(v));
-    let ids    = ["r0","r1","r2","r3","r4","r5","r6","r7"];
-    let catalog = make_catalog(ids, scores);
-    let k: u32 = 4;
-
-    let top:  TopK  = extract_top_k(scores_tensor(scores), catalog, k);
-    let mask: [u8]  = extract_top_k_mask(scores_tensor(scores), catalog, k);
-
-    assert_eq!(mask_popcount(mask), top.ids.len(),
-               "mask popcount must equal the number of top-K survivors");
-
-    // Every RouteId extract_top_k returned must be flipped in the mask at its
-    // own catalog index — and nothing else may be.
-    for t in 0..top.ids.len() {
-        let mut found: bool = false;
-        for r in 0..ids.len() {
-            if top.ids[t] == route_id_of(ids[r]) {
-                assert_eq!(mask[r], 1u8,
-                           "route selected by extract_top_k must be set in the mask");
-                found = true;
-            }
-        }
-        assert!(found, "every top-K RouteId must exist in the catalog");
+    // THE equivalence index recovery must preserve: the set of positions the
+    // mask flips is exactly the set of route ids extract_top_k returns.
+    // scores [4,9,1,9,7,2,7,0], k=4.
+    let ids: i64 = __mind_alloc(256);
+    let scores: i64 = __mind_alloc(64);
+    let sbuf: i64 = __mind_alloc(16);
+    let mut i: i64 = 0;
+    while i < 8 {
+        tt_mkid(ids, i, sbuf, tt_str_r(sbuf, i));
+        i = i + 1;
     }
+    __mind_store_i64(scores + 0, 262144);
+    __mind_store_i64(scores + 8, 589824);
+    __mind_store_i64(scores + 16, 65536);
+    __mind_store_i64(scores + 24, 589824);
+    __mind_store_i64(scores + 32, 458752);
+    __mind_store_i64(scores + 40, 131072);
+    __mind_store_i64(scores + 48, 458752);
+    __mind_store_i64(scores + 56, 0);
+    let out_ids: i64 = __mind_alloc(128);
+    let out_scores: i64 = __mind_alloc(32);
+    let mask: i64 = __mind_alloc(8);
+
+    let n: i64 = extract_top_k(scores, ids, 8, 4, out_ids, out_scores);
+    extract_top_k_mask(scores, ids, 8, 4, mask);
+    assert n == 4, "four survivors";
+    assert tt_popcount(mask, 8) == n, "mask popcount equals survivor count";
+
+    let mut t: i64 = 0;
+    while t < n {
+        let mut found: i64 = 0;
+        let mut r: i64 = 0;
+        while r < 8 {
+            if tt_id_eq(out_ids + t * 32, ids + r * 32) == 1 {
+                assert __mind_load_i8(mask + r) == 1, "selected route set in mask at its own index";
+                found = 1;
+            }
+            r = r + 1;
+        }
+        assert found == 1, "every top-K route id exists in the catalog";
+        t = t + 1;
+    }
+    __mind_free(mask);
+    __mind_free(out_ids);
+    __mind_free(out_scores);
+    __mind_free(ids);
+    __mind_free(scores);
+    __mind_free(sbuf);
 }
 
 #[test]
 fn test_top_k_mask_determinism_100_runs() {
-    // Bit-identity: 100 invocations over a tie-heavy catalog must produce the
-    // exact same mask every time. Ties dominate, so this exercises the pinned
-    // heap order end-to-end (ingest -> eviction -> drain -> index recovery).
-    let s = q16(3);
-    let scores = [s, q16(9), s, s, q16(9), s, s, s];
-    let ids    = ["r0","r1","r2","r3","r4","r5","r6","r7"];
-    let catalog = make_catalog(ids, scores);
-
-    let reference: [u8] = extract_top_k_mask(scores_tensor(scores), catalog, 4);
-
-    for _ in 0..100 {
-        let mask: [u8] = extract_top_k_mask(scores_tensor(scores), catalog, 4);
-        assert_eq!(mask.len(), reference.len());
-        for i in 0..reference.len() {
-            assert_eq!(mask[i], reference[i],
-                       "extract_top_k_mask must be bit-identical across runs");
-        }
+    // Tie-heavy catalog: [3,9,3,3,9,3,3,3], k=4. 100 invocations must
+    // produce the exact same mask bytes every time.
+    let ids: i64 = __mind_alloc(256);
+    let scores: i64 = __mind_alloc(64);
+    let sbuf: i64 = __mind_alloc(16);
+    let mut i: i64 = 0;
+    while i < 8 {
+        tt_mkid(ids, i, sbuf, tt_str_r(sbuf, i));
+        i = i + 1;
     }
-}
+    __mind_store_i64(scores + 0, 196608);
+    __mind_store_i64(scores + 8, 589824);
+    __mind_store_i64(scores + 16, 196608);
+    __mind_store_i64(scores + 24, 196608);
+    __mind_store_i64(scores + 32, 589824);
+    __mind_store_i64(scores + 40, 196608);
+    __mind_store_i64(scores + 48, 196608);
+    __mind_store_i64(scores + 56, 196608);
+    let reference: i64 = __mind_alloc(8);
+    extract_top_k_mask(scores, ids, 8, 4, reference);
 
-// ---------------------------------------------------------------------------
-// TODO(P1.1.10): replace PLACEHOLDER_HASH_* after first green run.
-//
-// After Phase 1 implements extract_top_k and canonical_result_hash:
-// 1. Run `mindc test tests/unit/test_top_k.mind` with the real implementation.
-// 2. Capture the printed hex digests from each oracle assertion failure.
-// 3. Replace each PLACEHOLDER_HASH_* token below with the captured value.
-// 4. Commit as: "test: pin top-K bit-identity oracles (P1.1.10)"
-//
-// Oracle map (computed 2026-05-13 against canonical serialization spec):
-//   PLACEHOLDER_HASH_BASIC_K3        -> 2255a0eabacda7217582a570d39d7f4ee5f359d8252417abce86fe5e3f6df42c
-//   PLACEHOLDER_HASH_K_EQUALS_N      -> 20b61f31c994adb67941b42a8c5fedf53aec26cdec71d37edc9ba1abb86522ab
-//   PLACEHOLDER_HASH_K_EXCEEDS_N     -> 20b61f31c994adb67941b42a8c5fedf53aec26cdec71d37edc9ba1abb86522ab
-//   PLACEHOLDER_HASH_SINGLE_K1       -> dfb045eaca8d9b9b97546b180f2620b39f4a6c576fb01e903956e143e3f5aa7c
-//   PLACEHOLDER_HASH_TIEBREAK_TWO_TIED -> 34ecc49fe44d56a736e6acd6766f7381cacb8e845593be624fce91f2618f87fa
-//   PLACEHOLDER_HASH_ALL_TIED_K2     -> 51ea94f034c83a64fe76d0d7512b3d36dab1f516d2ec60c63e2605d30fe575da
-//   PLACEHOLDER_HASH_100_RUNS        -> 712b0abc728c6510421f273b1cacf10e504b5c0f8a6cd8a61334e9a5ee2898f2
-//   PLACEHOLDER_HASH_ORACLE_BASIC_K3 -> 2255a0eabacda7217582a570d39d7f4ee5f359d8252417abce86fe5e3f6df42c
-//   PLACEHOLDER_HASH_ORACLE_TIEBREAK -> 34ecc49fe44d56a736e6acd6766f7381cacb8e845593be624fce91f2618f87fa
-//   PLACEHOLDER_HASH_ORACLE_ALL_TIED -> 51ea94f034c83a64fe76d0d7512b3d36dab1f516d2ec60c63e2605d30fe575da
-//   PLACEHOLDER_HASH_ORACLE_NEGATIVE -> 32f8880454a3312615c33b4aadd6d4a279bff0992551dcbb23dd118c45d7ae98
-//   PLACEHOLDER_HASH_ULP_K1          -> bc7a9280a6c70566f8b92c23f37373a1bb6c8273f9166fc7eeaba2a71d9a3013
+    let mask: i64 = __mind_alloc(8);
+    let mut run: i64 = 0;
+    while run < 100 {
+        extract_top_k_mask(scores, ids, 8, 4, mask);
+        let mut b: i64 = 0;
+        while b < 8 {
+            let got: i64 = __mind_load_i8(mask + b);
+            let want: i64 = __mind_load_i8(reference + b);
+            assert got == want, "mask bit-identical across runs";
+            b = b + 1;
+        }
+        run = run + 1;
+    }
+    __mind_free(mask);
+    __mind_free(reference);
+    __mind_free(ids);
+    __mind_free(scores);
+    __mind_free(sbuf);
+}

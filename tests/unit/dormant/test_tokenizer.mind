@@ -1,0 +1,280 @@
+// BPE 32k tokenizer contract — Phase 1.2.
+//
+// Targets:
+//   - src/tokenizer.mind :: tokenize_bpe   (encode contract + error surface)
+//   - src/tokenizer.mind :: tokenizer_hash (placeholder hash stability)
+//
+// The merge table under test is the 32-entry placeholder defined in
+// `src/tokenizer.mind`. Real 32k merges land with the first reference
+// checkpoint; the determinism contract these tests exercise is invariant
+// across that transition (only the specific token-id outputs change).
+//
+// Determinism: every assertion is over u32 / [u8; 32] equality. No
+// floating-point, no platform-dependent ordering.
+
+use crate::mind_nerve::MAX_REQUEST_TOKENS;
+use crate::mind_nerve::VOCAB_SIZE;
+use crate::mind_nerve::tokenizer::{
+    tokenize_bpe,
+    tokenizer_hash,
+    TokenizeError,
+    BPE_BASE_VOCAB,
+    BPE_TOTAL_VOCAB,
+    BPE_MERGE_COUNT,
+};
+
+// ---------------------------------------------------------------------------
+// Section 1 — Vocabulary parameter parity
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_bpe_base_vocab_is_byte_range() {
+    // Property: byte-level base occupies exactly the byte range 0..255.
+    // Any drift here breaks the OOV-free guarantee.
+    assert_eq!(BPE_BASE_VOCAB, 256_u32);
+}
+
+#[test]
+fn test_bpe_total_vocab_matches_global_vocab_size() {
+    // Property: the tokenizer's view of total vocabulary size matches the
+    // global `VOCAB_SIZE` constant from `lib.mind`. The two constants live
+    // in different modules so the model surface and tokenizer surface can
+    // be audited independently — but they MUST agree byte-for-byte.
+    assert_eq!(BPE_TOTAL_VOCAB, VOCAB_SIZE);
+    assert_eq!(BPE_TOTAL_VOCAB, 32768_u32);
+}
+
+#[test]
+fn test_bpe_merge_count_placeholder_size() {
+    // Property: the placeholder ships exactly 32 merges. When the real
+    // 32k table lands this assertion is the canary that flags the
+    // transition — bump it to (BPE_TOTAL_VOCAB - BPE_BASE_VOCAB) = 32512.
+    assert_eq!(BPE_MERGE_COUNT, 32_u32);
+}
+
+// ---------------------------------------------------------------------------
+// Section 2 — Error surface
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_tokenize_empty_input_rejected() {
+    // Property: empty bytes -> InputEmpty. The tokenizer refuses empty
+    // input explicitly so callers cannot accidentally hash an empty
+    // preimage into request_hash.
+    let empty: [u8] = [];
+    let got = tokenize_bpe(empty.as_slice());
+    match got {
+        Err(TokenizeError::InputEmpty) => {},
+        _ => panic!("expected InputEmpty"),
+    }
+}
+
+#[test]
+fn test_tokenize_too_long_rejected() {
+    // Property: input longer than MAX_REQUEST_TOKENS bytes is rejected
+    // before any merge work happens. Byte-level init produces one token
+    // per byte, so 1025 bytes -> 1025 initial tokens -> TooLong.
+    let n: usize = (MAX_REQUEST_TOKENS as usize) + 1;
+    let mut over: [u8] = [];
+    let mut i: usize = 0;
+    while i < n {
+        over.push(0x41_u8);   // 'A' — no merge rule applies to repeated 'A'
+        i = i + 1;
+    }
+    let got = tokenize_bpe(over.as_slice());
+    match got {
+        Err(TokenizeError::TooLong) => {},
+        _ => panic!("expected TooLong"),
+    }
+}
+
+#[test]
+fn test_tokenize_exact_cap_accepted() {
+    // Property: input of exactly MAX_REQUEST_TOKENS bytes whose tokens
+    // do not collide with any merge rule passes through unchanged. 'A'
+    // (0x41) appears nowhere in the placeholder merge table, so the
+    // tokenizer never collapses any adjacent pair.
+    let n: usize = MAX_REQUEST_TOKENS as usize;
+    let mut at_cap: [u8] = [];
+    let mut i: usize = 0;
+    while i < n {
+        at_cap.push(0x41_u8);
+        i = i + 1;
+    }
+    let got = tokenize_bpe(at_cap.as_slice()).expect("at-cap input should succeed");
+    assert_eq!(got.len(), n);
+}
+
+// ---------------------------------------------------------------------------
+// Section 3 — Encode behaviour
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_tokenize_single_ascii_byte_is_identity() {
+    // Property: a single byte produces a single token whose id equals
+    // the byte value. The merge loop has nothing to do on a 1-token
+    // sequence (no adjacent pair exists).
+    let one: [u8] = [0x41_u8];   // 'A'
+    let got = tokenize_bpe(one.as_slice()).expect("single byte should succeed");
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0], 0x41_u32);
+}
+
+#[test]
+fn test_tokenize_no_merge_applies_is_byte_identity() {
+    // Property: when no placeholder merge rule applies, the output is
+    // exactly the byte stream cast to u32. 'A' (0x41) and 'B' (0x42)
+    // both appear in no rule.
+    let input: [u8] = [0x41_u8, 0x42_u8, 0x41_u8, 0x42_u8];
+    let got = tokenize_bpe(input.as_slice()).expect("AB-only should succeed");
+    assert_eq!(got.len(), 4);
+    assert_eq!(got[0], 0x41_u32);
+    assert_eq!(got[1], 0x42_u32);
+    assert_eq!(got[2], 0x41_u32);
+    assert_eq!(got[3], 0x42_u32);
+}
+
+#[test]
+fn test_tokenize_repeated_double_letter_merges() {
+    // Property: "ll" (0x6C 0x6C) is at placeholder rank 16, learned id
+    // 256+16 = 272. Encoding "ll" must collapse both bytes into a
+    // single learned token.
+    let input: [u8] = [0x6C_u8, 0x6C_u8];   // "ll"
+    let got = tokenize_bpe(input.as_slice()).expect("'ll' should succeed");
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0], 272_u32);
+}
+
+#[test]
+fn test_tokenize_two_independent_merges() {
+    // Property: "llss" has two non-overlapping merges — "ll" (rank 16,
+    // id 272) and "ss" (rank 17, id 273). Both must fire; the final
+    // token stream is [272, 273].
+    //
+    // The encode order matters for the audit: BPE applies the
+    // lowest-rank merge first (here "ll" at rank 16, then "ss" at
+    // rank 17). The output is invariant to that order because the
+    // pairs do not overlap, but the determinism contract requires the
+    // specific scan order — this test pins it.
+    let input: [u8] = [0x6C_u8, 0x6C_u8, 0x73_u8, 0x73_u8];   // "llss"
+    let got = tokenize_bpe(input.as_slice()).expect("'llss' should succeed");
+    assert_eq!(got.len(), 2);
+    assert_eq!(got[0], 272_u32);
+    assert_eq!(got[1], 273_u32);
+}
+
+#[test]
+fn test_tokenize_leftmost_position_wins_for_same_merge() {
+    // Property: when the same merge rule applies at multiple positions,
+    // the leftmost position fires first. "lllll" (5 'l' bytes) — the
+    // "ll" rule (rank 16, id 272) applies at positions 0, 1, 2, 3.
+    // Leftmost-first iteration: collapse (0,1) -> [272, l, l, l]; then
+    // the rule no longer matches at position 0 (272 != 0x6C); leftmost
+    // remaining match is (1,2) on the original-coordinate residue,
+    // i.e., the first 'l' pair in [l, l, l]; collapse to
+    // [272, 272, l]; then no more matches. Final length = 3.
+    let input: [u8] = [0x6C_u8, 0x6C_u8, 0x6C_u8, 0x6C_u8, 0x6C_u8];   // "lllll"
+    let got = tokenize_bpe(input.as_slice()).expect("'lllll' should succeed");
+    assert_eq!(got.len(), 3);
+    assert_eq!(got[0], 272_u32);
+    assert_eq!(got[1], 272_u32);
+    assert_eq!(got[2], 0x6C_u32);
+}
+
+#[test]
+fn test_tokenize_output_length_within_cap() {
+    // Property: every successful tokenize_bpe output has length
+    // ≤ MAX_REQUEST_TOKENS. Test a mix of merge-friendly and
+    // merge-hostile inputs.
+    let inputs: [[u8]; 3] = [
+        [0x41_u8, 0x42_u8, 0x43_u8],                                       // "ABC"
+        [0x6C_u8, 0x6C_u8, 0x73_u8, 0x73_u8, 0x65_u8, 0x65_u8],            // "llssee"
+        [0x20_u8, 0x74_u8, 0x68_u8, 0x65_u8, 0x20_u8, 0x61_u8, 0x74_u8],   // " the at"
+    ];
+    let mut i: usize = 0;
+    while i < 3 {
+        let got = tokenize_bpe(inputs[i].as_slice()).expect("non-empty input should succeed");
+        assert!(got.len() <= (MAX_REQUEST_TOKENS as usize));
+        assert!(got.len() >= 1);
+        i = i + 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Section 4 — Determinism
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_tokenize_deterministic_across_calls() {
+    // Property: tokenize_bpe is a pure function of its input. Running it
+    // twice on the same input MUST produce byte-identical output. This is
+    // the core bit-identity contract that makes the tokenizer safe to
+    // hash into request_hash in the envelope.
+    let input: [u8] = [
+        0x20_u8, 0x74_u8, 0x68_u8, 0x65_u8,   // " the"
+        0x20_u8, 0x61_u8, 0x74_u8,            // " at"
+        0x6C_u8, 0x6C_u8,                     // "ll"
+    ];
+    let a = tokenize_bpe(input.as_slice()).expect("first call should succeed");
+    let b = tokenize_bpe(input.as_slice()).expect("second call should succeed");
+    assert_eq!(a.len(), b.len());
+    let mut i: usize = 0;
+    while i < a.len() {
+        assert_eq!(a[i], b[i]);
+        i = i + 1;
+    }
+}
+
+#[test]
+fn test_tokenize_distinct_inputs_distinct_outputs() {
+    // Property: different inputs that exercise different merge rules
+    // must NOT collapse to the same output. Defence against a bug where
+    // the splice path overwrites with a constant id.
+    let in_a: [u8] = [0x6C_u8, 0x6C_u8];                       // "ll" -> [272]
+    let in_b: [u8] = [0x73_u8, 0x73_u8];                       // "ss" -> [273]
+    let a = tokenize_bpe(in_a.as_slice()).expect("a should succeed");
+    let b = tokenize_bpe(in_b.as_slice()).expect("b should succeed");
+    assert_eq!(a.len(), 1);
+    assert_eq!(b.len(), 1);
+    assert!(a[0] != b[0]);
+}
+
+// ---------------------------------------------------------------------------
+// Section 5 — tokenizer_hash
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_tokenizer_hash_is_32_bytes() {
+    // Property: tokenizer_hash returns a [u8; 32] value. This is the
+    // type-level contract for ModelWeights.tokenizer_hash.
+    let h: [u8; 32] = tokenizer_hash();
+    let _len_check: usize = 32;
+    // Touch every byte so a stub returning a zero-length array would
+    // crash compilation rather than silently pass.
+    let mut sum: u32 = 0_u32;
+    let mut i: usize = 0;
+    while i < 32 {
+        sum = sum + (h[i] as u32);
+        i = i + 1;
+    }
+    // The placeholder preimage is 12 + 8*32 = 268 bytes; SHA-256 of any
+    // non-empty preimage is overwhelmingly unlikely to be all-zero. Treat
+    // an all-zero result as a regression to the stub state.
+    assert!(sum > 0_u32);
+}
+
+#[test]
+fn test_tokenizer_hash_is_stable_across_calls() {
+    // Property: tokenizer_hash is pure of its constant inputs and must
+    // return the byte-identical value on every call. NOTE — the specific
+    // byte pattern is NOT stable across Phase 1.2 commits (see
+    // src/tokenizer.mind header). This test pins the within-build
+    // stability, not the cross-build stability.
+    let h1: [u8; 32] = tokenizer_hash();
+    let h2: [u8; 32] = tokenizer_hash();
+    let mut i: usize = 0;
+    while i < 32 {
+        assert_eq!(h1[i], h2[i]);
+        i = i + 1;
+    }
+}

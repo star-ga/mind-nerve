@@ -1,0 +1,35 @@
+// tests/harness/rt_stub.mind — pure-MIND stand-in for the runtime_ffi
+// extern "C" surface, used ONLY by the run-harness images.
+//
+// Why this exists: the full-stack merged image (needed to execute the
+// composed inference pipeline) includes src/runtime_ffi.mind, whose
+// extern "C" declarations make mindc embed the whole single-file image as
+// a runtime-JIT fallback (E2024) — and `mindc run` fail-closed refuses to
+// execute a fallback entry module. Substituting this stub lets the harness
+// build a REAL native ELF and execute the pipeline end-to-end.
+//
+// Scope discipline: the stub replaces ONLY the host-FFI layer (clock /
+// stdin / stdout / stderr / file / entropy / exit), which the unit-gated
+// parse/compose paths never call. The production surface keeps the real
+// extern "C" declarations in src/runtime_ffi.mind (gated by mindc check
+// in leg 9). This is a test double for the host boundary, not a stub of
+// any ported semantics.
+
+pub const RT_OK: i64 = 0;
+pub const RT_ERR_IO: i64 = -1;
+pub const RT_ERR_UNSUPPORTED: i64 = -2;
+
+pub fn rt_monotonic_ns() -> i64 { return 0; }
+pub fn rt_read_stdin(buf: i64, cap: i64) -> i64 { return RT_ERR_UNSUPPORTED; }
+pub fn rt_write_stdout(buf: i64, len: i64) -> i64 { return RT_ERR_UNSUPPORTED; }
+pub fn rt_write_stderr(buf: i64, len: i64) -> i64 { return RT_ERR_UNSUPPORTED; }
+pub fn rt_file_size(path: i64, path_len: i64) -> i64 { return RT_ERR_UNSUPPORTED; }
+pub fn rt_read_file(path: i64, path_len: i64, buf: i64, cap: i64) -> i64 { return RT_ERR_UNSUPPORTED; }
+pub fn rt_os_entropy(buf: i64, len: i64) -> i64 { return RT_ERR_UNSUPPORTED; }
+pub fn rt_exit(code: i64) -> i64 { return code; }
+pub fn rt_is_err(rc: i64) -> i64 { if rc < 0 { return 1; } 0 }
+pub fn rt_read_complete(bytes_read: i64, probed_size: i64) -> i64 {
+    if bytes_read < 0 { return 0; }
+    if bytes_read == probed_size { return 1; }
+    0
+}

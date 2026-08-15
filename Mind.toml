@@ -23,21 +23,18 @@ license = "Apache-2.0"
 # spec/numerics.md for the per-op reduction-order contract.
 
 [mind]
-# Pinned to the toolchain surface that compiles the current source tree.
+# STATUS (2026-08-10): the sources listed below are QUARANTINED under
+# src/dormant/ and tests/unit/dormant/ — they target a dialect no shipping
+# mindc ever accepted (see src/dormant/README.md for the per-file port
+# table). This manifest describes the PORT TARGET for the pure-MIND
+# migration, not a currently buildable configuration; the live CI gate for
+# the .mind tree is tests/mindc_gate.sh against mind/Mind.toml.
 #
-# Floor (0.5.0): the std-surface era — pure-MIND std.vec / std.string /
-# std.map / std.io baked into mindc (RFC 0005 Phase C), `use std.*`
-# import resolution, and first-class Q16.16 (RFC 0001) — exactly what
-# mind-nerve's source tree consumes. Earlier versions reject the
-# qualified `use` paths and emulate Q16.16 through scalar math.
-#
-# Ceiling (0.8.0, exclusive): pre-allocates one major-minor of headroom
-# above the current shipping series so routine mindc upgrades stay
-# inside the manifest without a release cycle. Attribute surface is
-# unified on the single canonical `#[name]` form (RFC 0012); bare
-# `[name]` at item position is no longer an attribute.
-mindc-min    = "0.5.0"
-mindc-max    = "0.8.0"
+# Pins describe the port-target toolchain: mindc 0.10.2 is the first
+# release whose project-mode resolver name-checks fn bodies (mind#23) and
+# on which the mind/ kernel tree compiles clean (tests/mindc_gate.sh).
+mindc-min    = "0.10.2"
+mindc-max    = "0.11.0"
 spec-version = "1.0"
 
 # IR contract — mind-nerve compiles to mic@1 textual IR and is consumed

@@ -1,0 +1,221 @@
+// Session-scoped attestation envelope chain log.
+//
+// Audit anchor: Phase 1.3 — closes the "chain-of-one" gap in
+// `src/inference.mind` where `chain_prev` was previously hard-wired to
+// `[0u8; 32]` because there was no place to remember the SHA-256 of the
+// previous envelope. With a ChainLog threaded through preselect, every
+// envelope's `chain_prev` is the *previous* envelope's chain_curr, and
+// `evidence::verify_chain` can walk the full sequence end-to-end.
+//
+// DISCIPLINE
+//
+// - The first envelope minted in a session has `chain_prev = zeros32`.
+// - Every subsequent envelope's `chain_prev` equals SHA-256 of the
+//   previous envelope's 212-byte serialized form (= the previous
+//   envelope's `chain_curr`).
+// - There is no "reset" inside a session. A reset is a new session
+//   (i.e. construct a new `ChainLog`). The cryptographic chain is NOT
+//   forked by `ChainResetReason` metadata — that lives on the envelope
+//   itself; the log only knows about hash bytes.
+// - `session_id` is pinned for the life of the ChainLog. It is NOT
+//   serialized into the envelope (the v2 wire layout has no slot for
+//   it) — it is a host-local diagnostic for log correlation across
+//   tenants and replays.
+//
+// NO-ALLOC HOT PATH
+//
+// `append` takes the envelope as a fixed-size 212-byte reference,
+// hashes it with the streaming SHA-256 primitive in `src/sha256.mind`,
+// stores the resulting 32-byte digest in-place inside the ChainLog,
+// and returns it by value. The only memory the hot path touches beyond
+// the ChainLog itself is the SHA-256 internal state (a 64-byte stack
+// buffer + 8 u32 words + a u64 length counter — see `src/sha256.mind`).
+// No heap allocation, no Vec growth.
+
+use crate::mind_nerve::ATTESTATION_BYTES;
+use crate::mind_nerve::sha256::sha256;
+use crate::mind_nerve::clock;
+
+// ---------------------------------------------------------------------------
+// Public type
+// ---------------------------------------------------------------------------
+
+// Session-scoped state holder. One ChainLog per host inference session.
+//
+// Fields are public so verifiers and diagnostics can read the current
+// digest and counters without an accessor pyramid. They MUST be treated
+// as read-only by callers — mutation goes exclusively through `append`.
+// (MIND has no `pub(read)` modifier today; pattern is documented here.)
+pub struct ChainLog {
+    // SHA-256 of the most recently appended envelope (i.e. the value
+    // that the NEXT envelope's `chain_prev` field MUST equal). Initial
+    // value is the all-zero hash, matching the "first envelope in chain"
+    // convention pinned by `src/evidence.mind` and the §3 multi-link
+    // test in `tests/unit/test_evidence.mind`.
+    pub last_chain_curr: [u8; 32],
+
+    // Monotonic count of envelopes appended in this session. Never
+    // resets while the ChainLog lives. u64 is comfortably wider than
+    // any plausible per-session envelope count (10^10 envelopes/s for
+    // 58 years before wrap).
+    pub envelopes_emitted: u64,
+
+    // 128-bit session identifier. Pinned at construction and never
+    // mutated. NotBitIdentical when produced by `new_session` (reads
+    // OS entropy or a process-start timestamp); BitIdentical when
+    // produced by `new_session_with_id` (test-fixture path).
+    pub session_id: [u8; 16],
+}
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+// Zero hash sentinel used for `last_chain_curr` at session start and
+// returned by `chain_prev_for_next` before the first append. Matches
+// the "chain_prev = zeros if first envelope" convention in
+// `src/evidence.mind` §"verify_chain".
+const ZERO_HASH_32: [u8; 32] = [0u8; 32];
+
+// All-zero session id, used as a deterministic seed when
+// `getrandom` is unavailable and the monotonic clock has not yet
+// advanced. Real production callers should always get a non-zero
+// id from `new_session` because `monotonic_now_ms` is strictly
+// monotonic per process.
+const ZERO_SESSION_ID: [u8; 16] = [0u8; 16];
+
+// ---------------------------------------------------------------------------
+// Public constructors
+// ---------------------------------------------------------------------------
+
+// Production entry point. Derives a fresh `session_id` from OS entropy
+// when available; falls through to the first 16 bytes of
+// `sha256(monotonic_now_ms() as i64 little-endian bytes)` when entropy
+// is not wired on the active backend.
+//
+// NotBitIdentical: by construction. Two invocations of `new_session()`
+// on the same host produce different session_ids. The envelope wire
+// format does not include session_id, so this does not affect
+// envelope bit-identity across replays.
+@[determinism(NotBitIdentical)]
+pub fn new_session() -> ChainLog {
+    let id: [u8; 16] = derive_session_id();
+    ChainLog {
+        last_chain_curr:   ZERO_HASH_32,
+        envelopes_emitted: 0u64,
+        session_id:        id,
+    }
+}
+
+// Test-fixture entry point. The caller pins the session_id, which makes
+// every downstream `chain_prev` value bit-identical across runs.
+// Production hosts MUST NOT use this — the session_id is meant to be
+// per-session unique for tenant-correlation purposes.
+@[determinism(BitIdentical)]
+pub fn new_session_with_id(session_id: [u8; 16]) -> ChainLog {
+    ChainLog {
+        last_chain_curr:   ZERO_HASH_32,
+        envelopes_emitted: 0u64,
+        session_id:        session_id,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public hot-path API
+// ---------------------------------------------------------------------------
+
+// Read-only accessor: the value that the NEXT envelope's `chain_prev`
+// field MUST equal. Before the first append, this is `ZERO_HASH_32`
+// (the "first envelope in chain" sentinel). After every append, this
+// is the SHA-256 of the most recently appended envelope's 212-byte
+// serialized form.
+//
+// Callers MUST invoke `chain_prev_for_next(log)` BEFORE calling
+// `evidence::emit_inference(...)` and pass the returned hash as the
+// `chain_prev` argument. After `emit_inference` produces the 212-byte
+// envelope, callers MUST invoke `append(log, &envelope_bytes)` so the
+// log's `last_chain_curr` advances. The two calls bracket envelope
+// construction; reversing the order produces a chain-broken sequence.
+@[determinism(BitIdentical)]
+pub fn chain_prev_for_next(log: &ChainLog) -> [u8; 32] {
+    log.last_chain_curr
+}
+
+// Append an envelope to the log. Computes SHA-256 over the 212-byte
+// serialized envelope, stores the digest in `log.last_chain_curr`, and
+// increments `log.envelopes_emitted`. Returns the digest so callers
+// that care about the chain_curr value (e.g. external observers) can
+// see it without re-reading the log.
+//
+// Invariants:
+//   - On entry, `log.last_chain_curr` is the chain_prev of `envelope_bytes`.
+//     (Caller is responsible for this discipline; the log itself does
+//      not parse the envelope to verify.)
+//   - On return, `log.last_chain_curr` is the chain_curr of
+//     `envelope_bytes` (i.e. the chain_prev of the NEXT envelope).
+//   - `log.envelopes_emitted` has incremented by exactly 1.
+//   - `log.session_id` is unchanged.
+//
+// No allocation: the SHA-256 streaming buffer is on the stack inside
+// `sha256(...)`. The input is consumed by-reference; the digest is
+// stored in-place inside `log`.
+@[determinism(BitIdentical)]
+pub fn append(
+    log:            &mut ChainLog,
+    envelope_bytes: &[u8; ATTESTATION_BYTES as usize],
+) -> [u8; 32] {
+    // sha256 takes a &[u8]; the fixed-size reference coerces directly.
+    let chain_curr: [u8; 32] = sha256(envelope_bytes);
+    log.last_chain_curr   = chain_curr;
+    log.envelopes_emitted = log.envelopes_emitted + 1u64;
+    chain_curr
+}
+
+// Diagnostic: number of envelopes appended in this session. Never
+// decreases. Returns u64.
+@[determinism(BitIdentical)]
+pub fn count(log: &ChainLog) -> u64 {
+    log.envelopes_emitted
+}
+
+// ---------------------------------------------------------------------------
+// Private helpers
+// ---------------------------------------------------------------------------
+
+// Probe order for session_id derivation:
+//   1. mind-runtime `getrandom` (preferred on every backend that has it).
+//   2. SHA-256 of monotonic_now_ms (Phase-1.3 portable fallback).
+//
+// The `cfg(has_getrandom)` switch is set by mindc based on the active
+// backend manifest. CPU and CUDA backends have getrandom wired; WebGPU
+// does not as of Phase 1.
+fn derive_session_id() -> [u8; 16] {
+    #[cfg(has_getrandom)]
+    {
+        let mut id: [u8; 16] = [0u8; 16];
+        crate::std::random::getrandom(&mut id);
+        return id;
+    }
+    #[cfg(not(has_getrandom))]
+    {
+        let ms: i64 = clock::monotonic_now_ms();
+        let mut buf: [u8; 8] = [0u8; 8];
+        let u: u64 = ms as u64;
+        buf[0] = (u         & 0xFFu64) as u8;
+        buf[1] = ((u >> 8)  & 0xFFu64) as u8;
+        buf[2] = ((u >> 16) & 0xFFu64) as u8;
+        buf[3] = ((u >> 24) & 0xFFu64) as u8;
+        buf[4] = ((u >> 32) & 0xFFu64) as u8;
+        buf[5] = ((u >> 40) & 0xFFu64) as u8;
+        buf[6] = ((u >> 48) & 0xFFu64) as u8;
+        buf[7] = ((u >> 56) & 0xFFu64) as u8;
+        let digest: [u8; 32] = sha256(&buf);
+        let mut id: [u8; 16] = [0u8; 16];
+        let mut i: usize = 0;
+        while i < 16 {
+            id[i] = digest[i];
+            i = i + 1;
+        }
+        return id;
+    }
+}

@@ -62,10 +62,20 @@
 // Reduction order is inherited from each called kernel (documented in
 // their respective files). The driver itself only sequences kernel calls.
 //
-// No f32. No while. LUT imports: luts.softmax_q16 (via A1.1).
+// No f32. No while. Kernel/LUT imports below. mindc 0.10.2 name-checks
+// fn bodies (mind#23), so every cross-module callee needs its module
+// declared here — v0.4.4's single-file mode never checked fn bodies and
+// tolerated the undeclared deps.
 
 import std.vec;
 import luts.softmax_q16;
+import kernels.batched_matmul_q16;
+import kernels.embedding_q16;
+import kernels.gelu_q16;
+import kernels.l2_norm_q16;
+import kernels.layernorm_q16;
+import kernels.matmul_q16;
+import kernels.sliding_window;
 
 // ---------------------------------------------------------------------------
 // Architectural constants

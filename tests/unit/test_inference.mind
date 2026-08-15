@@ -1,310 +1,438 @@
-// Forward-path wiring: score_against_routes + preselect_pre_tokenized.
+// tests/unit/test_inference.mind — end-to-end preselect suite for
+// src/inference.mind (wave 4, 2026-08-12).
 //
-// Targets:
-//   - src/model.mind :: score_against_routes  (Part A, scoring head)
-//   - src/inference.mind :: preselect_pre_tokenized (Part B, orchestration)
-//   - src/inference.mind :: InferenceError    (Part C, error surface)
+// Ported from tests/unit/dormant/test_inference.mind over the handle ABI.
+// Runs through `mindc test` on a COMPLETE merged image (pinned luts +
+// src/lib + src/q16_16 + src/encoder_kernels + src/model + src/runtime_ffi
+// + src/sha256 + src/top_k + src/tokenizer + src/evidence + src/chain_log
+// + src/loader + src/inference + this file), driven by tests/mindc_gate.sh
+// leg 15 with an exact-count assertion — a "running 0 tests" output FAILS
+// the gate.
 //
-// Bit-identity contract (spec/numerics.md §"Pinned reductions"):
-//   score_against_routes[b, r] MUST equal q16_dot_pinned(query[b], routes[r])
-//   for every (b, r). Any vectorised lowering that produces a different byte
-//   pattern violates E_NERVE_001 (forward-path matmul) and E_NERVE_003
-//   (Q16.16 saturating MAC).
+// ORACLE PROVENANCE (CPython hashlib, computed 2026-08-12). Fixture: zero
+// weights, 3-route catalog with ids SHA-256("a"/"b"/"c"), zero embeddings,
+// zero prior, catalog-hash fixture 0x03*32, model 0x01*32 / tokenizer
+// 0x02*32 fixtures, k=2, ts=1000, arch=x86_64, wire=2:
+//   tokens [5,6,7]:
+//     request_hash  2e4c4603cb0dea8636f8e802bfa0f24caef5f9943377f91d89fd6fbd9577cd1c
+//     result_hash   e304894fab101e73f57e6274db924135597d74bdc35bb2f8300443812727587c
+//     chain_curr    fe6bade0e1f13c81fe6bb93689b624505f5d83bab80b189ceae9ba61d412e4b1
+//   bytes "AB" (tokens [65,66]):
+//     request_hash  e3d6ccee318fc8372e4396daa62213a829aadec40d289a56478b159979b46ffe
+//     chain_curr    1cb2be0e9c484551d2762565bcbea0b2cc3dd0b5ebdd5a8a43566be1ca1a18fc
+// All-tied zero logits make the SHA-256 route-id tie-break the sole
+// discriminator: sha order c < b < a, so k=2 selects [c, b].
 //
-// Q16.16 encoding: integer value V encodes as (V << 16) in i32.
+// ASSERT-EAGERNESS (r9 hazard): all results let-bound before asserts.
 
-use crate::mind_nerve::{
-    Q16_16,
-    ENCODER_HIDDEN,
-    ROUTE_EMBEDDING_DIM,
-    MAX_TOP_K,
-    MAX_REQUEST_TOKENS,
-    ATTESTATION_BYTES,
-};
-use crate::mind_nerve::model;
-use crate::mind_nerve::model::score_against_routes;
-use crate::mind_nerve::inference::{
-    preselect_pre_tokenized,
-    preselect_pre_tokenized_stateless,
-    InferenceError,
-    PreselectResult,
-    RouteCatalog,
-    UniqueRouteCatalog,
-    RouteId,
-    ModelWeights,
-};
-use crate::mind_nerve::q16_16::q16_dot_pinned;
-use crate::mind_nerve::sha256::sha256;
+// ── helpers (in_ prefix) ────────────────────────────────────────────────────
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-// q16(v): encode integer v as Q16.16 i32. Works for negative v.
-fn q16(v: i32) -> Q16_16 {
-    v << 16
-}
-
-// Build a [1, ENCODER_HIDDEN] tensor with a single non-zero at index `i`,
-// value q16(scale).
-fn one_hot_query(i: usize, scale: i32) -> tensor<Q16_16, [1, ENCODER_HIDDEN]> {
-    let mut row: [Q16_16; ENCODER_HIDDEN] = [0_i32; ENCODER_HIDDEN];
-    row[i] = q16(scale);
-    [row]
-}
-
-// Build a num_routes x ROUTE_EMBEDDING_DIM tensor where row r holds value
-// q16(r+1) at index `i` (matching the one_hot_query slot) and zero elsewhere.
-fn diagonal_routes(num_routes: usize, i: usize) -> tensor<Q16_16, [num_routes, ROUTE_EMBEDDING_DIM]> {
-    let mut t: tensor<Q16_16, [num_routes, ROUTE_EMBEDDING_DIM]> =
-        [[0_i32; ROUTE_EMBEDDING_DIM]; num_routes];
-    let mut r: usize = 0;
-    while r < num_routes {
-        t[r][i] = q16((r as i32) + 1_i32);
-        r = r + 1;
+fn in_zero(dst: i64, n: i64) -> i64 {
+    let mut i: i64 = 0;
+    while i < n {
+        __mind_store_i64(dst + i * 8, 0);
+        i = i + 1;
     }
+    0
+}
+
+fn in_fill8(dst: i64, n: i64, c: i64) -> i64 {
+    let mut i: i64 = 0;
+    while i < n {
+        __mind_store_i8(dst + i, c);
+        i = i + 1;
+    }
+    0
+}
+
+fn in_word(out: i64, w: i64) -> i64 {
+    let b0: i64 = __mind_load_i8(out + w * 4) & 255;
+    let b1: i64 = __mind_load_i8(out + w * 4 + 1) & 255;
+    let b2: i64 = __mind_load_i8(out + w * 4 + 2) & 255;
+    let b3: i64 = __mind_load_i8(out + w * 4 + 3) & 255;
+    b0 * 16777216 + b1 * 65536 + b2 * 256 + b3
+}
+
+fn in_check8(out: i64, w0: i64, w1: i64, w2: i64, w3: i64, w4: i64, w5: i64, w6: i64, w7: i64) -> i64 {
+    if in_word(out, 0) != w0 { return 1; }
+    if in_word(out, 1) != w1 { return 2; }
+    if in_word(out, 2) != w2 { return 3; }
+    if in_word(out, 3) != w3 { return 4; }
+    if in_word(out, 4) != w4 { return 5; }
+    if in_word(out, 5) != w5 { return 6; }
+    if in_word(out, 6) != w6 { return 7; }
+    if in_word(out, 7) != w7 { return 8; }
+    0
+}
+
+// The 3-route fixture catalog handle: ids = sha256("a"/"b"/"c"), zero
+// embeddings + prior, hash fixture 0x03*32.
+fn in_catalog() -> i64 {
+    let cat: i64 = __mind_alloc(5 * 8);
+    __mind_store_i64(cat + LOADER_CAT_N * 8, 3);
+    let ids: i64 = __mind_alloc(96);
+    let one: i64 = __mind_alloc(1);
+    __mind_store_i8(one, 97);
+    mn_sha256(one, 1, ids);
+    __mind_store_i8(one, 98);
+    mn_sha256(one, 1, ids + 32);
+    __mind_store_i8(one, 99);
+    mn_sha256(one, 1, ids + 64);
+    __mind_free(one);
+    __mind_store_i64(cat + LOADER_CAT_IDS * 8, ids);
+    let emb: i64 = __mind_alloc(3 * 256 * 8);
+    in_zero(emb, 3 * 256);
+    __mind_store_i64(cat + LOADER_CAT_EMB * 8, emb);
+    let prior: i64 = __mind_alloc(3 * 8);
+    in_zero(prior, 3);
+    __mind_store_i64(cat + LOADER_CAT_PRIOR * 8, prior);
+    let hash: i64 = __mind_alloc(32);
+    in_fill8(hash, 32, 3);
+    __mind_store_i64(cat + LOADER_CAT_HASH * 8, hash);
+    cat
+}
+
+// An all-zero 18-slot weight table with an 8-row embedding stand-in and an
+// all-alive head mask; mh = 0x01*32, th = 0x02*32. Matrix slots are full
+// [H, H] buffers — under-sized stand-ins pass the interpreter (OOB reads
+// return 0 there) but segfault native execution; found 2026-08-15 via the
+// run-harness bisect.
+fn in_weights(mh: i64, th: i64) -> i64 {
+    let wtab: i64 = __mind_alloc(18 * 8);
+    let emb: i64 = __mind_alloc(8 * 256 * 8);
+    in_zero(emb, 8 * 256);
+    __mind_store_i64(wtab + 0, emb);
+    let mut slot: i64 = 1;
+    while slot < 17 {
+        let layer_slot: i64 = (slot - 1) % 7;
+        let mut buf: i64 = 0;
+        if layer_slot < 4 {
+            buf = __mind_alloc(256 * 256 * 8);   // wq/wk/wv/wo matrices
+            in_zero(buf, 256 * 256);
+        } else {
+            buf = __mind_alloc(256 * 8);         // ln_gain/ln_bias/gate
+            in_zero(buf, 256);
+        }
+        __mind_store_i64(wtab + slot * 8, buf);
+        slot = slot + 1;
+    }
+    let mask: i64 = __mind_alloc(1);
+    __mind_store_i8(mask, 255);
+    __mind_store_i64(wtab + 17 * 8, mask);
+    in_fill8(mh, 32, 1);
+    in_fill8(th, 32, 2);
+    wtab
+}
+
+fn in_tokens567() -> i64 {
+    let t: i64 = __mind_alloc(3 * 8);
+    __mind_store_i64(t + 0, 5);
+    __mind_store_i64(t + 8, 6);
+    __mind_store_i64(t + 16, 7);
     t
 }
 
-// Build a fully-zero ModelWeights. The encoder bodies in model.mind require
-// the full weight manifest, so for tests that exercise the orchestration
-// layer without running the encoder we set ENCODER_HIDDEN to 0 weights —
-// the encoder still runs (over zero input) and produces zeros, which is
-// what we want for purely-orchestration tests.
-fn zero_model_weights() -> ModelWeights {
-    ModelWeights {
-        encoder:        model::EncoderWeights::zeros(),
-        model_hash:     [0u8; 32],
-        tokenizer_hash: [0u8; 32],
-    }
-}
-
-// Build a 2-route catalog from two distinct external ids, with zero embeddings.
-fn two_route_catalog() -> RouteCatalog {
-    let ids: [str; 2] = ["alpha", "beta"];
-    let scores: [Q16_16; 2] = [0_i32, 0_i32];
-    UniqueRouteCatalog::new(ids, scores).unwrap().as_catalog()
-}
-
-// ---------------------------------------------------------------------------
-// Part A: score_against_routes — shape + bit-identity to q16_dot_pinned.
-// ---------------------------------------------------------------------------
+// ── gates ───────────────────────────────────────────────────────────────────
 
 #[test]
-fn score_against_routes_shape_matches_inputs() {
-    let query  = one_hot_query(0, 1);
-    let routes = diagonal_routes(4, 0);
-
-    let logits = score_against_routes(query, routes);
-
-    assert logits.len() == 1, "batch dim preserved";
-    assert logits[0].len() == 4, "num_routes dim equals route table rows";
+fn test_infer_error_codes_pinned() {
+    assert INF_ERR_INVALID_K == -1, "InvalidK";
+    assert INF_ERR_TOO_LONG == -2, "RequestTooLong";
+    assert INF_ERR_EMPTY_CATALOG == -3, "EmptyCatalog";
+    assert INF_ERR_MODEL_MISMATCH == -4, "ModelMismatch";
+    assert INF_ERR_ENVELOPE == -5, "EnvelopeBuildFailed";
 }
 
 #[test]
-fn score_against_routes_dot_identity_one_hot() {
-    // query is e_0 * 1.0; routes[r][0] = (r+1). So logits[0, r] = (r+1).
-    let query  = one_hot_query(0, 1);
-    let routes = diagonal_routes(5, 0);
+fn test_infer_k_gate() {
+    let exp_h: i64 = exp_q16_init();
+    let rsqrt_h: i64 = rsqrt_q16_init();
+    let cat: i64 = in_catalog();
+    let mh: i64 = __mind_alloc(32);
+    let th: i64 = __mind_alloc(32);
+    let wtab: i64 = in_weights(mh, th);
+    let log: i64 = chain_log_new_with_id(mh);
+    let t: i64 = in_tokens567();
+    let oi: i64 = __mind_alloc(64);
+    let os: i64 = __mind_alloc(16);
+    let oe: i64 = __mind_alloc(212);
 
-    let logits = score_against_routes(query, routes);
-
-    let mut r: usize = 0;
-    while r < 5 {
-        let expected: Q16_16 = q16((r as i32) + 1_i32);
-        assert logits[0][r] == expected,
-            "logits[0, r] must equal route's diagonal value under one-hot query";
-        r = r + 1;
-    }
+    let r0: i64 = infer_preselect_pre_tokenized(t, 3, cat, wtab, mh, th, 0, 1000, mh, 0, log, exp_h, rsqrt_h, oi, os, oe);
+    let r65: i64 = infer_preselect_pre_tokenized(t, 3, cat, wtab, mh, th, 65, 1000, mh, 0, log, exp_h, rsqrt_h, oi, os, oe);
+    assert r0 == INF_ERR_INVALID_K, "k=0 rejected";
+    assert r65 == INF_ERR_INVALID_K, "k=65 rejected";
+    let cnt: i64 = chain_log_count(log);
+    assert cnt == 0, "no envelope minted on gate failures";
+    __mind_free(oe);
+    __mind_free(os);
+    __mind_free(oi);
+    __mind_free(t);
+    chain_log_free(log);
+    __mind_free(wtab);
+    __mind_free(th);
+    __mind_free(mh);
+    __mind_free(cat);
+    __mind_free(rsqrt_h);
+    __mind_free(exp_h);
 }
 
 #[test]
-fn score_against_routes_pinned_matches_q16_dot_pinned() {
-    // Bit-identity oracle: every (b, r) entry must equal a direct
-    // q16_dot_pinned call. This is the lint anchor for E_NERVE_001.
-    let mut q_row: [Q16_16; ENCODER_HIDDEN] = [0_i32; ENCODER_HIDDEN];
-    let mut k: usize = 0;
-    while k < ENCODER_HIDDEN {
-        // Alternating signs at modest magnitude — exercises q16_add
-        // saturation path without overflowing.
-        if (k & 1) == 0 {
-            q_row[k] = q16(((k as i32) % 7_i32) + 1_i32);
-        } else {
-            q_row[k] = q16(-(((k as i32) % 5_i32) + 1_i32));
-        }
-        k = k + 1;
-    }
-    let query: tensor<Q16_16, [1, ENCODER_HIDDEN]> = [q_row];
+fn test_infer_empty_catalog_gate() {
+    let exp_h: i64 = exp_q16_init();
+    let rsqrt_h: i64 = rsqrt_q16_init();
+    let cat: i64 = in_catalog();
+    __mind_store_i64(cat + LOADER_CAT_N * 8, 0);   // empty it
+    let mh: i64 = __mind_alloc(32);
+    let th: i64 = __mind_alloc(32);
+    let wtab: i64 = in_weights(mh, th);
+    let log: i64 = chain_log_new_with_id(mh);
+    let t: i64 = in_tokens567();
+    let oi: i64 = __mind_alloc(64);
+    let os: i64 = __mind_alloc(16);
+    let oe: i64 = __mind_alloc(212);
 
-    let num_routes: usize = 3;
-    let mut routes: tensor<Q16_16, [num_routes, ROUTE_EMBEDDING_DIM]> =
-        [[0_i32; ROUTE_EMBEDDING_DIM]; num_routes];
-    let mut r: usize = 0;
-    while r < num_routes {
-        let mut j: usize = 0;
-        while j < ROUTE_EMBEDDING_DIM {
-            routes[r][j] = q16((((j + r) as i32) % 11_i32) - 5_i32);
-            j = j + 1;
-        }
-        r = r + 1;
-    }
-
-    let logits = score_against_routes(query, routes);
-
-    let mut rr: usize = 0;
-    while rr < num_routes {
-        let expected: Q16_16 = q16_dot_pinned(&q_row, &routes[rr]);
-        assert logits[0][rr] == expected,
-            "score_against_routes must be bit-identical to q16_dot_pinned per (b, r)";
-        rr = rr + 1;
-    }
+    let rc: i64 = infer_preselect_pre_tokenized(t, 3, cat, wtab, mh, th, 2, 1000, mh, 0, log, exp_h, rsqrt_h, oi, os, oe);
+    assert rc == INF_ERR_EMPTY_CATALOG, "empty catalog rejected";
+    __mind_free(oe);
+    __mind_free(os);
+    __mind_free(oi);
+    __mind_free(t);
+    chain_log_free(log);
+    __mind_free(wtab);
+    __mind_free(th);
+    __mind_free(mh);
+    __mind_free(cat);
+    __mind_free(rsqrt_h);
+    __mind_free(exp_h);
 }
 
 #[test]
-fn score_against_routes_zero_query_yields_zeros() {
-    let query: tensor<Q16_16, [1, ENCODER_HIDDEN]> = [[0_i32; ENCODER_HIDDEN]];
-    let routes = diagonal_routes(8, 3);
+fn test_infer_token_cap_gate() {
+    let exp_h: i64 = exp_q16_init();
+    let rsqrt_h: i64 = rsqrt_q16_init();
+    let cat: i64 = in_catalog();
+    let mh: i64 = __mind_alloc(32);
+    let th: i64 = __mind_alloc(32);
+    let wtab: i64 = in_weights(mh, th);
+    let log: i64 = chain_log_new_with_id(mh);
+    let big: i64 = __mind_alloc(1025 * 8);
+    let oi: i64 = __mind_alloc(64);
+    let os: i64 = __mind_alloc(16);
+    let oe: i64 = __mind_alloc(212);
 
-    let logits = score_against_routes(query, routes);
-
-    let mut r: usize = 0;
-    while r < 8 {
-        assert logits[0][r] == 0_i32, "zero query yields zero scores everywhere";
-        r = r + 1;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Part C: InferenceError surface on preselect_pre_tokenized.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn preselect_rejects_k_zero() {
-    let catalog = two_route_catalog();
-    let weights = zero_model_weights();
-    let tokens: [u32; 1] = [42u32];
-
-    let result = preselect_pre_tokenized_stateless(&tokens, &catalog, &weights, 0u32);
-
-    match result {
-        Err(InferenceError::InvalidK) => { /* expected */ }
-        _ => { assert false, "k == 0 must yield InvalidK"; }
-    }
+    let rc: i64 = infer_preselect_pre_tokenized(big, 1025, cat, wtab, mh, th, 2, 1000, mh, 0, log, exp_h, rsqrt_h, oi, os, oe);
+    assert rc == INF_ERR_TOO_LONG, "1025 tokens rejected";
+    __mind_free(oe);
+    __mind_free(os);
+    __mind_free(oi);
+    __mind_free(big);
+    chain_log_free(log);
+    __mind_free(wtab);
+    __mind_free(th);
+    __mind_free(mh);
+    __mind_free(cat);
+    __mind_free(rsqrt_h);
+    __mind_free(exp_h);
 }
 
 #[test]
-fn preselect_rejects_k_above_max() {
-    let catalog = two_route_catalog();
-    let weights = zero_model_weights();
-    let tokens: [u32; 1] = [42u32];
+fn test_infer_model_pin_gate() {
+    // The pin lives on the full preselect path (dormant structure).
+    let exp_h: i64 = exp_q16_init();
+    let rsqrt_h: i64 = rsqrt_q16_init();
+    let cat: i64 = in_catalog();
+    let mh: i64 = __mind_alloc(32);
+    let th: i64 = __mind_alloc(32);
+    let wtab: i64 = in_weights(mh, th);
+    let log: i64 = chain_log_new_with_id(mh);
+    let wrong: i64 = __mind_alloc(32);
+    in_fill8(wrong, 32, 255);
+    let bytes: i64 = __mind_alloc(2);
+    __mind_store_i8(bytes, 65);
+    __mind_store_i8(bytes + 1, 66);
+    let oi: i64 = __mind_alloc(64);
+    let os: i64 = __mind_alloc(16);
+    let oe: i64 = __mind_alloc(212);
 
-    let result = preselect_pre_tokenized_stateless(&tokens, &catalog, &weights, MAX_TOP_K + 1u32);
+    let rbad: i64 = infer_preselect(bytes, 2, cat, wtab, mh, th, 2, 1000, wrong, 1, log, exp_h, rsqrt_h, oi, os, oe);
+    assert rbad == INF_ERR_MODEL_MISMATCH, "wrong expected model hash refused";
+    let cnt: i64 = chain_log_count(log);
+    assert cnt == 0, "no envelope minted on pin failure";
+    __mind_free(oe);
+    __mind_free(os);
+    __mind_free(oi);
+    __mind_free(bytes);
+    __mind_free(wrong);
+    chain_log_free(log);
+    __mind_free(wtab);
+    __mind_free(th);
+    __mind_free(mh);
+    __mind_free(cat);
+    __mind_free(rsqrt_h);
+    __mind_free(exp_h);
+}
 
-    match result {
-        Err(InferenceError::InvalidK) => { /* expected */ }
-        _ => { assert false, "k > MAX_TOP_K must yield InvalidK"; }
+// ── end-to-end (zero-weight fixture, hashlib-pinned) ────────────────────────
+// ── end-to-end scenarios ──────────────────────────────────────────────────
+// Mirrored natively by tests/harness/inference_main.mind (leg 15c): the
+// native ELF execution is the stronger evidence; these interpreter cases
+// pin the same oracles. Box discipline: bindings hoisted, return values
+// captured via direct heap stores, asserts read heap/hoisted state (see
+// header note on interpreter hazards).
+
+#[test]
+fn test_infer_end_to_end_oracle() {
+    let exp_h: i64 = exp_q16_init();
+    let rsqrt_h: i64 = rsqrt_q16_init();
+    let cat: i64 = in_catalog();
+    let mh: i64 = __mind_alloc(32);
+    let th: i64 = __mind_alloc(32);
+    let wtab: i64 = in_weights(mh, th);
+    let zid: i64 = __mind_alloc(16);
+    in_fill8(zid, 16, 0);
+    let log: i64 = chain_log_new_with_id(zid);
+    let t: i64 = in_tokens567();
+    let oi: i64 = __mind_alloc(64);
+    let os: i64 = __mind_alloc(16);
+    let oe: i64 = __mind_alloc(212);
+    let oe2: i64 = __mind_alloc(212);
+    let zeros: i64 = __mind_alloc(32);
+    in_fill8(zeros, 32, 0);
+    let cc: i64 = __mind_alloc(32);
+    let cc2: i64 = __mind_alloc(32);
+    let n_box: i64 = __mind_alloc(8);
+    let n2_box: i64 = __mind_alloc(8);
+    let vrc_box: i64 = __mind_alloc(8);
+    let vrc2_box: i64 = __mind_alloc(8);
+    let cnt_box: i64 = __mind_alloc(8);
+    let cnt2_box: i64 = __mind_alloc(8);
+    let ids: i64 = __mind_load_i64(cat + LOADER_CAT_IDS * 8);
+    let d0: i64 = __mind_alloc(8);
+    let d1: i64 = __mind_alloc(8);
+
+    __mind_store_i64(n_box, infer_preselect_pre_tokenized(t, 3, cat, wtab, mh, th, 2, 1000, mh, 0, log, exp_h, rsqrt_h, oi, os, oe));
+    __mind_store_i64(vrc_box, evidence_verify(oe, 212, zeros, cc));
+    __mind_store_i64(cnt_box, chain_log_count(log));
+    __mind_store_i64(n2_box, infer_preselect_pre_tokenized(t, 3, cat, wtab, mh, th, 2, 1001, mh, 0, log, exp_h, rsqrt_h, oi, os, oe2));
+    __mind_store_i64(vrc2_box, evidence_verify(oe2, 212, cc, cc2));
+    __mind_store_i64(cnt2_box, chain_log_count(log));
+    let mut i: i64 = 0;
+    let mut x0: i64 = 0;
+    let mut x1: i64 = 0;
+    while i < 32 {
+        x0 = x0 | (__mind_load_i8(oi + i) ^ __mind_load_i8(ids + 64 + i));
+        x1 = x1 | (__mind_load_i8(oi + 32 + i) ^ __mind_load_i8(ids + 32 + i));
+        i = i + 1;
     }
+    __mind_store_i64(d0, x0);
+    __mind_store_i64(d1, x1);
+
+    assert __mind_load_i64(n_box) == 2, "k=2 returns 2 entries";
+    assert __mind_load_i64(d0) == 0, "first is route c (lowest sha)";
+    assert __mind_load_i64(d1) == 0, "second is route b";
+    assert __mind_load_i64(os) == 0, "score 0 first";
+    assert __mind_load_i64(os + 8) == 0, "score 0 second";
+    assert __mind_load_i64(vrc_box) == 0, "envelope verifies as chain start";
+    assert in_check8(oe + OFFSET_REQUEST_HASH, 776750595, 3406686854, 922281986, 3214996044, 2935355796, 863500573, 2315087805, 2507656476) == 0, "request_hash oracle";
+    assert in_check8(oe + OFFSET_RESULT_HASH, 3808725327, 2869960307, 4118700660, 3683795253, 1501394109, 3277566712, 805585793, 656889980) == 0, "result_hash oracle";
+    assert in_check8(cc, 4268469728, 3790683265, 4268472630, 2310415440, 1599964090, 3087734940, 3941186145, 3558007985) == 0, "chain_curr oracle (whole-envelope byte equality)";
+    assert __mind_load_i64(cnt_box) == 1, "chain log advanced";
+    assert __mind_load_i64(n2_box) == 2, "second inference ok";
+    assert __mind_load_i64(vrc2_box) == 0, "second envelope chains from the first";
+    assert __mind_load_i64(cnt2_box) == 2, "chain log at 2";
 }
 
 #[test]
-fn preselect_rejects_oversize_token_stream() {
-    let catalog = two_route_catalog();
-    let weights = zero_model_weights();
+fn test_infer_full_path_bytes_oracle() {
+    // bytes "AB" -> tokens [65, 66] through the BPE tokenizer, then the
+    // same zero-weight forward path.
+    let exp_h: i64 = exp_q16_init();
+    let rsqrt_h: i64 = rsqrt_q16_init();
+    let cat: i64 = in_catalog();
+    let mh: i64 = __mind_alloc(32);
+    let th: i64 = __mind_alloc(32);
+    let wtab: i64 = in_weights(mh, th);
+    let zid: i64 = __mind_alloc(16);
+    in_fill8(zid, 16, 0);
+    let log: i64 = chain_log_new_with_id(zid);
+    let bytes: i64 = __mind_alloc(2);
+    __mind_store_i8(bytes, 65);
+    __mind_store_i8(bytes + 1, 66);
+    let oi: i64 = __mind_alloc(64);
+    let os: i64 = __mind_alloc(16);
+    let oe: i64 = __mind_alloc(212);
+    let zeros: i64 = __mind_alloc(32);
+    in_fill8(zeros, 32, 0);
+    let cc: i64 = __mind_alloc(32);
+    let n_box: i64 = __mind_alloc(8);
+    let vrc_box: i64 = __mind_alloc(8);
 
-    // MAX_REQUEST_TOKENS + 1 tokens, all zero. Avoid running the encoder by
-    // tripping the length gate before forward compute.
-    let n: usize = (MAX_REQUEST_TOKENS as usize) + 1;
-    let mut tokens: [u32; n] = [0u32; n];
+    __mind_store_i64(n_box, infer_preselect(bytes, 2, cat, wtab, mh, th, 2, 1000, mh, 0, log, exp_h, rsqrt_h, oi, os, oe));
+    __mind_store_i64(vrc_box, evidence_verify(oe, 212, zeros, cc));
 
-    let result = preselect_pre_tokenized_stateless(&tokens, &catalog, &weights, 1u32);
-
-    match result {
-        Err(InferenceError::RequestTooLong) => { /* expected */ }
-        _ => { assert false, "len > MAX_REQUEST_TOKENS must yield RequestTooLong"; }
-    }
+    assert __mind_load_i64(n_box) == 2, "full path returns 2";
+    assert in_check8(oe + OFFSET_REQUEST_HASH, 3822505198, 831506487, 776181466, 2787251112, 699064004, 220764758, 1200297369, 2041868286) == 0, "full-path request_hash oracle (tokens [65,66])";
+    assert __mind_load_i64(vrc_box) == 0, "envelope verifies";
+    assert in_check8(cc, 481476110, 2621982033, 3530958181, 3166609586, 3426603189, 3957152394, 1129737185, 3390707964) == 0, "full-path chain_curr oracle";
 }
 
 #[test]
-fn preselect_rejects_empty_catalog() {
-    let empty_catalog: RouteCatalog =
-        UniqueRouteCatalog::new([], []).unwrap().as_catalog();
-    let weights = zero_model_weights();
-    let tokens: [u32; 1] = [42u32];
+fn test_infer_stateless_is_chain_of_one() {
+    let exp_h: i64 = exp_q16_init();
+    let rsqrt_h: i64 = rsqrt_q16_init();
+    let cat: i64 = in_catalog();
+    let mh: i64 = __mind_alloc(32);
+    let th: i64 = __mind_alloc(32);
+    let wtab: i64 = in_weights(mh, th);
+    let t: i64 = in_tokens567();
+    let oi: i64 = __mind_alloc(64);
+    let os: i64 = __mind_alloc(16);
+    let oe1: i64 = __mind_alloc(212);
+    let oe2: i64 = __mind_alloc(212);
+    let zeros: i64 = __mind_alloc(32);
+    in_fill8(zeros, 32, 0);
+    let cc: i64 = __mind_alloc(32);
+    let n1_box: i64 = __mind_alloc(8);
+    let n2_box: i64 = __mind_alloc(8);
+    let v1_box: i64 = __mind_alloc(8);
+    let v2_box: i64 = __mind_alloc(8);
 
-    let result = preselect_pre_tokenized_stateless(&tokens, &empty_catalog, &weights, 1u32);
+    __mind_store_i64(n1_box, infer_preselect_pre_tokenized_stateless(t, 3, cat, wtab, mh, th, 2, 1000, mh, 0, exp_h, rsqrt_h, oi, os, oe1));
+    __mind_store_i64(n2_box, infer_preselect_pre_tokenized_stateless(t, 3, cat, wtab, mh, th, 2, 1000, mh, 0, exp_h, rsqrt_h, oi, os, oe2));
+    __mind_store_i64(v1_box, evidence_verify(oe1, 212, zeros, cc));
+    __mind_store_i64(v2_box, evidence_verify(oe2, 212, zeros, cc));
 
-    match result {
-        Err(InferenceError::EmptyCatalog) => { /* expected */ }
-        _ => { assert false, "empty catalog must yield EmptyCatalog"; }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Validation precedence — k checked before length, length before catalog.
-// ---------------------------------------------------------------------------
-//
-// Ordering matters: a request that is both oversize AND has bad k should
-// fail closed on k first, because k is the cheaper check and the field with
-// the most attacker leverage (it controls envelope.k which is wire-visible).
-// This regression-guards the InferenceError gate sequence in preselect().
-
-#[test]
-fn preselect_k_check_precedes_length_check() {
-    let catalog = two_route_catalog();
-    let weights = zero_model_weights();
-    let n: usize = (MAX_REQUEST_TOKENS as usize) + 1;
-    let mut tokens: [u32; n] = [0u32; n];
-
-    // k == 0 AND oversize tokens. Must report InvalidK, not RequestTooLong.
-    let result = preselect_pre_tokenized_stateless(&tokens, &catalog, &weights, 0u32);
-
-    match result {
-        Err(InferenceError::InvalidK) => { /* expected */ }
-        _ => { assert false, "k check must precede length check"; }
-    }
+    assert __mind_load_i64(n1_box) == 2, "first stateless call";
+    assert __mind_load_i64(n2_box) == 2, "second stateless call";
+    assert __mind_load_i64(v1_box) == 0, "first envelope is a chain start";
+    assert __mind_load_i64(v2_box) == 0, "second envelope is ALSO a chain start (chain-of-one)";
 }
 
 #[test]
-fn preselect_length_check_precedes_empty_catalog_check() {
-    let empty_catalog: RouteCatalog =
-        UniqueRouteCatalog::new([], []).unwrap().as_catalog();
-    let weights = zero_model_weights();
-    let n: usize = (MAX_REQUEST_TOKENS as usize) + 1;
-    let mut tokens: [u32; n] = [0u32; n];
+fn test_infer_empty_bytes_maps_to_invalid_k() {
+    let exp_h: i64 = exp_q16_init();
+    let rsqrt_h: i64 = rsqrt_q16_init();
+    let cat: i64 = in_catalog();
+    let mh: i64 = __mind_alloc(32);
+    let th: i64 = __mind_alloc(32);
+    let wtab: i64 = in_weights(mh, th);
+    let log: i64 = chain_log_new_with_id(mh);
+    let bytes: i64 = __mind_alloc(1);
+    let oi: i64 = __mind_alloc(64);
+    let os: i64 = __mind_alloc(16);
+    let oe: i64 = __mind_alloc(212);
 
-    // Oversize tokens AND empty catalog. Must report RequestTooLong first.
-    let result = preselect_pre_tokenized_stateless(&tokens, &empty_catalog, &weights, 1u32);
-
-    match result {
-        Err(InferenceError::RequestTooLong) => { /* expected */ }
-        _ => { assert false, "length check must precede empty-catalog check"; }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Envelope shape — when the forward path runs, the envelope is exactly
-// ATTESTATION_BYTES (= 212) bytes. The byte-level field-by-field contract
-// lives in tests/unit/test_evidence.mind §1; here we only assert the size
-// and that we got an Ok result with a non-empty result list.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn preselect_envelope_is_212_bytes() {
-    let catalog = two_route_catalog();
-    let weights = zero_model_weights();
-    let tokens: [u32; 4] = [1u32, 2u32, 3u32, 4u32];
-
-    let result = preselect_pre_tokenized_stateless(&tokens, &catalog, &weights, 1u32);
-
-    match result {
-        Ok(pr) => {
-            assert pr.envelope.len() == (ATTESTATION_BYTES as usize),
-                "envelope must be exactly ATTESTATION_BYTES = 212 bytes";
-            assert pr.route_ids.len() == 1, "k == 1 yields one route id";
-            assert pr.scores.len() == 1,    "k == 1 yields one score";
-        }
-        Err(_) => {
-            assert false, "forward path must succeed on well-formed inputs";
-        }
-    }
+    let rc: i64 = infer_preselect(bytes, 0, cat, wtab, mh, th, 2, 1000, mh, 0, log, exp_h, rsqrt_h, oi, os, oe);
+    assert rc == INF_ERR_INVALID_K, "tokenizer InputEmpty maps to InvalidK";
+    __mind_free(oe);
+    __mind_free(os);
+    __mind_free(oi);
+    __mind_free(bytes);
+    chain_log_free(log);
+    __mind_free(wtab);
+    __mind_free(th);
+    __mind_free(mh);
+    __mind_free(cat);
+    __mind_free(rsqrt_h);
+    __mind_free(exp_h);
 }

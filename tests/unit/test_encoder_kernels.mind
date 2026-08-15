@@ -1,0 +1,424 @@
+// tests/unit/test_encoder_kernels.mind — sliding-window encoder kernel
+// suite for src/encoder_kernels.mind (wave 4, 2026-08-12).
+//
+// Ported from the kernel-level coverage in tests/unit/dormant/
+// test_encoder.mind, re-expressed over the handle ABI (flat row-major
+// i64-lane buffers; LUT handles threaded explicitly). Runs through
+// `mindc test` on a merged image (mind/luts/exp_q16.mind +
+// mind/luts/sqrt_q16.mind + src/lib.mind + src/q16_16.mind +
+// src/encoder_kernels.mind + this file), driven by tests/mindc_gate.sh
+// leg 12 with an exact-count assertion — a "running 0 tests" output FAILS
+// the gate.
+//
+// ORACLE DISCIPLINE: every numeric expectation below is an EXACT analytic
+// value (identity projections, constant vectors, unit dots), not a
+// reproduced-LUT recomputation. q16_mul truncates ((a*b)>>16) and
+// q16_dot_pinned accumulates via saturating q16_add, so the fixtures use
+// values whose products are exact in Q16.16.
+
+fn ek_fill(dst: i64, n: i64, v: i64) -> i64 {
+    let mut i: i64 = 0;
+    while i < n {
+        __mind_store_i64(dst + i * 8, v);
+        i = i + 1;
+    }
+    0
+}
+
+fn ek_zero(dst: i64, n: i64) -> i64 {
+    return ek_fill(dst, n, 0);
+}
+
+// Identity matrix in Q16.16 ([h, h] row-major): w[k][o] = ONE iff k == o.
+fn ek_identity(w: i64, h: i64) -> i64 {
+    ek_zero(w, h * h);
+    let mut k: i64 = 0;
+    while k < h {
+        __mind_store_i64(w + (k * h + k) * 8, 65536);
+        k = k + 1;
+    }
+    0
+}
+
+fn ek_buf_eq(a: i64, b: i64, n: i64) -> i64 {
+    let mut i: i64 = 0;
+    while i < n {
+        if __mind_load_i64(a + i * 8) != __mind_load_i64(b + i * 8) { return 0; }
+        i = i + 1;
+    }
+    1
+}
+
+fn ek_all_eq(a: i64, n: i64, v: i64) -> i64 {
+    let mut i: i64 = 0;
+    while i < n {
+        if __mind_load_i64(a + i * 8) != v { return 0; }
+        i = i + 1;
+    }
+    1
+}
+
+// ── const pins ──────────────────────────────────────────────────────────────
+
+#[test]
+fn test_ek_const_pins() {
+    assert NORMALIZATION_KIND == 0, "default LayerNorm";
+    assert POOLING_KIND == 0, "default mean pool";
+    assert POOL_LATENT_QUERIES == 1, "default single latent query";
+    assert ATTN_SCALE_Q16 == 8192, "1/sqrt(64) in Q16.16";
+    assert STRIDE_FP_ENABLED == 0, "adaptive stride off by default";
+    assert STRIDE_LOW == 96, "STRIDE_LOW";
+    assert STRIDE_MID == 192, "STRIDE_MID == ATTN_WINDOW_STRIDE";
+    assert STRIDE_HIGH == 256, "STRIDE_HIGH";
+    assert STRIDE_FP_WINDOW == 16, "fingerprint window";
+    assert NUM_SINK_TOKENS == 0, "sinks off by default";
+    assert HEAD_MASK_BYTES == 1, "2 layers x 4 heads = 8 bits = 1 byte";
+    assert HEAD_MASK_TOTAL_BITS == 8, "total bits";
+}
+
+// ── window math ─────────────────────────────────────────────────────────────
+
+#[test]
+fn test_ek_num_windows() {
+    assert num_windows(0) == 0, "empty";
+    assert num_windows(1) == 1, "single token";
+    assert num_windows(256) == 1, "exactly one window";
+    assert num_windows(257) == 2, "one token past the window";
+    assert num_windows(448) == 2, "256 + 192 exactly covered by 2";
+    assert num_windows(449) == 3, "one past stride boundary needs 3";
+    assert num_windows(1024) == 5, "cap length";
+}
+
+// ── RFC-003 stride fingerprint + dispatch ───────────────────────────────────
+
+#[test]
+fn test_ek_stride_fingerprint_sums_leading_dim_abs() {
+    // 16 positions, leading dim = -1.0 each: q16_abs accumulates 1.0 x 16.
+    let x: i64 = __mind_alloc(16 * 256 * 8);
+    ek_zero(x, 16 * 256);
+    let mut i: i64 = 0;
+    while i < 16 {
+        __mind_store_i64(x + i * 256 * 8, -65536);
+        i = i + 1;
+    }
+    let fp: i64 = compute_stride_fingerprint(x, 16);
+    assert fp == 1048576, "16 x 1.0 fingerprint";
+    let fp0: i64 = compute_stride_fingerprint(x, 0);
+    assert fp0 == 0, "empty sequence fingerprints 0";
+    __mind_free(x);
+}
+
+#[test]
+fn test_ek_select_stride_defaults_to_mid() {
+    // With the backwards-soft sentinel thresholds every fingerprint lands
+    // on STRIDE_MID (both strict comparisons are unreachable).
+    assert select_stride(0) == 192, "zero fingerprint";
+    assert select_stride(1048576) == 192, "typical fingerprint";
+    assert select_stride(2147483647) == 192, "T_HIGH itself is not > T_HIGH";
+    assert select_stride(-2147483648) == 192, "T_LOW itself is not < T_LOW";
+}
+
+// ── RFC-005 head mask bit math ──────────────────────────────────────────────
+
+#[test]
+fn test_ek_head_mask_bit_packing() {
+    // Read results are let-bound before each mask mutation (r9
+    // deferred-assert discipline); assertions run at the end.
+    let mask: i64 = __mind_alloc(1);
+    __mind_store_i8(mask, 255);
+    let a_l0h0: i64 = is_head_alive(mask, 0, 0);
+    let a_l1h3: i64 = is_head_alive(mask, 1, 3);
+    __mind_store_i8(mask, 0);
+    let n_l0h0: i64 = is_head_alive(mask, 0, 0);
+    let n_l1h3: i64 = is_head_alive(mask, 1, 3);
+    // 0x0F = layer 0 alive, layer 1 pruned.
+    __mind_store_i8(mask, 15);
+    let h_l0h3: i64 = is_head_alive(mask, 0, 3);
+    let h_l1h0: i64 = is_head_alive(mask, 1, 0);
+    // Out-of-range pairs return alive defensively.
+    __mind_store_i8(mask, 0);
+    let o_l2: i64 = is_head_alive(mask, 2, 0);
+    let o_h4: i64 = is_head_alive(mask, 0, 4);
+    assert a_l0h0 == 1, "all alive: L0H0";
+    assert a_l1h3 == 1, "all alive: L1H3";
+    assert n_l0h0 == 0, "none alive: L0H0";
+    assert n_l1h3 == 0, "none alive: L1H3";
+    assert h_l0h3 == 1, "layer 0 alive";
+    assert h_l1h0 == 0, "layer 1 pruned";
+    assert o_l2 == 1, "layer 2 out of range -> alive";
+    assert o_h4 == 1, "head 4 out of range -> alive";
+    __mind_free(mask);
+}
+
+// ── embedding lookup ────────────────────────────────────────────────────────
+
+#[test]
+fn test_ek_token_embedding_lookup_gathers_and_clamps() {
+    // 4-row table (stand-in for VOCAB_SIZE rows), row r filled with r.
+    let emb: i64 = __mind_alloc(4 * 256 * 8);
+    let mut r: i64 = 0;
+    while r < 4 {
+        ek_fill(emb + r * 256 * 8, 256, r * 65536);
+        r = r + 1;
+    }
+    let ids: i64 = __mind_alloc(4 * 8);
+    __mind_store_i64(ids + 0, 2);
+    __mind_store_i64(ids + 8, 0);
+    __mind_store_i64(ids + 16, 1);
+    __mind_store_i64(ids + 24, 99999);   // OOV -> clamps to row 0
+    let out: i64 = __mind_alloc(4 * 256 * 8);
+
+    token_embedding_lookup(ids, 4, emb, out);
+    assert ek_all_eq(out + 0, 256, 131072) == 1, "row 0 = table row 2";
+    assert ek_all_eq(out + 256 * 8, 256, 0) == 1, "row 1 = table row 0";
+    assert ek_all_eq(out + 2 * 256 * 8, 256, 65536) == 1, "row 2 = table row 1";
+    assert ek_all_eq(out + 3 * 256 * 8, 256, 0) == 1, "OOV clamps to row 0";
+    __mind_free(out);
+    __mind_free(ids);
+    __mind_free(emb);
+}
+
+// ── LN affine + prenorm ─────────────────────────────────────────────────────
+
+#[test]
+fn test_ek_apply_ln_affine_exact() {
+    // normed = [1.0, 2.0], gain = [1.0, 1.0], bias = [0, 1.0]
+    // -> [1.0, 3.0], all products exact.
+    let normed: i64 = __mind_alloc(2 * 8);
+    __mind_store_i64(normed + 0, 65536);
+    __mind_store_i64(normed + 8, 131072);
+    let gain: i64 = __mind_alloc(2 * 8);
+    ek_fill(gain, 2, 65536);
+    let bias: i64 = __mind_alloc(2 * 8);
+    __mind_store_i64(bias + 0, 0);
+    __mind_store_i64(bias + 8, 65536);
+    let out: i64 = __mind_alloc(2 * 8);
+
+    apply_ln_affine(normed, gain, bias, out, 2);
+    assert __mind_load_i64(out + 0) == 65536, "1.0 * 1.0 + 0";
+    assert __mind_load_i64(out + 8) == 196608, "2.0 * 1.0 + 1.0";
+    __mind_free(out);
+    __mind_free(bias);
+    __mind_free(gain);
+    __mind_free(normed);
+}
+
+#[test]
+fn test_ek_prenorm_of_constant_vector_is_bias() {
+    // A constant row has zero centered activations; LayerNorm maps it to
+    // (near-)zero and the affine leaves exactly bias. Two positions.
+    let rsqrt_h: i64 = rsqrt_q16_init();
+    let x: i64 = __mind_alloc(2 * 256 * 8);
+    ek_fill(x, 2 * 256, 196608);   // 3.0 everywhere
+    let gain: i64 = __mind_alloc(256 * 8);
+    ek_fill(gain, 256, 65536);
+    let bias: i64 = __mind_alloc(256 * 8);
+    ek_fill(bias, 256, 327680);    // 5.0
+    let out: i64 = __mind_alloc(2 * 256 * 8);
+
+    prenorm_seq(x, gain, bias, out, 2, rsqrt_h);
+    // centered = 0; 0 * rsqrt(eps) = 0; 0 * 1.0 + 5.0 = 5.0 exactly.
+    assert ek_all_eq(out, 2 * 256, 327680) == 1, "constant input -> bias exactly";
+    __mind_free(out);
+    __mind_free(bias);
+    __mind_free(gain);
+    __mind_free(x);
+    __mind_free(rsqrt_h);
+}
+
+// ── project_linear ──────────────────────────────────────────────────────────
+
+#[test]
+fn test_ek_project_linear_identity_is_exact() {
+    let w: i64 = __mind_alloc(256 * 256 * 8);
+    ek_identity(w, 256);
+    let x: i64 = __mind_alloc(3 * 256 * 8);
+    // Distinct exact-representable values per lane.
+    let mut i: i64 = 0;
+    while i < 3 * 256 {
+        __mind_store_i64(x + i * 8, (i % 7 - 3) * 131072);
+        i = i + 1;
+    }
+    let out: i64 = __mind_alloc(3 * 256 * 8);
+
+    project_linear(x, w, out, 3);
+    assert ek_buf_eq(out, x, 3 * 256) == 1, "identity projection is the input";
+    __mind_free(out);
+    __mind_free(x);
+    __mind_free(w);
+}
+
+#[test]
+fn test_ek_project_linear_double_is_double() {
+    // W = 2.0 * I: out = 2x exactly (q16_mul(2.0, v) = v << 1, no
+    // truncation for these fixtures).
+    let w: i64 = __mind_alloc(256 * 256 * 8);
+    ek_identity(w, 256);
+    let mut k: i64 = 0;
+    while k < 256 {
+        __mind_store_i64(w + (k * 256 + k) * 8, 131072);
+        k = k + 1;
+    }
+    let x: i64 = __mind_alloc(256 * 8);
+    ek_fill(x, 256, 65536);
+    let out: i64 = __mind_alloc(256 * 8);
+
+    project_linear(x, w, out, 1);
+    assert ek_all_eq(out, 256, 131072) == 1, "2I projection doubles";
+    __mind_free(out);
+    __mind_free(x);
+    __mind_free(w);
+}
+
+// ── sliding-window attention ────────────────────────────────────────────────
+
+#[test]
+fn test_ek_attention_zero_weights_zero_output() {
+    // Full pipeline shape check: zero Q/K/V/WO -> zero scores, uniform
+    // softmax, zero values -> zero attended -> zero output. n spans two
+    // windows' worth of the machinery in miniature.
+    let exp_h: i64 = exp_q16_init();
+    let n: i64 = 5;
+    let x: i64 = __mind_alloc(n * 256 * 8);
+    ek_fill(x, n * 256, 65536);
+    let w: i64 = __mind_alloc(256 * 256 * 8);
+    ek_zero(w, 256 * 256);
+    let mask: i64 = __mind_alloc(1);
+    __mind_store_i8(mask, 255);
+    let out: i64 = __mind_alloc(n * 256 * 8);
+    ek_fill(out, n * 256, 777);   // poison: must be fully overwritten
+
+    sliding_window_attention(x, w, w, w, w, 192, mask, 0, out, n, exp_h);
+    assert ek_all_eq(out, n * 256, 0) == 1, "zero weights -> zero attention";
+    __mind_free(out);
+    __mind_free(mask);
+    __mind_free(w);
+    __mind_free(x);
+    __mind_free(exp_h);
+}
+
+#[test]
+fn test_ek_attention_dead_heads_contribute_zero() {
+    // With an all-pruned mask the per-head body never runs: output equals
+    // the zero-buffer projection regardless of weights. Use identity
+    // weights so a live head WOULD produce non-zero output.
+    let exp_h: i64 = exp_q16_init();
+    let n: i64 = 3;
+    let x: i64 = __mind_alloc(n * 256 * 8);
+    ek_fill(x, n * 256, 65536);
+    let wi: i64 = __mind_alloc(256 * 256 * 8);
+    ek_identity(wi, 256);
+    let mask: i64 = __mind_alloc(1);
+    __mind_store_i8(mask, 0);   // every head dead
+    let out: i64 = __mind_alloc(n * 256 * 8);
+
+    sliding_window_attention(x, wi, wi, wi, wi, 192, mask, 0, out, n, exp_h);
+    assert ek_all_eq(out, n * 256, 0) == 1, "all heads pruned -> zero output";
+    __mind_free(out);
+    __mind_free(mask);
+    __mind_free(wi);
+    __mind_free(x);
+    __mind_free(exp_h);
+}
+
+// ── gated residual ──────────────────────────────────────────────────────────
+
+#[test]
+fn test_ek_gated_residual_gate_zero_is_half() {
+    // sigmoid(0) = 0.5 = 32768 exactly (exp(0) = 1.0, 1/(1+1) in Q16.16).
+    // out = in + 0.5 * attn; fixtures are even so the truncation is exact.
+    let exp_h: i64 = exp_q16_init();
+    let n: i64 = 2;
+    let lin: i64 = __mind_alloc(n * 256 * 8);
+    ek_fill(lin, n * 256, 65536);    // 1.0
+    let attn: i64 = __mind_alloc(n * 256 * 8);
+    ek_fill(attn, n * 256, 131072);  // 2.0
+    let gate: i64 = __mind_alloc(256 * 8);
+    ek_zero(gate, 256);
+    let out: i64 = __mind_alloc(n * 256 * 8);
+
+    gated_residual(lin, attn, gate, out, n, exp_h);
+    assert ek_all_eq(out, n * 256, 131072) == 1, "1.0 + 0.5 * 2.0 = 2.0";
+    __mind_free(out);
+    __mind_free(gate);
+    __mind_free(attn);
+    __mind_free(lin);
+    __mind_free(exp_h);
+}
+
+// ── pooling ─────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_ek_mean_pool_constant_rows_is_constant() {
+    let exp_h: i64 = exp_q16_init();
+    let x: i64 = __mind_alloc(4 * 256 * 8);
+    // dim 0 = 2.0, all other dims = -1.0; 4 identical rows.
+    ek_fill(x, 4 * 256, -65536);
+    let mut i: i64 = 0;
+    while i < 4 {
+        __mind_store_i64(x + i * 256 * 8, 131072);
+        i = i + 1;
+    }
+    let out: i64 = __mind_alloc(256 * 8);
+
+    mean_pool_seq_kernel(x, out, 4, exp_h);
+    assert __mind_load_i64(out) == 131072, "dim 0 pools to 2.0";
+    assert ek_all_eq(out + 8, 255, -65536) == 1, "other dims pool to -1.0";
+    __mind_free(out);
+    __mind_free(x);
+    __mind_free(exp_h);
+}
+
+#[test]
+fn test_ek_mean_pool_empty_is_zero() {
+    let exp_h: i64 = exp_q16_init();
+    let out: i64 = __mind_alloc(256 * 8);
+    ek_fill(out, 256, 999);
+    mean_pool_seq_kernel(0, out, 0, exp_h);
+    assert ek_all_eq(out, 256, 0) == 1, "empty sequence pools to zero";
+    __mind_free(out);
+    __mind_free(exp_h);
+}
+
+#[test]
+fn test_ek_attn_pool_single_position_is_identity() {
+    // n = 1: softmax over one score is exactly 1.0, so the pool returns
+    // the single row regardless of q_latent.
+    let exp_h: i64 = exp_q16_init();
+    let x: i64 = __mind_alloc(256 * 8);
+    let mut d: i64 = 0;
+    while d < 256 {
+        __mind_store_i64(x + d * 8, (d % 5 - 2) * 65536);
+        d = d + 1;
+    }
+    let ql: i64 = pool_q_latent_default();
+    let out: i64 = __mind_alloc(256 * 8);
+
+    attn_pool_seq_kernel(x, ql, out, 1, exp_h);
+    assert ek_buf_eq(out, x, 256) == 1, "single-position attention pool is the row";
+    __mind_free(out);
+    __mind_free(ql);
+    __mind_free(x);
+    __mind_free(exp_h);
+}
+
+#[test]
+fn test_ek_attn_pool_multi_r1_matches_single() {
+    // r = 1 multi-query pool divides by 1 * ONE_Q16_16 — identical to the
+    // single-query kernel (the RFC-014 backwards-soft equivalence).
+    let exp_h: i64 = exp_q16_init();
+    let x: i64 = __mind_alloc(2 * 256 * 8);
+    ek_fill(x, 2 * 256, 65536);
+    let ql: i64 = pool_q_latent_default();
+    let out_single: i64 = __mind_alloc(256 * 8);
+    let out_multi: i64 = __mind_alloc(256 * 8);
+
+    attn_pool_seq_kernel(x, ql, out_single, 2, exp_h);
+    attn_pool_seq_kernel_multi(x, ql, 1, out_multi, 2, exp_h);
+    assert ek_buf_eq(out_single, out_multi, 256) == 1, "r=1 multi == single";
+    __mind_free(out_multi);
+    __mind_free(out_single);
+    __mind_free(ql);
+    __mind_free(x);
+    __mind_free(exp_h);
+}

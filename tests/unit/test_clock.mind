@@ -1,0 +1,74 @@
+// tests/unit/test_clock.mind — monotonic clock suite for src/clock.mind
+// (wave 3, 2026-08-12).
+//
+// The host-clock path (clock_host_now_ms) is NOT executed under `mindc
+// test` — no host shim in the test interpreter. What IS gated: the pure
+// ns→ms conversion boundaries, the injection fixture, and the counter
+// fallback's per-handle strict monotonicity (the property chain
+// monotonicity rests on). Runs through `mindc test` on a merged image
+// (src/runtime_ffi.mind + src/clock.mind + this file), driven by
+// tests/mindc_gate.sh leg 10 with an exact-count assertion — a
+// "running 0 tests" output FAILS the gate.
+
+#[test]
+fn test_clock_ms_from_ns_boundaries() {
+    assert clock_ms_from_ns(0) == 0, "zero";
+    assert clock_ms_from_ns(999999) == 0, "sub-ms truncates";
+    assert clock_ms_from_ns(1000000) == 1, "exactly 1ms";
+    assert clock_ms_from_ns(2520000000) == 2520, "2.52s";
+    assert clock_ms_from_ns(1000001) == 1, "1ms + 1ns truncates down";
+}
+
+#[test]
+fn test_clock_injection_is_identity() {
+    assert clock_now_ms_with_injection(0) == 0, "inject 0";
+    assert clock_now_ms_with_injection(42) == 42, "inject 42";
+    assert clock_now_ms_with_injection(9223372036854775807) == 9223372036854775807, "inject i64 max";
+}
+
+#[test]
+fn test_clock_counter_starts_at_one_and_increments() {
+    let c: i64 = clock_counter_new();
+    let v1: i64 = clock_counter_next(c);
+    let v2: i64 = clock_counter_next(c);
+    let v3: i64 = clock_counter_next(c);
+    assert v1 == 1, "first call yields 1";
+    assert v2 == 2, "second call yields 2";
+    assert v3 == 3, "third call yields 3";
+    clock_counter_free(c);
+}
+
+#[test]
+fn test_clock_counter_strictly_increasing_long_run() {
+    // 1000 calls, each strictly greater than the previous — the property
+    // envelope chain monotonicity rests on.
+    let c: i64 = clock_counter_new();
+    let mut prev: i64 = 0;
+    let mut i: i64 = 0;
+    while i < 1000 {
+        let v: i64 = clock_counter_next(c);
+        assert v == prev + 1, "strictly increasing by exactly 1";
+        prev = v;
+        i = i + 1;
+    }
+    assert prev == 1000, "1000 calls -> 1000";
+    clock_counter_free(c);
+}
+
+#[test]
+fn test_clock_counters_are_independent() {
+    // Two handles never share state (the dormant ThreadLocal static would
+    // have been process-global; the handle design is per-session).
+    let a: i64 = clock_counter_new();
+    let b: i64 = clock_counter_new();
+    let a1: i64 = clock_counter_next(a);
+    let a2: i64 = clock_counter_next(a);
+    let b1: i64 = clock_counter_next(b);
+    let a3: i64 = clock_counter_next(a);
+    assert a1 == 1, "a: 1";
+    assert a2 == 2, "a: 2";
+    assert b1 == 1, "b starts at 1 independently";
+    assert a3 == 3, "a unaffected by b's calls";
+    clock_counter_free(b);
+    clock_counter_free(a);
+}

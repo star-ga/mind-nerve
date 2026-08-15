@@ -1,0 +1,236 @@
+// tests/unit/test_model.mind — encoder + scoring-head suite for
+// src/model.mind (wave 4, 2026-08-12).
+//
+// Runs through `mindc test` on a merged image (mind/luts/exp_q16.mind +
+// mind/luts/sqrt_q16.mind + src/lib.mind + src/q16_16.mind +
+// src/encoder_kernels.mind + src/model.mind + this file), driven by
+// tests/mindc_gate.sh leg 13 with an exact-count assertion — a
+// "running 0 tests" output FAILS the gate.
+//
+// ORACLE DISCIPLINE: exact analytic fixtures only (unit dots, zero-weight
+// compositions, the zero-vector L2 guard) — no LUT recomputation.
+
+fn md_zero(dst: i64, n: i64) -> i64 {
+    let mut i: i64 = 0;
+    while i < n {
+        __mind_store_i64(dst + i * 8, 0);
+        i = i + 1;
+    }
+    0
+}
+
+fn md_fill(dst: i64, n: i64, v: i64) -> i64 {
+    let mut i: i64 = 0;
+    while i < n {
+        __mind_store_i64(dst + i * 8, v);
+        i = i + 1;
+    }
+    0
+}
+
+// An all-zero 18-slot weight table (embedding, 2 x 7 layer blocks, final
+// gain/bias all zero-filled; head mask 0xFF). Matrix slots are full
+// [H, H] buffers — under-sizing them passes the interpreter (OOB reads
+// return 0 there) but segfaults native execution; found 2026-08-15 via
+// the run-harness bisect.
+fn md_zero_wtab() -> i64 {
+    let wtab: i64 = __mind_alloc(18 * 8);
+    let emb: i64 = __mind_alloc(4 * 256 * 8);   // small stand-in table
+    md_zero(emb, 4 * 256);
+    __mind_store_i64(wtab + 0, emb);
+    let mut slot: i64 = 1;
+    while slot < 17 {
+        let layer_slot: i64 = (slot - 1) % 7;
+        let mut buf: i64 = 0;
+        if layer_slot < 4 {
+            buf = __mind_alloc(256 * 256 * 8);   // wq/wk/wv/wo matrices
+            md_zero(buf, 256 * 256);
+        } else {
+            buf = __mind_alloc(256 * 8);         // ln_gain/ln_bias/gate
+            md_zero(buf, 256);
+        }
+        __mind_store_i64(wtab + slot * 8, buf);
+        slot = slot + 1;
+    }
+    let mask: i64 = __mind_alloc(1);
+    __mind_store_i8(mask, 255);
+    __mind_store_i64(wtab + 17 * 8, mask);
+    wtab
+}
+
+#[test]
+fn test_model_wtab_slots_pinned() {
+    assert MODEL_WTAB_SLOTS == 18, "18 slots";
+    assert MODEL_WTAB_EMBEDDING == 0, "embedding slot";
+    assert MODEL_WTAB_L0_WQ == 1, "layer 0 wq";
+    assert MODEL_WTAB_L0_GATE == 7, "layer 0 gate";
+    assert MODEL_WTAB_L1_WQ == 8, "layer 1 wq";
+    assert MODEL_WTAB_L1_GATE == 14, "layer 1 gate";
+    assert MODEL_WTAB_FINAL_GAIN == 15, "final gain";
+    assert MODEL_WTAB_FINAL_BIAS == 16, "final bias";
+    assert MODEL_WTAB_HEAD_MASK == 17, "head mask";
+    assert HEAD_MASK_BYTES == 1, "mask bytes re-exported";
+}
+
+#[test]
+fn test_model_encoder_zero_weights_zero_output() {
+    // End-to-end composition: all-zero weights map any token sequence to
+    // the zero activation (embedding zeros -> prenorm(0)+0 -> attention 0
+    // -> x + sigmoid(0)*0 = 0 -> final prenorm 0).
+    let exp_h: i64 = exp_q16_init();
+    let rsqrt_h: i64 = rsqrt_q16_init();
+    let wtab: i64 = md_zero_wtab();
+    let ids: i64 = __mind_alloc(3 * 8);
+    __mind_store_i64(ids + 0, 0);
+    __mind_store_i64(ids + 8, 1);
+    __mind_store_i64(ids + 16, 2);
+    let out: i64 = __mind_alloc(3 * 256 * 8);
+    md_fill(out, 3 * 256, 4242);   // poison
+
+    model_encoder(ids, 3, wtab, exp_h, rsqrt_h, out);
+    let mut i: i64 = 0;
+    while i < 3 * 256 {
+        assert __mind_load_i64(out + i * 8) == 0, "zero weights -> zero encoding";
+        i = i + 1;
+    }
+    __mind_free(out);
+    __mind_free(ids);
+    __mind_free(wtab);
+    __mind_free(rsqrt_h);
+    __mind_free(exp_h);
+}
+
+#[test]
+fn test_model_mean_pool_wrapper() {
+    let exp_h: i64 = exp_q16_init();
+    let x: i64 = __mind_alloc(4 * 256 * 8);
+    md_fill(x, 4 * 256, 98304);   // 1.5 everywhere
+    let out: i64 = __mind_alloc(256 * 8);
+    model_mean_pool(x, 4, exp_h, out);
+    let mut d: i64 = 0;
+    while d < 256 {
+        assert __mind_load_i64(out + d * 8) == 98304, "constant rows pool to the constant";
+        d = d + 1;
+    }
+    __mind_free(out);
+    __mind_free(x);
+    __mind_free(exp_h);
+}
+
+#[test]
+fn test_model_l2_normalize_zero_vector_is_zero() {
+    // The 1-ULP guard keeps the function total: rsqrt saturates huge, but
+    // q16_mul(0, huge) = 0 — the zero vector maps to itself.
+    let rsqrt_h: i64 = rsqrt_q16_init();
+    let pooled: i64 = __mind_alloc(256 * 8);
+    md_zero(pooled, 256);
+    let out: i64 = __mind_alloc(256 * 8);
+    md_fill(out, 256, 777);
+    model_l2_normalize_pooled(pooled, rsqrt_h, out);
+    let mut d: i64 = 0;
+    while d < 256 {
+        assert __mind_load_i64(out + d * 8) == 0, "zero vector normalizes to zero";
+        d = d + 1;
+    }
+    __mind_free(out);
+    __mind_free(pooled);
+    __mind_free(rsqrt_h);
+}
+
+#[test]
+fn test_model_l2_normalize_deterministic_across_calls() {
+    let rsqrt_h: i64 = rsqrt_q16_init();
+    let pooled: i64 = __mind_alloc(256 * 8);
+    md_fill(pooled, 256, 196608);   // 3.0
+    let a: i64 = __mind_alloc(256 * 8);
+    let b: i64 = __mind_alloc(256 * 8);
+    model_l2_normalize_pooled(pooled, rsqrt_h, a);
+    model_l2_normalize_pooled(pooled, rsqrt_h, b);
+    let mut d: i64 = 0;
+    while d < 256 {
+        assert __mind_load_i64(a + d * 8) == __mind_load_i64(b + d * 8), "bit-identical across calls";
+        d = d + 1;
+    }
+    __mind_free(b);
+    __mind_free(a);
+    __mind_free(pooled);
+    __mind_free(rsqrt_h);
+}
+
+#[test]
+fn test_model_score_against_routes_unit_dots() {
+    // pooled = [1.0, 0, ...]: score_r = routes[r][0] exactly.
+    let pooled: i64 = __mind_alloc(256 * 8);
+    md_zero(pooled, 256);
+    __mind_store_i64(pooled, 65536);
+    let routes: i64 = __mind_alloc(3 * 256 * 8);
+    md_zero(routes, 3 * 256);
+    __mind_store_i64(routes + 0, 65536);                 // route 0: 1.0
+    __mind_store_i64(routes + 256 * 8, 131072);          // route 1: 2.0
+    __mind_store_i64(routes + 2 * 256 * 8, -65536);      // route 2: -1.0
+    let out: i64 = __mind_alloc(3 * 8);
+
+    model_score_against_routes(pooled, routes, 3, out);
+    assert __mind_load_i64(out + 0) == 65536, "route 0 score 1.0";
+    assert __mind_load_i64(out + 8) == 131072, "route 1 score 2.0";
+    assert __mind_load_i64(out + 16) == -65536, "route 2 score -1.0";
+    __mind_free(out);
+    __mind_free(routes);
+    __mind_free(pooled);
+}
+
+#[test]
+fn test_model_score_prefix_dim_cap() {
+    // pooled = [1.0, 2.0, 0...], route = [3.0, 4.0, 0...]:
+    // cap 1 -> 3.0; cap 2 -> 11.0; cap 0 -> 0; cap 999 -> full-rank 11.0.
+    let pooled: i64 = __mind_alloc(256 * 8);
+    md_zero(pooled, 256);
+    __mind_store_i64(pooled + 0, 65536);
+    __mind_store_i64(pooled + 8, 131072);
+    let routes: i64 = __mind_alloc(256 * 8);
+    md_zero(routes, 256);
+    __mind_store_i64(routes + 0, 196608);
+    __mind_store_i64(routes + 8, 262144);
+    let out: i64 = __mind_alloc(8);
+
+    model_score_against_routes_prefix(pooled, routes, 1, 1, out);
+    let v1: i64 = __mind_load_i64(out);
+    model_score_against_routes_prefix(pooled, routes, 1, 2, out);
+    let v2: i64 = __mind_load_i64(out);
+    model_score_against_routes_prefix(pooled, routes, 1, 0, out);
+    let v0: i64 = __mind_load_i64(out);
+    model_score_against_routes_prefix(pooled, routes, 1, 999, out);
+    let vfull: i64 = __mind_load_i64(out);
+    assert v1 == 196608, "cap 1 -> 3.0";
+    assert v2 == 720896, "cap 2 -> 11.0";
+    assert v0 == 0, "cap 0 -> 0";
+    assert vfull == 720896, "cap >= dim -> full rank";
+    __mind_free(out);
+    __mind_free(routes);
+    __mind_free(pooled);
+}
+
+#[test]
+fn test_model_score_masked_fill_and_short_mask() {
+    let pooled: i64 = __mind_alloc(256 * 8);
+    md_zero(pooled, 256);
+    __mind_store_i64(pooled, 65536);
+    let routes: i64 = __mind_alloc(3 * 256 * 8);
+    md_zero(routes, 3 * 256);
+    __mind_store_i64(routes + 0, 65536);
+    __mind_store_i64(routes + 256 * 8, 131072);
+    __mind_store_i64(routes + 2 * 256 * 8, 196608);
+    let mask: i64 = __mind_alloc(2);   // deliberately short: route 2 uncovered
+    __mind_store_i8(mask + 0, 1);
+    __mind_store_i8(mask + 1, 0);
+    let out: i64 = __mind_alloc(3 * 8);
+
+    model_score_against_routes_masked(pooled, routes, 3, mask, 2, MIN_Q16_16, out);
+    assert __mind_load_i64(out + 0) == 65536, "selected route scored";
+    assert __mind_load_i64(out + 8) == MIN_Q16_16, "masked-out route filled";
+    assert __mind_load_i64(out + 16) == MIN_Q16_16, "uncovered route treated as masked out";
+    __mind_free(out);
+    __mind_free(mask);
+    __mind_free(routes);
+    __mind_free(pooled);
+}

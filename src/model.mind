@@ -1,446 +1,206 @@
-// Model: encoder + scoring head. No decoder.
+// Model: encoder + scoring head. No decoder. Ported to the mindc 0.10.2
+// dialect 2026-08-12 (wave 4 of the pure-MIND migration; the dormant
+// pre-port source is preserved at src/dormant/model.mind).
 //
-// Phase 1 (`v0.1.0-alpha.2`, 2026-05-16) — bodies fully implemented against
-// `encoder_kernels.mind` + `q16_16.mind`. The function signatures here are
-// the stability contract; the @[determinism(BitIdentical)] and
-// @[reduction_order(Pinned)] attributes constrain implementations such that
-// changing shape, dtype, or summation order constitutes an architecture
-// change, not a bug fix.
+// Architectural decision (spec/architecture.md, unchanged): a decoder
+// cross-attending to a fixed route table has identical expressive power to
+// a single matmul between a pooled query vector and the route table, at a
+// fraction of the FLOPs. The decoder is omitted; the scoring head is a
+// mean-pool plus direct dot-product against the route embeddings.
 //
-// Phase 2 work on this file is weight-format consumption: pulling Q16.16
-// imported weights through `loader.mind` and asserting cross-arch bit
-// identity against tasks #57 / #59. The kernels here do not change.
-//
-// Architectural decision (see spec/architecture.md):
-// A decoder cross-attending to a fixed route table has identical expressive
-// power to a single matmul between a pooled query vector and the route table,
-// at a fraction of the FLOPs. The decoder is therefore omitted; the scoring
-// head is a mean-pool plus direct dot-product against the route embeddings.
-
-use crate::mind_nerve::{
-    Q16_16,
-    ENCODER_LAYERS, ENCODER_HIDDEN, ENCODER_HEADS, ENCODER_HEAD_DIM,
-    ATTN_WINDOW_SIZE, ATTN_WINDOW_STRIDE,
-    VOCAB_SIZE, MAX_REQUEST_TOKENS, ROUTE_EMBEDDING_DIM,
-};
-use crate::mind_nerve::q16_16::{
-    q16_dot_pinned, q16_mul, q16_add, q16_rsqrt, Q16_LAYERNORM_EPSILON,
-};
-
-// Module-private helpers — sliding-window attention kernels, embedding lookup,
-// pre-norm, gated residual, mean-pool. Not part of the public stability
-// surface; deliberately not `pub mod`. The Q16.16 primitives those helpers
-// compose against (`q16_dot_pinned`, `q16_sum_pinned`, `q16_softmax`,
-// `q16_layernorm`, `q16_sigmoid_lut`) are imported inside `encoder_kernels.mind`
-// directly; model.mind does not call them.
-mod encoder_kernels;
-
-// Re-export RFC-005's HEAD_MASK_BYTES at the model module path so external
-// callers (`loader.mind`, tests) can size the bitmask field on
-// `EncoderWeights` without reaching into the private encoder_kernels
-// submodule. The constant is fully determined by the compile-time
-// ENCODER_LAYERS × ENCODER_HEADS parameters.
-pub use encoder_kernels::HEAD_MASK_BYTES;
-
 // Encoder: 2 layers (ENCODER_LAYERS), sliding-window self-attention
 // (window=256, stride=192), gated residual, no FFN sublayer.
 //
-// Determinism is enforced by mindc lint codes E_NERVE_001 (reduction order)
-// and E_NERVE_004 (window overlap-add summation order).
-@[determinism(BitIdentical)]
-@[reduction_order(Pinned)]
-@[attention_kind(SlidingWindow(window = ATTN_WINDOW_SIZE, stride = ATTN_WINDOW_STRIDE))]
-pub fn encoder(
-    token_ids:   tensor<u32, [batch, seq_len]>,
-    weights:     EncoderWeights,
-) -> tensor<Q16_16, [batch, seq_len, ENCODER_HIDDEN]>
-where
-    seq_len <= MAX_REQUEST_TOKENS,
-{
-    // batch == 1 in Phase 1 (preselect is single-batch; throughput-mode batch
-    // ≥ 32 is a Phase 1 non-goal). The shape is kept on the public signature
-    // for forward-compatibility with Phase 2; the body iterates over the
-    // batch axis trivially.
-    let bsz: usize = token_ids.len();
-    let n:   usize = if bsz == 0 { 0 } else { token_ids[0].len() };
-    let h:   usize = ENCODER_HIDDEN as usize;
+// PORT NOTES (0.10.2 reality):
+//   - Tensors are flat row-major i64-lane buffers (see
+//     src/encoder_kernels.mind). batch == 1 in Phase 1 — the dormant batch
+//     axis is dropped from the signatures rather than iterated trivially;
+//     the Phase 2 batched surface can re-add it as an outer loop over the
+//     same per-request entry points.
+//   - The EncoderWeights struct becomes a WEIGHT TABLE: a 18-slot buffer
+//     of i64 buffer handles, laid out as:
+//       slot 0       token_embedding   [VOCAB_SIZE, H]
+//       slots 1..7   layer 0: wq, wk, wv, wo [H, H] each;
+//                    ln_gain, ln_bias, residual_gate [H] each
+//       slots 8..14  layer 1, same order
+//       slot 15      final_ln_gain     [H]
+//       slot 16      final_ln_bias     [H]
+//       slot 17      head_mask         [HEAD_MASK_BYTES bytes]
+//     The loader (wave 4) builds this table; MODEL_WTAB_* slot constants
+//     below are the single source of truth.
+//   - `@[determinism]` / `@[reduction_order(Pinned)]` have no 0.10.2
+//     equivalent; every reduction funnels through the pinned q16_16
+//     primitives, and tests/unit/test_model.mind pins the compositions.
+//   - HEAD_MASK_BYTES is re-exported here (the dormant `pub use`), so
+//     callers size the mask field without reaching into encoder_kernels.
 
-    let mut out: tensor<Q16_16, [bsz, n, ENCODER_HIDDEN]> =
-        [[[0_i32; ENCODER_HIDDEN]; n]; bsz];
+import src.lib;
+import src.q16_16;
+import src.encoder_kernels;
 
-    let mut b: usize = 0;
-    while b < bsz {
-        // Token embedding lookup: gather rows of `token_embedding` indexed by
-        // u32 token IDs. Out-of-vocab IDs are a tokenizer bug per spec; the
-        // kernel clamps defensively to id 0 to keep the function total.
-        let mut x: tensor<Q16_16, [n, ENCODER_HIDDEN]> =
-            encoder_kernels::token_embedding_lookup(&token_ids[b], weights.token_embedding);
+// Weight-table slot layout (single source of truth).
+pub const MODEL_WTAB_SLOTS:       i64 = 18;
+pub const MODEL_WTAB_EMBEDDING:   i64 = 0;
+pub const MODEL_WTAB_L0_WQ:       i64 = 1;
+pub const MODEL_WTAB_L0_WK:       i64 = 2;
+pub const MODEL_WTAB_L0_WV:       i64 = 3;
+pub const MODEL_WTAB_L0_WO:       i64 = 4;
+pub const MODEL_WTAB_L0_LN_GAIN:  i64 = 5;
+pub const MODEL_WTAB_L0_LN_BIAS:  i64 = 6;
+pub const MODEL_WTAB_L0_GATE:     i64 = 7;
+pub const MODEL_WTAB_L1_WQ:       i64 = 8;
+pub const MODEL_WTAB_L1_WK:       i64 = 9;
+pub const MODEL_WTAB_L1_WV:       i64 = 10;
+pub const MODEL_WTAB_L1_WO:       i64 = 11;
+pub const MODEL_WTAB_L1_LN_GAIN:  i64 = 12;
+pub const MODEL_WTAB_L1_LN_BIAS:  i64 = 13;
+pub const MODEL_WTAB_L1_GATE:     i64 = 14;
+pub const MODEL_WTAB_FINAL_GAIN:  i64 = 15;
+pub const MODEL_WTAB_FINAL_BIAS:  i64 = 16;
+pub const MODEL_WTAB_HEAD_MASK:   i64 = 17;
 
-        // RFC-003: content-fingerprinted adaptive window stride. Computed
-        // ONCE per inference against the embedded sequence; the selected
-        // stride is constant across both encoder layers within this
-        // inference (so the fingerprint is computed once, not per layer).
-        // With backwards-soft default `STRIDE_FP_ENABLED = 0`, the
-        // fingerprint and the select_stride() dispatch are statically
-        // dead and `stride = ATTN_WINDOW_STRIDE`, producing byte-identical
-        // attention to today. Audit 2026-05-14 hardened this from a
-        // mindc-DCE assumption to an explicit gate.
-        let stride: u32 = if encoder_kernels::STRIDE_FP_ENABLED == 1u32 {
-            let stride_fp: Q16_16 = encoder_kernels::compute_stride_fingerprint(x);
-            encoder_kernels::select_stride(stride_fp)
+// ─────────────────────────────────────────────────────────────────────────────
+// encoder — 2-layer sliding-window encoder, pre-norm, gated residual, no
+// FFN sublayer. token_ids at `ids_addr` (n i64 lanes); output is [n, H] at
+// `out` (caller-allocated). exp_h / rsqrt_h are the pinned LUT handles.
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub fn model_encoder(ids_addr: i64, n: i64, wtab: i64,
+                     exp_h: i64, rsqrt_h: i64, out: i64) -> i64 {
+    let h: i64 = ENCODER_HIDDEN;
+
+    // Token embedding lookup (OOV clamps to row 0 — see encoder_kernels).
+    let x: i64 = __mind_alloc(n * h * 8);
+    token_embedding_lookup(ids_addr, n, __mind_load_i64(wtab + MODEL_WTAB_EMBEDDING * 8), x);
+
+    // RFC-003 stride selection. With STRIDE_FP_ENABLED = 0 the fingerprint
+    // is never computed and stride = ATTN_WINDOW_STRIDE (byte-identical to
+    // the pre-RFC-003 path).
+    let mut stride: i64 = ATTN_WINDOW_STRIDE;
+    if STRIDE_FP_ENABLED == 1 {
+        stride = select_stride(compute_stride_fingerprint(x, n));
+    }
+
+    let ln: i64 = __mind_alloc(n * h * 8);
+    let attn: i64 = __mind_alloc(n * h * 8);
+    let x2: i64 = __mind_alloc(n * h * 8);
+
+    let mut layer_i: i64 = 0;
+    while layer_i < ENCODER_LAYERS {
+        let base: i64 = 1 + layer_i * 7;
+        let xcur: i64 = if layer_i == 0 { x } else { x2 };
+
+        // Pre-norm + affine, then sliding-window attention, then gated
+        // residual: x = x + sigmoid(gate) * attn.
+        prenorm_seq(xcur, __mind_load_i64(wtab + (base + 4) * 8),
+                    __mind_load_i64(wtab + (base + 5) * 8), ln, n, rsqrt_h);
+        sliding_window_attention(ln, __mind_load_i64(wtab + base * 8),
+                                 __mind_load_i64(wtab + (base + 1) * 8),
+                                 __mind_load_i64(wtab + (base + 2) * 8),
+                                 __mind_load_i64(wtab + (base + 3) * 8),
+                                 stride, __mind_load_i64(wtab + MODEL_WTAB_HEAD_MASK * 8),
+                                 layer_i, attn, n, exp_h);
+        gated_residual(xcur, attn, __mind_load_i64(wtab + (base + 6) * 8), x2, n, exp_h);
+        layer_i = layer_i + 1;
+    }
+
+    // Final layer-norm + affine before the scoring head.
+    prenorm_seq(x2, __mind_load_i64(wtab + MODEL_WTAB_FINAL_GAIN * 8),
+                __mind_load_i64(wtab + MODEL_WTAB_FINAL_BIAS * 8), out, n, rsqrt_h);
+
+    __mind_free(x2);
+    __mind_free(attn);
+    __mind_free(ln);
+    __mind_free(x);
+    0
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// mean-pool over the sequence axis (pinned reduction order; see
+// encoder_kernels.mean_pool_seq_kernel for the dispatch contract).
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub fn model_mean_pool(enc_out: i64, n: i64, exp_h: i64, out: i64) -> i64 {
+    return mean_pool_seq_kernel(enc_out, out, n, exp_h);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RFC-010 — L2-normalize the pooled query for the cosine-similarity scoring
+// head: sq_norm = q16_dot_pinned(row, row); guarded = sq_norm + 1 ULP;
+// inv_norm = q16_rsqrt(guarded); out[d] = q16_mul(row[d], inv_norm).
+// The zero-vector guard keeps the function total (multiplying the zero row
+// still yields zero).
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub fn model_l2_normalize_pooled(pooled: i64, rsqrt_h: i64, out: i64) -> i64 {
+    let sq_norm: i64 = q16_dot_pinned(pooled, pooled, ENCODER_HIDDEN);
+    let guarded: i64 = q16_add(sq_norm, Q16_LAYERNORM_EPSILON);
+    let inv_norm: i64 = q16_rsqrt(rsqrt_h, guarded);
+    let mut d: i64 = 0;
+    while d < ENCODER_HIDDEN {
+        __mind_store_i64(out + d * 8,
+                         q16_mul(__mind_load_i64(pooled + d * 8), inv_norm));
+        d = d + 1;
+    }
+    0
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Scoring head: out[r] = <pooled_query, route_embeddings[r]> via
+// q16_dot_pinned over the hidden axis. routes is [nr, H] row-major; out is
+// nr i64 lanes. Adding routes is appending rows — the encoder does not
+// retrain.
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub fn model_score_against_routes(pooled: i64, routes: i64, nr: i64, out: i64) -> i64 {
+    let mut r: i64 = 0;
+    while r < nr {
+        __mind_store_i64(out + r * 8,
+                         q16_dot_pinned(pooled, routes + r * ENCODER_HIDDEN * 8, ENCODER_HIDDEN));
+        r = r + 1;
+    }
+    0
+}
+
+// RFC-008 — Matryoshka coarse pass: contract only the first min(dim_cap,
+// ROUTE_EMBEDDING_DIM) dimensions. dim_cap >= ROUTE_EMBEDDING_DIM
+// degenerates to the full-rank dot (byte-identical to
+// model_score_against_routes).
+pub fn model_score_against_routes_prefix(pooled: i64, routes: i64, nr: i64,
+                                         dim_cap: i64, out: i64) -> i64 {
+    let mut cap: i64 = dim_cap;
+    if cap > ROUTE_EMBEDDING_DIM { cap = ROUTE_EMBEDDING_DIM; }
+    if cap < 0 { cap = 0; }
+    let mut r: i64 = 0;
+    while r < nr {
+        __mind_store_i64(out + r * 8,
+                         q16_dot_pinned(pooled, routes + r * ENCODER_HIDDEN * 8, cap));
+        r = r + 1;
+    }
+    0
+}
+
+// RFC-008 — Matryoshka fine pass over a shortlist mask (n bytes at
+// `mask`, 1 = rescore). Masked-out positions get `fill_value` (callers
+// pass MIN_Q16_16 so unselected routes can never beat a shortlisted one
+// downstream). r >= mask_len is treated as not-selected (defensive guard;
+// well-formed callers pass mask_len == nr).
+pub fn model_score_against_routes_masked(pooled: i64, routes: i64, nr: i64,
+                                         mask: i64, mask_len: i64,
+                                         fill_value: i64, out: i64) -> i64 {
+    let mut r: i64 = 0;
+    while r < nr {
+        let mut selected: i64 = 0;
+        if r < mask_len {
+            if __mind_load_i8(mask + r) == 1 { selected = 1; }
+        }
+        if selected == 1 {
+            __mind_store_i64(out + r * 8,
+                             q16_dot_pinned(pooled, routes + r * ENCODER_HIDDEN * 8, ENCODER_HIDDEN));
         } else {
-            ATTN_WINDOW_STRIDE
-        };
-
-        // 2-layer sliding-window encoder (loop bound = ENCODER_LAYERS).
-        // Pre-norm; no FFN sublayer.
-        let mut layer_i: u32 = 0;
-        while layer_i < ENCODER_LAYERS {
-            let w = weights.layers[layer_i as usize];
-
-            // Pre-norm: layer-norm + gain/bias affine, per token position.
-            // The 5-stage pinned layer-norm flow lives in `q16_layernorm`;
-            // `prenorm_seq` composes it per row and applies the affine.
-            let ln: tensor<Q16_16, [n, ENCODER_HIDDEN]> =
-                encoder_kernels::prenorm_seq(x, &w.ln_gain, &w.ln_bias);
-
-            // Sliding-window self-attention. Q/K/V projections, per-window
-            // softmax-attention, window overlap-add accumulation, output
-            // projection. Bit-identical reduction order pinned by ascending
-            // window iteration and pinned softmax/sum kernels. The `stride`
-            // argument is the RFC-003 runtime-selected per-inference stride.
-            // RFC-005: `&weights.head_mask` + `layer_i` carry the saliency-
-            // ranked head bitmask into the kernel; with the backwards-soft
-            // all-alive default every head runs and the output is byte-
-            // identical to the pre-RFC-005 path.
-            let attn: tensor<Q16_16, [n, ENCODER_HIDDEN]> =
-                encoder_kernels::sliding_window_attention(
-                    ln, w.wq, w.wk, w.wv, w.wo, stride,
-                    &weights.head_mask, layer_i,
-                );
-
-            // Gated residual replaces the FFN sublayer:
-            //   x = x + sigmoid(gate) * attn
-            // sigmoid via the truncated LUT in q16_16.mind.
-            x = encoder_kernels::gated_residual(x, attn, &w.residual_gate);
-
-            layer_i = layer_i + 1;
+            __mind_store_i64(out + r * 8, fill_value);
         }
-
-        // Final layer-norm + affine before returning to the scoring head.
-        let final_ln: tensor<Q16_16, [n, ENCODER_HIDDEN]> =
-            encoder_kernels::prenorm_seq(x, &weights.final_ln_gain, &weights.final_ln_bias);
-
-        let mut i: usize = 0;
-        while i < n {
-            let mut d: usize = 0;
-            while d < h {
-                out[b][i][d] = final_ln[i][d];
-                d = d + 1;
-            }
-            i = i + 1;
-        }
-        b = b + 1;
+        r = r + 1;
     }
-    return out;
-}
-
-// Mean-pool over the sequence axis. Pinned reduction order; bit-identical
-// across architectures because the summation tree is determined at compile
-// time by mindc, not by the runtime tensor shape.
-@[determinism(BitIdentical)]
-@[reduction_order(Pinned)]
-pub fn mean_pool_seq(
-    encoder_out: tensor<Q16_16, [batch, seq_len, ENCODER_HIDDEN]>,
-) -> tensor<Q16_16, [batch, ENCODER_HIDDEN]>
-where
-    seq_len <= MAX_REQUEST_TOKENS,
-{
-    let bsz: usize = encoder_out.len();
-    let h:   usize = ENCODER_HIDDEN as usize;
-    let mut out: tensor<Q16_16, [bsz, ENCODER_HIDDEN]> = [[0_i32; ENCODER_HIDDEN]; bsz];
-
-    let mut b: usize = 0;
-    while b < bsz {
-        // Pinned per-dimension sequential sum along seq_len followed by
-        // saturating divide by seq_len. Kernel lives in encoder_kernels so
-        // the reduction-strategy annotation site is co-located with the
-        // composition of `q16_sum_pinned` + `q16_div_sat`.
-        let pooled: [Q16_16; h] = encoder_kernels::mean_pool_seq_kernel(encoder_out[b]);
-        let mut d: usize = 0;
-        while d < h {
-            out[b][d] = pooled[d];
-            d = d + 1;
-        }
-        b = b + 1;
-    }
-    return out;
-}
-
-// RFC-010 — L2-normalize the pooled query for the cosine-similarity
-// scoring head.
-//
-// For each batch row, computes:
-//   (1) sq_norm  = q16_dot_pinned(row, row)              — sum of squares
-//                                                          via pinned self-dot
-//                                                          over the hidden axis
-//   (2) guarded  = q16_add(sq_norm, Q16_LAYERNORM_EPSILON) — zero-vector
-//                                                            guard (1 ULP); the
-//                                                            rsqrt LUT clamps
-//                                                            non-positive
-//                                                            inputs to
-//                                                            MAX_Q16_16 which
-//                                                            would scale the
-//                                                            vector to its
-//                                                            saturation
-//                                                            boundary —
-//                                                            multiplying by the
-//                                                            zero row still
-//                                                            yields zero, so
-//                                                            the function stays
-//                                                            total
-//   (3) inv_norm = q16_rsqrt(guarded)                     — truncated LUT
-//   (4) out[b,d] = q16_mul(row[d], inv_norm)              — elementwise rescale
-//
-// The new reduction site is the self-dot, which is `q16_dot_pinned`
-// (already pinned ascending over the hidden axis in q16_16.mind). The
-// elementwise rescale carries no reduction. Cross-arch bit-identity
-// follows from the deterministic composition of pinned primitives;
-// `q16_dot_pinned`, `q16_add`, `q16_rsqrt`, and `q16_mul` are all in
-// the bit-identity contract.
-//
-// Output range: when the input row's squared norm sits in the
-// `q16_rsqrt` LUT domain (0, 32.0], the per-element output is bounded
-// in `[-ONE_Q16_16, ONE_Q16_16]` within the LUT's truncation tolerance.
-// For pooled queries emitted by the layer-normalized encoder (per-dim
-// magnitude ≈ 1/sqrt(seq_len), squared norm ≈ ENCODER_HIDDEN / seq_len
-// at the median STARGA agent-CLI workload ≈ 256/340 ≈ 0.75), the
-// squared norm lands well within the LUT domain. Routes that would
-// otherwise produce squared norms above 32.0 in Q16.16 saturate to the
-// LUT boundary entry; the cosine score remains deterministic but loses
-// magnitude precision, which is the documented trade-off the calibrated
-// reference checkpoint (trained with the InfoNCE cosine-similarity
-// contrastive objective) is responsible for preventing.
-//
-// Backwards-soft note: this function is only invoked when
-// COSINE_SCORING_ENABLED == 1 at compile time; under the default it is
-// dead code, mindc dead-code-eliminates the body, and the binary stays
-// byte-identical to today.
-@[determinism(BitIdentical)]
-@[reduction_order(Pinned)]
-pub fn l2_normalize_pooled(
-    pooled: tensor<Q16_16, [batch, ENCODER_HIDDEN]>,
-) -> tensor<Q16_16, [batch, ENCODER_HIDDEN]>
-{
-    let bsz: usize = pooled.len();
-    let h:   usize = ENCODER_HIDDEN as usize;
-    let mut out: tensor<Q16_16, [bsz, ENCODER_HIDDEN]> = [[0_i32; ENCODER_HIDDEN]; bsz];
-
-    let mut b: usize = 0;
-    while b < bsz {
-        let row: &[Q16_16] = &pooled[b];
-        let sq_norm:  Q16_16 = q16_dot_pinned(row, row);
-        let guarded:  Q16_16 = q16_add(sq_norm, Q16_LAYERNORM_EPSILON);
-        let inv_norm: Q16_16 = q16_rsqrt(guarded);
-        let mut d: usize = 0;
-        while d < h {
-            out[b][d] = q16_mul(row[d], inv_norm);
-            d = d + 1;
-        }
-        b = b + 1;
-    }
-    return out;
-}
-
-// Scoring head: a single matmul between the pooled query vector and the
-// route embedding table.
-//
-// This replaces the prior decoder + classifier_head pair. Score for route i
-// is `dot(query, route_embeddings[i])` in Q16.16 with i64 accumulator,
-// shifted >> 16, saturated to i32.
-//
-// The route_embeddings tensor is the only `|RouteCatalog|`-dependent
-// parameter block. Adding routes is appending rows; it does not retrain
-// the encoder.
-@[determinism(BitIdentical)]
-@[reduction_order(Pinned)]
-pub fn score_against_routes(
-    pooled_query:     tensor<Q16_16, [batch, ENCODER_HIDDEN]>,
-    route_embeddings: tensor<Q16_16, [num_routes, ROUTE_EMBEDDING_DIM]>,
-) -> tensor<Q16_16, [batch, num_routes]>
-{
-    // Single-matmul scoring head: out[b, r] = <pooled_query[b], route_embeddings[r]>.
-    //
-    // Reduction order is pinned twice over:
-    //   (1) The outer (b, r) iteration is ascending, batch-major then
-    //       route-major. Output position is a pure function of (b, r); no
-    //       cross-output reduction.
-    //   (2) The inner dot product is `q16_dot_pinned`, which is
-    //       sequential left-to-right over the hidden axis (annotated
-    //       `@[reduction_order(Pinned)]` in q16_16.mind). Every Q16.16
-    //       multiply funnels through `q16_mul`'s single saturating-MAC
-    //       primitive, and every accumulate through `q16_add`'s
-    //       widen-then-saturate path. This is the lint anchor for
-    //       E_NERVE_001 (forward-path matmul) and E_NERVE_003 (Q16.16
-    //       saturating MAC).
-    //
-    // ENCODER_HIDDEN == ROUTE_EMBEDDING_DIM is invariant by construction
-    // (see lib.mind: `ROUTE_EMBEDDING_DIM: u32 = 256` // tied to ENCODER_HIDDEN).
-    // The typed signature pins the contraction axis; the slice operations
-    // below take whole rows.
-    //
-    // batch == 1 in Phase 1; the batch axis is iterated trivially to keep
-    // the public signature forward-compatible with Phase 2 batched inference.
-    let bsz: usize = pooled_query.len();
-    let nr:  usize = route_embeddings.len();
-
-    let mut out: tensor<Q16_16, [bsz, nr]> = [[0_i32; nr]; bsz];
-
-    let mut b: usize = 0;
-    while b < bsz {
-        let query_row: &[Q16_16] = &pooled_query[b];
-
-        let mut r: usize = 0;
-        while r < nr {
-            let route_row: &[Q16_16] = &route_embeddings[r];
-            out[b][r] = q16_dot_pinned(query_row, route_row);
-            r = r + 1;
-        }
-        b = b + 1;
-    }
-    return out;
-}
-
-// RFC-008 — Matryoshka coarse-pass scoring head.
-//
-// Identical reduction discipline to `score_against_routes` (ascending
-// (b, r) outer iteration, sequential left-to-right inner dot, every
-// multiply/accumulate funneled through the saturating `q16_mul` /
-// `q16_add` primitives) but contracts only the first `dim_cap`
-// dimensions of each (pooled_query[b], route_embeddings[r]) pair.
-//
-// `dim_cap` is clamped at ROUTE_EMBEDDING_DIM; values at or above
-// ROUTE_EMBEDDING_DIM degenerate this function to a full-rank dot
-// product that returns byte-identical output to `score_against_routes`
-// — guaranteeing the cascade is a no-op when the backwards-soft
-// default `MATRYOSHKA_COARSE_DIM = ROUTE_EMBEDDING_DIM` is in force.
-//
-// Bit-identity follows from the per-primitive contract: `q16_mul` is
-// the single saturating-MAC anchor (q16_16.mind §1), `q16_add` is
-// widen-then-saturate, and the outer (b, r, d) iteration is ascending.
-@[determinism(BitIdentical)]
-@[reduction_order(Pinned)]
-pub fn score_against_routes_prefix(
-    pooled_query:     tensor<Q16_16, [batch, ENCODER_HIDDEN]>,
-    route_embeddings: tensor<Q16_16, [num_routes, ROUTE_EMBEDDING_DIM]>,
-    dim_cap:          u32,
-) -> tensor<Q16_16, [batch, num_routes]>
-{
-    let bsz:  usize = pooled_query.len();
-    let nr:   usize = route_embeddings.len();
-    let full: usize = ROUTE_EMBEDDING_DIM as usize;
-    let cap:  usize = if (dim_cap as usize) > full { full } else { dim_cap as usize };
-
-    let mut out: tensor<Q16_16, [bsz, nr]> = [[0_i32; nr]; bsz];
-
-    let mut b: usize = 0;
-    while b < bsz {
-        let mut r: usize = 0;
-        while r < nr {
-            let mut acc: Q16_16 = 0_i32;
-            let mut d: usize = 0;
-            while d < cap {
-                let prod: Q16_16 = q16_mul(pooled_query[b][d], route_embeddings[r][d]);
-                acc = q16_add(acc, prod);
-                d = d + 1;
-            }
-            out[b][r] = acc;
-            r = r + 1;
-        }
-        b = b + 1;
-    }
-    return out;
-}
-
-// RFC-008 — Matryoshka fine-pass scoring head over a shortlist mask.
-//
-// Same `q16_dot_pinned` primitive as `score_against_routes` but gated
-// by a flat `[u8]` mask of length `num_routes` where `1` selects routes
-// for full-rank rescoring. Masked-out positions are filled with
-// `fill_value` (the caller passes MIN_Q16_16 so unselected routes can
-// never beat any shortlisted route in the downstream top-K extraction).
-//
-// Cross-arch bit-identity is preserved by the ascending (b, r)
-// iteration and the per-primitive contract on `q16_dot_pinned`. The
-// mask itself is materialised by the coarse pass via
-// `top_k::extract_top_k_mask`, whose bounded-heap reduction order is
-// already in the bit-identity contract (top_k.mind §"extract_top_k").
-@[determinism(BitIdentical)]
-@[reduction_order(Pinned)]
-pub fn score_against_routes_masked(
-    pooled_query:     tensor<Q16_16, [batch, ENCODER_HIDDEN]>,
-    route_embeddings: tensor<Q16_16, [num_routes, ROUTE_EMBEDDING_DIM]>,
-    mask:             &[u8],
-    fill_value:       Q16_16,
-) -> tensor<Q16_16, [batch, num_routes]>
-{
-    let bsz: usize = pooled_query.len();
-    let nr:  usize = route_embeddings.len();
-    let mlen: usize = mask.len();
-
-    let mut out: tensor<Q16_16, [bsz, nr]> = [[fill_value; nr]; bsz];
-
-    let mut b: usize = 0;
-    while b < bsz {
-        let query_row: &[Q16_16] = &pooled_query[b];
-        let mut r: usize = 0;
-        while r < nr {
-            // r >= mlen means the mask did not cover this row; treat it
-            // as "not selected" (fill_value already in place). This is
-            // a defensive guard — well-formed callers always pass a
-            // mask of length exactly `num_routes`.
-            if r < mlen && mask[r] == 1u8 {
-                let route_row: &[Q16_16] = &route_embeddings[r];
-                out[b][r] = q16_dot_pinned(query_row, route_row);
-            }
-            r = r + 1;
-        }
-        b = b + 1;
-    }
-    return out;
-}
-
-// Weight containers. Sizes derived from compile-time parameters in `lib.mind`.
-// Per-layer contents:
-//   - Wq, Wk, Wv, Wo:    (ENCODER_HIDDEN, ENCODER_HIDDEN) each
-//   - layer_norm_gain:   (ENCODER_HIDDEN,)
-//   - layer_norm_bias:   (ENCODER_HIDDEN,)
-//   - residual_gate:     (ENCODER_HIDDEN,)   // gated residual scalar per dim
-//
-// Total per layer: 4 * H^2 + 3 * H weights.
-// At H=384, L=12: ≈ 7.1M weights + ≈ 14K residual/norm params per encoder.
-pub struct EncoderLayerWeights {
-    pub wq:              tensor<Q16_16, [ENCODER_HIDDEN, ENCODER_HIDDEN]>,
-    pub wk:              tensor<Q16_16, [ENCODER_HIDDEN, ENCODER_HIDDEN]>,
-    pub wv:              tensor<Q16_16, [ENCODER_HIDDEN, ENCODER_HIDDEN]>,
-    pub wo:              tensor<Q16_16, [ENCODER_HIDDEN, ENCODER_HIDDEN]>,
-    pub ln_gain:         tensor<Q16_16, [ENCODER_HIDDEN]>,
-    pub ln_bias:         tensor<Q16_16, [ENCODER_HIDDEN]>,
-    pub residual_gate:   tensor<Q16_16, [ENCODER_HIDDEN]>,
-}
-
-pub struct EncoderWeights {
-    pub token_embedding: tensor<Q16_16, [VOCAB_SIZE, ENCODER_HIDDEN]>,
-    pub layers:          [EncoderLayerWeights; ENCODER_LAYERS],
-    pub final_ln_gain:   tensor<Q16_16, [ENCODER_HIDDEN]>,
-    pub final_ln_bias:   tensor<Q16_16, [ENCODER_HIDDEN]>,
-    // RFC-005: saliency-ranked attention-head bitmask. `bit_pos =
-    // layer_idx * ENCODER_HEADS + head_i`; alive iff the corresponding
-    // bit is 1. Loader populates this with [0xFFu8; HEAD_MASK_BYTES] for
-    // every weights file today (every head alive), making the kernel
-    // byte-identical to the pre-RFC-005 path. Once a saliency-calibrated
-    // bitmask ships from the offline training pipeline (along with a
-    // weights-file format bump), the loader will read it from disk and
-    // mind-nerve will start skipping the dead heads automatically.
-    pub head_mask:       [u8; HEAD_MASK_BYTES],
+    0
 }

@@ -129,7 +129,8 @@ to the Phase-1 PyTorch reference.
 
 ## Build
 
-Requires mindc v0.4.4+ with `std-surface cross-module-imports mlir-build`:
+Requires mindc v0.10.2 (`std-surface` is default; project mode via
+`mind/Mind.toml` — see `tests/mindc_gate.sh`):
 
 ```bash
 ./tools/build_native_encoder.sh
@@ -141,24 +142,35 @@ The output `.so` is staged to `python/mind_nerve/_native/libmind_nerve_encoder.s
 alongside the native runtime `libmindnerve.so`. Both are bundled into the
 wheel via `pyproject.toml` package-data.
 
-## Status (A1.3)
+## Status (re-assessed 2026-08-10)
 
-- [x] `c_abi.mind` — all 6 pub fn symbols defined, parse target written.
+- [x] `c_abi.mind` — all 6 pub fn symbols defined, compiles under mindc 0.10.2 project mode.
 - [x] `_native.py` — ctypes binding for all 6 entry points.
-- [x] `inference.py` — MIND_NERVE_BACKEND selector (native / pytorch).
+- [x] `inference.py` — MIND_NERVE_BACKEND selector (native / pytorch); native is the default.
 - [x] `tools/build_native_encoder.sh` — build pipeline scaffolding.
-- [ ] `libmind_nerve_encoder.so` — blocked on Phase 6.2 const-blob support
-      (mindc --emit-shared + full LUT linkage). Run the build script once
-      mindc v0.4.4 const-blob lands and the offline quantizer ships.
-- [ ] `route_table.q16.bin` — offline quantizer (quantize_phase1_to_q16.py)
-      deferred to Phase 6.2.
-- [ ] CUDA variant (`--target=cuda`) — deferred to A2 (v0.4.1) per spec §3.2.
+- [x] `libmind_nerve_encoder.so` — **SHIPPED 2026-05-19**: bundled in the
+      published wheel with a real `encoder_weights.q16.bin` blob (closes
+      roadmap task #59).
+- [ ] Native link of the full kernel tree as one `.so` — blocked on mindc
+      symbol-visibility/mangling (private helpers emit as global symbols in
+      every object → multiple-definition at link). Tracked as a mind-repo
+      follow-up from the 2026-08-10 audit.
+- [ ] CUDA variant (`--target=cuda`) — the bit-identity harness's CUDA leg is
+      an unimplemented sentinel (`CUDA_DEFERRED_TO_V0_4_1`); hardware is no
+      longer a blocker (U1 RTX 3080 live). Task #57 stays open until the CUDA
+      emit path exists and the SHA run is recorded.
 
-## A1.4 Blocker Notes
+## A1.4 harness status (re-assessed 2026-08-10)
 
-Before the A1.4 bit-identity harness can run:
+The bit-identity harness (`tests/bit_identity/`) runs green today on the
+pytorch and native backends (CI `bit-identity-cpu` job). Historical
+blockers 1–2 below are cleared (the encoder `.so` ships; the runtime loads
+`encoder_weights.q16.bin`); the CUDA leg remains a sentinel until the CUDA
+emit path exists (task #57).
 
-1. `tools/build_native_encoder.sh` must succeed (needs mindc const-blob).
-2. `quantize_phase1_to_q16.py` must produce `route_table.q16.bin`.
+1. ~~`tools/build_native_encoder.sh` must succeed~~ — done; the wheel bundles
+   the resulting `.so`.
+2. `route_table.q16.bin` — the offline-quantized route table remains
+   deferred; the native path scores against `route_table.npy` today.
 3. The A1.1 LUT precision gate (≤ 1 ULP-eq error on 1M samples) must pass.
 4. The A1.2 single-forward-pass bit-identity vs Q16.16 numpy reference must pass.

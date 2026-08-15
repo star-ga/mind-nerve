@@ -1,0 +1,184 @@
+// tests/harness/inference_main.mind — native run-harness for the composed
+// inference pipeline. Built by tests/mindc_gate.sh leg 15 into a scratch
+// project and executed as a REAL ELF.
+//
+// Why a run-harness instead of `mindc test` for the end-to-end scenarios:
+// the 0.10.2 test interpreter progressively loses environment state around
+// heavy callees (repro: mind-flow/target/repro-0.10.2/r11_*, see
+// src/dormant/README.md wave-4 notes), so a full encoder->pool->score->
+// top-K->hash->envelope->chain composition cannot execute in a single
+// `mindc test` case. The native path has no such bug — and gating the
+// composition on a real ELF is strictly stronger evidence.
+//
+// Exit codes: 0 = every check passed; otherwise the first failing check's
+// code (two digits: scenario * 10 + step).
+//
+// ORACLE PROVENANCE (CPython hashlib, 2026-08-12; see
+// tests/unit/test_inference.mind header): zero-weight fixture, 3-route
+// catalog (ids SHA-256("a"/"b"/"c")), k=2, ts=1000 (first) / 1001
+// (second), arch=x86_64, wire=2.
+
+fn hz_zero(dst: i64, n: i64) -> i64 {
+    let mut i: i64 = 0;
+    while i < n {
+        __mind_store_i64(dst + i * 8, 0);
+        i = i + 1;
+    }
+    0
+}
+
+fn hz_fill8(dst: i64, n: i64, c: i64) -> i64 {
+    let mut i: i64 = 0;
+    while i < n {
+        __mind_store_i8(dst + i, c);
+        i = i + 1;
+    }
+    0
+}
+
+fn hz_word(out: i64, w: i64) -> i64 {
+    let b0: i64 = __mind_load_i8(out + w * 4) & 255;
+    let b1: i64 = __mind_load_i8(out + w * 4 + 1) & 255;
+    let b2: i64 = __mind_load_i8(out + w * 4 + 2) & 255;
+    let b3: i64 = __mind_load_i8(out + w * 4 + 3) & 255;
+    b0 * 16777216 + b1 * 65536 + b2 * 256 + b3
+}
+
+fn hz_check8(out: i64, w0: i64, w1: i64, w2: i64, w3: i64, w4: i64, w5: i64, w6: i64, w7: i64) -> i64 {
+    if hz_word(out, 0) != w0 { return 1; }
+    if hz_word(out, 1) != w1 { return 2; }
+    if hz_word(out, 2) != w2 { return 3; }
+    if hz_word(out, 3) != w3 { return 4; }
+    if hz_word(out, 4) != w4 { return 5; }
+    if hz_word(out, 5) != w5 { return 6; }
+    if hz_word(out, 6) != w6 { return 7; }
+    if hz_word(out, 7) != w7 { return 8; }
+    0
+}
+
+fn hz_catalog() -> i64 {
+    let cat: i64 = __mind_alloc(5 * 8);
+    __mind_store_i64(cat + LOADER_CAT_N * 8, 3);
+    let ids: i64 = __mind_alloc(96);
+    let one: i64 = __mind_alloc(1);
+    __mind_store_i8(one, 97);
+    mn_sha256(one, 1, ids);
+    __mind_store_i8(one, 98);
+    mn_sha256(one, 1, ids + 32);
+    __mind_store_i8(one, 99);
+    mn_sha256(one, 1, ids + 64);
+    __mind_free(one);
+    __mind_store_i64(cat + LOADER_CAT_IDS * 8, ids);
+    let emb: i64 = __mind_alloc(3 * 256 * 8);
+    hz_zero(emb, 3 * 256);
+    __mind_store_i64(cat + LOADER_CAT_EMB * 8, emb);
+    let prior: i64 = __mind_alloc(3 * 8);
+    hz_zero(prior, 3);
+    __mind_store_i64(cat + LOADER_CAT_PRIOR * 8, prior);
+    let hash: i64 = __mind_alloc(32);
+    hz_fill8(hash, 32, 3);
+    __mind_store_i64(cat + LOADER_CAT_HASH * 8, hash);
+    cat
+}
+
+fn hz_weights(mh: i64, th: i64) -> i64 {
+    let wtab: i64 = __mind_alloc(18 * 8);
+    let emb: i64 = __mind_alloc(8 * 256 * 8);
+    hz_zero(emb, 8 * 256);
+    __mind_store_i64(wtab + 0, emb);
+    let mut slot: i64 = 1;
+    while slot < 17 {
+        let layer_slot: i64 = (slot - 1) % 7;
+        let mut buf: i64 = 0;
+        if layer_slot < 4 {
+            buf = __mind_alloc(256 * 256 * 8);
+            hz_zero(buf, 256 * 256);
+        } else {
+            buf = __mind_alloc(256 * 8);
+            hz_zero(buf, 256);
+        }
+        __mind_store_i64(wtab + slot * 8, buf);
+        slot = slot + 1;
+    }
+    let mask: i64 = __mind_alloc(1);
+    __mind_store_i8(mask, 255);
+    __mind_store_i64(wtab + 17 * 8, mask);
+    hz_fill8(mh, 32, 1);
+    hz_fill8(th, 32, 2);
+    wtab
+}
+
+fn hz_tokens567() -> i64 {
+    let t: i64 = __mind_alloc(3 * 8);
+    __mind_store_i64(t + 0, 5);
+    __mind_store_i64(t + 8, 6);
+    __mind_store_i64(t + 16, 7);
+    t
+}
+
+fn main() -> i32 {
+    let exp_h: i64 = exp_q16_init();
+    let rsqrt_h: i64 = rsqrt_q16_init();
+    let cat: i64 = hz_catalog();
+    let mh: i64 = __mind_alloc(32);
+    let th: i64 = __mind_alloc(32);
+    let wtab: i64 = hz_weights(mh, th);
+    let zid: i64 = __mind_alloc(16);
+    hz_fill8(zid, 16, 0);
+    let log: i64 = chain_log_new_with_id(zid);
+    let t: i64 = hz_tokens567();
+    let oi: i64 = __mind_alloc(64);
+    let os: i64 = __mind_alloc(16);
+    let oe: i64 = __mind_alloc(212);
+    let oe2: i64 = __mind_alloc(212);
+    let zeros: i64 = __mind_alloc(32);
+    hz_fill8(zeros, 32, 0);
+    let cc: i64 = __mind_alloc(32);
+    let cc2: i64 = __mind_alloc(32);
+
+    // ── Scenario 1 (codes 10..19): stateful pre_tokenized, full oracle ──
+    let n: i64 = infer_preselect_pre_tokenized(t, 3, cat, wtab, mh, th, 2, 1000, mh, 0, log, exp_h, rsqrt_h, oi, os, oe);
+    if n != 2 { return 10; }
+    if __mind_load_i64(os) != 0 { return 11; }
+    if __mind_load_i64(os + 8) != 0 { return 11; }
+    // Tie-break order: sha("c") < sha("b") < sha("a") -> [c, b].
+    let ids: i64 = __mind_load_i64(cat + LOADER_CAT_IDS * 8);
+    let mut i: i64 = 0;
+    while i < 32 {
+        if __mind_load_i8(oi + i) != __mind_load_i8(ids + 64 + i) { return 12; }
+        if __mind_load_i8(oi + 32 + i) != __mind_load_i8(ids + 32 + i) { return 12; }
+        i = i + 1;
+    }
+    if evidence_verify(oe, 212, zeros, cc) != 0 { return 13; }
+    if hz_check8(oe + OFFSET_REQUEST_HASH, 776750595, 3406686854, 922281986, 3214996044, 2935355796, 863500573, 2315087805, 2507656476) != 0 { return 14; }
+    if hz_check8(oe + OFFSET_RESULT_HASH, 3808725327, 2869960307, 4118700660, 3683795253, 1501394109, 3277566712, 805585793, 656889980) != 0 { return 15; }
+    if hz_check8(cc, 4268469728, 3790683265, 4268472630, 2310415440, 1599964090, 3087734940, 3941186145, 3558007985) != 0 { return 16; }
+    if chain_log_count(log) != 1 { return 17; }
+
+    // Second inference in the session: chain_prev == first chain_curr.
+    let n2: i64 = infer_preselect_pre_tokenized(t, 3, cat, wtab, mh, th, 2, 1001, mh, 0, log, exp_h, rsqrt_h, oi, os, oe2);
+    if n2 != 2 { return 18; }
+    if evidence_verify(oe2, 212, cc, cc2) != 0 { return 19; }
+    if chain_log_count(log) != 2 { return 17; }
+
+    // ── Scenario 2 (codes 20..29): full path through the tokenizer ──
+    let bytes: i64 = __mind_alloc(2);
+    __mind_store_i8(bytes, 65);
+    __mind_store_i8(bytes + 1, 66);
+    let log2: i64 = chain_log_new_with_id(zid);
+    let n3: i64 = infer_preselect(bytes, 2, cat, wtab, mh, th, 2, 1000, mh, 0, log2, exp_h, rsqrt_h, oi, os, oe);
+    if n3 != 2 { return 20; }
+    if hz_check8(oe + OFFSET_REQUEST_HASH, 3822505198, 831506487, 776181466, 2787251112, 699064004, 220764758, 1200297369, 2041868286) != 0 { return 21; }
+    if evidence_verify(oe, 212, zeros, cc) != 0 { return 22; }
+    if hz_check8(cc, 481476110, 2621982033, 3530958181, 3166609586, 3426603189, 3957152394, 1129737185, 3390707964) != 0 { return 23; }
+
+    // ── Scenario 3 (codes 30..39): stateless is always a chain-of-one ──
+    let n4: i64 = infer_preselect_pre_tokenized_stateless(t, 3, cat, wtab, mh, th, 2, 1000, mh, 0, exp_h, rsqrt_h, oi, os, oe);
+    if n4 != 2 { return 30; }
+    let n5: i64 = infer_preselect_pre_tokenized_stateless(t, 3, cat, wtab, mh, th, 2, 1000, mh, 0, exp_h, rsqrt_h, oi, os, oe2);
+    if n5 != 2 { return 31; }
+    if evidence_verify(oe, 212, zeros, cc) != 0 { return 32; }
+    if evidence_verify(oe2, 212, zeros, cc2) != 0 { return 33; }
+
+    return 0;
+}

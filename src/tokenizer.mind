@@ -1,6 +1,8 @@
-// BPE 32k tokenizer — byte-level Byte-Pair Encoding, pure MIND.
+// BPE 32k tokenizer — byte-level Byte-Pair Encoding, pure MIND. Ported to
+// the mindc 0.10.2 dialect 2026-08-12 (wave 2 of the pure-MIND migration;
+// the dormant pre-port source is preserved at src/dormant/tokenizer.mind).
 //
-// Audit anchor: T-1 (tokenizer determinism), T-2 (tokenizer hash binding).
+// Audit anchors: T-1 (tokenizer determinism), T-2 (tokenizer hash binding).
 //
 // MODEL
 // -----
@@ -9,322 +11,225 @@
 //      value. Guarantees no OOV — any UTF-8 input is representable.
 //   2. Merge table. An ordered list of `(left_id, right_id) -> merged_id`
 //      rules. The encoder iteratively applies the lowest-rank applicable
-//      merge until no merge applies. Lower index in BPE_MERGES = higher
-//      priority. The learned token id for rule at index `i` is
-//      `256 + i` (placement under BPE_BASE_VOCAB).
+//      merge until no merge applies. Lower rank = higher priority. The
+//      learned token id for rule at rank `i` is `256 + i`.
 //   3. Vocabulary. IDs 0..255 = byte-level base. IDs 256..32767 = learned
 //      merges, of which Phase 1.2 ships only 32 placeholders (real 32k
 //      merges arrive bundled with the first reference checkpoint).
 //
 // PHASE 1.2 STATUS
 // ----------------
-// THIS FILE SHIPS A PLACEHOLDER MERGE TABLE.
-//
-//   - BPE_MERGES below is a 32-entry placeholder so the public API
-//     (`tokenize_bpe`, `tokenizer_hash`) is exercisable end-to-end and
-//     the `preselect` byte-path can run without falling back to
-//     `preselect_pre_tokenized`.
-//   - The placeholder merges are NOT the trained 32k table. Real merges
-//     will land with the first reference checkpoint as a Phase 1.2
-//     deliverable; that drop replaces `BPE_MERGES` wholesale and grows
-//     `BPE_MERGE_COUNT` from 32 to 32_512.
-//   - The `TOKENIZER_HASH` constant below is computed against the
-//     placeholder table and is **not** a stable identifier across Phase 1.2
-//     commits. It WILL change once the real merge table lands; any
-//     persisted envelope referencing the placeholder hash is therefore a
-//     pre-release artifact and is not replay-comparable across the
-//     placeholder → real-merges transition.
+// THIS FILE SHIPS THE PLACEHOLDER MERGE TABLE (32 entries), unchanged from
+// the dormant source. The placeholder merges are NOT the trained 32k table;
+// the drop replaces BPE_MERGE_LEFT/RIGHT wholesale and grows
+// BPE_MERGE_COUNT from 32 to 32512. `tokenizer_hash` is computed against
+// the placeholder table and WILL change at that transition.
 //
 // DETERMINISM
 // -----------
-// Every public function is `@[determinism(BitIdentical)]`. The algorithm
-// uses only u32 equality and integer comparisons; there are no numeric
-// reductions, so `@[reduction_order(Pinned)]` does not apply. The byte
-// stream → token stream mapping is required to be bit-identical across
-// backends because the resulting token sequence feeds `request_hash` in
-// the attestation envelope.
+// The algorithm uses only integer equality and integer comparisons; no
+// floats, no clocks, no platform-dependent ordering. The byte stream →
+// token stream mapping is bit-identical across backends because the token
+// sequence feeds `request_hash` in the attestation envelope. The dormant
+// `@[determinism(BitIdentical)]` attribute has no 0.10.2 equivalent; the
+// discipline is by construction and pinned by tests/unit/test_tokenizer.mind
+// (including the hashlib-verified tokenizer_hash oracle).
 //
-// ALGORITHM
-// ---------
-// Standard byte-level BPE encode (the "lowest-rank-applicable" form):
-//
-//   1. tokens := [byte_i as u32 for byte_i in input]
-//   2. loop:
-//        scan BPE_MERGES top-down (index 0 first); for each merge rule
-//        (L, R) at rank `r`, walk the current tokens left-to-right and
-//        check if any adjacent pair (tokens[i], tokens[i+1]) equals (L, R).
-//        - If a match is found at position `i`, splice: replace
-//          tokens[i..i+2] with [256 + r], then restart the outer loop.
-//        - If no rule matches any adjacent pair, the loop terminates.
-//   3. return tokens.
-//
-// The "lowest-rank-applicable pair" rule is the standard BPE encode
-// contract: among all applicable merges, apply the one with the lowest
-// table index; among multiple positions for that same merge, apply at
-// the leftmost position. Because the entire decision procedure consists
-// of u32 equality compares and a leftmost-first scan, the output is
-// bit-identical across architectures.
+// PORT NOTES (0.10.2 reality):
+//   - Byte-slice I/O contract: input bytes and output token ids cross the
+//     API as raw i64 buffer handles (input: one byte per offset; output
+//     tokens: i64 lanes at an 8-byte stride), matching src/sha256.mind,
+//     src/top_k.mind, mind/luts. The dormant `&[u8]` in / `[u32]` out
+//     surface is not expressible in 0.10.2.
+//   - Result<[u32], TokenizeError> becomes a signed return convention:
+//     tokenize_bpe returns the token count (>= 1) on success, or a
+//     negative error code (TOKENIZE_ERR_EMPTY / TOKENIZE_ERR_TOO_LONG).
+//   - The merge table is two parallel const arrays (0.10.2 has no tuple
+//     type); runtime indexing of const arrays is verified to execute in
+//     the `mindc test` interpreter.
+//   - The encode loop avoids `break`/`continue`: found-flags gate the
+//     scans (same discipline as src/top_k.mind).
 
-use crate::mind_nerve::MAX_REQUEST_TOKENS;
-use crate::mind_nerve::sha256::sha256 as sha256_impl;
+import src.lib;
+import src.sha256;
 
-// ---------------------------------------------------------------------------
-// Section 1 — Vocabulary parameters (compile-time, part of model_hash via
-// the tokenizer manifest)
-// ---------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────────
+// Vocabulary parameters (part of model_hash via the tokenizer manifest)
+// ─────────────────────────────────────────────────────────────────────────────
 
 // Number of byte-level base tokens. IDs 0..255 are the raw bytes.
-pub const BPE_BASE_VOCAB:  u32 = 256;
+pub const BPE_BASE_VOCAB: i64 = 256;
 
-// Total vocabulary size. Must equal `crate::mind_nerve::VOCAB_SIZE`. The
-// duplicate constant here keeps this module independent of the parent
-// re-export cycle; the parity is asserted in the test suite.
-pub const BPE_TOTAL_VOCAB: u32 = 32768;
+// Total vocabulary size. Must equal VOCAB_SIZE (src/lib.mind) — the parity
+// is asserted in tests/unit/test_tokenizer.mind.
+pub const BPE_TOTAL_VOCAB: i64 = 32768;
 
 // Number of learned merges in the current artifact. Placeholder = 32;
-// real reference checkpoint = 32_512 (= 32768 - 256). Changing this is
-// a model-architecture change that requires a new `model_hash` and a
-// new `tokenizer_hash`.
-pub const BPE_MERGE_COUNT: u32 = 32;
+// real reference checkpoint = 32512 (= 32768 - 256). Changing this is a
+// model-architecture change requiring a new model_hash and tokenizer_hash.
+pub const BPE_MERGE_COUNT: i64 = 32;
 
-// ---------------------------------------------------------------------------
-// Section 2 — Placeholder merge table
-// ---------------------------------------------------------------------------
+// Signed return codes for tokenize_bpe (the dormant TokenizeError enum,
+// flattened for the handle ABI).
+pub const TOKENIZE_ERR_EMPTY:    i64 = -1;
+pub const TOKENIZE_ERR_TOO_LONG: i64 = -2;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Placeholder merge table
+// ─────────────────────────────────────────────────────────────────────────────
 //
-// Format: BPE_MERGES[i] = (left_id, right_id). The learned token id for
-// rule `i` is `BPE_BASE_VOCAB + i` (i.e., 256 + i). The rules are written
-// against byte-level ids only (both `left_id` and `right_id` < 256) which
-// keeps the placeholder table easy to reason about; real trained merges
-// will reference learned ids as left/right operands once the rank ladder
-// goes past depth 1.
-//
-// Byte values picked for plausibility under EN+RU UTF-8 workloads:
-//   0x20 = ' '        0x65 = 'e'      0x6F = 'o'
-//   0x61 = 'a'        0x68 = 'h'      0x72 = 'r'
-//   0x63 = 'c'        0x69 = 'i'      0x73 = 's'
-//   0x64 = 'd'        0x6C = 'l'      0x74 = 't'
-//   0x6E = 'n'        0x75 = 'u'
-//   0xD0, 0xD1 = leading bytes of 2-byte Cyrillic UTF-8 sequences.
-pub const BPE_MERGES: [(u32, u32); 32] = [
-    // rank 0..15 — common English bigrams and " <letter>" pairs.
-    (0x20, 0x74),  // 256: " t"
-    (0x20, 0x61),  // 257: " a"
-    (0x68, 0x65),  // 258: "he"
-    (0x69, 0x6E),  // 259: "in"
-    (0x65, 0x72),  // 260: "er"
-    (0x6F, 0x6E),  // 261: "on"
-    (0x20, 0x73),  // 262: " s"
-    (0x61, 0x74),  // 263: "at"
-    (0x65, 0x6E),  // 264: "en"
-    (0x6E, 0x64),  // 265: "nd"
-    (0x74, 0x69),  // 266: "ti"
-    (0x65, 0x73),  // 267: "es"
-    (0x6F, 0x72),  // 268: "or"
-    (0x74, 0x65),  // 269: "te"
-    (0x6F, 0x66),  // 270: "of"   (0x66 = 'f')
-    (0x65, 0x64),  // 271: "ed"
-    // rank 16..23 — repeated letters and common doubles.
-    (0x6C, 0x6C),  // 272: "ll"
-    (0x73, 0x73),  // 273: "ss"
-    (0x65, 0x65),  // 274: "ee"
-    (0x6F, 0x6F),  // 275: "oo"
-    (0x74, 0x74),  // 276: "tt"
-    (0x66, 0x66),  // 277: "ff"
-    (0x70, 0x70),  // 278: "pp"   (0x70 = 'p')
-    (0x6E, 0x6E),  // 279: "nn"
-    // rank 24..31 — Cyrillic UTF-8 lead-byte pairs (placeholder; the real
-    // table will include learned 2-byte Cyrillic sequences as single
-    // tokens). Each rule pairs the UTF-8 lead byte 0xD0 / 0xD1 with a
-    // common continuation byte from the Cyrillic block.
-    (0xD0, 0xB0),  // 280: U+0430 'а'
-    (0xD0, 0xB5),  // 281: U+0435 'е'
-    (0xD0, 0xB8),  // 282: U+0438 'и'
-    (0xD0, 0xBE),  // 283: U+043E 'о'
-    (0xD0, 0xBD),  // 284: U+043D 'н'
-    (0xD1, 0x82),  // 285: U+0442 'т'
-    (0xD1, 0x80),  // 286: U+0440 'р'
-    (0xD1, 0x81),  // 287: U+0441 'с'
+// Rank i pairs (BPE_MERGE_LEFT[i], BPE_MERGE_RIGHT[i]); the learned token id
+// is BPE_BASE_VOCAB + i. All operands are byte-level ids (< 256) in the
+// placeholder table. Byte values (decimal):
+//   rank 0..15  — common English bigrams and " <letter>" pairs:
+//                 " t" " a" "he" "in" "er" "on" " s" "at"
+//                 "en" "nd" "ti" "es" "or" "te" "of" "ed"
+//   rank 16..23 — repeated letters: "ll" "ss" "ee" "oo" "tt" "ff" "pp" "nn"
+//   rank 24..31 — Cyrillic UTF-8 lead-byte pairs: 0xD0/0xD1 + a common
+//                 continuation byte (U+0430 U+0435 U+0438 U+043E U+043D
+//                 U+0442 U+0440 U+0441).
+
+const BPE_MERGE_LEFT: [i64; 32] = [
+    32, 32, 104, 105, 101, 111, 32, 97,
+    101, 110, 116, 101, 111, 116, 111, 101,
+    108, 115, 101, 111, 116, 102, 112, 110,
+    208, 208, 208, 208, 208, 209, 209, 209,
 ];
 
-// ---------------------------------------------------------------------------
-// Section 3 — Error surface
-// ---------------------------------------------------------------------------
+const BPE_MERGE_RIGHT: [i64; 32] = [
+    116, 97, 101, 110, 114, 110, 115, 116,
+    110, 100, 105, 115, 114, 101, 102, 100,
+    108, 115, 101, 111, 116, 102, 112, 110,
+    176, 181, 184, 190, 189, 130, 128, 129,
+];
 
-// Closed set of tokenizer failure modes. `preselect` maps these onto
-// `InferenceError::InvalidK` (for `InputEmpty`, treated as a malformed
-// request) and `InferenceError::RequestTooLong`.
-pub enum TokenizeError {
-    // Input byte slice has length zero. The tokenizer refuses empty input
-    // explicitly so callers cannot accidentally hash an empty preimage
-    // into `request_hash`.
-    InputEmpty,
-
-    // Output token count exceeds `MAX_REQUEST_TOKENS`. Because the
-    // byte-level base produces one token per input byte before any
-    // merges, this fires when `bytes.len() > MAX_REQUEST_TOKENS`
-    // regardless of how aggressive the merge table is.
-    TooLong,
-}
-
-// ---------------------------------------------------------------------------
-// Section 4 — Public API
-// ---------------------------------------------------------------------------
-
-// Encode a UTF-8 byte slice into BPE token ids.
+// ─────────────────────────────────────────────────────────────────────────────
+// tokenize_bpe
 //
-// Contract:
-//   - bytes.len() == 0          -> Err(TokenizeError::InputEmpty)
-//   - bytes.len() > MAX_REQUEST_TOKENS -> Err(TokenizeError::TooLong)
-//     (because the byte-level init step would already exceed the cap;
-//      merges only shrink the sequence, so no later check is needed)
-//   - otherwise                 -> Ok(tokens) with tokens.len() ≤ bytes.len()
+// Encode `n` UTF-8 bytes at `bytes_addr` (one byte per offset) into BPE
+// token ids written as i64 lanes to `out_tokens` (caller-allocated,
+// capacity >= n lanes — merges never grow the sequence).
 //
-// Determinism: bit-identical across architectures. Every comparison is
-// over u32; no floating-point, no platform-dependent ordering.
-@[determinism(BitIdentical)]
-pub fn tokenize_bpe(bytes: &[u8]) -> Result<[u32], TokenizeError> {
-    let n: usize = bytes.len();
-    if n == 0 {
-        return Err(TokenizeError::InputEmpty);
-    }
-    if n > (MAX_REQUEST_TOKENS as usize) {
-        return Err(TokenizeError::TooLong);
-    }
+// Returns:
+//   TOKENIZE_ERR_EMPTY    (-1)  n == 0 — the tokenizer refuses empty input
+//                               explicitly so callers cannot hash an empty
+//                               preimage into request_hash.
+//   TOKENIZE_ERR_TOO_LONG (-2)  n > MAX_REQUEST_TOKENS — byte-level init
+//                               would already exceed the cap.
+//   token count (>= 1)          otherwise; count <= n.
+//
+// Algorithm: standard lowest-rank-applicable encode. Scan ranks top-down;
+// for each rule, walk the current tokens left-to-right for the leftmost
+// matching adjacent pair; splice (overwrite + shift-left, no allocation);
+// restart. Terminates at fixpoint or single token. Worst-case iterations
+// n - 1 (each merge shrinks the sequence by exactly one).
+// ─────────────────────────────────────────────────────────────────────────────
 
-    // Step 1 — byte-level initialisation.
-    let mut tokens: [u32] = [];
-    let mut i: usize = 0;
+pub fn tokenize_bpe(bytes_addr: i64, n: i64, out_tokens: i64) -> i64 {
+    if n == 0 { return TOKENIZE_ERR_EMPTY; }
+    if n > MAX_REQUEST_TOKENS { return TOKENIZE_ERR_TOO_LONG; }
+
+    // Step 1 — byte-level initialisation (one token per byte).
+    let mut i: i64 = 0;
     while i < n {
-        tokens.push(bytes[i] as u32);
+        __mind_store_i64(out_tokens + i * 8, __mind_load_i8(bytes_addr + i) & 255);
         i = i + 1;
     }
 
-    // Step 2 — iterative lowest-rank merge.
-    //
-    // Outer loop terminates either when no merge rule matches any adjacent
-    // pair, or when the token sequence has collapsed to a single token
-    // (no adjacent pairs left). The worst-case iteration count is
-    // bytes.len() - 1 because each successful merge strictly decreases
-    // `tokens.len()` by exactly one.
-    loop {
-        let tlen: usize = tokens.len();
+    // Step 2 — iterative lowest-rank merge (found-flags instead of break).
+    let mut tlen: i64 = n;
+    let mut cont: i64 = 1;
+    while cont == 1 {
         if tlen < 2 {
-            break;
-        }
-
-        // Find the lowest-rank applicable merge. `best_rank` carries the
-        // merge index; `best_pos` carries the leftmost position at which
-        // that merge applies. `best_rank == BPE_MERGE_COUNT` (a sentinel
-        // one past the last valid rank) means no rule applied.
-        let mut best_rank: u32   = BPE_MERGE_COUNT;
-        let mut best_pos:  usize = 0;
-
-        let mut rank: u32 = 0;
-        while rank < BPE_MERGE_COUNT {
-            let merge = BPE_MERGES[rank as usize];
-            let left:  u32 = merge.0;
-            let right: u32 = merge.1;
-
-            // Leftmost match for this rule.
-            let mut p: usize = 0;
-            let limit: usize = tlen - 1;
-            let mut found: bool = false;
-            while p < limit {
-                if tokens[p] == left && tokens[p + 1] == right {
-                    best_rank = rank;
-                    best_pos  = p;
-                    found     = true;
-                    break;
+            cont = 0;
+        } else {
+            let mut best_rank: i64 = BPE_MERGE_COUNT;
+            let mut best_pos: i64 = 0;
+            let mut found: i64 = 0;
+            let mut rank: i64 = 0;
+            while rank < BPE_MERGE_COUNT {
+                if found == 0 {
+                    let left: i64 = BPE_MERGE_LEFT[rank];
+                    let right: i64 = BPE_MERGE_RIGHT[rank];
+                    let mut p: i64 = 0;
+                    let limit: i64 = tlen - 1;
+                    while p < limit {
+                        if found == 0 {
+                            if __mind_load_i64(out_tokens + p * 8) == left {
+                                if __mind_load_i64(out_tokens + (p + 1) * 8) == right {
+                                    best_rank = rank;
+                                    best_pos = p;
+                                    found = 1;
+                                }
+                            }
+                        }
+                        p = p + 1;
+                    }
                 }
-                p = p + 1;
+                rank = rank + 1;
             }
-            if found {
-                break;
+
+            if found == 0 {
+                cont = 0;
+            } else {
+                // Splice: tokens[best_pos] = merged id, shift left, shrink.
+                __mind_store_i64(out_tokens + best_pos * 8, BPE_BASE_VOCAB + best_rank);
+                let mut j: i64 = best_pos + 1;
+                while j + 1 < tlen {
+                    __mind_store_i64(out_tokens + j * 8, __mind_load_i64(out_tokens + (j + 1) * 8));
+                    j = j + 1;
+                }
+                tlen = tlen - 1;
             }
-            rank = rank + 1;
         }
-
-        if best_rank == BPE_MERGE_COUNT {
-            // No rule applied to any adjacent pair — fixpoint reached.
-            break;
-        }
-
-        // Step 2c — splice: replace tokens[best_pos..best_pos+2] with the
-        // single merged token id (BPE_BASE_VOCAB + best_rank). Implemented
-        // as in-place overwrite + shift-left to avoid allocation.
-        let merged_id: u32 = BPE_BASE_VOCAB + best_rank;
-        tokens[best_pos] = merged_id;
-        let mut j: usize = best_pos + 1;
-        while j + 1 < tlen {
-            tokens[j] = tokens[j + 1];
-            j = j + 1;
-        }
-        tokens.pop();
     }
 
-    // Defence-in-depth — the initial-length gate already guarantees the
-    // post-merge sequence is ≤ MAX_REQUEST_TOKENS because merges never
-    // grow the sequence. Re-check anyway so a future signature change
-    // (e.g., a pre-seeded sentinel token) cannot silently slip past the
-    // cap without breaking this contract.
-    if tokens.len() > (MAX_REQUEST_TOKENS as usize) {
-        return Err(TokenizeError::TooLong);
-    }
-
-    Ok(tokens)
+    // Defence-in-depth: merges never grow the sequence, so the initial gate
+    // already bounds the output; re-check so a future signature change
+    // cannot slip past the cap silently.
+    if tlen > MAX_REQUEST_TOKENS { return TOKENIZE_ERR_TOO_LONG; }
+    tlen
 }
 
-// Returns the tokenizer artifact hash. Computed once at compile time as
-// SHA-256 of the canonical tokenizer serialization:
+// ─────────────────────────────────────────────────────────────────────────────
+// tokenizer_hash — SHA-256 of the canonical tokenizer serialization:
 //
 //   BPE_BASE_VOCAB  (u32 LE, 4 bytes) ||
 //   BPE_TOTAL_VOCAB (u32 LE, 4 bytes) ||
 //   BPE_MERGE_COUNT (u32 LE, 4 bytes) ||
 //   for rank i in 0..BPE_MERGE_COUNT:
-//       BPE_MERGES[i].0 (u32 LE, 4 bytes) ||
-//       BPE_MERGES[i].1 (u32 LE, 4 bytes)
+//       BPE_MERGE_LEFT[i]  (u32 LE, 4 bytes) ||
+//       BPE_MERGE_RIGHT[i] (u32 LE, 4 bytes)
 //
-// Total preimage length = 12 + 8 * BPE_MERGE_COUNT bytes.
+// Total preimage length = 12 + 8 * BPE_MERGE_COUNT = 268 bytes.
 //
-// Callers must treat this hash as part of the model artifact. It enters
-// `ModelWeights.tokenizer_hash`, which is bound into every attestation
-// envelope. The exact byte pattern of the placeholder hash is **not**
-// stable across Phase 1.2 commits (see header comment).
-@[determinism(BitIdentical)]
-pub fn tokenizer_hash() -> [u8; 32] {
-    sha256_impl(canonical_serialization_bytes().as_slice())
+// Writes the 32-byte digest to `out_addr` (caller-allocated), returns 0.
+// The hash enters ModelWeights.tokenizer_hash and is bound into every
+// attestation envelope. The placeholder-table byte pattern is NOT stable
+// across Phase 1.2 commits (see header). Pinned against CPython hashlib in
+// tests/unit/test_tokenizer.mind.
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn store_u32_le(buf: i64, off: i64, v: i64) -> i64 {
+    __mind_store_i8(buf + off + 0, v & 255);
+    __mind_store_i8(buf + off + 1, (v >> 8) & 255);
+    __mind_store_i8(buf + off + 2, (v >> 16) & 255);
+    __mind_store_i8(buf + off + 3, (v >> 24) & 255);
+    0
 }
 
-// ---------------------------------------------------------------------------
-// Section 5 — Internal helpers
-// ---------------------------------------------------------------------------
-
-// Build the canonical-serialization byte buffer fed to SHA-256 inside
-// `tokenizer_hash`. Kept private; the byte layout is the load-bearing
-// contract, not the helper itself.
-@[determinism(BitIdentical)]
-fn canonical_serialization_bytes() -> [u8] {
-    let mut buf: [u8] = [];
-    push_u32_le(&mut buf, BPE_BASE_VOCAB);
-    push_u32_le(&mut buf, BPE_TOTAL_VOCAB);
-    push_u32_le(&mut buf, BPE_MERGE_COUNT);
-    let mut i: u32 = 0;
+pub fn tokenizer_hash(out_addr: i64) -> i64 {
+    let buf: i64 = __mind_alloc(12 + BPE_MERGE_COUNT * 8);
+    store_u32_le(buf, 0, BPE_BASE_VOCAB);
+    store_u32_le(buf, 4, BPE_TOTAL_VOCAB);
+    store_u32_le(buf, 8, BPE_MERGE_COUNT);
+    let mut i: i64 = 0;
     while i < BPE_MERGE_COUNT {
-        let m = BPE_MERGES[i as usize];
-        push_u32_le(&mut buf, m.0);
-        push_u32_le(&mut buf, m.1);
+        store_u32_le(buf, 12 + i * 8, BPE_MERGE_LEFT[i]);
+        store_u32_le(buf, 12 + i * 8 + 4, BPE_MERGE_RIGHT[i]);
         i = i + 1;
     }
-    buf
-}
-
-// Append a u32 in little-endian byte order to a byte buffer. Used by the
-// canonical-serialization helper above so the SHA-256 preimage is
-// architecture-independent.
-@[determinism(BitIdentical)]
-fn push_u32_le(buf: &mut [u8], v: u32) {
-    buf.push(( v         & 0xFFu32) as u8);
-    buf.push(((v >>  8)  & 0xFFu32) as u8);
-    buf.push(((v >> 16)  & 0xFFu32) as u8);
-    buf.push(((v >> 24)  & 0xFFu32) as u8);
+    mn_sha256(buf, 12 + BPE_MERGE_COUNT * 8, out_addr);
+    __mind_free(buf);
+    0
 }

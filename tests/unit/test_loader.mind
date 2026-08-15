@@ -1,0 +1,532 @@
+// tests/unit/test_loader.mind — catalog/weights parser + manifest suite
+// for src/loader.mind (wave 4, 2026-08-12).
+//
+// Runs through `mindc test` on a merged image (src/lib.mind +
+// src/sha256.mind + src/runtime_ffi.mind + src/model.mind +
+// src/loader.mind + this file), driven by tests/mindc_gate.sh leg 14 with
+// an exact-count assertion — a "running 0 tests" output FAILS the gate.
+//
+// ORACLE PROVENANCE (CPython hashlib, computed 2026-08-12):
+//   catalog fixture (route0 id=0x10*32 emb=256x1.0; route1 id=0x20*32
+//     emb=256x(-1.0), v1):
+//     9c2aca93efd21bc3d1f2df72c12ebc946bf4e6cdb618ae5f70a21342f67ec73b
+//   compute_model_hash (108-byte architecture preimage):
+//     1fa83bb329f7896c8e82d22658f251899c4bcf25f0d85fba767e259348f02a1b
+//   manifest aggregate over the two-entry fixture (alpha/beta):
+//     66af12ce335b65a19b5808f2f87534bed98f35815d951162b450016607cbe346
+//   manifest JSON fixture is asserted byte-for-byte against the Python-
+//   rendered document (345 bytes).
+//
+// NOTE: parse_weights' positive path and build_tensor_manifest process the
+// full 32 MiB embedding table; they are gated by `mindc check` here and
+// exercised at integration time. The dequantization formula is pinned
+// AS-WRITTEN (see the anomaly flag in src/loader.mind's header).
+//
+// ASSERT-EAGERNESS (r9 hazard): all results let-bound before asserts.
+
+// ── helpers (ld_ prefix) ────────────────────────────────────────────────────
+
+fn ldw8(buf: i64, off: i64, v: i64) -> i64 {
+    __mind_store_i8(buf + off, v);
+    0
+}
+
+fn ldw32(buf: i64, off: i64, v: i64) -> i64 {
+    __mind_store_i8(buf + off + 0, v & 255);
+    __mind_store_i8(buf + off + 1, (v >> 8) & 255);
+    __mind_store_i8(buf + off + 2, (v >> 16) & 255);
+    __mind_store_i8(buf + off + 3, (v >> 24) & 255);
+    0
+}
+
+fn ldw16(buf: i64, off: i64, v: i64) -> i64 {
+    __mind_store_i8(buf + off + 0, v & 255);
+    __mind_store_i8(buf + off + 1, (v >> 8) & 255);
+    0
+}
+
+fn ldw_i32(buf: i64, off: i64, v: i64) -> i64 {
+    ldw32(buf, off, v)
+}
+
+fn ldw_fill(buf: i64, off: i64, n: i64, c: i64) -> i64 {
+    let mut i: i64 = 0;
+    while i < n {
+        __mind_store_i8(buf + off + i, c);
+        i = i + 1;
+    }
+    0
+}
+
+fn ldt_word(out: i64, w: i64) -> i64 {
+    let b0: i64 = __mind_load_i8(out + w * 4) & 255;
+    let b1: i64 = __mind_load_i8(out + w * 4 + 1) & 255;
+    let b2: i64 = __mind_load_i8(out + w * 4 + 2) & 255;
+    let b3: i64 = __mind_load_i8(out + w * 4 + 3) & 255;
+    b0 * 16777216 + b1 * 65536 + b2 * 256 + b3
+}
+
+fn ldt_check8(out: i64, w0: i64, w1: i64, w2: i64, w3: i64, w4: i64, w5: i64, w6: i64, w7: i64) -> i64 {
+    if ldt_word(out, 0) != w0 { return 1; }
+    if ldt_word(out, 1) != w1 { return 2; }
+    if ldt_word(out, 2) != w2 { return 3; }
+    if ldt_word(out, 3) != w3 { return 4; }
+    if ldt_word(out, 4) != w4 { return 5; }
+    if ldt_word(out, 5) != w5 { return 6; }
+    if ldt_word(out, 6) != w6 { return 7; }
+    if ldt_word(out, 7) != w7 { return 8; }
+    0
+}
+
+fn ldt_hex_digest(buf: i64, off: i64, hb: i64) -> i64 {
+    let nib_hi: i64 = (hb >> 4) & 15;
+    let nib_lo: i64 = hb & 15;
+    let mut hi: i64 = 48 + nib_hi;
+    if nib_hi > 9 { hi = 87 + nib_hi; }
+    let mut lo: i64 = 48 + nib_lo;
+    if nib_lo > 9 { lo = 87 + nib_lo; }
+    __mind_store_i8(buf + off, hi);
+    __mind_store_i8(buf + off + 1, lo);
+    0
+}
+
+// Build the 2172-byte v1 catalog fixture at `buf`.
+// Layout: header(48) + ids(64) + embeddings(2048) + trailer(8) + offset(4).
+fn ldt_catalog_fixture(buf: i64) -> i64 {
+    // header
+    ldw8(buf, 0, 77);
+    ldw8(buf, 1, 78);
+    ldw8(buf, 2, 67);
+    ldw8(buf, 3, 49);
+    ldw16(buf, 4, 1);
+    ldw16(buf, 6, 0);
+    ldw32(buf, 8, 2);
+    ldw32(buf, 12, 256);
+    // catalog_hash (oracle value, big-endian byte order as stored)
+    let hw: [i64; 32] = [
+        156, 42, 202, 147, 239, 210, 27, 195, 209, 242, 223, 114, 193, 46, 188, 148,
+        107, 244, 230, 205, 182, 24, 174, 95, 112, 162, 19, 66, 246, 126, 199, 59,
+    ];
+    let mut i: i64 = 0;
+    while i < 32 {
+        __mind_store_i8(buf + 16 + i, hw[i]);
+        i = i + 1;
+    }
+    // route ids
+    ldw_fill(buf, 48, 32, 16);
+    ldw_fill(buf, 80, 32, 32);
+    // embeddings: route0 = 256 x 1.0 (65536), route1 = 256 x -1.0 (-65536)
+    i = 0;
+    while i < 256 {
+        ldw_i32(buf, 112 + i * 4, 65536);
+        ldw_i32(buf, 112 + 1024 + i * 4, -65536);
+        i = i + 1;
+    }
+    // external id table at 2160: "ra", "rb"
+    ldw16(buf, 2160, 2);
+    ldw8(buf, 2162, 114);
+    ldw8(buf, 2163, 97);
+    ldw16(buf, 2164, 2);
+    ldw8(buf, 2166, 114);
+    ldw8(buf, 2167, 98);
+    // trailer offset field
+    ldw32(buf, 2168, 2160);
+    2172
+}
+
+// ── parse_catalog ───────────────────────────────────────────────────────────
+
+#[test]
+fn test_loader_catalog_fixture_parses() {
+    let buf: i64 = __mind_alloc(2172);
+    ldt_catalog_fixture(buf);
+    let cat: i64 = __mind_alloc(5 * 8);
+    let rc: i64 = loader_parse_catalog(buf, 2172, cat);
+    assert rc == LD_OK, "fixture parses";
+
+    let n: i64 = __mind_load_i64(cat + LOADER_CAT_N * 8);
+    assert n == 2, "two routes";
+    let ids: i64 = __mind_load_i64(cat + LOADER_CAT_IDS * 8);
+    assert __mind_load_i8(ids + 0) == 16, "route 0 id byte";
+    assert __mind_load_i8(ids + 32) == 32, "route 1 id byte";
+    let emb: i64 = __mind_load_i64(cat + LOADER_CAT_EMB * 8);
+    assert __mind_load_i64(emb + 0) == 65536, "route 0 emb 1.0";
+    assert __mind_load_i64(emb + 256 * 8) == -65536, "route 1 emb -1.0";
+    let prior: i64 = __mind_load_i64(cat + LOADER_CAT_PRIOR * 8);
+    assert __mind_load_i64(prior) == 0, "v1 prior is implicit zero";
+    let hash: i64 = __mind_load_i64(cat + LOADER_CAT_HASH * 8);
+    let hrc: i64 = ldt_check8(hash, 2620050067, 4023524291, 3522355058, 3241065620, 1811211981, 3055070815, 1889669954, 4135503675);
+    assert hrc == 0, "recomputed catalog hash matches the hashlib oracle";
+    __mind_free(cat);
+    __mind_free(buf);
+}
+
+#[test]
+fn test_loader_catalog_gate_order() {
+    let buf: i64 = __mind_alloc(2172);
+    let total: i64 = ldt_catalog_fixture(buf);
+    let cat: i64 = __mind_alloc(5 * 8);
+
+    let r_trunc: i64 = loader_parse_catalog(buf, 30, cat);
+    assert r_trunc == LD_ERR_TRUNCATED, "short file -> truncated";
+
+    ldw8(buf, 3, 50);
+    let r_magic: i64 = loader_parse_catalog(buf, total, cat);
+    assert r_magic == LD_ERR_BAD_MAGIC, "bad magic rejected";
+    ldw8(buf, 3, 49);
+
+    ldw16(buf, 4, 9);
+    let r_ver: i64 = loader_parse_catalog(buf, total, cat);
+    assert r_ver == LD_ERR_VERSION, "version 9 rejected";
+    ldw16(buf, 4, 1);
+
+    ldw8(buf, 6, 1);
+    let r_rsv: i64 = loader_parse_catalog(buf, total, cat);
+    assert r_rsv == LD_ERR_RESERVED, "non-zero reserved rejected";
+    ldw8(buf, 6, 0);
+
+    ldw32(buf, 12, 128);
+    let r_shape: i64 = loader_parse_catalog(buf, total, cat);
+    assert r_shape == LD_ERR_SHAPE, "wrong embedding_dim rejected";
+    ldw32(buf, 12, 256);
+
+    __mind_free(cat);
+    __mind_free(buf);
+}
+
+#[test]
+fn test_loader_catalog_rejects_hash_mismatch_and_duplicates() {
+    let buf: i64 = __mind_alloc(2172);
+    let total: i64 = ldt_catalog_fixture(buf);
+    let cat: i64 = __mind_alloc(5 * 8);
+
+    // Flip one embedding byte: stored hash no longer matches.
+    ldw8(buf, 112, 1);
+    let r_hash: i64 = loader_parse_catalog(buf, total, cat);
+    assert r_hash == LD_ERR_HASH, "tampered embedding -> HashMismatch";
+    ldw8(buf, 112, 0);
+
+    // Duplicate route ids (route 1 := route 0) — but the stored hash must
+    // still match for the dup gate to be reached, so the dup check fires
+    // BEFORE the hash check in gate order... the parser checks uniqueness
+    // before hashing, so a dup fixture with the original stored hash still
+    // reports the duplicate.
+    ldw_fill(buf, 80, 32, 16);
+    let r_dup: i64 = loader_parse_catalog(buf, total, cat);
+    assert r_dup == LD_ERR_DUP_ROUTE, "duplicate route id rejected (A3)";
+
+    __mind_free(cat);
+    __mind_free(buf);
+}
+
+#[test]
+fn test_loader_catalog_trailer_validation() {
+    let buf: i64 = __mind_alloc(2172);
+    let total: i64 = ldt_catalog_fixture(buf);
+    let cat: i64 = __mind_alloc(5 * 8);
+
+    // Corrupt the trailer offset.
+    ldw32(buf, 2168, 1000);
+    let r_off: i64 = loader_parse_catalog(buf, total, cat);
+    assert r_off == LD_ERR_TRUNCATED, "wrong trailer offset rejected";
+    ldw32(buf, 2168, 2160);
+
+    // Non-UTF-8 external id (lone continuation byte 0x80).
+    ldw8(buf, 2162, 128);
+    let r_utf: i64 = loader_parse_catalog(buf, total, cat);
+    assert r_utf == LD_ERR_UTF8, "invalid UTF-8 external id rejected";
+
+    __mind_free(cat);
+    __mind_free(buf);
+}
+
+// ── UTF-8 validator ─────────────────────────────────────────────────────────
+
+#[test]
+fn test_loader_utf8_validator() {
+    let buf: i64 = __mind_alloc(16);
+
+    // ASCII.
+    ldw8(buf, 0, 65);
+    let a: i64 = ld_utf8_valid(buf, 0, 1, 16);
+    assert a == 1, "ASCII valid";
+
+    // 2-byte Cyrillic 'а' = D0 B0.
+    ldw8(buf, 0, 208);
+    ldw8(buf, 1, 176);
+    let c: i64 = ld_utf8_valid(buf, 0, 2, 16);
+    assert c == 1, "2-byte Cyrillic valid";
+
+    // Lone continuation.
+    ldw8(buf, 0, 128);
+    let l: i64 = ld_utf8_valid(buf, 0, 1, 16);
+    assert l == 0, "lone continuation rejected";
+
+    // Overlong 2-byte (C0 80).
+    ldw8(buf, 0, 192);
+    ldw8(buf, 1, 128);
+    let o: i64 = ld_utf8_valid(buf, 0, 2, 16);
+    assert o == 0, "overlong 2-byte rejected";
+
+    // Surrogate (ED A0 80).
+    ldw8(buf, 0, 237);
+    ldw8(buf, 1, 160);
+    ldw8(buf, 2, 128);
+    let s: i64 = ld_utf8_valid(buf, 0, 3, 16);
+    assert s == 0, "surrogate rejected";
+
+    // Truncated 3-byte.
+    ldw8(buf, 0, 224);
+    ldw8(buf, 1, 160);
+    let t: i64 = ld_utf8_valid(buf, 0, 2, 16);
+    assert t == 0, "truncated 3-byte rejected";
+
+    // 4-byte max (F4 8F BF BF = U+10FFFF) valid; F4 90.. out of range.
+    ldw8(buf, 0, 244);
+    ldw8(buf, 1, 143);
+    ldw8(buf, 2, 191);
+    ldw8(buf, 3, 191);
+    let f: i64 = ld_utf8_valid(buf, 0, 4, 16);
+    assert f == 1, "U+10FFFF valid";
+    ldw8(buf, 1, 144);
+    let f2: i64 = ld_utf8_valid(buf, 0, 4, 16);
+    assert f2 == 0, "beyond U+10FFFF rejected";
+
+    __mind_free(buf);
+}
+
+// ── dequantization (formula pinned AS-WRITTEN — see loader header) ─────────
+
+#[test]
+fn test_loader_dequantize_v1_per_channel() {
+    // h = 4 stand-in. v1: one scale per output channel.
+    // int8 row 0 = [2, 2, 2, 2], scale 65536 (1.0):
+    //   (2*65536 + 32768) >> 16 = 2  (the as-written formula; see anomaly
+    //   flag in src/loader.mind — a Q16.16-expecting formula would give
+    //   131072).
+    let bytes: i64 = __mind_alloc(64);
+    ldw_fill(bytes, 0, 16, 2);
+    ldw_i32(bytes, 16, 65536);
+    ldw_i32(bytes, 20, 131072);
+    ldw_i32(bytes, 24, 65536);
+    ldw_i32(bytes, 28, 65536);
+    let out: i64 = __mind_alloc(16 * 8);
+
+    ld_dequantize_matrix(bytes, 0, 16, 4, 0, out);
+    let v00: i64 = __mind_load_i64(out + 0);
+    let v10: i64 = __mind_load_i64(out + 4 * 8);
+    // Negative int8: -2 with scale 1.0 -> (-131072 + 32768) >> 16 = -2
+    // (arithmetic shift floors; -98304 >> 16 = -2).
+    ldw8(bytes, 0, 254);
+    ld_dequantize_matrix(bytes, 0, 16, 4, 0, out);
+    let vneg: i64 = __mind_load_i64(out + 0);
+    assert v00 == 2, "v1 formula: (2*1.0+0.5)>>16 = 2";
+    assert v10 == 4, "scale 2.0 -> 4";
+    assert vneg == -2, "negative int8 dequantizes signed";
+    __mind_free(out);
+    __mind_free(bytes);
+}
+
+#[test]
+fn test_loader_dequantize_v2_groupwise() {
+    // h = 64 (2 groups of 32). Group 0 scale 1.0, group 1 scale 2.0;
+    // int8 = 1 everywhere: group 0 -> (65536+32768)>>16 = 1,
+    // group 1 -> (131072+32768)>>16 = 2.
+    let bytes: i64 = __mind_alloc(64 * 64 + 64 * 2 * 4);
+    ldw_fill(bytes, 0, 64 * 64, 1);
+    let scales_off: i64 = 64 * 64;
+    let mut oc: i64 = 0;
+    while oc < 64 {
+        ldw_i32(bytes, scales_off + (oc * 2 + 0) * 4, 65536);
+        ldw_i32(bytes, scales_off + (oc * 2 + 1) * 4, 131072);
+        oc = oc + 1;
+    }
+    let out: i64 = __mind_alloc(64 * 64 * 8);
+
+    ld_dequantize_matrix(bytes, 0, scales_off, 64, 1, out);
+    assert __mind_load_i64(out + 0) == 1, "group 0 uses scale 1.0";
+    assert __mind_load_i64(out + 31 * 8) == 1, "group 0 last column";
+    assert __mind_load_i64(out + 32 * 8) == 2, "group 1 uses scale 2.0";
+    assert __mind_load_i64(out + 63 * 8) == 2, "group 1 last column";
+    __mind_free(out);
+    __mind_free(bytes);
+}
+
+// ── parse_weights negative gates (positive path needs the 32 MiB embedding)─
+
+#[test]
+fn test_loader_weights_gates() {
+    let buf: i64 = __mind_alloc(128);
+    ldw_fill(buf, 0, 128, 0);
+    let wtab: i64 = __mind_alloc(18 * 8);
+    let mh: i64 = __mind_alloc(32);
+    let th: i64 = __mind_alloc(32);
+
+    let r_short: i64 = loader_parse_weights(buf, 40, wtab, mh, th);
+    assert r_short == LD_ERR_TRUNCATED, "short file -> truncated";
+
+    ldw8(buf, 0, 77);
+    ldw8(buf, 1, 78);
+    ldw8(buf, 2, 87);
+    ldw8(buf, 3, 50);
+    let r_magic: i64 = loader_parse_weights(buf, 128, wtab, mh, th);
+    assert r_magic == LD_ERR_BAD_MAGIC, "MNW2 is not MNW1";
+    ldw8(buf, 3, 49);
+
+    ldw16(buf, 4, 9);
+    let r_ver: i64 = loader_parse_weights(buf, 128, wtab, mh, th);
+    assert r_ver == LD_ERR_VERSION, "version 9 rejected";
+    ldw16(buf, 4, 1);
+
+    ldw8(buf, 6, 7);
+    let r_rsv: i64 = loader_parse_weights(buf, 128, wtab, mh, th);
+    assert r_rsv == LD_ERR_RESERVED, "reserved rejected";
+    ldw8(buf, 6, 0);
+
+    ldw32(buf, 72, 3);
+    let r_layers: i64 = loader_parse_weights(buf, 128, wtab, mh, th);
+    assert r_layers == LD_ERR_SHAPE, "encoder_layers != 2 rejected";
+    ldw32(buf, 72, 2);
+    ldw32(buf, 76, 128);
+    let r_hidden: i64 = loader_parse_weights(buf, 128, wtab, mh, th);
+    assert r_hidden == LD_ERR_SHAPE, "encoder_hidden != 256 rejected";
+    ldw32(buf, 76, 256);
+
+    // Valid header but nowhere near the full size -> truncated.
+    let r_trunc2: i64 = loader_parse_weights(buf, 128, wtab, mh, th);
+    assert r_trunc2 == LD_ERR_TRUNCATED, "short payload -> truncated";
+
+    __mind_free(th);
+    __mind_free(mh);
+    __mind_free(wtab);
+    __mind_free(buf);
+}
+
+// ── compute_model_hash oracle ───────────────────────────────────────────────
+
+#[test]
+fn test_loader_model_hash_oracle() {
+    let out: i64 = __mind_alloc(32);
+    loader_compute_model_hash(out);
+    // 1fa83bb3… (hashlib over the 108-byte architecture preimage).
+    let rc: i64 = ldt_check8(out, 531119027, 704088428, 2390938150, 1492275593, 2622213925, 4040712122, 1987978643, 1223698971);
+    assert rc == 0, "model_hash matches the hashlib oracle";
+    __mind_free(out);
+}
+
+// ── manifest machinery oracles ──────────────────────────────────────────────
+
+#[test]
+fn test_loader_neuron_hash_vector() {
+    // [1.0 x 4] -> sha256 over 16 bytes of 00 00 01 00.
+    let v: i64 = __mind_alloc(4 * 8);
+    let mut i: i64 = 0;
+    while i < 4 {
+        __mind_store_i64(v + i * 8, 65536);
+        i = i + 1;
+    }
+    let out: i64 = __mind_alloc(32);
+    loader_neuron_hash(v, 4, out);
+    // d9e0a41282edfca0326061f2136e65a2c6ed63d0139f4cfd812f46d951be1dab
+    let rc: i64 = ldt_check8(out, 3655377938, 2196634784, 845177330, 326002082, 3337446352, 329207037, 2167359193, 1371413931);
+    assert rc == 0, "neuron hash matches hashlib";
+    __mind_free(out);
+    __mind_free(v);
+}
+
+#[test]
+fn test_loader_manifest_aggregate_and_json() {
+    // Two-entry fixture: ("alpha", 4, 1, hash[1.0 x4]),
+    // ("beta", 2, 2, hash[-1.0 x4]).
+    let v1: i64 = __mind_alloc(4 * 8);
+    let mut i: i64 = 0;
+    while i < 4 {
+        __mind_store_i64(v1 + i * 8, 65536);
+        i = i + 1;
+    }
+    let v2: i64 = __mind_alloc(4 * 8);
+    i = 0;
+    while i < 4 {
+        __mind_store_i64(v2 + i * 8, -65536);
+        i = i + 1;
+    }
+    let h1: i64 = __mind_alloc(32);
+    loader_neuron_hash(v1, 4, h1);
+    let h2: i64 = __mind_alloc(32);
+    loader_neuron_hash(v2, 4, h2);
+
+    let name_a: i64 = __mind_alloc(5);
+    ldw8(name_a, 0, 97);
+    ldw8(name_a, 1, 108);
+    ldw8(name_a, 2, 112);
+    ldw8(name_a, 3, 104);
+    ldw8(name_a, 4, 97);
+    let name_b: i64 = __mind_alloc(4);
+    ldw8(name_b, 0, 98);
+    ldw8(name_b, 1, 101);
+    ldw8(name_b, 2, 116);
+    ldw8(name_b, 3, 97);
+
+    let entries: i64 = __mind_alloc(2 * 5 * 8);
+    __mind_store_i64(entries + 0, name_a);
+    __mind_store_i64(entries + 8, 5);
+    __mind_store_i64(entries + 16, 4);
+    __mind_store_i64(entries + 24, 1);
+    __mind_store_i64(entries + 32, h1);
+    __mind_store_i64(entries + 40, name_b);
+    __mind_store_i64(entries + 48, 4);
+    __mind_store_i64(entries + 56, 2);
+    __mind_store_i64(entries + 64, 2);
+    __mind_store_i64(entries + 72, h2);
+
+    let agg: i64 = __mind_alloc(32);
+    loader_manifest_aggregate(entries, 2, agg);
+    // 66af12ce… (hashlib over the MNPM preimage).
+    let rc: i64 = ldt_check8(agg, 1722749646, 861627809, 2606237938, 4168430782, 3650041217, 1570050402, 3025142118, 130802502);
+    assert rc == 0, "manifest aggregate matches hashlib";
+
+    // JSON export: byte-for-byte against the Python-rendered document.
+    let json: i64 = __mind_alloc(512);
+    let jl: i64 = loader_manifest_export(entries, 2, agg, json, 512);
+    assert jl == 345, "json length 345";
+    // Spot anchors + full hash of the document: compare against Python's
+    // sha256 of the expected JSON.
+    let jh: i64 = __mind_alloc(32);
+    mn_sha256(json, jl, jh);
+    // sha256 of the expected 345-byte JSON (hashlib, 2026-08-12):
+    //   a974d81537fabce1f3c38f5cc93975a422f30fcf3cd98013422b6fc828c1d346
+    let jrc: i64 = ldt_check8(jh, 2843006997, 939179233, 4089679708, 3375986084, 586354639, 1020887059, 1110142920, 683791174);
+    assert jrc == 0, "manifest JSON byte-identical to the Python rendering";
+
+    __mind_free(jh);
+    __mind_free(json);
+    __mind_free(agg);
+    __mind_free(entries);
+    __mind_free(name_b);
+    __mind_free(name_a);
+    __mind_free(h2);
+    __mind_free(h1);
+    __mind_free(v2);
+    __mind_free(v1);
+}
+
+#[test]
+fn test_loader_manifest_export_capacity_gate() {
+    let name_a: i64 = __mind_alloc(1);
+    ldw8(name_a, 0, 97);
+    let h1: i64 = __mind_alloc(32);
+    ldw_fill(h1, 0, 32, 1);
+    let entries: i64 = __mind_alloc(5 * 8);
+    __mind_store_i64(entries + 0, name_a);
+    __mind_store_i64(entries + 8, 1);
+    __mind_store_i64(entries + 16, 1);
+    __mind_store_i64(entries + 24, 1);
+    __mind_store_i64(entries + 32, h1);
+    let json: i64 = __mind_alloc(16);
+    let rc: i64 = loader_manifest_export(entries, 1, h1, json, 16);
+    assert rc == LD_ERR_TRUNCATED, "insufficient capacity rejected, not overrun";
+    __mind_free(json);
+    __mind_free(entries);
+    __mind_free(h1);
+    __mind_free(name_a);
+}

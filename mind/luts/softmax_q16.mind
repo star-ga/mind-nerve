@@ -4,6 +4,10 @@
 
 import std.vec;
 
+// Stage 2 calls exp_q16_lookup (mind/luts/exp_q16.mind); the import is
+// required — mindc >= 0.10 name-checks fn bodies (mind#23).
+import luts.exp_q16;
+
 // softmax_q16 — Q16.16 softmax kernel.
 //
 // Implements the 5-stage pinned pipeline from spec/numerics.md §5 and
@@ -32,9 +36,7 @@ import std.vec;
 // ── Stage 1 helper: find max (tail-recursive, ascending index) ───────────────
 
 pub fn softmax_max_step(buf: i64, n: i64, idx: i64, acc: i64) -> i64 {
-    if idx >= n {
-        return acc;
-    }
+    if idx >= n { return acc; }
     let v: i64 = __mind_load_i64(buf + idx * 8);
     if v > acc {
         return softmax_max_step(buf, n, idx + 1, v);
@@ -46,9 +48,7 @@ pub fn softmax_max_step(buf: i64, n: i64, idx: i64, acc: i64) -> i64 {
 // Returns Q32.32 sum D.  Writes y_i back into buf[i] as Q16.16.
 
 pub fn softmax_exp_sum_step(exp_h: i64, buf: i64, n: i64, idx: i64, m: i64, acc_q32: i64) -> i64 {
-    if idx >= n {
-        return acc_q32;
-    }
+    if idx >= n { return acc_q32; }
     let xi: i64 = __mind_load_i64(buf + idx * 8);
     let shifted: i64 = xi - m;
     let yi: i64 = exp_q16_lookup(exp_h, shifted);
@@ -78,9 +78,7 @@ pub fn softmax_exp_sum_step(exp_h: i64, buf: i64, n: i64, idx: i64, m: i64, acc_
 //   y_i/2^16 * (2^48 / D) >> 32  ==  (y_i / D) * 2^16  (Q16.16).
 
 pub fn softmax_scale_step(recip: i64, buf: i64, n: i64, idx: i64) -> i64 {
-    if idx >= n {
-        return 0;
-    }
+    if idx >= n { return 0; }
     let yi: i64 = __mind_load_i64(buf + idx * 8);
     let prod: i64 = (yi * recip) >> 32;
     let q16_max: i64 = 2147483647;
@@ -88,11 +86,7 @@ pub fn softmax_scale_step(recip: i64, buf: i64, n: i64, idx: i64) -> i64 {
     let clamped: i64 = if prod > q16_max {
         q16_max
     } else {
-        if prod < q16_min {
-            q16_min
-        } else {
-            prod
-        }
+        if prod < q16_min { q16_min } else { prod }
     };
     __mind_store_i64(buf + idx * 8, clamped);
     softmax_scale_step(recip, buf, n, idx + 1)
@@ -101,9 +95,7 @@ pub fn softmax_scale_step(recip: i64, buf: i64, n: i64, idx: i64) -> i64 {
 // ── Top-level softmax kernel ──────────────────────────────────────────────────
 
 pub fn softmax_q16_run(exp_h: i64, recip_h: i64, buf: i64, n: i64) -> i64 {
-    if n <= 0 {
-        return 0;
-    }
+    if n <= 0 { return 0; }
 
     // Stage 1: find max.  Seed with first element.
     let first: i64 = __mind_load_i64(buf);
@@ -115,11 +107,7 @@ pub fn softmax_q16_run(exp_h: i64, recip_h: i64, buf: i64, n: i64) -> i64 {
     // sum (no precision lost in the narrowing).
     let d_q32: i64 = softmax_exp_sum_step(exp_h, buf, n, 0, m, 0);
     let d_q16: i64 = d_q32 >> 16;
-    let d_safe: i64 = if d_q16 <= 0 {
-        1
-    } else {
-        d_q16
-    };
+    let d_safe: i64 = if d_q16 <= 0 { 1 } else { d_q16 };
 
     // Stage 4: precise reciprocal of the fractional Q16.16 sum.
     //   recip = floor(2^48 / D)   (D in Q16.16)
@@ -150,26 +138,19 @@ pub fn softmax_q16_run(exp_h: i64, recip_h: i64, buf: i64, n: i64) -> i64 {
 // __mind_nerve_lut_exp_h / __mind_nerve_lut_recip_h are resolved at .so
 // link time (same MIND<->C bare-name convention as __mind_alloc).
 
-pub fn softmax_q16_rows(exp_h: i64, recip_h: i64, buf: i64, n_rows: i64, row_len: i64, r: i64) -> i64 {
-    if r >= n_rows {
-        return 0;
-    }
+pub fn softmax_q16_rows(exp_h: i64, recip_h: i64,
+                        buf: i64, n_rows: i64, row_len: i64, r: i64) -> i64 {
+    if r >= n_rows { return 0; }
     let row: i64 = buf + r * row_len * 8;
     softmax_q16_run(exp_h, recip_h, row, row_len);
     softmax_q16_rows(exp_h, recip_h, buf, n_rows, row_len, r + 1)
 }
 
 pub fn softmax_q16(buf: i64, n_rows: i64, row_len: i64) -> i64 {
-    if buf == 0 {
-        return 0;
-    }
-    if n_rows <= 0 {
-        return 0;
-    }
-    if row_len <= 0 {
-        return 0;
-    }
-    let exp_h: i64 = __mind_nerve_lut_exp_h();
+    if buf == 0 { return 0; }
+    if n_rows <= 0 { return 0; }
+    if row_len <= 0 { return 0; }
+    let exp_h: i64   = __mind_nerve_lut_exp_h();
     let recip_h: i64 = __mind_nerve_lut_recip_h();
     softmax_q16_rows(exp_h, recip_h, buf, n_rows, row_len, 0)
 }

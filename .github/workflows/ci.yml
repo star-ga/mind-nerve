@@ -278,18 +278,24 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      # Pinned to the mindc release the tree is validated against.
+      # Pinned to the mindc build the tree is validated against.
       # Re-pinning means: run tests/mindc_gate.sh locally against the new
-      # release, then update this ref, the gate's version assertion, and
+      # build, then update this ref, the gate's version assertion, and
       # mind/Mind.toml together. (The previous v0.4.4 pin passed only
       # because single-file mode never name-checked fn bodies — mind#23;
       # 0.10.2 checks them and resolves cross-module imports in project
       # mode via mind/Mind.toml.)
-      - name: Checkout mind compiler at v0.10.2
+      # NOTE: pinned to a post-v0.10.2 main sha (still reports "mind
+      # 0.10.2") because the leg-15 native-ELF harness needs the RI-D
+      # native-ELF note-emit fixes that landed after the v0.10.2 tag
+      # (star-ga/mind#311/#312); the bare tag fails lowering with
+      # "non-i64 argument to call" (G1, star-ga/mind#234). Re-pin to the
+      # next tagged release once one contains those fixes.
+      - name: Checkout mind compiler (0.10.2 + RI-D native-ELF fixes)
         uses: actions/checkout@v7
         with:
           repository: star-ga/mind
-          ref: v0.10.2
+          ref: f68ff638
           path: mind-compiler
       # The gate's native-symbol leg (nm on target/obj/*.o) requires REAL
       # native codegen: without the mlir-build feature every module falls

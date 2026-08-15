@@ -19,7 +19,10 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install ruff
-        run: pip install ruff==0.5.7
+        # Pinned to the same 0.16.x line the dev extra requires
+        # (ruff>=0.16.1) so the CI gate and a developer's local run cannot
+        # disagree on format rules — the 0.5.7 pin predated the dev pin.
+        run: pip install ruff==0.16.2
       - name: ruff check
         run: ruff check python/mind_nerve
       - name: ruff format check
@@ -270,41 +273,58 @@ jobs:
         run: pytest tests/perf -v --tb=short -m perf || true
 
   mindc-parse:
-    name: mindc-parse (Phase 2 Q16.16 kernels)
+    name: mindc-gate (Phase 2 Q16.16 kernels, mindc 0.10.2)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - name: Checkout mind compiler at v0.4.4
+      # Pinned to the mindc release the tree is validated against.
+      # Re-pinning means: run tests/mindc_gate.sh locally against the new
+      # release, then update this ref, the gate's version assertion, and
+      # mind/Mind.toml together. (The previous v0.4.4 pin passed only
+      # because single-file mode never name-checked fn bodies — mind#23;
+      # 0.10.2 checks them and resolves cross-module imports in project
+      # mode via mind/Mind.toml.)
+      - name: Checkout mind compiler at v0.10.2
         uses: actions/checkout@v7
         with:
           repository: star-ga/mind
-          ref: v0.4.4
+          ref: v0.10.2
           path: mind-compiler
+      # The gate's native-symbol leg (nm on target/obj/*.o) requires REAL
+      # native codegen: without the mlir-build feature every module falls
+      # back to embedded-source objects and the leg necessarily fails
+      # (codex audit 2026-08, #21). mlir-build also needs the MLIR toolchain
+      # on PATH — same mlir-20-tools/clang-20 install the mind repo's own CI
+      # uses on ubuntu-latest (LLVM 20 from noble universe).
+      - name: Install MLIR toolchain (Ubuntu 24.04 LLVM 20)
+        run: |
+          ok=0
+          for attempt in 1 2 3 4 5; do
+            sudo apt-get update || true
+            if sudo apt-get install -y --fix-missing mlir-20-tools clang-20; then ok=1; break; fi
+            echo "apt attempt $attempt failed (mirror outage?); retry in $((attempt * 20))s"
+            sleep $((attempt * 20))
+          done
+          [ "$ok" = 1 ] || { echo "MLIR toolchain unavailable after 5 attempts"; exit 1; }
+          echo "/usr/lib/llvm-20/bin" >> "$GITHUB_PATH"
+      - name: Verify MLIR toolchain on PATH
+        run: |
+          mlir-opt --version | head -1
+          mlir-translate --version | head -1
+          clang --version | head -1
       - name: Build mindc
         working-directory: mind-compiler
-        run: cargo build --release --features "std-surface cross-module-imports" --bin mindc
-      - name: Parse every .mind file in mind/luts/, mind/kernels/, and mind/exports/
+        run: cargo build --release --features "std-surface cross-module-imports mlir-build" --bin mindc
+      # Fail-closed gate: project-mode compile of all 17 kernel-tree
+      # modules + the 5-test LUT bit-identity smoke. The script never
+      # trusts exit codes alone — it rejects error-severity diagnostics,
+      # unexpected embedded-source fallbacks, and "running 0 tests"
+      # silent-green output. See tests/mindc_gate.sh.
+      - name: Run the fail-closed mindc gate (kernel tree + LUT smoke)
         run: |
-          MINDC=$(pwd)/mind-compiler/target/release/mindc
-          fail=0
-          for f in mind/luts/*.mind mind/kernels/*.mind mind/exports/*.mind; do
-            [ -f "$f" ] || continue
-            echo "::group::Parsing $f"
-            if "$MINDC" "$f" --emit-ir > /dev/null 2>&1; then
-              echo "  OK"
-            else
-              echo "  FAIL — re-running with output:"
-              "$MINDC" "$f" --emit-ir || true
-              fail=1
-            fi
-            echo "::endgroup::"
-          done
-          if [ $fail -ne 0 ]; then
-            echo "::error::One or more .mind files failed to parse under the in-tree mindc"
-            exit 1
-          fi
-          echo "All .mind kernels + LUTs parse cleanly under the in-tree mindc."
+          MINDC=$(pwd)/mind-compiler/target/release/mindc \
+            bash tests/mindc_gate.sh
 
   bit-identity-cpu:
     name: Bit-identity harness (CPU / PyTorch baseline)

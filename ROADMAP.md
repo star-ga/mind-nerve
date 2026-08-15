@@ -46,15 +46,18 @@ Three blockers were raised 2026-05-14. Status after the Phase 1 alpha sprint:
    native runtime bundled inside the wheel. The Phase-1 PyTorch
    inference path published in this repository works without it.
 
-**Release status (2026-05-18):** `v0.3.0-beta.2` is the current PyPI
-public — wheel + sdist live at
-[pypi.org/project/mind-nerve/0.3.0b2](https://pypi.org/project/mind-nerve/0.3.0b2/),
-GitHub release at
-[v0.3.0-beta.2](https://github.com/star-ga/mind-nerve/releases/tag/v0.3.0-beta.2).
-Single change on top of beta.1 is the flock-guarded `ensure()` daemon
-spawn (closes the multi-spawn race that pinned memory under
-high-concurrency CLI use). Weights on Hugging Face under Apache-2.0
-(`star-ga/mind-nerve`). The PyTorch-based inference path remains
+**Release status (2026-08-10):** `v0.3.0b8` is the current PyPI public
+(beta series: wheel + sdist live at
+[pypi.org/project/mind-nerve/](https://pypi.org/project/mind-nerve/);
+`0.3.0b9` is in progress on main. Weights on Hugging Face under Apache-2.0
+(`star-ga/mind-nerve`). Since beta.2 the repo has shipped the integrations
+hook subsystem (per-prompt routing hook + structural skills-dir projection
++ npy-aligned hygiene), the **`mind-nerve acquire` subsystem** (curated
+external skill/agent/MCP discovery → quarantine → deterministic fail-closed
+static vetting → hash-manifested hub install → live daemon reindex; see
+[docs/acquisition.md](docs/acquisition.md)), and hook hardening (malformed
+catalog rows can no longer kill a prompt's routing; the SessionStart banner
+is throttled). The PyTorch-based inference path remains
 the trial surface that drives adoption; Phase-2 native MIND inference +
 cross-arch bit-identity + p95 ≤ 30 ms remain on the deferred list below,
 but the upstream `mindc` blockers underneath that list have moved — see
@@ -150,16 +153,22 @@ threshold loosened to +7% to absorb GitHub-hosted runner variance
 without weakening the moat).  Phase D₂b (cross-arg Named-struct
 identity matching) deferred until first user-visible need.
 
+> **Status frame (2026-08-10):** `mindc` is now at **v0.10.2** (2026-08-07) —
+> the 0.2.6 / 0.3.0 / 0.4.x milestones below are historical context, kept
+> because they explain the sequencing. The native-ELF self-host fixed point
+> is closed upstream, which is what makes the Pure-MIND migration section
+> at the bottom of this file active rather than aspirational.
+
 | Task | Blocker | mindc milestone | Status |
 |---|---|---|---|
-| Cross-arch bit-identity (x86-CPU vs CUDA) | `pub fn` → C symbol export so the native MIND inference kernel is callable as a `cdylib` | **0.2.6** — `pub fn`-to-C, `[exports]`, `--profile` flag | **mindc-side SHIPPED** (RFC 0002 D2–D5 in `0a408e3`, `_v1` ABI lock in `de6cf18`, RFC 0003 cdylib seam). mind-nerve-side validation (mindc CUDA build + bit-identical SHA) still pending hardware — task #57 stays open. |
-| p95 ≤ 30 ms on 4-core CPU | Native `cdylib` emit so the PyTorch encode-cost (~270 ms today) can be replaced by a Q16.16 native kernel | **0.3.0** — `--lib` cdylib, AOT codegen, MIC profile-locked headers | **mindc-side SHIPPED in mindc v0.3.0** (2026-05-18). Tagged at `star-ga/mind@v0.3.0` with all of: `--emit-shared` cdylib flag (`c444c77`), Phase 0/1/1.5 std-surface intrinsics, P0d `Instr::FnDef`→`func.func` (`aacebe1`), RFC 0005 P0e Step 1 struct heap-record write (`2f98a4f`), P0f Step 1 `FieldAccess` read for local-`Ident` receivers (`c706a3e`), and P0f Step 2 (`b458932`) covering chained access, fn-return receivers, and struct-typed parameters via the `struct_resolver` Span-keyed side-table. 16 std-surface integration tests + 145 lib tests (each feature config) all green; bench gate `<17.3 µs` on the largest tracked network. mind-nerve-side wheel/native-encoder integration still pending (#59 stays open until the Q16.16 mindc-emitted `.so` is linked into the published wheel sibling-style). |
+| Cross-arch bit-identity (x86-CPU vs CUDA) | `pub fn` → C symbol export so the native MIND inference kernel is callable as a `cdylib` | **0.2.6** — `pub fn`-to-C, `[exports]`, `--profile` flag | **mindc-side SHIPPED** (RFC 0002 D2–D5 in `0a408e3`, `_v1` ABI lock in `de6cf18`, RFC 0003 cdylib seam); the **vector-path gate was closed upstream in mind v0.6.4** (2026-05-19, byte-identical to the Track A scalar oracle). The "pending hardware" note is stale — the U1 host has a live RTX 3080. What remains is real work, not just a run: the harness's CUDA leg (`tests/bit_identity/runner.py`) currently emits a `CUDA_DEFERRED_TO_V0_4_1` sentinel — the CUDA emit path for the Q16.16 kernels has to be built (mindc CUDA backend) before any SHA can be compared. Task #57 stays open; hardware is no longer an excuse. |
+| p95 ≤ 30 ms on 4-core CPU | Native `cdylib` emit so the PyTorch encode-cost (~270 ms today) can be replaced by a Q16.16 native kernel | **0.3.0** — `--lib` cdylib, AOT codegen, MIC profile-locked headers | **CLOSED (2026-08-10 re-assessment).** The Q16.16 native encoder shipped: `libmind_nerve_encoder.so` has been bundled in the published wheel since 2026-05-19 with a real `encoder_weights.q16.bin` weight blob, and `MIND_NERVE_BACKEND=native` is the default routing path with PyTorch fallback (see CHANGELOG v0.3.0b7 "thesis-pure encode path" and the `_native` runtime). Task #59 is done; the remaining latency evidence lives in `docs/benchmarks.md`. |
 
-Both tasks remain tracked (#57 and #59 in the work queue). `#57` re-opens
-the moment mind-nerve has a CUDA host to run the bit-identical-SHA harness
-against the now-emittable C-ABI library; `#59` re-opens once the mindc
-0.3.0 struct-ABI lowering ships and the Q16.16 native encoder kernel can
-be linked into the wheel as a sibling `.so`.
+Task #57 remains tracked in the work queue and is no longer
+hardware-blocked: it closes when the CUDA emit path for the Q16.16 kernels
+exists (the harness leg is a sentinel today) and the bit-identical-SHA run
+on the U1 RTX 3080 records a matching hash. #59 is closed as of the
+2026-08-10 re-assessment above.
 
 ## Phase 2 — Production path (target: Q2 2027)
 
@@ -400,7 +409,7 @@ review roadmaps before writing the federation code — not pre-committed here.
 | Federated routing typed-interface stub (`python/mind_nerve/federation.py`) | **DONE** (design-only) |
 | Federated routing contract tests (`tests/integration/test_federation_reconcile.py`) | **DONE** (design-only) |
 | mind-mem v4 cognitive-kernel binding spec (`spec/mind_mem_v4_integration.md`) | **DONE** (design-only) |
-| Skill marketplace functional ship | **BLOCKED** — requires Phase 2 completion |
+| Skill marketplace functional ship | **PARTIALLY SHIPPED (2026-08-10)** — the discovery → vetting → install → reindex core is live as `mind-nerve acquire` (curated sources, quarantine, fail-closed static malware scan, license gate, hash-manifested hub install, daemon reindex; `docs/acquisition.md`). What remains gated on Phase 2 is the *signed-provider federation* half (Ed25519-pinned providers, JSON-RPC deltas, `CatalogLoad` attestation) — the `marketplace.py` stubs above. |
 | Federated routing functional ship | **BLOCKED** — requires Phase 2 + the typed-edges composition layer |
 | mind-mem v4 cognitive-kernel integration functional ship | **BLOCKED** — requires mind-mem v4 |
 
@@ -594,6 +603,13 @@ always matches the installed version** — the CLI serves the guide, not the pro
 ## Pure-MIND Self-Hosting Migration
 
 > Ecosystem-wide milestone — gated on the `mind` compiler reaching self-host completeness.
+> **End state (operator directive, 2026-08-10): NO language other than MIND in
+> this repository.** Python, TypeScript, and shell are deleted component by
+> component as each MIND replacement is byte-proven against them — the Python
+> tree is the migration oracle and survives exactly until each proof lands,
+> never longer. Distribution becomes a single native binary per platform
+> (guiding constraint #3); the PyPI Python series ends at v0.3.0b9, with the
+> pure-MIND line shipping as binary releases.
 
 Once the `mind` toolchain self-hosts (the open-core compiler builds itself byte-identically),
 this repository's **TypeScript + Python** implementation is migrated to **pure, executing MIND**, so the whole
@@ -601,8 +617,47 @@ MIND ecosystem runs on its own deterministic, byte-identical, evidence-carrying 
 wedge applied to ourselves.
 
 - **Gate:** `mind` self-host keystone complete (see the `mind` roadmap self-host track).
+  **Gate status (2026-08-10): MET for the subset mind-nerve needs.** mind v0.10.2
+  closed the native-ELF self-host fixed point (keystone 7/7), and mind-nerve's
+  inference is Q16.16 — i.e. integer arithmetic, exactly the subset the self-host
+  substrate covers. The `std` library now carries the porting surface the
+  non-numeric parts need (`net`, `http`, `tls13`/`x509`, `json`, `toml`, `fs`,
+  `process`, `reactor`, `cli`).
+- **Carry-forward workstream (started 2026-08-10):** the repo's `.mind` tree
+  predates the current compiler — the CI-gated kernel surface
+  (`mind/{luts,kernels,exports}`) pinned mindc v0.4.4 and failed under 0.10.2
+  (cross-module resolution + warnings-as-errors), and `src/*.mind` +
+  `tests/unit/*.mind` targeted a dialect no shipping mindc ever accepted
+  (documented in `audits/2026-08-10-ci-mirror-audit.md`). Step zero landed the
+  same day: the kernel tree is ported to project-mode 0.10.2, CI is re-pinned,
+  and `tests/mindc_gate.sh` fails closed on 0-tests-run.
+- **Active port program (started 2026-08-10, COMPLETE 2026-08-15):** the 13
+  quarantined front-end files (~6,600 lines) ported back in dependency order —
+  sha256 / q16_16 / lib, then top_k / tokenizer / chain_log, then runtime_ffi /
+  clock, then evidence / model / loader / encoder_kernels / inference — each
+  gated on: compiles under 0.10.2 project mode, executing `#[test]` coverage
+  wired into the gate with exact-count assertions, and bit-for-bit oracle
+  equivalence with the Python reference. **All 13/13 PORTED, 0 blocked** —
+  267 executing tests across gate legs 3–15 plus a native-ELF end-to-end
+  harness (real ELF, byte oracle vs CPython hashlib). Settled design decisions
+  landed as specified: LUTs delegate to the pinned `mind/luts` tables; the host
+  contract is `extern "C"` pointer+length out-params; the clock is one
+  latency-only extern shim, never in routing math or any hash; the evidence
+  chain is always on. Three compiler findings filed upstream (r9 lazy assert
+  evaluation, r10 misleading unresolved-ref diagnostics, r11 interpreter
+  bounds-check gap).
+- **After the core:** CLI (`std/cli`) → daemon (`std/net`+`std/reactor`) →
+  MCP stdio server (`std/json`) → hook (compiled binary replacing the Python
+  script) → discovery/acquire/security_scan (needs the `std` HTTPS surface:
+  `http`+`tls13`+`x509` — the least-proven leg, proven or reported) → the
+  TypeScript installer as a compiled MIND binary. Each deletion of a
+  Python/TS/shell file happens only after its MIND replacement is byte-proven.
 - **Approach:** port via the `mind-migrator` path — to the executable MIND subset, verifying every
   emitted symbol actually runs and reusing `std` primitives; no silent AOT-only stubs.
 - **Invariant:** migration preserves behavior and the cross-substrate byte-identity gate — no
   regression in determinism or the signed evidence chain.
-- **Status:** Planned — sequenced after `mind` self-host; tracked here so the endgame is explicit.
+- **Status:** Core .mind surface COMPLETE (2026-08-15) — kernel tree + all 13
+  front-end files compile and execute on mindc 0.10.2 under the fail-closed
+  gate. Remaining migration legs (CLI → daemon → MCP server → hook →
+  discovery/acquire → installer as compiled MIND binaries) sequence behind the
+  `std` HTTPS surface proof, per the carry-forward plan above.

@@ -180,6 +180,12 @@ mind-nerve-install install --cli claude-code --with-preselect --with-mind-mem
 mind-nerve handles intent routing; mind-mem provides search-backed memory.
 Together they bracket the prompt path.
 
+> **Recommended companion:** [`mind-mem`](https://github.com/star-ga/mind-mem)
+> is our open-source (Apache-2.0) governed memory engine for agent CLIs —
+> hybrid BM25+vector recall, a tamper-evident evidence chain, and an MCP
+> server that plugs into the same installer. If you take one other tool from
+> this ecosystem, take that one.
+
 ## Integrations
 
 | Host                        | Mechanism                                          | Status |
@@ -211,6 +217,28 @@ mind-nerve-install install --cli all
 | `mind-nerve-preselect` | UserPromptSubmit hook that atomically projects the skills dir |
 | `mind-nerve-install` | wires the above into each CLI's config |
 
+## Acquiring skills
+
+`mind-nerve acquire` finds external skills/agents/MCP servers in curated
+sources (Anthropic's skills repo, the official MCP servers repo, the MCP
+registry API, GitHub search), vets them with a deterministic fail-closed
+static scanner (shell-pipe installers, reverse shells, exfiltration
+collectors, prompt injection, archive escapes, obfuscation, credential
+access, persistence hooks), and installs the clean ones into the hub:
+
+```bash
+mind-nerve acquire search "pdf"
+mind-nerve acquire install <url> [--accept-warnings]
+mind-nerve acquire list
+mind-nerve acquire remove <name>
+```
+
+Fetches land in a size/file-count-capped quarantine dir first; a FAIL
+verdict never reaches the hub. Installs write a per-file SHA-256 manifest,
+reindex the route table through the license gate, and restart the routing
+daemon so every hooked CLI sees the new skill immediately. Full threat model
+and source-registry format: [docs/acquisition.md](docs/acquisition.md).
+
 ## Configuration
 
 | Env var                       | Default                                     | What it controls |
@@ -226,6 +254,7 @@ mind-nerve-install install --cli all
 | `MIND_NERVE_LOG`              | `~/.mind-nerve/hook.log`                    | jsonl log for the preselect hook |
 | `MIND_NERVE_CORE_ALWAYS_ON`   | `diagnose:code-review:git-workflow:…`       | colon-separated names always added to the projection |
 | `MIND_NERVE_HF_REVISION`      | pinned commit SHA in the package             | override the Hugging Face model revision to download; set to a specific commit SHA or tag for reproducible artifact pinning |
+| `MIND_NERVE_ENV_FILE`         | `~/.mind-nerve/env`                         | shared env file: `KEY=VALUE` lines (`#` comments) read by the hook, the MCP server, and the daemon spawner; an explicitly exported var or CLI-config pin ALWAYS wins — the file only fills vars that are unset |
 
 ## How it works
 
@@ -328,6 +357,15 @@ bundled into the binary, with a `$MIND_STDLIB_PATH` env-var
 fork-without-recompile escape hatch, and Named-struct parameter names
 preserved in arity/type error messages).  Remaining work is the
 mind-nerve-side native encoder kernel that links against the toolchain.
+The CI gate for the `mind/` kernel tree is pinned to
+[`mindc` 0.10.2](https://github.com/star-ga/mind/releases/tag/v0.10.2)
+(built with `std-surface,cross-module-imports,mlir-build` — `mlir-build`
+produces the real native objects the gate's symbol leg checks): 0.10.2
+name-checks
+function bodies (mind#23) and resolves the tree's cross-module imports
+in project mode via `mind/Mind.toml`. Run the same gate locally with
+`bash tests/mindc_gate.sh` — it is fail-closed and never trusts a bare
+exit code.
 
 **Phase 3** — Catalog v2: license-aware ingest at scale, evidence-chain
 proofs, per-tenant route tables.
@@ -404,6 +442,7 @@ If mind-nerve helps your work, a citation is appreciated:
 
 - **PyPI**: <https://pypi.org/project/mind-nerve/>
 - **Phase-1 weights**: <https://huggingface.co/star-ga/mind-nerve>
+- **mind-mem** (companion memory engine, Apache-2.0): <https://github.com/star-ga/mind-mem>
 - **MIND language**: <https://mindlang.dev>
 - **Changelog**: [`CHANGELOG.md`](./CHANGELOG.md)
 - **Roadmap**: [`ROADMAP.md`](./ROADMAP.md)

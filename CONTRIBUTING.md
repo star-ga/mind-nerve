@@ -47,6 +47,15 @@ pip install -e ".[dev,mcp]"
 This installs `pytest`, `ruff`, and `build` as dev dependencies and the
 `mcp` Python package as the optional MCP extra.
 
+To work on the MIND kernel tree (`mind/`), install the CI-pinned compiler:
+`cargo install --git https://github.com/star-ga/mind --tag v0.10.2 --bin mindc --features std-surface,cross-module-imports,mlir-build`
+(the `mlir-build` feature is what produces real native objects — the gate's
+native-symbol leg fails on embedded-fallback builds — and it needs the MLIR
+toolchain on PATH: `sudo apt-get install mlir-20-tools clang-20` with
+`/usr/lib/llvm-20/bin` on PATH)
+— then validate changes with `bash tests/mindc_gate.sh` (fail-closed;
+never trust a bare `mindc` exit code).
+
 ## Running tests
 
 The Python unit tests live under `tests/python/` and are the gate every

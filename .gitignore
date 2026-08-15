@@ -1,5 +1,6 @@
 # Build artefacts
 /target/
+/mind/target/
 /build/
 *.o
 *.so

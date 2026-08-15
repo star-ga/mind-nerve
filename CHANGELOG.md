@@ -4,6 +4,144 @@ All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](htt
 
 ## [Unreleased]
 
+## [0.3.0b9] — 2026-08-15
+
+### Fix — hook: malformed catalog rows can no longer kill a prompt's routing
+
+A catalog row carrying a whole document as its `name` (observed live: a 300+
+char runbook with embedded newlines) was turned into a candidate agent
+filename by `agent_path()`; `stat()` on it raised `ENAMETOOLONG` —
+`Path.is_file()` does **not** swallow it — the hook's fatal handler fired,
+and the prompt lost ALL of its routes, valid ones included. Route names are
+catalog-controlled text, so `agent_path()` now skips names that could never
+be agent files (path separators, NUL, > 200 bytes) and treats `OSError` from
+`stat` as "not an agent". The malformed row degrades to an unresolved route;
+the rest of the table is unaffected. Regression test drives the real hook
+subprocess with a monster-name route and asserts the valid sibling still
+routes (verified: fails against the unfixed hook, passes against the fix).
+
+### Fix — hook: SessionStart banner throttled
+
+CLIs that fire SessionStart on every resume re-injected the full
+`## mind-nerve ready` banner into every restored transcript. The banner is
+now emitted at most once per 12 h per state dir (sentinel next to
+`MIND_NERVE_LOG`; `MIND_NERVE_SESSION_BANNER_MINUTES` configures, `0`
+restores always-show). The skill projection still runs on every SessionStart
+— only the announcement is throttled.
+
+### Fix — audit sweep (2026-08-10 CI-mirror)
+
+### Fix — acquire security-audit hardening, round 2 (codex audit, 2026-08)
+
+Six further findings against acquire/security_scan, all fixed with
+regression tests:
+
+- **Symlink-to-skipped-dir bypass (HIGH)**: `SKILL.md -> dist/payload.md`
+  vetted clean because `dist/` is never walked and internal symlinks were
+  trusted without scanning their content. Internal symlinks whose resolved
+  target sits in a skipped dir now FAIL (`symlink-to-skipped-dir`), and
+  `_copy_local` preserves symlinks for the scanner to judge instead of
+  silently dropping them into an empty package.
+- **Shell-continuation rule bypass (HIGH)**: per-line regexes missed
+  `curl … \` <newline> `| bash` and prompt-injection phrases split across
+  lines. The line rules now also run on a backslash-folded view and a
+  sliding 2-line window (deduped against per-line hits).
+- **Tree-URL ref ignored + unconfined subdir (MEDIUM)**:
+  `tree/<ref>/<subdir>` clones honour `ref` via `--branch` (fail loudly on
+  un-cloneable refs; the manifest records the actual resolved commit), and
+  subdirs containing `..`/absolute components are rejected.
+- **Zero-route installs reported success (MEDIUM)**: when the reindex adds 0
+  routes (license gate excluded everything / no routable content), install
+  returns a `no-routable-content` warning and the CLI exits 3 with a stderr
+  message. Benign reinstalls (all rows already indexed) stay quiet. Also
+  documented: `kind="mcp"` candidates are vetted/installed as content but
+  NOT registered into any CLI's MCP config (follow-up).
+- **Tar FIFO/device members (MEDIUM)**: `_safe_members` now rejects any
+  member that is not a regular file, dir, or safe link — on every Python
+  version (a FIFO member could block a reader indefinitely).
+- **ClamAV determinism (LOW)**: clamscan is now opt-in
+  (`use_clamav=True` / `--clamav`) since its verdicts depend on the host
+  signature DB, and clamav finding excerpts carry the signature name only,
+  never host paths.
+
+### Fix — acquire security-audit hardening (cross-CLI audit, 2026-08)
+
+Twelve findings against the new acquire subsystem, all fixed with regression
+tests:
+
+- **NUL content-scan bypass (CRITICAL)**: any NUL in the first 8 KiB used to
+  skip all line rules, so a NUL-prefixed `SKILL.md` carrying `curl | sh`
+  installed clean. Now only known-binary extensions skip; other files are
+  scanned with NULs stripped plus a `binary-content-in-text-file` WARN.
+- **git clone option injection**: URLs starting with `-` are refused, and
+  `--` terminates option parsing.
+- **git clone skipped the quarantine caps**: byte/file caps are now
+  re-measured post-clone, fail-closed.
+- **Search-result tree URLs were uninstallable**:
+  `https://github.com/<o>/<r>/tree/<ref>/<subdir>` now clones the parent repo
+  and installs `<subdir>` as the package root; the manifest records
+  `repo_url` + `subdir`.
+- **Prefix prune deleted sibling routes**: `remove pdf-tools` no longer
+  prunes `pdf-tools-2`'s route rows (exact-or-`os.sep`-boundary match).
+- **Tar bomb**: uncompressed byte/file caps enforced pre-extraction.
+- **Symlink boundary check**: resolved-path parents comparison instead of
+  `startswith`.
+- **Reindex failure now exits 1** with a stderr message (the install itself
+  stands; the signal matters).
+- HTTP read cap aligned to the 25 MB quarantine cap (was 16 MiB, truncating
+  legal tarballs).
+- `tarfile filter="data"` is feature-detected (`hasattr(tarfile,
+  "data_filter")`) — the pyproject floor is Python 3.10, where early patch
+  releases lack the kwarg.
+- Nested archive *member content* is line-scanned (bounded: 1 MiB/member,
+  8 MiB/archive; nested archives flagged `nested-archive-opaque` WARN).
+- `remove()` no longer routes through `inference._resolve_runtime_dir`, which
+  could auto-seed from Hugging Face — remove stays fully local.
+
+- `mind_train.py`: import `losses` from the non-deprecated
+  `sentence_transformers.sentence_transformer.losses` path (the old import
+  warns under sentence-transformers ≥ 5.5 and breaks in a future release).
+- Integration tests: the env-gated skip reason now names the actual opt-in
+  (`MIND_NERVE_RUN_INTEGRATION=1`) instead of "needs mind-nerve checkout".
+
+### Feat — `mind-nerve acquire`: vetted external skill/agent/MCP acquisition
+
+A new `acquire` subsystem closes the "router knows the hub, but the hub only
+grows by hand" gap: operators can now search curated external sources, vet
+candidates deeply, and install the clean ones into the hub with a live
+reindex.
+
+- **Sources** (`acquire.sources` / `acquire search`). In-code defaults —
+  `github:anthropics/skills`, `github:modelcontextprotocol/servers`, the MCP
+  registry API, and a GitHub repo-search fallback (`GITHUB_TOKEN`-aware,
+  graceful on the 403 rate limit) — plus a user extension file
+  `<runtime_dir>/acquire_sources.json`. Per-source network failures degrade
+  to empty results, never a crash.
+- **Quarantine fetch** (`acquire.fetch`). Local/`file://` copies, shallow
+  git clones (commit SHA recorded), and capped tarball extraction all land
+  in `<runtime_dir>/quarantine/<sha256(url)[:16]>/`; 25 MB / 2000-file caps
+  are enforced during extraction, and archive path/symlink escapes are
+  refused before a single byte lands.
+- **Vetting** (`security_scan.scan_path` / `acquire vet`). A deterministic
+  static vetter — pure function of file bytes, no network, no clock, no
+  execution — with PASS/WARN/FAIL verdicts and per-finding
+  `file:line/rule/excerpt`. FAIL: shell-pipe installers, reverse shells,
+  crypto miners, exfiltration collectors, prompt injection (incl. MCP tool
+  descriptions), archive escapes. WARN: dynamic exec, credential paths,
+  persistence hooks, obfuscation (installable only with
+  `--accept-warnings`). Fail-closed on any scanner error; optional
+  `clamscan` fold-in.
+- **Install/remove** (`acquire install|list|remove`). PASS/WARN packages
+  copy into the hub under a slugified unique name with a
+  `.mind-nerve-install.json` manifest (per-file SHA-256, source URL, commit
+  SHA — no timestamps), then reindex via `discovery.scan(trusted=False)` so
+  the license gate applies, and restart `mind-nerve-routed` (new
+  `ensure.restart_daemon`) so hooked CLIs route to the new skill on the
+  next prompt. `remove` refuses any directory without an install manifest
+  and prunes `route_table.jsonl`/`route_table.npy` row-aligned, atomically.
+- **Hook**: the no-match context now points at
+  `mind-nerve acquire search "<query>"` when nothing local routes.
+
 ### Feat — CLI integrations: per-prompt routing hook (reachable hub without the announce cost)
 
 A hub of ~1,374 skills symlinked into a CLI's skills directory is bulk-announced
@@ -118,6 +256,97 @@ moments later. Warmup now runs in a background thread: `initialize` /
 away, and a `tools/call` arriving before warmup finishes blocks until the model
 is ready (thread-safe, one-time load). No API or behaviour change to the
 `mind_nerve_route` tool — it just works out of the box across MCP clients.
+
+### Feat — pure-MIND front-end port complete (13/13 dormant files on mindc 0.10.2)
+
+The entire dormant front-end tree (`src/*.mind`, ~6.6k lines that had never
+compiled under any shipping mindc) is ported to the real 0.10.2 dialect and
+EXECUTES: sha256 16/16, q16_16 86/86, lib 12/12, top_k 30/30, tokenizer
+18/18, chain_log 5/5, runtime_ffi 3/3, clock 5/5, evidence 36/36,
+encoder_kernels 17/17, model 8/8, loader 12/12, inference 9/9 — 267 tests
+wired as exact-count legs 3–15 of `tests/mindc_gate.sh`, plus a native-ELF
+end-to-end harness (stateful oracle + chain link, full-path bytes oracle vs
+CPython hashlib). The wave-3 host ABI was redesigned for the shipped extern
+surface: pointer+length out-params, caller-owned buffers, explicit
+host-vs-counter clock, caller-supplied entropy seeds — no wall-clock, no
+thread-locals, no cfg. Numerics delegate to the pinned `mind/luts` tables
+("delegate, never duplicate"). Bit-oracles pinned against CPython hashlib /
+a reference Python BPE throughout. Three compiler findings with minimal
+repros were filed upstream (lazy assert evaluation in `mindc test`,
+misleading unresolved-ref diagnostics, missing interpreter bounds checks).
+Honest flags preserved in file headers: loader's INT8→Q16.16 dequantize
+keeps the reference formula verbatim (suspected 2^16-fold scale error —
+decision belongs to the checkpoint pipeline); dormant
+`preselect_pre_tokenized` intentionally lacks the model-hash pin.
+
+### Fix — pre-release cross-CLI audit, round 3 (grok + claude-fable + codex, 2026-08)
+
+Three independent CLI auditors reviewed the full changeset; all returned
+BLOCK. 24 distinct findings fixed across two passes, each with a
+regression test proven red first:
+
+- **Directory-symlink exfiltration (CRITICAL, reproduced by all three)**:
+  a package `docs -> ~/.ssh` vetted PASS (dir symlinks never reached the
+  file-only symlink checks) and `copytree(symlinks=False)` then
+  dereferenced it into the hub. Directory symlinks now get the same
+  escape/skip-dir/dangling rules as files, install copies `symlinks=True`
+  so vetted links stay links, dangling links FAIL at vet, and a failed
+  copy rmtrees the partial hub dir.
+- **Skipped-dir payload (CRITICAL)**: `dist/guide.md` carrying
+  `curl … | bash` installed unscanned via the tarball/git-clone fetch
+  paths. All fetch paths now filter `SKIP_DIRS` to match the scanner
+  contract (plus defense-in-depth `ignore=` at install).
+- **NUL-byte scan bypasses (CRITICAL ×2)**: NUL-prefixed archive members
+  skipped line rules, and the NUL probe only covered the first 8 KiB
+  (`cu\0rl` mid-buffer passed even though bash strips NULs). NUL handling
+  now spans the whole scanned buffer, top-level and archive members alike.
+- **Windows drive-qualified tar members (CRITICAL)**: `C:\…` member/link
+  forms rejected version-independently of `data_filter`.
+- **`--register-mcp` executes unvetted artifacts (CRITICAL)**: `npx -y
+  <ident>` from `server.json` allowed leading-dash option injection and
+  ran never-scanned registry artifacts. Registration now only accepts
+  local, path-checked entry points inside the vetted package.
+- Shell-pipe FAIL rule widened (`/bin/sh`, `python[0-9.]*`, `ruby`,
+  `perl`, `node`, `sudo -E`, `eval $(…)`, process substitution);
+  prompt-injection detection gained a whole-file whitespace-normalized
+  pass (3+-line splits); archive dispatch by magic bytes with an
+  `unscanned-binary` WARN for opaque executables; streaming member caps +
+  mid-flight clone size monitor (DoS); local/`file://` fetch restricted
+  to operator-typed targets (registry candidates are https-only); clone
+  URLs redacted (userinfo/query/fragment) in manifests, CLI output, and
+  error text; MCP config replacement is mode-preserving + fsynced;
+  reinstall prunes stale route rows transactionally; curated GitHub
+  agent hits emit per-artifact `kind="agent"` candidates that survive
+  fetch with their relative path; the hook honours daemon-provided
+  `kind`/`source_path` when root-confined (acquired agents no longer
+  drop as unknown).
+- Installer: documented flag-first order (`install --mcp-launcher uvx
+  <client>`) parsed correctly; `--mcp` (MCP-only mode) no longer
+  suppresses the MCP write itself (inverted guard); Vibe entries emit
+  the required `transport = "stdio"` with a `mcp-schema` verify check;
+  Vibe/Grok idempotency compares the complete managed entry; Cody/Aider
+  instruction blocks are format-valid JSON/YAML and verify parses them;
+  `verify` gained the `mcp-env-pin` check (WARN when a populated local
+  runtime dir exists but the entry lacks `MIND_NERVE_RUNTIME_DIR`) and
+  install pins only populated runtime dirs.
+- CI: the `mindc-gate` job builds mindc with `mlir-build` (without it the
+  native-symbol leg necessarily fails on embedded-fallback objects) and
+  installs `mlir-20-tools`/`clang-20`; gate install hints and docs match.
+
+### Feat — installer: `verify` verb + `--mcp-launcher venv|uvx` + corrected MCP entry
+
+`mind-nerve-install verify [--cli X]` checks every wired surface per client
+(config parses, hook block present, hook script executable, env pins, hook
+fail-open probe, MCP entry/command, daemon socket) and FAILs legacy
+`mind-nerve mcp-facade` entries (the Python package never had that
+subcommand — those entries were dead). MCP entries now point at the
+`mind-nerve-mcp` console script (venv launcher, default) or
+`uvx --from mind-nerve mind-nerve-mcp` (`--mcp-launcher uvx`), with
+`TRANSFORMERS_NO_TORCHVISION=1` always pinned and `MIND_NERVE_RUNTIME_DIR`
+pinned when a populated local runtime dir exists (fleet incident
+2026-07-10). Kimi wiring uses the documented shapes: flat `[[hooks]]` in
+`config.toml` + `~/.kimi-code/mcp.json` (`mcpServers`). Registry covers 20
+clients.
 
 ## [0.3.0b8] — 2026-05-20 — hotfix: revert #233(a), yanks v0.3.0b7
 

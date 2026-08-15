@@ -295,7 +295,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: star-ga/mind
-          ref: f68ff638
+          ref: f68ff638d983dbf2dc593d1f8870963b3b396744
           path: mind-compiler
       # The gate's native-symbol leg (nm on target/obj/*.o) requires REAL
       # native codegen: without the mlir-build feature every module falls

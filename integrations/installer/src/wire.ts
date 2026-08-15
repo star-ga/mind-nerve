@@ -28,20 +28,6 @@ import {
 import { convertToRouterDir, restoreSkillsDir } from "./skills_dir.js";
 import { InstallerError } from "./errors.js";
 
-/** Defaults chosen from measurement, not taste — see WireOptions docs. */
-export const DEFAULT_TOP_K = 8;
-/**
- * Measured on the live daemon: for "prove an exact minimum move floor for an
- * ARC-AGI-3 level" the correct hit scored 0.437 while ranks 2-8 scored
- * 0.267-0.282 and were all unrelated (GraphQL depth-limit attacks, SOC tabletop
- * exercises, ...). 7 of 8 injected rows were noise and all 7 got projected.
- * ~0.40+ is a real hit, ~0.30 is noise, 0.74 was a clean hit for
- * "deploy a site to cloudflare pages". 0.35 sits in the gap.
- */
-export const DEFAULT_MIN_SCORE = 0.35;
-export const DEFAULT_SOCKET_TIMEOUT = 2.0;
-export const DEFAULT_CORE_SKILLS: readonly string[] = ["mind-nerve-router"];
-
 export interface WireOptions {
   /** Absolute path to the shared hook implementation in this repo. */
   readonly hookSourcePath: string;
@@ -53,10 +39,12 @@ export interface WireOptions {
   readonly socketPath: string;
   /** Directories holding agent .md definitions. */
   readonly agentDirs: readonly string[];
-  readonly topK?: number;
-  readonly minScore?: number;
-  readonly socketTimeout?: number;
-  readonly coreSkills?: readonly string[];
+  /**
+   * NOTE: tuning knobs (TOP_K, MIN_SCORE, CORE_SKILLS, SOCKET_TIMEOUT) are
+   * deliberately NOT wiring options — the shared hook owns their defaults,
+   * and a wrapper-pinned copy goes stale (the 0.35 MIN_SCORE pin overrode
+   * the hook's recalibrated 0.40 default until 2026-08-11).
+   */
   /** Home directory override (tests). */
   readonly homeDir?: string;
   /** Clock override (tests). */
@@ -121,10 +109,6 @@ export async function wireClient(
     hubDir: opts.hubDir,
     socketPath: opts.socketPath,
     agentDirs: opts.agentDirs,
-    topK: opts.topK ?? DEFAULT_TOP_K,
-    minScore: opts.minScore ?? DEFAULT_MIN_SCORE,
-    coreSkills: opts.coreSkills ?? DEFAULT_CORE_SKILLS,
-    socketTimeout: opts.socketTimeout ?? DEFAULT_SOCKET_TIMEOUT,
     logPath: hookLogPath(spec.name, homeDir),
   });
   const wrapper = buildHookWrapper(shared, env);

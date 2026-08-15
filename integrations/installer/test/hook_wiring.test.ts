@@ -5,6 +5,7 @@
 // router twice per prompt.
 
 import { describe, it, expect } from "vitest";
+import TOML from "@iarna/toml";
 import {
   mergeJsonHooks,
   removeJsonHooks,
@@ -242,6 +243,56 @@ describe("buildTomlHookBlock", () => {
 });
 
 // ---------------------------------------------------------------------------
+// kimi TOML shape — flat [[hooks]] elements, the ONLY shape kimi-code reads
+// (official hooks docs, fetched 2026-08-11). Extra fields inside a [[hooks]]
+// element can fail kimi's whole config load, so the block must be minimal.
+// ---------------------------------------------------------------------------
+
+const KIMI_SURFACE: SkillSurface = { ...TOML_SURFACE, hookWireFmt: "toml-hooks-kimi" };
+
+describe("kimi TOML hook shape (toml-hooks-kimi)", () => {
+  it("renders flat [[hooks]] entries with event/command/timeout", () => {
+    const block = buildTomlHookBlock(KIMI_SURFACE);
+    expect(block).toContain(HOOK_BLOCK_BEGIN);
+    expect(block).toContain("[[hooks]]");
+    expect(block).toContain('event = "UserPromptSubmit"');
+    expect(block).toContain('event = "SessionStart"');
+    expect(block).toContain(`command = ${JSON.stringify(KIMI_SURFACE.hookScriptPath)}`);
+    expect(block).toContain(`timeout = ${KIMI_SURFACE.hookTimeoutSecs}`);
+  });
+
+  it("never emits the Claude [[hooks.<Event>]] shape", () => {
+    const block = buildTomlHookBlock(KIMI_SURFACE);
+    expect(block).not.toContain("[[hooks.");
+    expect(block).not.toContain("hooks = [");
+  });
+
+  it("parses as TOML with only event/command/timeout per element", () => {
+    const existing = '[model]\ndefault = "kimi-for-coding"\n';
+    const { updated } = mergeTomlHooks(existing, KIMI_SURFACE);
+    const parsed = TOML.parse(updated) as Record<string, unknown>;
+    expect(parsed["model"]).toEqual({ default: "kimi-for-coding" });
+    const hooks = parsed["hooks"] as Array<Record<string, unknown>>;
+    expect(hooks).toHaveLength(2);
+    for (const element of hooks) {
+      expect(Object.keys(element).sort()).toEqual(["command", "event", "timeout"]);
+      expect(element["command"]).toBe(KIMI_SURFACE.hookScriptPath);
+    }
+    expect(hooks.map((h) => h["event"]).sort()).toEqual([
+      "SessionStart",
+      "UserPromptSubmit",
+    ]);
+  });
+
+  it("is idempotent via mergeTomlHooks and removable byte-for-byte", () => {
+    const existing = '[model]\ndefault = "x"\n';
+    const first = mergeTomlHooks(existing, KIMI_SURFACE).updated;
+    expect(mergeTomlHooks(first, KIMI_SURFACE).changed).toBe(false);
+    expect(removeTomlHooks(first).updated).toBe(existing);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Wrapper generation
 // ---------------------------------------------------------------------------
 
@@ -251,24 +302,16 @@ describe("buildHookWrapper", () => {
     hubDir: "/home/u/.agents/skills-hub",
     socketPath: "/run/user/1000/mind-nerve.sock",
     agentDirs: ["/home/u/.claude/agents"],
-    topK: 8,
-    minScore: 0.35,
-    coreSkills: ["mind-nerve-router"],
-    socketTimeout: 2,
     logPath: "/home/u/.mind-nerve/logs/x.log",
   });
 
-  it("exports every parameter the hook reads", () => {
+  it("exports only the path/socket pins that parameterise the shared hook", () => {
     expect(Object.keys(env).sort()).toEqual([
       "MIND_NERVE_AGENT_DIRS",
-      "MIND_NERVE_CORE_SKILLS",
       "MIND_NERVE_LOG",
-      "MIND_NERVE_MIN_SCORE",
       "MIND_NERVE_PROJECTED_DIR",
       "MIND_NERVE_SOCKET",
-      "MIND_NERVE_SOCKET_TIMEOUT",
       "MIND_NERVE_SOURCE_DIR",
-      "MIND_NERVE_TOP_K",
     ]);
   });
 
@@ -276,8 +319,18 @@ describe("buildHookWrapper", () => {
     expect(env["MIND_NERVE_PROJECTED_DIR"]).toBe(SURFACE.skillsDir);
   });
 
-  it("carries the measured 0.35 score floor", () => {
-    expect(env["MIND_NERVE_MIN_SCORE"]).toBe("0.35");
+  it("does NOT pin tuning knobs — the hook owns their defaults", () => {
+    // Regression: the wrapper used to pin MIND_NERVE_MIN_SCORE=0.35, silently
+    // overriding the hook's recalibrated 0.40 default (2026-08-08). The hook
+    // source is the single source of truth for every tuning knob.
+    for (const knob of [
+      "MIND_NERVE_MIN_SCORE",
+      "MIND_NERVE_TOP_K",
+      "MIND_NERVE_CORE_SKILLS",
+      "MIND_NERVE_SOCKET_TIMEOUT",
+    ]) {
+      expect(env, `${knob} must not be pinned`).not.toHaveProperty(knob);
+    }
   });
 
   it("execs the ONE shared hook implementation", () => {

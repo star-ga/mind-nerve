@@ -28,9 +28,24 @@ export function buildInstructionBlock(projectionDir: string | null): string {
 }
 
 /**
+ * The block with every line as a YAML comment — the only format-valid way
+ * to carry it in aider's `.aider.conf.yml` (codex#17: raw prose lines made
+ * the file unparseable). The markers already start with `#`.
+ */
+export function buildYamlCommentBlock(projectionDir: string | null): string {
+  return buildInstructionBlock(projectionDir)
+    .split("\n")
+    .map((l) => (l.length > 0 && !l.startsWith("#") ? `# ${l}` : l))
+    .join("\n");
+}
+
+/**
  * Appends the mind-nerve instruction block to targetPath (workspace-relative
  * unless absolute is passed). Creates the file and its parent directory if
  * they do not exist.
+ *
+ * `style` "yaml-comment" writes the comment-block form (aider); "prose" is
+ * the plain markdown block for genuine rules files.
  *
  * Idempotent: if BLOCK_MARKER already exists in the file, returns false
  * (no write performed).
@@ -40,6 +55,7 @@ export function buildInstructionBlock(projectionDir: string | null): string {
 export async function appendInstructionBlock(
   targetPath: string,
   projectionDir: string | null,
+  style: "prose" | "yaml-comment" = "prose",
 ): Promise<boolean> {
   // Ensure parent directory exists.
   await fs.mkdir(path.dirname(targetPath), { recursive: true });
@@ -55,9 +71,84 @@ export async function appendInstructionBlock(
     return false; // already installed
   }
 
-  const block = buildInstructionBlock(projectionDir);
+  const block =
+    style === "yaml-comment"
+      ? buildYamlCommentBlock(projectionDir)
+      : buildInstructionBlock(projectionDir);
   const separator = existing.length > 0 && !existing.endsWith("\n") ? "\n\n" : "\n";
   await fs.writeFile(targetPath, existing + separator + block, "utf8");
+  return true;
+}
+
+/** Top-level JSON key carrying the managed block in JSON configs (cody). */
+export const MANAGED_JSON_KEY = "mind-nerve";
+
+/**
+ * JSON-config variant (cody's `.cody/config.json`): prose appended to JSON
+ * is a guaranteed parse error (codex#17), so the block lives under a
+ * top-level "mind-nerve" key instead. Idempotent by key presence. An
+ * existing file that does not parse as a JSON object is refused loudly —
+ * never silently rewritten.
+ */
+export async function upsertInstructionJson(
+  targetPath: string,
+  projectionDir: string | null,
+): Promise<boolean> {
+  await fs.mkdir(path.dirname(targetPath), { recursive: true });
+
+  let existing = "";
+  try {
+    existing = await fs.readFile(targetPath, "utf8");
+  } catch {
+    // File does not exist — will be created.
+  }
+
+  let cfg: Record<string, unknown> = {};
+  if (existing.trim().length > 0) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(existing);
+    } catch {
+      throw new Error(
+        `refusing to merge into unparseable JSON config: ${targetPath} — fix or remove it first`,
+      );
+    }
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      throw new Error(
+        `refusing to merge into non-object JSON config: ${targetPath}`,
+      );
+    }
+    cfg = parsed as Record<string, unknown>;
+  }
+
+  if (cfg[MANAGED_JSON_KEY] !== undefined) {
+    return false; // already installed
+  }
+  cfg[MANAGED_JSON_KEY] = {
+    managed: true,
+    instructions: buildInstructionBlock(projectionDir),
+  };
+  await fs.writeFile(targetPath, JSON.stringify(cfg, null, 2) + "\n", "utf8");
+  return true;
+}
+
+/** Removes the managed JSON key written by upsertInstructionJson. */
+export async function removeInstructionJson(targetPath: string): Promise<boolean> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(await fs.readFile(targetPath, "utf8"));
+  } catch {
+    return false; // missing or unparseable — nothing to remove
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return false;
+  }
+  const cfg = parsed as Record<string, unknown>;
+  if (cfg[MANAGED_JSON_KEY] === undefined) {
+    return false;
+  }
+  delete cfg[MANAGED_JSON_KEY];
+  await fs.writeFile(targetPath, JSON.stringify(cfg, null, 2) + "\n", "utf8");
   return true;
 }
 

@@ -1,8 +1,8 @@
 // mind-nerve installer — Copyright 2026 STARGA Inc. Apache-2.0.
 
 import fs from "node:fs/promises";
-import path from "node:path";
 import os from "node:os";
+import path from "node:path";
 import { type AgentSpec } from "./registry.js";
 import { createBackup } from "./backup.js";
 import { ensureProjectionDir } from "./projector.js";
@@ -12,8 +12,9 @@ import {
   mergeTomlMcp,
   isJsonMcpFmt,
   isTomlMcpFmt,
+  type McpLauncher,
 } from "./mcp_rewire.js";
-import { appendInstructionBlock, BLOCK_MARKER } from "./instruction_block.js";
+import { appendInstructionBlock, BLOCK_MARKER, upsertInstructionJson } from "./instruction_block.js";
 import { wireClient, type WireOptions, type WireResult } from "./wire.js";
 import { InstallerError } from "./errors.js";
 
@@ -25,8 +26,15 @@ export interface InstallOptions {
    * Defaults to process.cwd().
    */
   workspace?: string;
-  /** Skip MCP rewire even if the client supports MCP. */
+  /** MCP-only mode: perform ONLY the MCP rewire (skip projection dir,
+   * instruction block, and skill-surface wiring). */
   mcpOnly?: boolean;
+  /**
+   * How MCP server entries are launched. "venv" (default) pins the absolute
+   * venv binary path; "uvx" launches via `uvx --from mind-nerve
+   * mind-nerve-mcp` so the host needs no pre-built venv.
+   */
+  mcpLauncher?: McpLauncher;
   /**
    * STARGA power-user shared projection: use this dir instead of per-CLI
    * projection. Only relevant for clients with projectionDir != null.
@@ -56,6 +64,40 @@ export interface InstallResult {
 }
 
 /**
+ * True when *dir* holds a populated runtime: manifest.json or
+ * route_table.jsonl — the same condition Python's _default_user_runtime_dir
+ * prefers the STARGA dash dir on.
+ */
+export async function runtimeDirPopulated(dir: string): Promise<boolean> {
+  for (const marker of ["manifest.json", "route_table.jsonl"]) {
+    try {
+      await fs.access(path.join(dir, marker));
+      return true;
+    } catch {
+      // marker absent — try the next
+    }
+  }
+  return false;
+}
+
+/**
+ * Runtime dir holding route_table.jsonl + the row-aligned route_table.npy.
+ * Returns the dir only when it is POPULATED on this host — an empty or
+ * merely-existing dir must not be pinned: the pin would shadow the MCP's
+ * Hugging Face auto-seed with nothing, while Python acquire/inference only
+ * prefer the dir when manifest.json is present (fleet audit 2026-08).
+ * Mirrors runtimeDir() in index.ts. Fleet incident 2026-07-10: without the
+ * pin the MCP silently loads the OSS catalog instead of the local route
+ * table.
+ */
+export async function existingRuntimeDir(): Promise<string | null> {
+  const dir =
+    process.env.MIND_NERVE_RUNTIME_DIR ??
+    path.join(os.homedir(), ".local", "share", "mind-nerve-runtime");
+  return (await runtimeDirPopulated(dir)) ? dir : null;
+}
+
+/**
  * Runs the full 4-step install for a single client:
  *   1. Detection: caller is responsible (call detectClient first).
  *   2. Projection dir setup (if the client has a skill surface).
@@ -74,13 +116,13 @@ export async function installClient(
   let idempotentNoop = true;
 
   // -------------------------------------------------------------------------
-  // Step 2: Projection dir
+  // Step 2: Projection dir (skipped in MCP-only mode)
   // -------------------------------------------------------------------------
   const effectiveProjectionDir =
     opts.sharedProjectionDir ??
     spec.projectionDir;
 
-  if (effectiveProjectionDir !== null) {
+  if (effectiveProjectionDir !== null && opts.mcpOnly !== true) {
     // ensureProjectionDir is idempotent (mkdir -p). Only mark changed if the
     // directory did not exist before.
     let projDirExisted = false;
@@ -98,14 +140,18 @@ export async function installClient(
   }
 
   // -------------------------------------------------------------------------
-  // Step 3: MCP rewire
+  // Step 3: MCP rewire — ALWAYS runs when the client has an MCP surface.
+  // (--mcp / mcpOnly used to suppress THIS step too, making "MCP-only mode"
+  // a no-op; audit finding 2026-08 r4 / codex#14. MCP-only mode skips steps
+  // 2, 4 and 5 — never this one.)
   // -------------------------------------------------------------------------
   let effectiveMcpPath: string | null = null;
-  if (spec.mcpFmt !== null && spec.mcpPath !== null && !opts.mcpOnly) {
+  if (spec.mcpFmt !== null && spec.mcpPath !== null) {
     effectiveMcpPath = resolvePath(spec.mcpPath, ws);
     const srv = buildMcpSpec(
       opts.mindNerveBin,
-      upstreamConfigPath(spec.name),
+      opts.mcpLauncher ?? "venv",
+      await existingRuntimeDir(),
     );
 
     if (isJsonMcpFmt(spec.mcpFmt)) {
@@ -181,10 +227,17 @@ export async function installClient(
   if (spec.instructionFilePath !== null) {
     effectiveConfigPath = resolvePath(spec.instructionFilePath, ws);
 
-    const didWrite = await appendInstructionBlock(
-      effectiveConfigPath,
-      effectiveProjectionDir,
-    );
+    // The block must stay FORMAT-VALID for structured configs (codex#17):
+    // cody's .cody/config.json takes a managed JSON key, aider's
+    // .aider.conf.yml takes a comment block, plain rules files take prose.
+    const didWrite =
+      spec.configFmt === "json-generic"
+        ? await upsertInstructionJson(effectiveConfigPath, effectiveProjectionDir)
+        : await appendInstructionBlock(
+            effectiveConfigPath,
+            effectiveProjectionDir,
+            spec.configFmt === "yaml-aider" ? "yaml-comment" : "prose",
+          );
     if (didWrite) {
       changed = true;
       idempotentNoop = false;
@@ -244,14 +297,6 @@ export async function installClient(
 function resolvePath(p: string, ws: string): string {
   if (path.isAbsolute(p)) return p;
   return path.join(ws, p);
-}
-
-/**
- * Returns the path to the upstream MCP config TOML for this client.
- * These configs live in ~/.config/mind-nerve/mcp/<clientName>.toml.
- */
-function upstreamConfigPath(clientName: string): string {
-  return path.join(os.homedir(), ".config", "mind-nerve", "mcp", `${clientName}.toml`);
 }
 
 async function writeJsonFile(filePath: string, data: Record<string, unknown>): Promise<void> {

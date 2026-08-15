@@ -130,21 +130,44 @@ export function removeJsonHooks(
 }
 
 // ---------------------------------------------------------------------------
-// TOML hook wiring (codex, grok, kimi)
+// TOML hook wiring (codex, grok: "toml-hooks"; kimi: "toml-hooks-kimi")
 // ---------------------------------------------------------------------------
 
-/** Renders the managed TOML block. Deterministic — used for idempotency too. */
+/**
+ * Renders the managed TOML block. Deterministic — used for idempotency too.
+ *
+ * Two shapes, keyed off the surface's hookWireFmt:
+ *  - "toml-hooks":      `[[hooks.<Event>]]` tables with a `hooks = [...]`
+ *                       array — the Claude-native shape codex/grok parse.
+ *  - "toml-hooks-kimi": flat `[[hooks]]` array elements with only
+ *                       event/command/timeout — the ONLY shape kimi-code
+ *                       reads (official hooks docs). Extra fields inside a
+ *                       `[[hooks]]` element can fail kimi's whole config
+ *                       load, so nothing else is emitted.
+ */
 export function buildTomlHookBlock(surface: SkillSurface): string {
   const lines: string[] = [HOOK_BLOCK_BEGIN];
-  for (const event of surface.hookEvents) {
-    lines.push(
-      `[[hooks.${event}]]`,
-      "hooks = [",
-      `  { type = "command", command = ${JSON.stringify(surface.hookScriptPath)}, ` +
-        `timeout = ${surface.hookTimeoutSecs} },`,
-      "]",
-      "",
-    );
+  if (surface.hookWireFmt === "toml-hooks-kimi") {
+    for (const event of surface.hookEvents) {
+      lines.push(
+        "[[hooks]]",
+        `event = ${JSON.stringify(event)}`,
+        `command = ${JSON.stringify(surface.hookScriptPath)}`,
+        `timeout = ${surface.hookTimeoutSecs}`,
+        "",
+      );
+    }
+  } else {
+    for (const event of surface.hookEvents) {
+      lines.push(
+        `[[hooks.${event}]]`,
+        "hooks = [",
+        `  { type = "command", command = ${JSON.stringify(surface.hookScriptPath)}, ` +
+          `timeout = ${surface.hookTimeoutSecs} },`,
+        "]",
+        "",
+      );
+    }
   }
   lines.push(HOOK_BLOCK_END, "");
   return lines.join("\n");
@@ -200,16 +223,18 @@ export function removeTomlHooks(existingText: string): MergeResult<string> {
  * The env the hook needs to behave as THIS CLI's router. Written next to the
  * hook script so the wiring is inspectable, and so a user can override any
  * knob without editing the shared script.
+ *
+ * ONLY path/socket pins are exported. Tuning knobs (TOP_K, MIN_SCORE,
+ * CORE_SKILLS, SOCKET_TIMEOUT, ...) are deliberately NOT pinned: the shared
+ * hook is their single source of truth, and a pinned copy goes stale — the
+ * wrapper used to pin MIN_SCORE=0.35, silently overriding the hook's
+ * recalibrated 0.40 default (2026-08-08).
  */
 export function buildHookEnv(args: {
   readonly surface: SkillSurface;
   readonly hubDir: string;
   readonly socketPath: string;
   readonly agentDirs: readonly string[];
-  readonly topK: number;
-  readonly minScore: number;
-  readonly coreSkills: readonly string[];
-  readonly socketTimeout: number;
   readonly logPath: string;
 }): Record<string, string> {
   return {
@@ -217,10 +242,6 @@ export function buildHookEnv(args: {
     MIND_NERVE_SOURCE_DIR: args.hubDir,
     MIND_NERVE_PROJECTED_DIR: args.surface.skillsDir,
     MIND_NERVE_AGENT_DIRS: args.agentDirs.join(":"),
-    MIND_NERVE_TOP_K: String(args.topK),
-    MIND_NERVE_MIN_SCORE: String(args.minScore),
-    MIND_NERVE_CORE_SKILLS: args.coreSkills.join(","),
-    MIND_NERVE_SOCKET_TIMEOUT: String(args.socketTimeout),
     MIND_NERVE_LOG: args.logPath,
   };
 }
@@ -257,7 +278,10 @@ export function isJsonHookFmt(surface: SkillSurface): boolean {
 }
 
 export function isTomlHookFmt(surface: SkillSurface): boolean {
-  return surface.hookWireFmt === "toml-hooks";
+  return (
+    surface.hookWireFmt === "toml-hooks" ||
+    surface.hookWireFmt === "toml-hooks-kimi"
+  );
 }
 
 export function assertKnownHookFmt(

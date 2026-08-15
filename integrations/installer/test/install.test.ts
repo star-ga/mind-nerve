@@ -4,6 +4,7 @@ import { describe, it, expect, afterEach } from "vitest";
 import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
+import YAML from "js-yaml";
 import { installClient } from "../src/install.js";
 import { AGENT_REGISTRY } from "../src/registry.js";
 import { backupPath } from "../src/backup.js";
@@ -406,6 +407,76 @@ describe("installClient — windsurf", () => {
   });
 });
 
+describe("installClient — MCP-only mode (--mcp)", () => {
+  it("writes the MCP entry and skips projection + instruction block", async () => {
+    // codex#14: mcpOnly used to suppress the MCP rewire ITSELF, making
+    // `install --mcp <client>` a silent no-op.
+    const tmp = await makeTmp();
+    const configPath = path.join(tmp, "settings.json");
+    await cloneFixture("claude-settings-before.json", configPath);
+    const projDir = path.join(tmp, "proj");
+    const spec = {
+      ...AGENT_REGISTRY.get("claude-code")!,
+      configPath,
+      mcpPath: configPath,
+      projectionDir: projDir,
+    };
+
+    const result = await installClient(spec, {
+      mindNerveBin: FAKE_BIN,
+      workspace: tmp,
+      mcpOnly: true,
+    });
+
+    expect(result.changed).toBe(true);
+    const written = await readJson(configPath);
+    const servers = written["mcpServers"] as Record<string, unknown>;
+    expect(servers).toHaveProperty("mind-nerve");
+    // MCP-only mode must NOT create the projection dir.
+    await expect(fs.stat(projDir)).rejects.toThrow();
+  });
+});
+
+describe("installClient — format-valid instruction blocks (codex#17)", () => {
+  it("aider: the YAML config stays parseable (comment block)", async () => {
+    const tmp = await makeTmp();
+    await fs.writeFile(path.join(tmp, ".aider.conf.yml"), "read: [AGENTS.md]\n");
+    const spec = { ...AGENT_REGISTRY.get("aider")! };
+    const result = await installClient(spec, {
+      mindNerveBin: FAKE_BIN,
+      workspace: tmp,
+    });
+    expect(result.changed).toBe(true);
+    const content = await readText(path.join(tmp, ".aider.conf.yml"));
+    expect(() => YAML.load(content)).not.toThrow();
+    expect(content).toContain("# mind-nerve managed");
+    // The user's own key survived.
+    expect((YAML.load(content) as Record<string, unknown>)["read"]).toEqual([
+      "AGENTS.md",
+    ]);
+  });
+
+  it("cody: the JSON config stays parseable (managed key)", async () => {
+    const tmp = await makeTmp();
+    const spec = { ...AGENT_REGISTRY.get("cody")! };
+    const result = await installClient(spec, {
+      mindNerveBin: FAKE_BIN,
+      workspace: tmp,
+    });
+    expect(result.changed).toBe(true);
+    const raw = await readText(path.join(tmp, ".cody", "config.json"));
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    expect(parsed).toHaveProperty("mind-nerve");
+    expect(raw).toContain("mind-nerve managed");
+    // Idempotent: a second install does not rewrite.
+    const again = await installClient(spec, {
+      mindNerveBin: FAKE_BIN,
+      workspace: tmp,
+    });
+    expect(again.changed).toBe(false);
+  });
+});
+
 describe("--all install produces backups", () => {
   it("produces at least one .bak file when JSON clients are installed", async () => {
     const tmp = await makeTmp();
@@ -426,5 +497,48 @@ describe("--all install produces backups", () => {
     const bak = result.backedUp[0]!;
     expect(bak).toMatch(/\.bak-mind-nerve-\d+$/);
     await expect(fs.stat(bak)).resolves.toBeTruthy();
+  });
+});
+
+describe("installClient — runtime dir pin", () => {
+  it("pins MIND_NERVE_RUNTIME_DIR only when the dir is populated", async () => {
+    // Audit finding 2026-08 r3: an empty-but-existing runtime dir used to be
+    // pinned, shadowing the MCP's Hugging Face auto-seed with nothing.
+    const tmp = await makeTmp();
+    const configPath = path.join(tmp, "settings.json");
+    await cloneFixture("claude-settings-before.json", configPath);
+    const spec = {
+      ...AGENT_REGISTRY.get("claude-code")!,
+      configPath,
+      mcpPath: configPath,
+    };
+    const rt = path.join(tmp, "rt");
+    await fs.mkdir(rt, { recursive: true });
+
+    const prev = process.env.MIND_NERVE_RUNTIME_DIR;
+    process.env.MIND_NERVE_RUNTIME_DIR = rt;
+    try {
+      // Empty dir: no pin.
+      await installClient(spec, { mindNerveBin: FAKE_BIN, workspace: tmp });
+      let written = await readJson(configPath);
+      let entry = (written["mcpServers"] as Record<string, unknown>)[
+        "mind-nerve"
+      ] as Record<string, unknown>;
+      let env = entry["env"] as Record<string, string>;
+      expect(env["MIND_NERVE_RUNTIME_DIR"]).toBeUndefined();
+
+      // Populated dir (manifest.json): pinned.
+      await fs.writeFile(path.join(rt, "manifest.json"), "{}\n");
+      await installClient(spec, { mindNerveBin: FAKE_BIN, workspace: tmp });
+      written = await readJson(configPath);
+      entry = (written["mcpServers"] as Record<string, unknown>)[
+        "mind-nerve"
+      ] as Record<string, unknown>;
+      env = entry["env"] as Record<string, string>;
+      expect(env["MIND_NERVE_RUNTIME_DIR"]).toBe(rt);
+    } finally {
+      if (prev === undefined) delete process.env.MIND_NERVE_RUNTIME_DIR;
+      else process.env.MIND_NERVE_RUNTIME_DIR = prev;
+    }
   });
 });

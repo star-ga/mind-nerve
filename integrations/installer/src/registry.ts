@@ -32,10 +32,21 @@ export type McpFmt =
  *
  * All six skill-surface CLIs speak the Claude-compatible hook protocol
  * (`UserPromptSubmit` / `SessionStart`, JSON on stdin, `hookSpecificOutput`
- * with `additionalContext` on stdout) — they differ only in whether the
- * registration lives in a JSON settings file or a TOML config file.
+ * with `additionalContext` on stdout) — they differ only in the container:
+ *
+ *  - "json-hooks":      a JSON settings file (claude-code, gemini, qwen).
+ *  - "toml-hooks":      TOML `[[hooks.<Event>]]` tables holding a `hooks = [...]`
+ *                       array (codex, grok — grok's live config is the working
+ *                       reference for this shape).
+ *  - "toml-hooks-kimi": TOML `[[hooks]]` array elements with flat
+ *                       event/matcher/command/timeout fields — the ONLY shape
+ *                       kimi-code parses, per the official docs
+ *                       (kimi.com/code/docs/en/kimi-code-cli/customization/hooks.html).
+ *                       The Claude `[[hooks.<Event>]]` shape is silently dead
+ *                       there, and extra fields inside a `[[hooks]]` element
+ *                       can fail the whole config load.
  */
-export type HookWireFmt = "json-hooks" | "toml-hooks";
+export type HookWireFmt = "json-hooks" | "toml-hooks" | "toml-hooks-kimi";
 
 /**
  * The skill-announce surface of a CLI: where its skills directory lives, and
@@ -74,6 +85,12 @@ export interface AgentSpec {
   readonly mcpPath: string | null;
   /** MCP serialisation format — null if this client has no MCP surface. */
   readonly mcpFmt: McpFmt;
+  /**
+   * When true, verify FAILs the managed MCP entry unless it carries
+   * transport = "stdio" (Vibe 2.9.6 rejects entries without the
+   * discriminator — codex#16).
+   */
+  readonly mcpRequiresStdioTransport?: boolean;
   /** Paths to probe when checking if the client is installed (fs existence). */
   readonly detectPaths: readonly string[];
   /** Binary names to probe on $PATH. */
@@ -137,7 +154,7 @@ function projDir(clientName: string): string {
 }
 
 /**
- * AGENT_REGISTRY — 17 AI coding clients.
+ * AGENT_REGISTRY — 20 AI coding clients.
  *
  * Ported from mind-mem src/mind_mem/hook_installer.py AGENT_REGISTRY (lines 629-808)
  * and extended with mind-nerve-specific fields (projectionDir, instructionFilePath).
@@ -209,6 +226,7 @@ export const AGENT_REGISTRY: ReadonlyMap<string, AgentSpec> = new Map<
       configPath: path.join(h(), ".vibe", "config.toml"),
       mcpPath: path.join(h(), ".vibe", "config.toml"),
       mcpFmt: "mcp-toml-vibe",
+      mcpRequiresStdioTransport: true,
       detectPaths: [path.join(h(), ".vibe")],
       detectBinaries: ["vibe"],
       alwaysOffer: false,
@@ -276,8 +294,8 @@ export const AGENT_REGISTRY: ReadonlyMap<string, AgentSpec> = new Map<
       description: "Moonshot Kimi Code CLI",
       configFmt: "toml-vibe",
       configPath: path.join(h(), ".kimi-code", "config.toml"),
-      mcpPath: path.join(h(), ".kimi-code", "config.toml"),
-      mcpFmt: "mcp-toml-vibe",
+      mcpPath: path.join(h(), ".kimi-code", "mcp.json"),
+      mcpFmt: "mcp-json-servers",
       detectPaths: [path.join(h(), ".kimi-code")],
       detectBinaries: ["kimi"],
       alwaysOffer: false,
@@ -287,12 +305,14 @@ export const AGENT_REGISTRY: ReadonlyMap<string, AgentSpec> = new Map<
         skillsDir: path.join(h(), ".kimi-code", "skills"),
         hookScriptPath: path.join(h(), ".kimi-code", "hooks", "mind-nerve-hook"),
         hookConfigPath: path.join(h(), ".kimi-code", "config.toml"),
-        hookWireFmt: "toml-hooks",
+        hookWireFmt: "toml-hooks-kimi",
         verified:
-          "~/.kimi-code/config.toml read live (extra_skill_dirs = []); " +
-          "~/.kimi-code/skills is a real dir (2 entries); kimi binary contains " +
-          "UserPromptSubmit x23, SessionStart x69, extra_skill_dirs x7, " +
-          "SKILL.md x30. Exact TOML hook table shape NOT confirmed — see README.",
+          "Official kimi-code docs (hooks.html + mcp.html, fetched " +
+          "2026-08-11): hooks are ONLY [[hooks]] array elements with " +
+          "event/matcher/command/timeout in config.toml — the Claude " +
+          "[[hooks.<Event>]] shape is never read. MCP servers live in " +
+          "~/.kimi-code/mcp.json ({\"mcpServers\": {...}}, " +
+          "Claude-Desktop-compatible), NOT config.toml [mcp_servers.*].",
       }),
     },
   ],

@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { type AgentSpec } from "./registry.js";
 import { restoreLatestBackup } from "./backup.js";
-import { removeInstructionBlock } from "./instruction_block.js";
+import { removeInstructionBlock, removeInstructionJson } from "./instruction_block.js";
 import { unwireClient, type UnwireResult } from "./wire.js";
 import { InstallerError } from "./errors.js";
 
@@ -66,7 +66,11 @@ export async function uninstallClient(
   if (spec.instructionFilePath !== null) {
     const instrPath = resolvePath(spec.instructionFilePath, ws);
     try {
-      const removed = await removeInstructionBlock(instrPath);
+      // cody's config.json carries the block as a managed JSON key.
+      const removed =
+        spec.configFmt === "json-generic"
+          ? await removeInstructionJson(instrPath)
+          : await removeInstructionBlock(instrPath);
       if (removed) {
         removedBlocks.push(instrPath);
         changed = true;

@@ -17,7 +17,7 @@ const SKILL_SURFACE_CLIS = [
   ["codex", ".codex/skills", ".codex/config.toml", "toml-hooks"],
   ["gemini", ".gemini/skills", ".gemini/settings.json", "json-hooks"],
   ["grok", ".grok/skills", ".grok/config.toml", "toml-hooks"],
-  ["kimi", ".kimi-code/skills", ".kimi-code/config.toml", "toml-hooks"],
+  ["kimi", ".kimi-code/skills", ".kimi-code/config.toml", "toml-hooks-kimi"],
   ["qwen", ".qwen/skills", ".qwen/settings.json", "json-hooks"],
 ] as const;
 
@@ -129,6 +129,21 @@ describe("AGENT_REGISTRY", () => {
     expect(spec?.projectionDir).not.toBeNull();
     expect(spec?.projectionDir).toContain("mind-nerve");
     expect(spec?.projectionDir).toContain("claude-code");
+  });
+
+  it("kimi uses the documented shapes: mcp.json + flat [[hooks]] (docs 2026-08-11)", () => {
+    // Official kimi-code docs: MCP servers live in ~/.kimi-code/mcp.json
+    // ({"mcpServers": {...}}, Claude-Desktop-compatible); hooks are ONLY
+    // [[hooks]] array elements in config.toml. The config.toml [mcp_servers]
+    // surface and the Claude [[hooks.<Event>]] shape are never read.
+    const spec = AGENT_REGISTRY.get("kimi");
+    expect(spec).toBeDefined();
+    expect(spec!.mcpPath).toBe(path.join(home, ".kimi-code", "mcp.json"));
+    expect(spec!.mcpFmt).toBe("mcp-json-servers");
+    expect(spec!.skillSurface?.hookWireFmt).toBe("toml-hooks-kimi");
+    expect(spec!.skillSurface?.hookConfigPath).toBe(
+      path.join(home, ".kimi-code", "config.toml"),
+    );
   });
 
   it("clients without skill surface have projectionDir null", () => {

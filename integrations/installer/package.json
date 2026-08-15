@@ -1,7 +1,7 @@
 {
   "name": "@mind-nerve/installer",
   "version": "0.1.0",
-  "description": "mind-nerve install matrix — wires 17 AI CLI clients to the mind-nerve MCP façade",
+  "description": "mind-nerve install matrix — wires 20 AI CLI clients to the mind-nerve MCP server",
   "type": "module",
   "main": "dist/index.js",
   "bin": {

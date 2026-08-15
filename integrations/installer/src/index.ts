@@ -4,17 +4,22 @@
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs/promises";
-import { fileURLToPath } from "node:url";
+import { existsSync, realpathSync } from "node:fs";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { AGENT_REGISTRY, ALL_CLIENT_NAMES, requireSpec } from "./registry.js";
 import { detectClient, detectAll } from "./detect.js";
 import { installClient } from "./install.js";
 import { uninstallClient } from "./uninstall.js";
 import { runHygiene } from "./hygiene.js";
+import { type WireOptions } from "./wire.js";
 import {
-  DEFAULT_MIN_SCORE,
-  DEFAULT_TOP_K,
-  type WireOptions,
-} from "./wire.js";
+  verifyClient,
+  summarize,
+  hasFailures,
+  looksInstalled,
+  type ClientReport,
+} from "./verify.js";
+import { type McpLauncher } from "./mcp_rewire.js";
 import { InstallerError } from "./errors.js";
 
 // ---------------------------------------------------------------------------
@@ -30,9 +35,25 @@ const INTEGRATIONS_ROOT = path.resolve(
   "..",
 );
 
-const HOOK_SOURCE = path.join(INTEGRATIONS_ROOT, "hook", "mind-nerve-hook");
+// The compiled entry runs from dist/src/ (one level deeper than src/), so the
+// naive "../.." lands on integrations/installer instead of integrations/.
+// Walk the candidates and take the first root that actually contains the hook.
+function findIntegrationsRoot(): string {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  for (const up of ["..", "../..", "../../.."]) {
+    const candidate = path.resolve(here, up);
+    if (existsSync(path.join(candidate, "hook", "mind-nerve-hook"))) {
+      return candidate;
+    }
+  }
+  return INTEGRATIONS_ROOT; // preserve the old error path (ENOENT at read time)
+}
+
+const EFFECTIVE_ROOT = findIntegrationsRoot();
+
+const HOOK_SOURCE = path.join(EFFECTIVE_ROOT, "hook", "mind-nerve-hook");
 const ROUTER_SKILL = path.join(
-  INTEGRATIONS_ROOT,
+  EFFECTIVE_ROOT,
   "hook",
   "assets",
   "mind-nerve-router.SKILL.md",
@@ -63,8 +84,6 @@ function defaultWireOptions(): WireOptions {
       path.join(home, ".claude", "agents"),
       path.join(home, ".agents", "agents"),
     ],
-    topK: Number(envOr("MIND_NERVE_TOP_K", String(DEFAULT_TOP_K))),
-    minScore: Number(envOr("MIND_NERVE_MIN_SCORE", String(DEFAULT_MIN_SCORE))),
   };
 }
 
@@ -87,6 +106,9 @@ async function main(): Promise<void> {
     case "uninstall":
       await cmdUninstall(args.slice(1));
       break;
+    case "verify":
+      await cmdVerify(args.slice(1));
+      break;
     case "list-clients":
       await cmdListClients();
       break;
@@ -108,13 +130,76 @@ async function main(): Promise<void> {
 // mind-nerve install --mcp <client>
 // mind-nerve install --shared a,b,c
 // ---------------------------------------------------------------------------
+
+export interface InstallArgs {
+  readonly all: boolean;
+  readonly mcpOnly: boolean;
+  readonly noWire: boolean;
+  readonly sharedClients: readonly string[];
+  readonly mcpLauncher: McpLauncher;
+  readonly clientArg: string | undefined;
+}
+
+export type InstallArgsResult = InstallArgs | { readonly error: string };
+
+/**
+ * Parses `install` argv. Flags may precede OR follow the client name —
+ * `install --mcp-launcher uvx claude-code` and `install claude-code
+ * --mcp-launcher uvx` are equivalent (audit finding 2026-08 r3: the
+ * documented flag-first order used to hard-fail because args[0] was taken
+ * as the client). `--shared` and `--mcp-launcher` consume the next token as
+ * their value; the first remaining non-flag token is the client.
+ */
+export function parseInstallArgs(args: readonly string[]): InstallArgsResult {
+  let mcpLauncher: McpLauncher = "venv";
+  let sharedClients: string[] = [];
+  const positional: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const tok = args[i];
+    if (tok === undefined) continue;
+    if (tok === "--shared") {
+      const value = args[i + 1];
+      if (value !== undefined && !value.startsWith("--")) {
+        sharedClients = value.split(",");
+        i++;
+      }
+      continue;
+    }
+    if (tok === "--mcp-launcher") {
+      const value = args[i + 1];
+      if (value !== "venv" && value !== "uvx") {
+        return {
+          error: `mind-nerve: bad --mcp-launcher '${String(value)}' (want venv|uvx)`,
+        };
+      }
+      mcpLauncher = value;
+      i++;
+      continue;
+    }
+    if (tok.startsWith("--")) continue; // --all / --mcp / --no-wire
+    positional.push(tok);
+  }
+  return {
+    all: args.includes("--all"),
+    mcpOnly: args.includes("--mcp"),
+    noWire: args.includes("--no-wire"),
+    sharedClients,
+    mcpLauncher,
+    clientArg: positional[0],
+  };
+}
+
 async function cmdInstall(args: string[]): Promise<void> {
-  const flagAll = args.includes("--all");
-  const flagMcp = args.includes("--mcp");
-  const flagNoWire = args.includes("--no-wire");
-  const sharedIdx = args.indexOf("--shared");
-  const sharedArg = sharedIdx !== -1 ? args[sharedIdx + 1] : undefined;
-  const sharedClients = sharedArg !== undefined ? sharedArg.split(",") : [];
+  const parsed = parseInstallArgs(args);
+  if ("error" in parsed) {
+    process.stderr.write(parsed.error + "\n");
+    process.exit(1);
+  }
+  const flagAll = parsed.all;
+  const flagMcp = parsed.mcpOnly;
+  const flagNoWire = parsed.noWire;
+  const sharedClients = [...parsed.sharedClients];
+  const mcpLauncher = parsed.mcpLauncher;
 
   const sharedProjectionDir =
     sharedClients.length > 0
@@ -128,6 +213,7 @@ async function cmdInstall(args: string[]): Promise<void> {
   const buildOpts = (useShared: boolean) => ({
     mindNerveBin: MIND_NERVE_BIN,
     mcpOnly: flagMcp,
+    mcpLauncher,
     ...(useShared && sharedProjectionDir !== undefined
       ? { sharedProjectionDir }
       : {}),
@@ -169,8 +255,8 @@ async function cmdInstall(args: string[]): Promise<void> {
   }
 
   // Single client install.
-  const clientArg = flagMcp ? args[args.indexOf("--mcp") + 1] : args[0];
-  if (clientArg === undefined || clientArg.startsWith("--")) {
+  const clientArg = parsed.clientArg;
+  if (clientArg === undefined) {
     process.stderr.write("Usage: mind-nerve install [--all] [--mcp] [--shared a,b] <client>\n");
     process.exit(1);
   }
@@ -310,6 +396,77 @@ async function cmdUninstall(args: string[]): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// mind-nerve verify [--cli <name|all>] [--json]
+// ---------------------------------------------------------------------------
+async function cmdVerify(args: string[]): Promise<void> {
+  const flagJson = args.includes("--json");
+  const cliIdx = args.indexOf("--cli");
+  const cliArg = cliIdx !== -1 ? args[cliIdx + 1] : undefined;
+  if (cliIdx !== -1 && (cliArg === undefined || cliArg.startsWith("--"))) {
+    process.stderr.write("Usage: mind-nerve verify [--cli <name|all>] [--json]\n");
+    process.exit(1);
+  }
+
+  const specs = [...AGENT_REGISTRY.values()];
+  let targets;
+  if (cliArg === "all") {
+    targets = specs;
+  } else if (cliArg !== undefined) {
+    targets = [resolveSpec(cliArg)];
+  } else {
+    // No --cli: verify only clients that have something on disk.
+    const installed = await Promise.all(
+      specs.map(async (s) => ((await looksInstalled(s, process.cwd())) ? s : null)),
+    );
+    targets = installed.filter((s) => s !== null);
+    if (targets.length === 0) {
+      process.stderr.write(
+        "mind-nerve: no installs found on this host — nothing to verify\n",
+      );
+      if (flagJson) {
+        process.stdout.write(
+          JSON.stringify({ clients: [], summary: summarize([]) }, null, 2) + "\n",
+        );
+      }
+      return;
+    }
+  }
+
+  const reports: ClientReport[] = [];
+  for (const spec of targets) {
+    reports.push(await verifyClient(spec, { socketPath: defaultSocket() }));
+  }
+
+  const summary = summarize(reports);
+
+  if (flagJson) {
+    process.stdout.write(
+      JSON.stringify({ clients: reports, summary }, null, 2) + "\n",
+    );
+  } else {
+    for (const report of reports) {
+      process.stdout.write(`${report.client}: ${report.status}\n`);
+      for (const check of report.checks) {
+        process.stdout.write(
+          `  ${check.status.padEnd(4)}  ${check.name}: ${check.message}\n`,
+        );
+        if (check.hint !== null) {
+          process.stdout.write(`        hint: ${check.hint}\n`);
+        }
+      }
+    }
+    process.stdout.write(
+      `\nsummary: ${summary.clients} client(s), ` +
+        `${summary.pass} PASS, ${summary.warn} WARN, ${summary.fail} FAIL\n`,
+    );
+  }
+
+  if (hasFailures(reports)) {
+    process.exitCode = 1;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // mind-nerve list-clients
 // ---------------------------------------------------------------------------
 async function cmdListClients(): Promise<void> {
@@ -381,8 +538,23 @@ Usage:
   mind-nerve install --mcp <client>      MCP-only mode (skip skill projection)
   mind-nerve install --no-wire <client>  Skip the skills dir + hook wiring
   mind-nerve install --shared a,b,c      STARGA power-user: shared projection dir
+  mind-nerve install --mcp-launcher venv|uvx <client>
+                                         venv (default): pin the absolute venv
+                                         binary path — zero first-launch cost,
+                                         works offline, needs the venv present.
+                                         uvx: write 'uvx --from mind-nerve
+                                         mind-nerve-mcp' — no pre-built venv
+                                         needed, but first launch downloads the
+                                         package; offline hosts stay on venv.
   mind-nerve uninstall <client>          Reverse install, restore backup
   mind-nerve uninstall --all             Uninstall all clients
+  mind-nerve verify [--cli <name|all>] [--json]
+                                         Self-test existing installs: config
+                                         parses + managed markers, hook script
+                                         fail-open probe, skills dir state, MCP
+                                         entry + command resolution, env pins,
+                                         daemon socket (WARN only). Exits
+                                         non-zero iff any check FAILs.
   mind-nerve list-clients                Show all clients + detection status
   mind-nerve status                      Show which installs are active
   mind-nerve hygiene [--dry-run]         Repoint + prune the route table and
@@ -411,12 +583,20 @@ Known clients: ${ALL_CLIENT_NAMES.join(", ")}
 `);
 }
 
-// Run.
-main().catch((err: unknown) => {
-  if (err instanceof InstallerError) {
-    process.stderr.write(`mind-nerve installer error [${err.code}] (${err.clientName}): ${err.message}\n`);
-  } else {
-    process.stderr.write(`mind-nerve installer fatal: ${String(err)}\n`);
-  }
-  process.exit(1);
-});
+// Run — only when executed directly, so tests can import parseInstallArgs
+// without booting the CLI. realpathSync resolves the npm-bin symlink before
+// comparing against this module's URL.
+const isDirectRun =
+  process.argv[1] !== undefined &&
+  import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href;
+
+if (isDirectRun) {
+  main().catch((err: unknown) => {
+    if (err instanceof InstallerError) {
+      process.stderr.write(`mind-nerve installer error [${err.code}] (${err.clientName}): ${err.message}\n`);
+    } else {
+      process.stderr.write(`mind-nerve installer fatal: ${String(err)}\n`);
+    }
+    process.exit(1);
+  });
+}

@@ -149,7 +149,11 @@ describe("wireClient — JSON-configured CLI", () => {
     const wrapper = await fs.readFile(spec.skillSurface!.hookScriptPath, "utf8");
     expect(wrapper).toContain(`exec '${shared}'`);
     expect(wrapper).toContain(`export MIND_NERVE_PROJECTED_DIR='${skillsDir}'`);
-    expect(wrapper).toContain("export MIND_NERVE_MIN_SCORE='0.35'");
+    // Tuning knobs stay unpinned — the shared hook owns their defaults
+    // (regression: a pinned MIND_NERVE_MIN_SCORE='0.35' overrode the hook's
+    // recalibrated 0.40 default).
+    expect(wrapper).not.toContain("MIND_NERVE_MIN_SCORE");
+    expect(wrapper).not.toContain("MIND_NERVE_TOP_K");
     expect(
       (await fs.stat(spec.skillSurface!.hookScriptPath)).mode & 0o111,
     ).toBeGreaterThan(0);

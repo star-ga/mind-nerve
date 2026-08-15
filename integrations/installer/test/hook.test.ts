@@ -882,3 +882,243 @@ describe("hook injected context", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Regression: malformed catalog rows must not kill routing
+// ---------------------------------------------------------------------------
+
+describe("hook malformed-route resilience", () => {
+  it("survives a route whose name is a whole document (ENAMETOOLONG regression)", async () => {
+    // Observed live 2026-08-10: a catalog row carried a 300+ char runbook with
+    // newlines as its "name". agent_path() turned it into a filename, stat()
+    // raised ENAMETOOLONG (Path.is_file does NOT swallow it), the fatal
+    // handler fired, and the prompt lost ALL of its routes — the valid ones
+    // included. The hook must degrade that one row, not the whole routing.
+    const root = await makeTmp();
+    const hub = await makeHub(root, ["mind-nerve-router", "alpha"]);
+    const agents = path.join(root, "agents");
+    await fs.mkdir(agents, { recursive: true });
+    const monster =
+      "reddit-starga-engagement\n\nmonitor r/localllama etc\n" +
+      "x".repeat(300);
+    const daemon = await startDaemon(root, {
+      kind: "reply",
+      body: JSON.stringify({
+        routes: [route(monster, 0.99), route("alpha", 0.9)],
+      }),
+    });
+    try {
+      const env = baseEnv({
+        hub,
+        projected: path.join(root, "skills"),
+        socket: daemon.socketPath,
+        log: path.join(root, "hook.log"),
+      });
+      env.MIND_NERVE_AGENT_DIRS = agents;
+      const run = await runHook(
+        JSON.stringify({ hookEventName: "UserPromptSubmit", prompt: "do a thing" }),
+        env,
+      );
+      expect(run.code).toBe(0);
+      const ctx = contextOf(run) ?? "";
+      // The valid route still routes; the malformed row degrades to
+      // "unknown" instead of taking the whole table down with it.
+      expect(ctx).toContain("`alpha`");
+      expect(ctx).not.toContain("mind-nerve ready");
+      // Codex audit 2026-08-10: an unresolved row carries unsanitized catalog
+      // text — it must never reach the injected context at all (prompt-
+      // injection via route name), not even escaped.
+      expect(ctx).not.toContain("reddit-starga-engagement");
+    } finally {
+      await daemon.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SessionStart banner throttle
+// ---------------------------------------------------------------------------
+
+describe("hook SessionStart banner throttle", () => {
+  it("announces once, then stays silent within the interval", async () => {
+    const root = await makeTmp();
+    const hub = await makeHub(root, ["mind-nerve-router"]);
+    const env = baseEnv({
+      hub,
+      projected: path.join(root, "skills"),
+      socket: path.join(root, "no-such.sock"),
+      log: path.join(root, "hook.log"),
+    });
+    const first = await runHook(
+      JSON.stringify({ hookEventName: "SessionStart" }),
+      env,
+    );
+    expect(contextOf(first) ?? "").toContain("mind-nerve ready");
+
+    const second = await runHook(
+      JSON.stringify({ hookEventName: "SessionStart" }),
+      env,
+    );
+    expect(second.code).toBe(0);
+    // Projection still happens; only the banner is throttled.
+    expect(second.stdout.trim()).toBe("{}");
+    expect((await fs.readdir(path.join(root, "skills"))).sort()).toEqual([
+      "README.md",
+      "mind-nerve-router",
+    ]);
+  });
+
+  it("MIND_NERVE_SESSION_BANNER_MINUTES=0 restores always-show", async () => {
+    const root = await makeTmp();
+    const hub = await makeHub(root, ["mind-nerve-router"]);
+    const env = {
+      ...baseEnv({
+        hub,
+        projected: path.join(root, "skills"),
+        socket: path.join(root, "no-such.sock"),
+        log: path.join(root, "hook.log"),
+      }),
+      MIND_NERVE_SESSION_BANNER_MINUTES: "0",
+    };
+    for (let i = 0; i < 2; i++) {
+      const run = await runHook(
+        JSON.stringify({ hookEventName: "SessionStart" }),
+        env,
+      );
+      expect(contextOf(run) ?? "").toContain("mind-nerve ready");
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Regression: Markdown-hostile hub dir names must not break the table
+// ---------------------------------------------------------------------------
+
+describe("hook table path sanitization", () => {
+  it("sanitizes backticks/pipes/newlines in route paths", async () => {
+    // Audit 2026-08 r3: _table_cell guarded the route NAME but the PATH was
+    // interpolated raw — a hub dir named with a backtick/pipe/newline broke
+    // the table row (acquire slugifies; hand-made hub dirs are not).
+    const root = await makeTmp();
+    const evil = "evil`pipe|skill";
+    const hub = await makeHub(root, ["mind-nerve-router", evil]);
+    const daemon = await startDaemon(root, {
+      kind: "reply",
+      body: JSON.stringify({ routes: [route(evil, 0.9)] }),
+    });
+    try {
+      const run = await runHook(
+        JSON.stringify({ prompt: "evil" }),
+        baseEnv({
+          hub,
+          projected: path.join(root, "skills"),
+          socket: daemon.socketPath,
+          log: path.join(root, "hook.log"),
+        }),
+      );
+      expect(run.code).toBe(0);
+      const ctx = contextOf(run) ?? "";
+      const rows = ctx.split("\n").filter((l) => /^\| \d+ \|/.test(l));
+      expect(rows.length).toBe(1);
+      // A raw pipe in the path would add a cell: a well-formed 5-column row
+      // has exactly 6 delimiters.
+      expect(rows[0]!.split("|").length - 1).toBe(6);
+      expect(ctx).not.toContain(evil);
+    } finally {
+      await daemon.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Daemon-provided kind/source_path (acquired agents) — audit 2026-08 r4
+// ---------------------------------------------------------------------------
+
+describe("hook daemon-provided kind/source_path", () => {
+  it("routes an acquired agent via its confined source_path", async () => {
+    // codex#12: an acquired agent lives at hub/<pkg>/agents/foo.md — no
+    // SKILL.md in the hub dir, not in AGENT_DIRS — so name-based resolution
+    // dropped it as unknown. The daemon's kind + source_path must win.
+    const root = await makeTmp();
+    const hub = path.join(root, "hub");
+    const agentDir = path.join(hub, "acq-pack", "agents");
+    await fs.mkdir(path.join(hub, "mind-nerve-router"), { recursive: true });
+    await fs.writeFile(
+      path.join(hub, "mind-nerve-router", "SKILL.md"),
+      "# mind-nerve-router\n",
+    );
+    await fs.mkdir(agentDir, { recursive: true });
+    const agentPath = path.join(agentDir, "foo-reviewer.md");
+    await fs.writeFile(agentPath, "# foo-reviewer\n");
+
+    const daemon = await startDaemon(root, {
+      kind: "reply",
+      body: JSON.stringify({
+        routes: [
+          {
+            name: "foo-reviewer",
+            score: 0.9,
+            source_repo: "acquire:wshobson-agents",
+            kind: "agent",
+            source_path: agentPath,
+          },
+        ],
+      }),
+    });
+    try {
+      const run = await runHook(
+        JSON.stringify({ prompt: "review my code" }),
+        baseEnv({
+          hub,
+          projected: path.join(root, "skills"),
+          socket: daemon.socketPath,
+          log: path.join(root, "hook.log"),
+        }),
+      );
+      const ctx = contextOf(run) ?? "";
+      const rows = ctx.split("\n").filter((l) => /^\| \d+ \|/.test(l));
+      expect(rows.length).toBe(1);
+      expect(rows[0]).toContain("agent");
+      expect(rows[0]).toContain(agentPath);
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  it("never honours a source_path outside the hub/agent roots", async () => {
+    const root = await makeTmp();
+    const hub = await makeHub(root, ["mind-nerve-router"]);
+    const outside = path.join(root, "outside.md");
+    await fs.writeFile(outside, "# outside\n");
+    const daemon = await startDaemon(root, {
+      kind: "reply",
+      body: JSON.stringify({
+        routes: [
+          {
+            name: "escapee",
+            score: 0.9,
+            source_repo: "acquire:evil",
+            kind: "agent",
+            source_path: outside,
+          },
+        ],
+      }),
+    });
+    try {
+      const run = await runHook(
+        JSON.stringify({ prompt: "escapee" }),
+        baseEnv({
+          hub,
+          projected: path.join(root, "skills"),
+          socket: daemon.socketPath,
+          log: path.join(root, "hook.log"),
+        }),
+      );
+      const ctx = contextOf(run) ?? "";
+      expect(ctx).not.toContain(outside);
+      expect(ctx).not.toContain("escapee");
+    } finally {
+      await daemon.close();
+    }
+  });
+});

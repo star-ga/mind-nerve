@@ -196,7 +196,15 @@ which paths were restored, which were missing, and any I/O errors.
 Public release wheels and source distributions published to PyPI are
 built and published from `.github/workflows/release.yml` using PyPI's
 [trusted-publishing](https://docs.pypi.org/trusted-publishers/) OIDC
-flow — no long-lived `PYPI_API_TOKEN` secret is required.
+flow — no long-lived `PYPI_API_TOKEN` secret is required. The PyPI-side
+trusted publisher must be registered with exactly these claims:
+repository `star-ga/mind-nerve`, workflow `release.yml`, environment
+`pypi` (the workflow sets `environment: pypi`, so the OIDC `sub` is
+`repo:star-ga/mind-nerve:environment:pypi`). If that registration is
+missing or mismatched the exchange fails with `invalid-publisher`; the
+documented fallback is a project-scoped API token with
+`twine upload --repository mind-nerve dist/*` (v0.3.0b9 shipped this
+way).
 
 Each release attaches:
 

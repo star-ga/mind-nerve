@@ -13,7 +13,7 @@ Lives next to `ROADMAP.md` as the operational plan for the Phase 1 build.
 | **Tokenizer** | Custom BPE, 32k vocab, trained on the merged catalog + query corpus | Tool/skill names have unique vocabulary (`mcp__server__tool_name`, `RFC_NNN_NAME`, etc.) — generic BPE wastes tokens here. |
 | **Architecture (frozen)** | Encoder-only (drop-the-decoder), sliding-window self-attention (window=256, stride=192), direct scoring head over catalog | Scaffold landed 2026-05-13. Frozen per ROADMAP.md. |
 | **Quantization** | INT8 weights, Q16.16 activations, cross-arch bit-identity gate | Non-negotiable Phase 1 exit criterion. |
-| **Integration approach** | Wrapper-process daemon + filesystem overlay + MCP gateway hybrid | Multi-LLM consensus (grok-4.3 + deepseek-v4-pro + internal). Covers 17 CLIs without per-CLI plugin matrix. |
+| **Integration approach** | Wrapper-process daemon + filesystem overlay + MCP gateway hybrid | Multi-LLM consensus (grok-4.3 + deepseek-v4-pro + internal). Covers 20 CLIs via the installer registry. |
 | **Distribution** | One core artifact (`nerve` Python package on PyPI), thin wrappers for brew / npm / Claude Code marketplace / VS Code marketplace | Same artifact pulled by every channel. |
 | **Protection** | Open Python orchestrator + wrappers; closed `nerve-runtime.so` built via STARGA protection toolchain | Mirrors mind-mem's public/protected split. |
 | **Brand** | `nerve.md` domain (available, registry NIC.MD) | Drops the `mind-` prefix on purpose — free/open product with its own identity. |

@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="https://pypi.org/project/mind-nerve/"><img alt="PyPI" src="https://img.shields.io/pypi/v/mind-nerve.svg?color=blue&style=flat-square"></a>
+  <a href="https://pypi.org/project/mind-nerve/"><img alt="PyPI" src="https://img.shields.io/pypi/v/mind-nerve.svg?include_prereleases&color=blue&style=flat-square"></a>
   <a href="https://pypi.org/project/mind-nerve/"><img alt="Python versions" src="https://img.shields.io/pypi/pyversions/mind-nerve.svg?style=flat-square"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/License-Apache_2.0-blue?style=flat-square"></a>
   <a href="https://github.com/star-ga/mind-nerve/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/star-ga/mind-nerve/ci.yml?branch=main&style=flat-square&label=CI"></a>
@@ -206,6 +206,14 @@ mind-nerve-install detect    # see what's installed on this machine
 mind-nerve-install install --cli all
 ```
 
+The full 20-client matrix (grok, kimi, qwen, windsurf, continue, cline,
+roo, zed, aider, copilot, cody, qodo, …) plus the `verify` verb — per-client
+checks of config, hooks, env pins, MCP entry, and daemon socket — lives in
+the TypeScript installer under `integrations/installer/`
+(`npm install && npm run build`, then `node dist/src/index.js install
+<client>` / `verify --cli all`; bin name `mind-nerve-installer`, npm
+publication pending).
+
 ## Console scripts
 
 | Script | What it does |
@@ -289,32 +297,36 @@ Phase 2 is being brought up incrementally and is not yet end-to-end.
   `MIND_NERVE_HF_REVISION`).
 - **Latency:** warm-daemon p95 ~23 ms on GPU, ~90 ms on a 4-core CPU. The
   ≤30 ms-on-CPU target is the **Phase 2** target, not the Phase 1 result.
-- **License:** Apache-2.0 end-to-end. Phase 1 does not load
-  `libmindnerve.so`; it runs entirely on the Python wheel surface.
+- **License:** Apache-2.0 end-to-end. The wheel runs entirely on its own
+  Apache-2.0 surface (the bundled native Q16.16 encoder `cdylib`
+  included); it never loads the separately-licensed `libmindnerve.so`
+  runtime.
 
-### Phase 2 backend — in progress (A1.5 PARTIAL)
+### Phase 2 backend — native encoder shipping (default since 0.3.0b9)
 
 The same drop-the-decoder + sliding-window encoder design, compiled to a
-native MIND Q16.16 fixed-point `cdylib` that the wheel loads through a
-C-ABI shim. Goals: remove the PyTorch dependency, close the ≤30 ms-on-CPU
+native MIND Q16.16 fixed-point `cdylib` that ships inside the wheel and is
+the **default backend** (`MIND_NERVE_BACKEND=pytorch` selects the PyTorch
+fallback). Goals: remove the PyTorch dependency, close the ≤30 ms-on-CPU
 budget, and prove cross-architecture bit-identity across CUDA and WebGPU
 (x86_64 and ARM64 CPU byte-identity already verified on real hardware).
 
-Status, as of commit
-[`b9b6401`](https://github.com/star-ga/mind-nerve/commit/b9b6401)
-(A1.5 PARTIAL):
+Status, as of v0.3.0b9:
 
 - ✅ A1.1–A1.4 — Q16.16 corpus, encoder kernels, C-ABI export surface, and
   the SHA-256 bit-identity harness scaffold all landed.
-- ✅ A1.5 — pure-MIND encoder `cdylib` builds. The native **score path**
-  (matmul against the 11,922-row route table) measures
-  **p50 14.4 ms / p95 15.1 ms** on a 4-core CPU at commit `b9b6401` —
-  already inside the Phase 2 budget for that stage of the pipeline.
-- 🚧 Blocked on **mindc Phase 6.2** quantizer + SIMD lowering for the
-  full encoder forward; until that lands, the wheel still routes through
-  the Phase 1 PyTorch backend by default.
+- ✅ A1.5 — pure-MIND encoder `cdylib` builds and ships in the wheel. The
+  native **score path** (matmul against the 11,922-row route table)
+  measures **p50 14.4 ms / p95 15.1 ms** on a 4-core CPU — already inside
+  the Phase 2 budget for that stage of the pipeline.
+- ✅ Full `.mind` tree ported to mindc 0.10.2 (2026-08-15) — the 17-module
+  kernel tree AND all 13 front-end files (sha256, q16_16, tokenizer,
+  evidence, encoder_kernels, model, loader, inference, …) compile and
+  execute, gated by the fail-closed `tests/mindc_gate.sh` (267
+  exact-count tests + a native-ELF end-to-end harness byte-verified
+  against CPython hashlib).
 - 🚧 Cross-architecture bit-identity hardware validation across CUDA and
-  WebGPU is the gating step before Phase 2 becomes the default backend.
+  WebGPU is the gating step before Phase 2 is declared complete.
   x86_64 (AVX2) and ARM64 (NEON) CPU byte-identity is verified on real
   hardware via the MIND Q16.16 cross-substrate proof.
 
@@ -322,10 +334,10 @@ Status, as of commit
 
 - **Latency p95 ≤ 30 ms** on 4-core CPU — non-negotiable end target. Phase 1
   hits 23 ms via the GPU+daemon path and ~90 ms with a warm daemon on
-  4-core CPU; the full ≤30 ms-on-CPU budget closes with the Phase 2 native
-  MIND Q16.16 inference loop (toolchain-side mindc prerequisites landed by
-  v0.4.2 / RFC 0005 Phase C — mindc is on the v0.10.x line today;
-  mind-nerve-side native encoder is the remaining work).
+  4-core CPU; the ≤30 ms-on-CPU budget closes with the native
+  MIND Q16.16 inference loop (the mindc-side prerequisites and the
+  mind-nerve-side encoder both shipped; the encoder cdylib is the default
+  backend since 0.3.0b9).
 - **Cross-architecture bit-identity** — same request on x86, ARM, CUDA, and
   WebGPU returns the same top-K. Q16.16 fixed-point throughout, no IEEE-754
   fallback in the inference path. (Phase 2 gate; mindc-side cdylib emit
@@ -338,9 +350,9 @@ Status, as of commit
 
 ## Roadmap
 
-**Phase 1 (now)** — Public alpha. PyTorch inference, HF-hosted weights, MCP
-+ hooks integrations, six target CLIs, 96.06% top-5 accuracy on a 11,922-route
-catalog.
+**Phase 1 (shipping)** — Public beta. Native Q16.16 encoder by default
+(PyTorch fallback), HF-hosted weights, MCP + hooks integrations, 20
+installer targets, 96.06% top-5 accuracy on a 11,922-route catalog.
 
 **Phase 2 (next)** — Native MIND Q16.16 inference loop replaces PyTorch.
 Cross-architecture bit-identity gate. p95 budget tightens. The HF artifact
@@ -355,8 +367,10 @@ struct + FieldAccess ABI), and
 (RFC 0005 Phase 2 + B + C + D₁ + D₂a — pure-MIND std.vec/string/map/io
 bundled into the binary, with a `$MIND_STDLIB_PATH` env-var
 fork-without-recompile escape hatch, and Named-struct parameter names
-preserved in arity/type error messages).  Remaining work is the
-mind-nerve-side native encoder kernel that links against the toolchain.
+preserved in arity/type error messages). The mind-nerve-side encoder
+kernel has since shipped in the wheel (default backend), and the whole
+`.mind` tree — kernel surface plus the 13 front-end files — compiles and
+executes on the current toolchain.
 The CI gate for the `mind/` kernel tree is pinned to
 [`mindc` 0.10.2](https://github.com/star-ga/mind/releases/tag/v0.10.2)
 (built with `std-surface,cross-module-imports,mlir-build` — `mlir-build`

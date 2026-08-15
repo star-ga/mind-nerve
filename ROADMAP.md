@@ -46,10 +46,10 @@ Three blockers were raised 2026-05-14. Status after the Phase 1 alpha sprint:
    native runtime bundled inside the wheel. The Phase-1 PyTorch
    inference path published in this repository works without it.
 
-**Release status (2026-08-10):** `v0.3.0b8` is the current PyPI public
+**Release status (2026-08-15):** `v0.3.0b9` is the current PyPI public
 (beta series: wheel + sdist live at
-[pypi.org/project/mind-nerve/](https://pypi.org/project/mind-nerve/);
-`0.3.0b9` is in progress on main. Weights on Hugging Face under Apache-2.0
+[pypi.org/project/mind-nerve/](https://pypi.org/project/mind-nerve/)).
+Weights on Hugging Face under Apache-2.0
 (`star-ga/mind-nerve`). Since beta.2 the repo has shipped the integrations
 hook subsystem (per-prompt routing hook + structural skills-dir projection
 + npy-aligned hygiene), the **`mind-nerve acquire` subsystem** (curated

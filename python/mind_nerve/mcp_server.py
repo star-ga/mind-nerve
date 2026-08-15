@@ -157,6 +157,11 @@ def handle(msg: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Fill any unset MIND_NERVE_* pins from the shared env file BEFORE the
+    # daemon socket path is resolved — an explicit export always wins.
+    from .shared_env import apply_shared_env
+
+    apply_shared_env()
     # No warmup: this process never loads a model. Ranking belongs to the
     # daemon, so ``initialize`` and ``tools/list`` answer instantly and the
     # ~860 MB encoder is resident exactly once on the box instead of twice.

@@ -402,6 +402,102 @@ def cmd_watch(args: argparse.Namespace) -> int:
     return 0
 
 
+def _print_json(out: object, indent: bool) -> None:
+    print(json.dumps(out, indent=2 if indent else None, separators=None if indent else (",", ":")))
+
+
+def cmd_acquire_sources(args: argparse.Namespace) -> int:
+    from . import acquire
+
+    _print_json({"sources": acquire.load_sources(args.runtime_dir)}, args.indent)
+    return 0
+
+
+def cmd_acquire_search(args: argparse.Namespace) -> int:
+    from . import acquire
+
+    out = acquire.search(
+        args.query,
+        runtime_dir=args.runtime_dir,
+        limit=args.limit,
+    )
+    _print_json(out, args.indent)
+    return 0
+
+
+def cmd_acquire_vet(args: argparse.Namespace) -> int:
+    from . import acquire
+
+    out = acquire.vet(args.path, use_clamav=args.clamav)
+    _print_json(out, args.indent)
+    return 0 if out["verdict"] == "PASS" else 1
+
+
+def cmd_acquire_install(args: argparse.Namespace) -> int:
+    from . import acquire
+
+    candidate = acquire.Candidate(
+        name=args.name or args.target,
+        source=args.source or "manual",
+        url=args.target,
+        kind=args.kind,
+    )
+    try:
+        out = acquire.install(
+            candidate,
+            hub_dir=args.hub,
+            runtime_dir=args.runtime_dir,
+            accept_warnings=args.accept_warnings,
+            use_clamav=args.clamav,
+            register_mcp=args.register_mcp,
+            # The CLI target is operator-typed: local dirs / file:// allowed.
+            allow_local=True,
+        )
+    except acquire.FetchError as e:
+        _print_json({"installed": False, "error": str(e)}, args.indent)
+        return 2
+    _print_json(out, args.indent)
+    if not out.get("installed"):
+        return 1
+    if out.get("reindex_error"):
+        # The package is in the hub but NOT in the route table: the daemon
+        # will never route to it. That is a failed install from the
+        # operator's perspective — say so and exit non-zero.
+        print(
+            f"mind-nerve acquire: installed but reindex failed: {out['reindex_error']}",
+            file=sys.stderr,
+        )
+        return 1
+    if out.get("warning", "").startswith("no-routable-content"):
+        # Distinct exit: the install completed but nothing is routable
+        # (license gate excluded everything, or no routable files exist).
+        print(f"mind-nerve acquire: {out['warning']}", file=sys.stderr)
+        return 3
+    reg = out.get("mcp_registration")
+    if args.register_mcp and reg is not None and not reg.get("registered"):
+        print(
+            f"mind-nerve acquire: MCP registration refused: {reg.get('error')}",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
+def cmd_acquire_list(args: argparse.Namespace) -> int:
+    from . import acquire
+
+    _print_json({"installed": acquire.list_installed(args.hub)}, args.indent)
+    return 0
+
+
+def cmd_acquire_remove(args: argparse.Namespace) -> int:
+    from . import acquire
+
+    out = acquire.remove(args.name, hub_dir=args.hub, runtime_dir=args.runtime_dir)
+    _print_json(out, args.indent)
+    return 0 if out.get("removed") else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="mind-nerve")
     ap.add_argument("--version", action="version", version=f"mind-nerve {__version__}")
@@ -678,6 +774,92 @@ def build_parser() -> argparse.ArgumentParser:
     p_watch.add_argument("--interval", type=float, default=5.0, help="Poll interval (sec)")
     p_watch.add_argument("--include-unknown", action="store_true")
     p_watch.set_defaults(func=cmd_watch)
+
+    p_acq = sub.add_parser(
+        "acquire",
+        help="Find, vet, and install external skills/agents/MCP servers "
+        "(quarantine + security scan + license gate + daemon reindex).",
+    )
+    acq_sub = p_acq.add_subparsers(dest="acquire_cmd", required=True)
+
+    p_acq_sources = acq_sub.add_parser("sources", help="List the source registry as JSON")
+    p_acq_sources.add_argument("--indent", action="store_true", help="Pretty-print JSON output.")
+    p_acq_sources.set_defaults(func=cmd_acquire_sources)
+
+    p_acq_search = acq_sub.add_parser("search", help="Search enabled sources for candidates")
+    p_acq_search.add_argument("query", help="Search query")
+    p_acq_search.add_argument("--limit", type=int, default=20, help="Max candidates (default: 20)")
+    p_acq_search.add_argument("--indent", action="store_true", help="Pretty-print JSON output.")
+    p_acq_search.set_defaults(func=cmd_acquire_search)
+
+    p_acq_vet = acq_sub.add_parser(
+        "vet", help="Security-scan + license-classify a local package dir (no install)"
+    )
+    p_acq_vet.add_argument("path", help="Directory to vet (e.g. a quarantine dir)")
+    p_acq_vet.add_argument(
+        "--clamav",
+        action="store_true",
+        help="Also fold in clamscan when installed (OPT-IN: clamav verdicts "
+        "depend on the host signature DB, so the report is no longer the "
+        "deterministic artifact it is by default).",
+    )
+    p_acq_vet.add_argument("--indent", action="store_true", help="Pretty-print JSON output.")
+    p_acq_vet.set_defaults(func=cmd_acquire_vet)
+
+    p_acq_install = acq_sub.add_parser(
+        "install",
+        help="Fetch -> vet -> install a candidate (URL, file:// path, or local dir)",
+    )
+    p_acq_install.add_argument(
+        "target",
+        help="Git URL, tarball URL, file:// URL, or local directory of the package",
+    )
+    p_acq_install.add_argument("--name", default=None, help="Hub name (default: derived)")
+    p_acq_install.add_argument("--source", default=None, help="Source label (default: 'manual')")
+    p_acq_install.add_argument(
+        "--kind",
+        choices=["skill", "agent", "mcp"],
+        default="skill",
+        help="Candidate kind (default: skill). kind=mcp enables --register-mcp.",
+    )
+    p_acq_install.add_argument(
+        "--register-mcp",
+        action="store_true",
+        help="Also register a kind=mcp package's server entry point into the "
+        "active CLIs' MCP configs (opt-in; refuses without a recognizable "
+        "entry point: server.json, pyproject [project.scripts], package.json bin).",
+    )
+    p_acq_install.add_argument(
+        "--hub",
+        default=None,
+        help="Hub directory (default: $MIND_NERVE_SOURCE_DIR or ~/.agents/skills-hub)",
+    )
+    p_acq_install.add_argument(
+        "--accept-warnings",
+        action="store_true",
+        help="Install despite a WARN vetting verdict. FAIL is never installable.",
+    )
+    p_acq_install.add_argument(
+        "--clamav",
+        action="store_true",
+        help="Also fold in clamscan when installed (opt-in; see acquire vet --help)",
+    )
+    p_acq_install.add_argument("--indent", action="store_true", help="Pretty-print JSON output.")
+    p_acq_install.set_defaults(func=cmd_acquire_install)
+
+    p_acq_list = acq_sub.add_parser("list", help="List packages installed via acquire")
+    p_acq_list.add_argument("--hub", default=None, help="Hub directory (default: as for install)")
+    p_acq_list.add_argument("--indent", action="store_true", help="Pretty-print JSON output.")
+    p_acq_list.set_defaults(func=cmd_acquire_list)
+
+    p_acq_rm = acq_sub.add_parser(
+        "remove",
+        help="Remove an acquire-installed package (refuses dirs without an install manifest)",
+    )
+    p_acq_rm.add_argument("name", help="Hub name of the installed package")
+    p_acq_rm.add_argument("--hub", default=None, help="Hub directory (default: as for install)")
+    p_acq_rm.add_argument("--indent", action="store_true", help="Pretty-print JSON output.")
+    p_acq_rm.set_defaults(func=cmd_acquire_remove)
 
     return ap
 

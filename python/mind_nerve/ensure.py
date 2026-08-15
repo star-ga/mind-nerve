@@ -20,6 +20,7 @@ per socket, ever, across any number of parallel `ensure` invocations.
 from __future__ import annotations
 
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -102,17 +103,23 @@ def _detach_kwargs() -> dict[str, Any]:
 
 def _spawn_daemon(daemon: str, log_path: Path) -> None:
     """Spawn `mind-nerve-routed` detached. Caller MUST hold the spawn lock."""
+    from .shared_env import load_shared_env
+
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_handle = log_path.open("ab", buffering=0)
     log_handle.write(
         f"\n--- mind-nerve-routed-ensure spawn @ {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n".encode()
     )
+    # The daemon inherits this process's environment, with UNSET pins filled
+    # from the shared env file — explicit exports always win.
+    env = {**load_shared_env(), **os.environ}
     try:
         subprocess.Popen(
             [daemon],
             stdin=subprocess.DEVNULL,
             stdout=log_handle,
             stderr=log_handle,
+            env=env,
             **_detach_kwargs(),
         )
     except OSError as e:
@@ -120,6 +127,98 @@ def _spawn_daemon(daemon: str, log_path: Path) -> None:
             log_handle.write(f"spawn failed: {e}\n".encode())
         finally:
             log_handle.close()
+
+
+def _running_daemon_pids() -> list[int]:
+    """PIDs of live ``mind-nerve-routed`` processes (best-effort).
+
+    Linux ``/proc`` scan matching the console-script basename in argv; on
+    platforms without ``/proc`` returns ``[]`` (restart is then a no-op and
+    the table reload simply takes effect on the next natural daemon
+    restart). Never raises.
+    """
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return []
+    me = os.getpid()
+    pids: list[int] = []
+    try:
+        entries = list(proc.iterdir())
+    except OSError:
+        return []
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == me:
+            continue
+        # Same-UID only: without this, one project's `acquire install` would
+        # SIGTERM/SIGKILL every mind-nerve-routed on the box — including
+        # daemons owned by other runtime dirs (2026-08-10 codex audit).
+        # Cross-user kills already fail EPERM and are caught below; this
+        # filter keeps us from even considering them, and (with hidepid=2)
+        # their cmdlines may not be readable anyway.
+        try:
+            if (entry / "status").read_bytes().split(b"Uid:")[1].split()[0] != str(
+                os.geteuid()
+            ).encode():
+                continue
+        except (OSError, IndexError):
+            continue
+        try:
+            raw = (entry / "cmdline").read_bytes()
+        except OSError:
+            continue
+        for arg in raw.split(b"\0"):
+            if not arg:
+                continue
+            base = os.path.basename(arg.decode("utf-8", "replace"))
+            # Match the console script and `python -m mind_nerve.daemon`.
+            if base == "mind-nerve-routed" or base == "mind_nerve.daemon":
+                pids.append(pid)
+                break
+    return sorted(pids)
+
+
+def _pid_alive(pid: int) -> bool:
+    stat = Path(f"/proc/{pid}/stat")
+    try:
+        # A zombie is as good as dead for our purposes.
+        return stat.read_text().rsplit(")", 1)[-1].split()[0] != "Z"
+    except (OSError, IndexError):
+        return False
+
+
+def restart_daemon(grace_seconds: float = 2.0) -> dict[str, Any]:
+    """Terminate any running ``mind-nerve-routed`` so it reloads the table.
+
+    The daemon loads the route table into memory once at startup, so after
+    ANY table mutation (``acquire install`` / ``acquire remove``) the live
+    process serves a stale catalog until restarted. There is deliberately
+    no respawn here: the next CLI invocation goes through ``ensure.main()``
+    which re-spawns the daemon under its flock guard. Best-effort and
+    never raises — a missed restart degrades to stale routing, not an
+    error.
+    """
+    pids = _running_daemon_pids()
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            continue
+    deadline = time.monotonic() + grace_seconds
+    survivors: list[int] = []
+    while time.monotonic() < deadline:
+        survivors = [p for p in pids if _pid_alive(p)]
+        if not survivors:
+            break
+        time.sleep(0.05)
+    for pid in survivors:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            continue
+    return {"restarted": bool(pids), "pids": pids}
 
 
 def main() -> int:

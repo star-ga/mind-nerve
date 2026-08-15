@@ -24,7 +24,7 @@ import pytest
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("MIND_NERVE_RUN_INTEGRATION") != "1",
-    reason="needs mind-nerve checkout",
+    reason="set MIND_NERVE_RUN_INTEGRATION=1 to run (needs a local mind-nerve runtime)",
 )
 
 

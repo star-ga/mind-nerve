@@ -381,7 +381,8 @@ def _train_python_backend(config: TrainConfig) -> TrainResult:
     produce an equivalent checkpoint.
     """
     import torch
-    from sentence_transformers import InputExample, SentenceTransformer, losses
+    from sentence_transformers import InputExample, SentenceTransformer
+    from sentence_transformers.sentence_transformer import losses
     from torch.utils.data import DataLoader
 
     started_at_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())

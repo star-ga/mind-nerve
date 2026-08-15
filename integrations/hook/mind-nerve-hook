@@ -45,6 +45,8 @@ Configuration (all optional, all env):
   MIND_NERVE_LOG             JSONL log path
   MIND_NERVE_TELEMETRY       JSONL telemetry path
   MIND_NERVE_OVERFETCH       raw K requested from the daemon (default 80)
+  MIND_NERVE_SESSION_BANNER_MINUTES  min minutes between SessionStart banners
+                             (default 720; 0 = show on every SessionStart)
 """
 from __future__ import annotations
 
@@ -65,6 +67,34 @@ from pathlib import Path
 
 ROUTER_NAME = "mind-nerve-router"
 _HOME = os.path.expanduser("~")
+
+
+def _load_shared_env() -> None:
+    """Fill UNSET env vars from the shared env file (~/.mind-nerve/env).
+
+    One place for the pins every CLI config would otherwise repeat
+    (MIND_NERVE_RUNTIME_DIR, MIND_NERVE_BACKEND, ...). An explicitly
+    exported variable ALWAYS wins — the file only fills what is unset.
+    Inlined here (rather than imported from the package) so the hook stays
+    a standalone script; keep this parser byte-compatible with
+    mind_nerve.shared_env.load_shared_env. Never raises.
+    """
+    try:
+        path = os.environ.get("MIND_NERVE_ENV_FILE") or os.path.join(_HOME, ".mind-nerve", "env")
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line or len(line) > 4096:
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip()
+                if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) and key not in os.environ:
+                    os.environ[key] = value.strip()
+    except Exception:
+        pass
+
+
+_load_shared_env()
 
 
 def _default_socket() -> str:
@@ -202,6 +232,14 @@ APPLY_RATIO_GATE = False
 
 INTENT_GATE_ON = _env_flag("MIND_NERVE_INTENT_GATE", True)
 MIN_CONTENT_WORDS = _env_int("MIND_NERVE_MIN_CONTENT_WORDS", 3)
+# SessionStart banner throttle. The "## mind-nerve ready" context exists to
+# orient the model once; CLIs that fire SessionStart on every resume were
+# re-injecting it into every restored transcript (user-visible noise, and it
+# displaced the actual route table in at least one TUI). Emit it at most once
+# per this many minutes per state dir; 0 restores the old always-show behaviour.
+SESSION_BANNER_MIN_INTERVAL_S = (
+    _env_float("MIND_NERVE_SESSION_BANNER_MINUTES", 720.0) * 60.0
+)
 PROJECT_MODE = os.environ.get("MIND_NERVE_PROJECT_MODE", "symlink").strip().lower()
 KEEP_GENERATIONS = max(1, _env_int("MIND_NERVE_KEEP_GENERATIONS", 3))
 SOCKET_TIMEOUT = _env_float("MIND_NERVE_SOCKET_TIMEOUT", 2.0)
@@ -555,6 +593,21 @@ def skill_path(name: str, source: dict[str, Path]) -> str | None:
     return str(source[match] / "SKILL.md") if match else None
 
 
+def _plausible_agent_filename(fn: str) -> bool:
+    """True when *fn* could ever name a real agent file.
+
+    Route names are catalog-controlled text. A malformed catalog row can carry
+    a whole document as its "name" (observed live: a 300+ char Reddit runbook
+    with newlines). Turning that into a filename and stat()ing it raises
+    ENAMETOOLONG on Linux — Path.is_file() does NOT swallow it — and the hook
+    died via the fatal handler, silently killing routing for that prompt.
+    """
+    if not fn or "/" in fn or "\0" in fn:
+        return False
+    # NAME_MAX is 255; leave headroom for the extension and stay portable.
+    return len(fn.encode("utf-8", "replace")) <= 200
+
+
 def agent_path(name: str) -> str | None:
     if not name:
         return None
@@ -564,9 +617,14 @@ def agent_path(name: str) -> str | None:
             continue
         for c in candidates:
             for fn in (f"{c}.md", f"{c}.yaml", f"{c}.yml"):
+                if not _plausible_agent_filename(fn):
+                    continue
                 p = root / fn
-                if p.is_file():
-                    return str(p)
+                try:
+                    if p.is_file():
+                        return str(p)
+                except OSError:
+                    continue
         try:
             lower = {f.name.lower(): f for f in root.iterdir() if f.is_file()}
         except Exception:
@@ -587,6 +645,38 @@ def classify_route(name: str, source: dict[str, Path]) -> tuple[str, str | None]
     if ap:
         return "agent", ap
     return "unknown", None
+
+
+def _confined_source_path(r: dict) -> str | None:
+    """The daemon-provided source_path, only when it resolves inside a known
+    root (the skills hub or an agent dir) and names a real file.
+
+    Acquired agents live at hub/<pkg>/agents/foo.md — name-based resolution
+    never finds them (no SKILL.md in the hub dir, not in AGENT_DIRS), so
+    they were reclassified as unknown and dropped (audit, 2026-08 r4 /
+    codex#12). The path is still catalog data feeding model-facing context,
+    so a row pointing OUTSIDE those roots is never honoured.
+    """
+    sp = str(r.get("source_path") or "")
+    if not sp:
+        return None
+    try:
+        resolved = Path(sp).resolve()
+    except OSError:
+        return None
+    for root in (SOURCE_DIR, *AGENT_DIRS):
+        try:
+            rr = root.resolve()
+        except OSError:
+            continue
+        if resolved != rr and rr not in resolved.parents:
+            continue
+        try:
+            if resolved.is_file():
+                return str(resolved)
+        except OSError:
+            continue
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -618,7 +708,15 @@ def dedup_routes(routes: list[dict], source: dict[str, Path]) -> list[dict]:
         name = str(r.get("name") or "").strip()
         if not name or is_system_route(r):
             continue
-        kind, path = classify_route(name, source)
+        # The daemon's own classification wins when its source_path is
+        # root-confined (acquired agents/skills); name-based resolution is
+        # the fallback for rows that carry no usable path.
+        daemon_kind = str(r.get("kind") or "")
+        confined = _confined_source_path(r)
+        if daemon_kind in ("skill", "agent") and confined is not None:
+            kind, path = daemon_kind, confined
+        else:
+            kind, path = classify_route(name, source)
         resolved = resolve_name(name, source)
         identity = resolved or slug(name)
         enriched = dict(r)
@@ -899,8 +997,24 @@ NO_MATCH_CONTEXT = (
     "and acting on them is worse than having none.\n\n"
     "Use your own judgement and the built-in tools. If you believe a specialised\n"
     "procedure exists, re-route with a sharper query via `mind_nerve_route`.\n"
+    'No local skill matched; fetch vetted ones with `mind-nerve acquire search "<query>"`.\n'
     "Hub (do NOT list it): `{hub}`\n"
 )
+
+
+def _table_cell(text: str, cap: int = 80) -> str:
+    """Sanitize catalog-controlled text for the injected Markdown table.
+
+    Resolved route names come from real on-disk dir/file names, so they are
+    safe in practice — but the table is model-facing context, so strip the
+    Markdown-hostile characters anyway and cap the length. Newlines, backticks
+    and pipes are the injection carriers (a raw newline breaks the row and
+    starts a new, attacker-controlled line).
+    """
+    cleaned = re.sub(r"[`|\r\n\t]+", " ", text).strip()
+    if len(cleaned) > cap:
+        cleaned = cleaned[: cap - 1] + "…"
+    return cleaned
 
 
 def build_context(routes: list[dict], projected: int, min_score: float) -> str:
@@ -930,9 +1044,13 @@ def build_context(routes: list[dict], projected: int, min_score: float) -> str:
         elif kind == "agent":
             agent_n += 1
         path = r.get("path")
-        path_s = f"`{path}`" if path else "_(unresolved)_"
+        # The path carries the hub dir name, which is NOT slugified for
+        # first-party / hand-made hub entries — a backtick/pipe/newline in
+        # it would break the row just like a hostile route name. Sanitize
+        # with a wider cap: a truncated path is one the agent cannot read.
+        path_s = f"`{_table_cell(str(path), cap=240)}`" if path else "_(unresolved)_"
         lines.append(
-            f"| {i} | `{r.get('name')}` | {kind} | {r.get('score_f', 0.0):.3f} | {path_s} |"
+            f"| {i} | `{_table_cell(str(r.get('name') or ''))}` | {kind} | {r.get('score_f', 0.0):.3f} | {path_s} |"
         )
     lines += [
         "",
@@ -982,6 +1100,32 @@ SESSION_START_CONTEXT = (
 )
 
 
+def _session_banner_due() -> bool:
+    """Throttle the SessionStart banner; the projection runs regardless.
+
+    The sentinel lives next to the hook log so a redirected MIND_NERVE_LOG
+    (tests, per-CLI state) gets an independent banner clock. Best-effort: any
+    filesystem error means 'due' — a spurious banner costs a few tokens, a
+    spuriously suppressed one costs orientation.
+    """
+    if SESSION_BANNER_MIN_INTERVAL_S <= 0:
+        return True
+    sentinel = LOG_PATH.parent / "last_session_banner"
+    try:
+        last = float(sentinel.read_text().strip())
+    except Exception:
+        last = 0.0
+    now = time.time()
+    if now - last < SESSION_BANNER_MIN_INTERVAL_S:
+        return False
+    try:
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        sentinel.write_text(f"{now:.3f}")
+    except Exception:
+        pass
+    return True
+
+
 def main() -> None:
     t0 = time.time()
     data = read_stdin()
@@ -1005,7 +1149,10 @@ def main() -> None:
         selected = select_for_projection([], source)
         n = write_projection(selected) if selected else 0
         log({"event": "session_start", "projected": n})
-        emit(event, SESSION_START_CONTEXT.format(hub=SOURCE_DIR, n=len(source)))
+        if _session_banner_due():
+            emit(event, SESSION_START_CONTEXT.format(hub=SOURCE_DIR, n=len(source)))
+        else:
+            emit(event, None)
         return
 
     should_route, reason, prompt = intent_gate(raw_prompt)
@@ -1047,7 +1194,14 @@ def main() -> None:
 
     deduped = dedup_routes(routes, source)
     thresholded = apply_threshold(deduped, MIN_SCORE)
-    kept = thresholded[:TOP_K]
+    # Drop unresolved rows BEFORE slicing top-K. An "unknown" route has no
+    # path — zero routing value — and its name is unsanitized catalog text:
+    # interpolating it into the injected Markdown table would let a malformed
+    # (or hostile) catalog row write arbitrary instructions into the model's
+    # context (2026-08-10 codex audit). Resolved names are safe by
+    # construction — they matched a real hub dir or agent file on disk.
+    resolved = [r for r in thresholded if r.get("kind") in ("skill", "agent")]
+    kept = resolved[:TOP_K]
     ratio = top2_ratio(deduped)
 
     selected = select_for_projection(kept, source)

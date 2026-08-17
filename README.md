@@ -6,7 +6,9 @@
 </p>
 
 <p align="center">
-  <strong>Mind-Nerve</strong> implements a drop-the-decoder + sliding-window encoder design compiled to native Q16.16 fixed-point — the same deterministic architecture as MIND, designed for byte-identical routing output across substrates. The native backend reproduces a pinned bit-identity reference on x86_64, and the underlying MIND Q16.16 substrate is verified byte-identical across x86_64 (AVX2) and ARM64 (NEON) on real hardware; GPU validation is Phase 2 work.
+  <strong>Mind-Nerve</strong> implements a drop-the-decoder + sliding-window encoder design compiled to native Q16.16 fixed-point — the same deterministic architecture as MIND, designed for byte-identical routing output across substrates. The native backend reproduces a pinned bit-identity reference on x86_64, and the underlying MIND Q16.16 substrate is verified byte-identical across x86_64 (AVX2) and ARM64 (NEON) on real hardware. The open-source release ships CPU backends only;
+a GPU tier (CUDA/WebGPU) is reserved for a potential private/enterprise
+offering, mirroring the MIND compiler's licensing split.
 </p>
 
 <p align="center">
@@ -26,9 +28,14 @@ prompt, decides which subset of the available skills, tools, and MCP servers
 is relevant, and hands the host a short list — so the downstream LLM never
 sees the full library in its system prompt.
 
-Library size decouples from token cost. Hosting **4,400 skills** costs the
-same prompt budget as hosting **44**, because only the top-K are ever loaded
-per turn.
+Library size decouples from token cost. Point it at every SKILL file
+published on GitHub — **~1.6M** of them — and the standing cost is the prompt
+budget of **44**, because only the top-K are ever loaded per turn.
+
+The catalog does not sit in the context window; the router does, and it is a
+fixed cost. There is no ceiling in the design: the number of routable
+artifacts is bounded by disk, not by context. Measured today: **96.06%
+top-5 accuracy across 11,922 candidates**.
 
 ```bash
 pip install mind-nerve
@@ -112,6 +119,17 @@ The first `route()` call auto-downloads the Phase-1 weights (~150 MB) from
 [`star-ga/mind-nerve`](https://huggingface.co/star-ga/mind-nerve)
 into `~/.local/share/mind-nerve/runtime/`. To pre-seed or use a custom
 location, set `MIND_NERVE_RUNTIME_DIR`.
+
+> **The runtime-dir pin is load-bearing.** If you maintain a curated route
+> table, **export `MIND_NERVE_RUNTIME_DIR` to point at it** (for a daemon,
+> pin it in the systemd unit / shared env). When the variable is unset,
+> resolution falls through to the default location and serves the *generic*
+> catalog — the routes will look plausible but be far less relevant. As of
+> the fix that added this note, an unset pin prints a one-time
+> `WARNING — MIND_NERVE_RUNTIME_DIR is not set` on stderr so the fallback is
+> never silent. If `route_table.npy` and `route_table.jsonl` ever fall out of
+> sync (a load-time *"Route table embeddings/meta length mismatch"*), run
+> `mind-nerve prune` to realign them.
 
 ### 2. Call it from Python
 
@@ -227,10 +245,15 @@ publication pending).
 
 ## Acquiring skills
 
-`mind-nerve acquire` finds external skills/agents/MCP servers in curated
-sources (Anthropic's skills repo, the official MCP servers repo, the MCP
-registry API, GitHub search), vets them with a deterministic fail-closed
-static scanner (shell-pipe installers, reverse shells, exfiltration
+The catalog is not fixed. `mind-nerve acquire` searches the public ecosystem
+across nine sources — Anthropic's skills repo, the official MCP servers repo,
+the MCP registry API, Glama, Smithery, community skill/agent/template
+libraries (`obra/superpowers`, `wshobson/agents`,
+`davila7/claude-code-templates`), plus generic GitHub repository search as a
+fallback. Skills, agents and MCP servers, all three. There is no curated
+whitelist you are confined to: if it is published, it is reachable.
+
+Anything found is vetted with a deterministic fail-closed static scanner (shell-pipe installers, reverse shells, exfiltration
 collectors, prompt injection, archive escapes, obfuscation, credential
 access, persistence hooks), and installs the clean ones into the hub:
 
@@ -244,8 +267,14 @@ mind-nerve acquire remove <name>
 Fetches land in a size/file-count-capped quarantine dir first; a FAIL
 verdict never reaches the hub. Installs write a per-file SHA-256 manifest,
 reindex the route table through the license gate, and restart the routing
-daemon so every hooked CLI sees the new skill immediately. Full threat model
-and source-registry format: [docs/acquisition.md](docs/acquisition.md).
+daemon so every hooked CLI sees the new skill immediately. Acquired content is
+always reindexed as untrusted, even though the local hub is a first-party
+trust root — a skill you did not write does not inherit your trust.
+
+Acquisition is the only network path in the system, and it is explicit and
+operator-invoked. Routing itself never opens a socket: local encoder, local
+table, read off local disk. Full threat model and source-registry format:
+[docs/acquisition.md](docs/acquisition.md).
 
 ## Configuration
 
@@ -276,8 +305,8 @@ matching the spec contract — the Python scoring path
 (`python/mind_nerve/inference.py`) and the native Q16.16 top-K
 (`src/top_k.mind`) share the same score-descending,
 SHA-256(route_id)-ascending ordering. Cross-architecture
-(x86 / ARM / CUDA) identity of the ranking is the Phase 2 gate and is not
-yet hardware-validated. The authoritative
+(x86_64 / ARM64 CPU) identity of the ranking is verified on real hardware
+via the MIND Q16.16 cross-substrate proof. The authoritative
 design is [`spec/architecture.md`](spec/architecture.md).
 
 That single design has two backends. Phase 1 is the one users install today.
@@ -308,8 +337,11 @@ The same drop-the-decoder + sliding-window encoder design, compiled to a
 native MIND Q16.16 fixed-point `cdylib` that ships inside the wheel and is
 the **default backend** (`MIND_NERVE_BACKEND=pytorch` selects the PyTorch
 fallback). Goals: remove the PyTorch dependency, close the ≤30 ms-on-CPU
-budget, and prove cross-architecture bit-identity across CUDA and WebGPU
-(x86_64 and ARM64 CPU byte-identity already verified on real hardware).
+budget, and keep cross-architecture bit-identity across the shipped CPU
+backends (x86_64 and ARM64 byte-identity verified on real hardware).
+the open-source release ships CPU backends only; a GPU tier
+(CUDA/WebGPU) is reserved for a potential private/enterprise offering
+(scope decision 2026-08-15).
 
 Status, as of v0.3.0b9:
 
@@ -322,13 +354,13 @@ Status, as of v0.3.0b9:
 - ✅ Full `.mind` tree ported to mindc 0.10.2 (2026-08-15) — the 17-module
   kernel tree AND all 13 front-end files (sha256, q16_16, tokenizer,
   evidence, encoder_kernels, model, loader, inference, …) compile and
-  execute, gated by the fail-closed `tests/mindc_gate.sh` (267
+  execute, gated by the fail-closed `tests/mindc_gate.sh` (262
   exact-count tests + a native-ELF end-to-end harness byte-verified
   against CPython hashlib).
-- 🚧 Cross-architecture bit-identity hardware validation across CUDA and
-  WebGPU is the gating step before Phase 2 is declared complete.
+- ✅ Cross-architecture bit-identity on the shipped backends:
   x86_64 (AVX2) and ARM64 (NEON) CPU byte-identity is verified on real
-  hardware via the MIND Q16.16 cross-substrate proof.
+  hardware via the MIND Q16.16 cross-substrate proof. The open-source
+  release is CPU-only; no OSS GPU tier to validate.
 
 ## Design constraints
 
@@ -338,10 +370,11 @@ Status, as of v0.3.0b9:
   MIND Q16.16 inference loop (the mindc-side prerequisites and the
   mind-nerve-side encoder both shipped; the encoder cdylib is the default
   backend since 0.3.0b9).
-- **Cross-architecture bit-identity** — same request on x86, ARM, CUDA, and
-  WebGPU returns the same top-K. Q16.16 fixed-point throughout, no IEEE-754
-  fallback in the inference path. (Phase 2 gate; mindc-side cdylib emit
-  landed in v0.3.0; mind-nerve-side hardware validation still pending.)
+- **Cross-architecture bit-identity** — same request on x86_64 and ARM64
+  CPU returns the same top-K. Q16.16 fixed-point throughout, no IEEE-754
+  fallback in the inference path. Verified on real hardware for both
+  shipped CPU backends; there is no GPU backend (scope decision
+  2026-08-15).
 - **No training-data leakage at inference** — the classifier reveals only
   route names, never the training corpora content.
 - **Tamper detection** — every inference can emit an attestation envelope

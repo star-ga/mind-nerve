@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>Intent-classification preselector for agent runtimes.</strong><br>
-  <em>Open the library, hide the cost.</em>
+  <em>Every skill available. None of them loaded.</em>
 </p>
 
 <p align="center">

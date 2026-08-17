@@ -14,8 +14,10 @@ shipped.
    in Phase 1, must port to native MIND by Phase 2.
 2. **Q16.16 throughout the inference path.** No IEEE-754 fallback. Cross-arch
    bit-identity is non-negotiable.
-3. **Single binary, all backends.** One `mind-nerve` CLI runs on x86, ARM,
-   CUDA, WebGPU, NPU without rebuild.
+3. **Single binary, shipped backends.** One `mind-nerve` CLI runs on x86_64
+   and ARM64 CPU without rebuild. (Scope decision 2026-08-15: the
+   open-source release ships CPU backends only; a GPU tier is reserved
+   for a potential private/enterprise offering.)
 4. **Latency p95 ≤ 30 ms on CPU.** Architecture decisions that cannot meet
    this on commodity CPU are rejected.
 5. **Attestation on every inference.** Request hash, model hash, result hash
@@ -73,8 +75,8 @@ without measurable accuracy impact on agent-CLI request distributions.
 
 **Exit criteria**:
 
-- Architecture compiles in pure MIND on at least the CUDA and CPU backends
-- Forward pass produces bit-identical Q16.16 outputs on x86-CPU and CUDA
+- Architecture compiles in pure MIND on the x86_64 and ARM64 CPU backends
+- Forward pass produces bit-identical Q16.16 outputs on x86_64 and ARM64 CPU
 - Reference weights (English intent corpus) achieve ≥ 92% top-5 accuracy on
   the held-out STARGA agent skill catalog
 - p95 inference latency ≤ 30 ms on 4-core CPU at single-batch (4096 tokens)
@@ -86,7 +88,6 @@ without measurable accuracy impact on agent-CLI request distributions.
 
 **Deferred to Phase 2**:
 
-- ARM, WebGPU, NPU backends (CUDA + CPU only in Phase 1)
 - Native-MIND training pipeline (Phase 1 uses external training framework,
   reads weights into MIND inference)
 - Per-CLI hook-surface stabilisation for runtimes whose hook protocol is
@@ -161,14 +162,64 @@ identity matching) deferred until first user-visible need.
 
 | Task | Blocker | mindc milestone | Status |
 |---|---|---|---|
-| Cross-arch bit-identity (x86-CPU vs CUDA) | `pub fn` → C symbol export so the native MIND inference kernel is callable as a `cdylib` | **0.2.6** — `pub fn`-to-C, `[exports]`, `--profile` flag | **mindc-side SHIPPED** (RFC 0002 D2–D5 in `0a408e3`, `_v1` ABI lock in `de6cf18`, RFC 0003 cdylib seam); the **vector-path gate was closed upstream in mind v0.6.4** (2026-05-19, byte-identical to the Track A scalar oracle). The "pending hardware" note is stale — the U1 host has a live RTX 3080. What remains is real work, not just a run: the harness's CUDA leg (`tests/bit_identity/runner.py`) currently emits a `CUDA_DEFERRED_TO_V0_4_1` sentinel — the CUDA emit path for the Q16.16 kernels has to be built (mindc CUDA backend) before any SHA can be compared. Task #57 stays open; hardware is no longer an excuse. |
+| Cross-arch bit-identity (x86-CPU vs ARM-CPU) | `pub fn` → C symbol export so the native MIND inference kernel is callable as a `cdylib` | **0.2.6** — `pub fn`-to-C, `[exports]`, `--profile` flag | **mindc-side SHIPPED** (RFC 0002 D2–D5 in `0a408e3`, `_v1` ABI lock in `de6cf18`, RFC 0003 cdylib seam); the **vector-path gate was closed upstream in mind v0.6.4** (2026-05-19, byte-identical to the Track A scalar oracle). **Task #57 CLOSED AS DESCOPED (2026-08-15):** it originally tracked an x86-CPU-vs-CUDA bit-identity leg — the harness carried a `CUDA_DEFERRED_TO_V0_4_1` sentinel because no CUDA emit path for the Q16.16 kernels existed. The product decision is that the open-source release ships x86_64/ARM64 CPU only; a GPU tier (CUDA/WebGPU) is reserved for a potential private/enterprise offering rather than this repo, the sentinel scaffolding is removed, and the shipped CPU pair already carries the byte-identity proof. |
 | p95 ≤ 30 ms on 4-core CPU | Native `cdylib` emit so the PyTorch encode-cost (~270 ms today) can be replaced by a Q16.16 native kernel | **0.3.0** — `--lib` cdylib, AOT codegen, MIC profile-locked headers | **CLOSED (2026-08-10 re-assessment).** The Q16.16 native encoder shipped: `libmind_nerve_encoder.so` has been bundled in the published wheel since 2026-05-19 with a real `encoder_weights.q16.bin` weight blob, and `MIND_NERVE_BACKEND=native` is the default routing path with PyTorch fallback (see CHANGELOG v0.3.0b7 "thesis-pure encode path" and the `_native` runtime). Task #59 is done; the remaining latency evidence lives in `docs/benchmarks.md`. |
 
-Task #57 remains tracked in the work queue and is no longer
-hardware-blocked: it closes when the CUDA emit path for the Q16.16 kernels
-exists (the harness leg is a sentinel today) and the bit-identical-SHA run
-on the U1 RTX 3080 records a matching hash. #59 is closed as of the
-2026-08-10 re-assessment above.
+Task #57 is closed as descoped (2026-08-15): mind-nerve ships x86_64/ARM64
+CPU backends only, so the OSS CUDA leg it tracked will not be built
+   (a GPU tier, if it ever ships, belongs to a private/enterprise line,
+   not this repo). #59 is
+closed as of the 2026-08-10 re-assessment above.
+
+### Architecture constraint on any future GPU tier (2026-08-17)
+
+The descope above is a **distribution** decision — which backends the OSS
+release ships. It is silent on **architecture**, and that silence is the
+risk: a future implementer could reasonably read "GPU tier reserved for
+enterprise" and build it as a CUDA lowering, believing they were following
+the plan. They would not be. Stating the constraint before the thing it
+constrains exists is the cheap moment.
+
+**If a GPU tier is ever built, it emits MIND-native kernels through our own
+emitter — not a lowering to PTX/NVVM against the CUDA toolchain.**
+
+The reason is the wedge, not preference. The two approaches produce
+byte-identity with different epistemic status:
+
+- **CUDA lowering** makes byte-identity *a result you verify* — per vendor,
+  per toolchain version, per driver. It also reintroduces exactly the
+  proprietary-toolchain dependency the LLVM-independence track exists to
+  shed. Today's only GPU evidence in `~/mind` is a single f64 workload
+  verified against CUDA `sm_86`, explicitly documented as a one-off
+  demonstration and **not** CI-gated (`docs/determinism.md:101`); RFC 0015's
+  conformance table records `x86 ↔ CUDA — no test`. That is the shape a
+  vendor-lowered tier keeps: one blessed configuration at a time.
+- **MIND-native GPU kernels** make byte-identity *a property you construct*.
+  Determinism comes from reduction order, FMA contraction, SIMD/lane width
+  and accumulation width being pinned by our own emitter — the same reason
+  x86_64 ↔ ARM64 holds today without a per-CPU blessing, rather than because
+  a vendor BLAS happened to agree.
+
+Consequences for whoever builds it:
+
+1. The Q16.16 router kernels (`mind/kernels/` — wordpiece tokenizer,
+   `matmul_q16`, `layernorm_q16`) are the port targets. They are CPU kernels
+   today; a GPU emitter for them does not exist in this repo or in `~/mind`
+   (the MLIR GPU path is `#[cfg(feature = "mlir-gpu")]` and its single test
+   asserts *fallback*, not identity).
+2. Correctness is gated the same way the CPU pair is: the GPU result must be
+   byte-identical to the shipped CPU reference on the pinned canaries, not
+   "within tolerance" of it. A GPU tier that needs a tolerance is not a
+   mind-nerve GPU tier.
+3. Do **not** benchmark against or claim parity with a vendor BLAS as the
+   determinism argument. Speed comparisons are a separate claim with a
+   separate gate (one-sided criterion, worth-it decision, top-K agreement
+   reported alongside any speedup).
+
+Cross-reference: `~/mind` `docs/determinism.md` (§ CUDA one-off demonstration,
+§ commercial-runtime substrates) and RFC 0015's conformance table. If either
+side of that pair changes, both must change together — a divergence between
+this constraint and the compiler's determinism doc is itself a defect.
 
 ## Phase 2 — Production path (target: Q2 2027)
 
@@ -660,7 +711,6 @@ wedge applied to ourselves.
   front-end files compile and execute on mindc 0.10.2 under the fail-closed
   gate. Remaining migration legs (CLI → daemon → MCP server → hook →
   discovery/acquire → installer as compiled MIND binaries) sequence behind the
-  `std` HTTPS surface proof, per the carry-forward plan above.
   `std` HTTPS surface proof, per the carry-forward plan above.
 
 ## Model catalog boundary + post-install skill rating (design, 2026-08-17)

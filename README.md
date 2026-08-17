@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>Intent-classification preselector for agent runtimes.</strong><br>
-  <em>Every skill available. None of them loaded.</em>
+  <em>Every skill available. Few in context.</em>
 </p>
 
 <p align="center">

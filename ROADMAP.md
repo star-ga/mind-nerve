@@ -661,3 +661,146 @@ wedge applied to ourselves.
   gate. Remaining migration legs (CLI → daemon → MCP server → hook →
   discovery/acquire → installer as compiled MIND binaries) sequence behind the
   `std` HTTPS surface proof, per the carry-forward plan above.
+  `std` HTTPS surface proof, per the carry-forward plan above.
+
+## Model catalog boundary + post-install skill rating (design, 2026-08-17)
+
+Two related questions, settled together because the second is only safe once
+the first draws a line: **can mind-nerve catalog and select LLM models**, and
+**can it rate the artifacts `acquire` installs?**
+
+### The boundary: mind-nerve routes to manifests, never binds seats
+
+**Decision: the model catalog does NOT live in mind-nerve.** Model selection
+stays in naestro (`services/runtime/kernel.routing.ts`,
+`kernel.routing-health.ts`, `kernel.routing-lineage.ts`), which already owns
+it, and where provider-concentration limits are already a constitutional rule.
+
+The reason is a property difference, not a preference. mind-nerve's catalog is
+**static artifacts on disk** — a SKILL.md, an agent `.md`, an MCP manifest —
+each embedded once, offline, into a frozen route table. The router never
+executes them; it names one and returns the name. That is exactly why routing
+can be socket-free and byte-identical: it is a pure function over a table that
+does not move.
+
+A model catalog is the opposite: **live endpoints** with credentials, quotas,
+health, latency, cost-per-token, and billing state, none of which are true for
+long. A model catalog is only useful if it is *current*, which means it has to
+probe. Merge the two and the route table becomes mutable at runtime by network
+state — the determinism claim stops holding, not because routing changed, but
+because what is routable now depends on whether an API answered.
+
+The seam that composes them without merging:
+
+| Concern | Home |
+|---|---|
+| Intent → artifact (skills, agents, MCP servers) over a frozen table | **mind-nerve** |
+| Model seat selection by live health / quota / cost | **naestro** (`kernel.routing-health.ts`) |
+| Route decision + skill-read telemetry | **mind-nerve** hook pair (built) |
+| Model-call observability, lineage, replay | **naestro** (R76 event stream) |
+
+mind-nerve *can* route to an MCP server entry, and an MCP server can be a model
+gateway — so the router already reaches models by naming a static manifest,
+without knowing that model's health. Selection among live seats stays naestro's
+call. **mind-nerve says "this intent wants a model gateway"; naestro says "and
+today that is seat X, because three seats are billing-dead."**
+
+**Non-goal, stated so a future agent cannot accidentally build it:** mind-nerve
+does not enumerate, health-check, price, or select LLM model endpoints, and does
+not hold provider credentials. Adding a second model router here would create
+exactly the two-systems-disagreeing failure the federation ownership correction
+above (2026-06-03) already ruled against for trust-rating.
+
+**The one model-adjacent thing that IS mind-nerve-shaped:** offline intent
+*classification* over model classes — deciding "this query wants a reasoning
+model" via the Q16.16 encoder against a frozen label set, deterministically and
+without a probe. That is a static classification over a frozen table, i.e. the
+thing this router already is. Its output is a **class label handed to naestro to
+bind**, never a seat. Worth building only if a caller needs the class decision
+to be replayable; it does not justify a catalog.
+
+### Closes open decision 3 (decentralized vs central LLM-model observability)
+
+Open decision 3 in the federated trust-rating section above asks where LLM-model
+observability lives. **It is not mind-nerve's, under either answer.** Model
+telemetry belongs to naestro's routing-health/lineage surface, feeding the
+rating scorer; the decentralized-gossip-vs-central-collector question is a
+naestro-internal transport call. mind-nerve's read layer is the route-decision
+and skill-read telemetry it already emits. Decisions 1 and 2 remain open.
+
+### Post-install rating: the gap `acquire` actually opens
+
+`acquire` (`python/mind_nerve/acquire.py`) gates on **pre-install** properties:
+capped quarantine, security scan, SPDX license gate, hash manifest, and reindex
+as `trusted=False`. Every gate inspects the artifact's *contents* before it can
+be routed to. Nothing measures what happens *after* install.
+
+That was tolerable with a curated 1,347-skill hub. It is not once the source
+registry includes a generic GitHub-search fallback: a user grows a table of
+artifacts nobody here has ever reviewed, and the only signal that a bad
+acquisition happened is their agent quietly getting worse.
+
+**What already exists — do not rebuild it.** The measurement substrate is
+built and shipping:
+
+- `integrations/hook/mind-nerve-hook` emits a `route_decision` record per
+  routing event: `query_sha` (never the prompt — privacy contract), the
+  `top[]` array with per-route `name`/`score`/`kind`/`path`, `min_score`,
+  `top2_ratio`, the raw→deduped→thresholded→kept funnel counts, and latency.
+- `integrations/hook/mind-nerve-observe` closes the loop on `PostToolUse`,
+  recording whether a projected SKILL.md was subsequently **read**. Joining on
+  `generation` pairs each decision with the reads that followed it.
+- Both are **opt-in** (`MIND_NERVE_TELEMETRY` empty = disabled) and fail-open.
+
+Injected-vs-read is already the ground-truth signal. What is missing is
+everything downstream of it.
+
+**N1 — per-artifact aggregation over existing telemetry.** Roll the
+decision/read join up per route ID: times ranked top-K, times projected, times
+actually read, score distribution. Read-only over data already emitted; no new
+collection, no new hook, no schema change. This is the cheap prerequisite and
+it is the whole of the near-term ask.
+
+**N2 — `top2_ratio` as the scale canary.** The hook already computes and logs
+the deduped runner-up/leader ratio (deliberately never gating — see
+`APPLY_RATIO_GATE`). Track its distribution **as a function of catalog size**.
+A drifting ratio as N grows is the early warning that precision is degrading
+under an open acquisition path, visible in production before a benchmark run
+would catch it. Note the known confound recorded at `top2_ratio`: near-duplicate
+skills drive the raw ratio toward 1.0 for catalog-redundancy reasons unrelated
+to ranker certainty, which is why dedup precedes the computation and why this is
+a *canary*, not a metric.
+
+**N3 — rating + eviction. GATED, and the gate is the point.**
+
+A router that rates its own routes, and then feeds those ratings back into its
+own score floor or ranking, holds a **second authority over its own decisions**.
+It can then improve its measured accuracy by narrowing what it is willing to
+route to — the same failure class as a search loop that optimises a lower bound
+by weakening its own judge, and the same class the campaign-config
+`forbidden_files` discipline and mind-lab §0's single-keep/discard-authority
+rule exist to prevent.
+
+Constraint, binding on any implementation:
+
+> Ratings derived from routing telemetry are **observed and reported only**.
+> They may rank a list for a human and may inform an eviction *proposal*. They
+> may not automatically adjust `MIND_NERVE_MIN_SCORE`, reorder ranking, or
+> remove a route from the table. Floor changes and evictions are separate,
+> explicit, operator-gated acts.
+
+This is written before the mechanism exists, deliberately: the constraint is
+cheap now and expensive to retrofit once a feedback path is wired.
+
+**Relationship to trust-rating (above).** N1–N3 are *node-local, behavioural*
+signals over artifacts this node installed. They are not the federated
+trust-rating system — that is naestro's (R19), and mind-nerve consumes its
+output as a routing input. If both ever exist, node-local rating is one possible
+*input* to naestro's scorer, never a competing score computed here.
+
+**Prior-art note.** The event-stream/observability architecture belongs to
+naestro R76–R78; nothing here duplicates it. What is mind-nerve-specific is the
+*record shape* (route decision + skill read), which already exists, and the
+aggregation and self-rating constraint above, which do not. Rating and eviction
+have no external prior art to lean on — the harness shape observed elsewhere is
+a debugging log, which rates nothing; the self-rating trap is ours to name.

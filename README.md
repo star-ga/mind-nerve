@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/brand/mind-mark.svg" alt="" width="110">
+</p>
+
 <h1 align="center">mind-nerve</h1>
 
 <p align="center">

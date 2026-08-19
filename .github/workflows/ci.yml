@@ -484,26 +484,11 @@ jobs:
           echo "Comparator smoke completed — sentinel ↔ sentinel passed."
 
       # -----------------------------------------------------------------------
-      # Step 7: Run CUDA backend (emits CUDA_DEFERRED_TO_V0_4_1 per §3.2).
-      # -----------------------------------------------------------------------
-      - name: Run CUDA backend (deferred sentinel per §3.2)
-        run: |
-          python3 tests/bit_identity/runner.py \
-            --backend cuda \
-            --limit 5 \
-            --out /tmp/hashes_cuda_ci.json
-          python3 -c "
-          import json, sys
-          blob = json.loads(open('/tmp/hashes_cuda_ci.json').read())
-          sentinel = 'CUDA_DEFERRED_TO_V0_4_1'
-          for r in blob['records']:
-              for k, v in r['hashes'].items():
-                  assert v == sentinel, f'Expected {sentinel!r}, got {v!r}'
-          print('CUDA sentinel: all hashes are CUDA_DEFERRED_TO_V0_4_1 — OK.')
-          "
-
-      # -----------------------------------------------------------------------
-      # Step 8: Sliding-window invariant (§3.3) — fast, no model needed.
+      # Sliding-window invariant (§3.3) — fast, no model needed.
+      # (The former CUDA-sentinel step was removed with the runner's cuda
+      # backend: a GPU tier, if ever built, emits MIND-native kernels rather
+      # than a CUDA lowering — the deferred-sentinel placeholder no longer
+      # applies. See ROADMAP.md GPU-tier constraint + Mind.toml [targets.cuda].)
       # -----------------------------------------------------------------------
       - name: Sliding-window invariant test (§3.3)
         run: |

@@ -291,11 +291,19 @@ jobs:
       # (star-ga/mind#311/#312); the bare tag fails lowering with
       # "non-i64 argument to call" (G1, star-ga/mind#234). Re-pin to the
       # next tagged release once one contains those fixes.
-      - name: Checkout mind compiler (0.10.2 + RI-D native-ELF fixes)
+      # 2026-08-19: bumped f68ff638 -> 95344367. The kernel tree now calls
+      # __mind_blas_gemv_q16_mt (deterministic MT Q16.16 gemv + persistent
+      # thread pool + teardown destructor) plus __mind_nerve_blas_matmul_q16_i64
+      # and the lut_{rsqrt,exp,tanh}_h intrinsics; none were registered in
+      # STD_SURFACE_INTRINSICS before this sha, so the old pin fell back to JIT
+      # on 5 modules. Still reports "mind 0.10.2". Verified: tests/mindc_gate.sh
+      # GATE PASS against a mindc built at 95344367 (std-surface
+      # cross-module-imports mlir-build).
+      - name: Checkout mind compiler (0.10.2 + RI-D + MT-gemv/pool intrinsics)
         uses: actions/checkout@v7
         with:
           repository: star-ga/mind
-          ref: f68ff638d983dbf2dc593d1f8870963b3b396744
+          ref: 95344367f8995361deaa4b95ef1d81fce017ac04
           path: mind-compiler
       # The gate's native-symbol leg (nm on target/obj/*.o) requires REAL
       # native codegen: without the mlir-build feature every module falls

@@ -22,17 +22,17 @@
 # fails the gate.
 #
 # Legs:
-#   1. Project-mode compile of all 17 CI-gated files in mind/
-#      (`mindc build --emit=object`). Requires ZERO error-severity
-#      diagnostics and per-module native objects for the 13 pure-MIND
-#      modules. The 4 modules that call the C-runtime shims
-#      (`__mind_nerve_lut_*` / `__mind_nerve_blas_*`, resolved at .so link
-#      time against mind/runtime/*.c) are an enumerated exception: mindc
-#      0.10.2 warns E2024 on any `__mind_*` callee outside its intrinsic
-#      table and falls back to embedded-source for exactly those modules.
-#      The final LINK is expected to fail (the shim symbols are provided
-#      by the C runtime at .so packaging time, and private per-module
-#      helpers share global symbol names) — object emission is the gate.
+#   1. Project-mode NATIVE build of all 19 CI-gated files in mind/
+#      (`mindc build`). Requires ZERO error-severity diagnostics, ZERO
+#      JIT/embedded fallback, ZERO launcher-link fallback, real native
+#      objects for ALL 19 modules, and a REAL ELF linked artifact. The four
+#      C-shim modules (kernels/matmul_blas.mind + luts/{rsqrt,softmax,tanh}
+#      _q16.mind) now compile natively: their five __mind_nerve_* C-ABI
+#      callees are registered in mindc's STD_SURFACE_INTRINSICS and DEFINED
+#      at link time by the manifest [targets.cpu].native_sources C runtime
+#      (runtime/blas_shims_i64.c + runtime/lut_cache.c). (Prior gate rigged:
+#      it whitelisted exactly 4 E2024 fallbacks + a launcher and passed on a
+#      degraded non-native artifact — the exact silent-green trap.)
 #   2. LUT bit-identity smoke: merge mind/luts/*.mind + the generated
 #      tests/luts_smoke.mind fixture + the #[test] wrappers in
 #      tests/luts_smoke_test.mind into one self-contained module (mindc
@@ -179,17 +179,45 @@ COUNT=$(echo "$ON_DISK" | wc -l)
 echo "   OK: ${COUNT} .mind files on disk == ${COUNT} manifest entries"
 
 # ---------------------------------------------------------------------------
-# Leg 1 — project-mode compile of the 17-file kernel tree
+# Leg 1 — project-mode NATIVE build of the 19-file kernel tree, asserting a
+# REAL ELF with ZERO JIT/launcher fallback.
+#
+# HARDENED (2026-08-16): the four C-shim modules (kernels/matmul_blas.mind +
+# luts/{rsqrt,softmax,tanh}_q16.mind) now compile NATIVELY — their five
+# __mind_nerve_* C-ABI callees are registered in mindc's STD_SURFACE_INTRINSICS
+# (so the MLIR backend emits a plain `func.call @__mind_nerve_*` instead of the
+# E2024 self-host-only advisory + runtime-JIT fallback) and are DEFINED at link
+# time by the manifest `[targets.cpu].native_sources` C runtime
+# (runtime/blas_shims_i64.c + runtime/lut_cache.c). There is therefore NO
+# reason for any module to embed or any link to fall back.
+#
+# The PRIOR gate whitelisted exactly 4 E2024 fallbacks + a launcher fallback
+# and reported GREEN on that degraded, non-native artifact — the exact
+# silent-green trap this script exists to prevent (a public "compiled MIND end
+# to end, no runtime, bit-identical bytes" claim must be LITERALLY true of the
+# built artifact). Leg 1 now:
+#   * FAILS on ANY "not natively compiled" / "runtime-JIT fallback" line;
+#   * FAILS on ANY "native link failed" / launcher-script fallback;
+#   * asserts the LINKED artifact is a real ELF (magic \x7fELF, `file` says ELF,
+#     NOT a #! shell script, NO "mind-runtime" exec shim);
+#   * asserts all 19 modules produced real native objects (pub fn symbols
+#     present, ELF relocatable), keyed to the SAME module set registered above.
+# mindc build exits 0 in degraded states, so NONE of these trusts the exit
+# code — every check pattern-matches the log and inspects the artifact bytes.
 # ---------------------------------------------------------------------------
-echo "== Leg 1: project-mode compile (mind/ tree, 17 modules)"
+echo "== Leg 1: project-mode NATIVE build (mind/ tree, 19 modules, real ELF)"
 
 cd "${REPO_ROOT}/mind"
-# Fresh object dir every run + bypass the incremental object cache: a
-# stale target/obj can mask a source regression (objects from a previous
-# green run would otherwise be re-checked without recompiling).
-rm -rf target/obj
+# Fresh object dir + artifact every run + bypass the incremental object cache:
+# a stale target/obj (or a leftover launcher artifact from a degraded prior
+# run) could otherwise mask a source/link regression.
+rm -rf target/obj target/debug/mind-nerve-kernels
 BUILD_LOG="${WORK_DIR}/build.log"
-"${MINDC}" build --emit=object --no-cache >"${BUILD_LOG}" 2>&1 || \
+# Default (binary) emit → linked native executable at target/debug/<output>.
+# The generous tool timeout covers the -O2 C-runtime compile of the 57 KiB
+# blas_shims_i64.c on a cold machine.
+MINDC_BUILD_TOOL_TIMEOUT_SECS="${MINDC_BUILD_TOOL_TIMEOUT_SECS:-900}" \
+    "${MINDC}" build --no-cache >"${BUILD_LOG}" 2>&1 || \
     fail "mindc build exited non-zero (see below)
 $(cat "${BUILD_LOG}")"
 
@@ -201,68 +229,71 @@ if grep -q 'error\[' "${BUILD_LOG}"; then
 $(grep 'error\[' "${BUILD_LOG}" | head -20)"
 fi
 
-# [WARN] policy: every "not natively compiled" fallback must be one of the
-# four enumerated C-shim modules, and its reason must be the E2024
-# intrinsic-table warning for a __mind_nerve_* symbol. Exactly one
-# additional WARN is allowed: the final-link fallback (shim symbols are
-# owned by mind/runtime/*.c at .so packaging time — out of mindc's scope).
-SHIM_MODULES="luts/rsqrt_q16.mind luts/softmax_q16.mind luts/tanh_q16.mind kernels/matmul_blas.mind"
+# ZERO-fallback policy. Any embedded/JIT fallback or launcher-link fallback is
+# a HARD failure — the artifact would not be a real native binary. These are
+# the exact silent-green shapes mindc emits while still exiting 0.
+if grep -qE 'not natively compiled|runtime-JIT fallback' "${BUILD_LOG}"; then
+    fail "JIT/embedded fallback in native build (expected ZERO):
+$(grep -nE 'not natively compiled|runtime-JIT fallback' "${BUILD_LOG}")"
+fi
+if grep -q 'native link failed' "${BUILD_LOG}"; then
+    fail "native link fell back to a launcher (expected a real ELF):
+$(grep -n 'native link failed' "${BUILD_LOG}")"
+fi
+if grep -q '\[WARN\]' "${BUILD_LOG}"; then
+    fail "unexpected [WARN] line in native build (expected none):
+$(grep -n '\[WARN\]' "${BUILD_LOG}")"
+fi
 
-warn_count=0
-link_fallbacks=0
-while IFS= read -r line; do
-    case "${line}" in
-        *"not natively compiled"*)
-            warn_count=$((warn_count + 1))
-            mod="$(printf '%s' "${line}" | sed 's/^\[WARN\] //; s/:.*//')"
-            base="${mod##*/}"
-            dir="$(printf '%s' "${mod}" | sed 's:.*/mind/\([^/]*/[^/]*\)$:\1:; s:.*/\([^/]*/[^/]*\)$:\1:')"
-            rel="${dir}"
-            ok=0
-            for m in ${SHIM_MODULES}; do
-                if [ "${rel}" = "${m}" ] || [ "${base}" = "${m##*/}" ]; then
-                    case "${line}" in
-                        *E2024*__mind_nerve_*) ok=1 ;;
-                    esac
-                fi
-            done
-            [ "${ok}" -eq 1 ] || fail "unexpected module fallback: ${line}"
-            ;;
-        *"native link failed"*)
-            link_fallbacks=$((link_fallbacks + 1))
-            ;;
-        *\[WARN\]*)
-            fail "unrecognized [WARN] line: ${line}"
-            ;;
-    esac
-done < "${BUILD_LOG}"
+# Assert the LINKED artifact is a real native ELF executable, not a launcher.
+ARTIFACT="target/debug/mind-nerve-kernels"
+[ -f "${ARTIFACT}" ] || fail "no build artifact at ${ARTIFACT}"
+# (1) `file` must report ELF.
+if ! file "${ARTIFACT}" | grep -q 'ELF'; then
+    fail "artifact is not an ELF: $(file "${ARTIFACT}")"
+fi
+# (2) First 4 bytes must be the ELF magic \x7fELF (0x7f 45 4c 46).
+MAGIC="$(od -An -tx1 -N4 "${ARTIFACT}" | tr -d ' \n')"
+[ "${MAGIC}" = "7f454c46" ] || \
+    fail "artifact magic is ${MAGIC:-<empty>}, expected 7f454c46 (\\x7fELF) — not a native ELF"
+# (3) It must NOT be a shell script and must carry no mind-runtime exec shim
+#     (the launcher fallback is a #!/bin/bash script that execs mind-runtime).
+if head -c 2 "${ARTIFACT}" | grep -q '#!'; then
+    fail "artifact begins with a #! shebang — it is a launcher script, not an ELF"
+fi
+if grep -aq 'mind-runtime' "${ARTIFACT}"; then
+    fail "artifact contains a 'mind-runtime' exec shim — degraded launcher, not a native binary"
+fi
+echo "   OK: linked artifact is a real native ELF (magic 7f454c46, no launcher/shim)"
 
-[ "${warn_count}" -eq 4 ] || \
-    fail "expected exactly 4 E2024 shim-module fallbacks, saw ${warn_count}"
-[ "${link_fallbacks}" -le 1 ] || \
-    fail "expected at most 1 link-fallback notice, saw ${link_fallbacks}"
-
-# The 13 pure-MIND modules must have produced REAL native objects (their
-# pub fn symbols present), proving parse + type-check + IR lowering +
-# native codegen. Embedded-fallback objects contain only the
-# mind_module_*_get_ir/get_source symbols.
-PURE_MODULES="exports_c_abi kernels_batched_matmul_q16 kernels_embedding_q16 kernels_encode kernels_gelu_q16 kernels_l2_norm_q16 kernels_layernorm_q16 kernels_matmul_q16 kernels_sliding_window kernels_topk_q16 luts_exp_q16 luts_recip_q32 luts_sqrt_q16"
-for m in ${PURE_MODULES}; do
+# All 19 project modules must have produced REAL native objects (their pub fn
+# symbols present), proving parse + type-check + IR lowering + native codegen.
+# An embedded-fallback object would contain only mind_module_*_get_ir/get_source.
+NATIVE_MODULES="exports_c_abi kernels_batched_matmul_q16 kernels_embedding_q16 kernels_encode kernels_gelu_q16 kernels_l2_norm_q16 kernels_layernorm_q16 kernels_matmul_blas kernels_matmul_q16 kernels_sliding_window kernels_topk_q16 kernels_wordpiece luts_exp_q16 luts_recip_q32 luts_rsqrt_q16 luts_softmax_q16 luts_sqrt_q16 luts_tanh_q16 luts_vocab_wp"
+mod_count=0
+for m in ${NATIVE_MODULES}; do
     obj="target/obj/${m}.o"
     [ -f "${obj}" ] || fail "missing object for module ${m}"
+    file "${obj}" | grep -q 'ELF' || fail "object ${m}.o is not an ELF: $(file "${obj}")"
     if command -v nm >/dev/null 2>&1; then
-        # A native-compiled module exports at least one function symbol
-        # beyond the embedded-source get_ir/get_source pair.
-        syms="$(nm "${obj}" 2>/dev/null | grep -c ' T ' || true)"
-        [ "${syms}" -gt 2 ] || \
-            fail "module ${m} has no native fn symbols (only ${syms} T symbols) — embedded fallback?"
+        # Native-vs-embedded is decided by symbol IDENTITY, not count: an
+        # embedded runtime-JIT fallback object carries ONLY the
+        # `mind_module_<name>_get_ir` / `_get_source` marker pair and none of
+        # the module's own code, whereas a natively-compiled object defines its
+        # `pub fn` text symbols and NO get_ir/get_source marker. (A count
+        # threshold is wrong: a real native module with a single `pub fn` — e.g.
+        # luts/rsqrt_q16.mind — has just one `T` symbol.)
+        if nm "${obj}" 2>/dev/null | grep -qE 'mind_module_.*_get_ir|mind_module_.*_get_source|get_ir$|get_source$'; then
+            fail "module ${m} is an embedded runtime-JIT fallback (get_ir/get_source marker present), not native"
+        fi
+        tsyms="$(nm "${obj}" 2>/dev/null | grep -c ' [Tt] ' || true)"
+        [ "${tsyms}" -ge 1 ] || \
+            fail "module ${m} has no native text symbols (${tsyms}) — not natively compiled?"
     fi
+    mod_count=$((mod_count + 1))
 done
-# The 4 shim modules must be present as (embedded) objects too.
-for m in luts_rsqrt_q16 luts_softmax_q16 luts_tanh_q16 kernels_matmul_blas; do
-    [ -f "target/obj/${m}.o" ] || fail "missing object for shim module ${m}"
-done
-echo "   OK: 17/17 modules compiled; 13 native objects verified; 4 documented E2024 shim fallbacks"
+[ "${mod_count}" -eq 19 ] || fail "expected 19 native module objects, verified ${mod_count}"
+echo "   OK: 19/19 modules compiled to real native objects; zero JIT/launcher fallback"
 
 # ---------------------------------------------------------------------------
 # Leg 2 — LUT bit-identity smoke via mindc test (merged self-contained image)
@@ -957,4 +988,4 @@ rc=0
 $(cat "${HARNESS_RUN_LOG}")"
 echo "   OK: native e2e harness — real ELF, exit 0 (stateful oracle + chain link, full-path bytes oracle, stateless chain-of-one)"
 
-echo "GATE PASS: mindc 0.10.2 — 17/17 kernel-tree modules compile in project mode; 5/5 LUT smoke tests green; src/sha256.mind 16/16, src/q16_16.mind 86/86, src/lib.mind 12/12, src/top_k.mind 30/30, src/tokenizer.mind 18/18, src/chain_log.mind 5/5, src/runtime_ffi.mind 3/3, src/clock.mind 5/5, src/evidence.mind 36/36, src/encoder_kernels.mind 17/17, src/model.mind 8/8, src/loader.mind 12/12, src/inference.mind 9/9 + native e2e harness green"
+echo "GATE PASS: mindc 0.10.2 — 19/19 kernel-tree modules natively compile + link into a real ELF (zero JIT/launcher fallback); 5/5 LUT smoke tests green; src/sha256.mind 16/16, src/q16_16.mind 86/86, src/lib.mind 12/12, src/top_k.mind 30/30, src/tokenizer.mind 18/18, src/chain_log.mind 5/5, src/runtime_ffi.mind 3/3, src/clock.mind 5/5, src/evidence.mind 36/36, src/encoder_kernels.mind 17/17, src/model.mind 8/8, src/loader.mind 12/12, src/inference.mind 9/9 + native e2e harness green"

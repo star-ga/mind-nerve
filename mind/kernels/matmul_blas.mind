@@ -62,15 +62,14 @@ import std.vec;
 // surface is a thin extern wrapper that lets c_abi.mind switch over by
 // changing a single call site.
 // ---------------------------------------------------------------------------
-pub fn matmul_score_blas(catalog: i64, qv: i64, out: i64, n_rows: i64) -> i64 {
-    __mind_nerve_blas_matmul_score_q16_i64(catalog, qv, out, n_rows, 384)
-}
-
-// dot_q16_blas — single-row Q16.16 dot for callers that want to hand-roll
-// the outer loop in MIND (kept for future use; not currently wired).
-pub fn dot_q16_blas(a: i64, b: i64, len: i64) -> i64 {
-    __mind_nerve_blas_dot_q16_i64(a, b, len)
-}
+// NOTE (Phase A1.6): the former score-path wrappers matmul_score_blas /
+// dot_q16_blas were removed. mn_encoder_score now runs a pure-MIND path over
+// the compiler-emitted multithreaded intrinsic __mind_blas_gemv_q16_mt (see
+// mind/exports/c_abi.mind); no C shim is on the score path. The encode-path
+// wrappers below (matmul_q16_blas / qkt_blas / attnv_blas) still delegate to
+// blas_shims_i64.c, which remains linked for the encode BLAS and the
+// __mind_nerve_blas_{get,set}_use_avx2 dispatch hooks bound by the perf/
+// byte-identity harness.
 
 // matmul_q16_blas — full Q16.16 matrix multiply (M×K)·(K×N) → (M×N).
 //

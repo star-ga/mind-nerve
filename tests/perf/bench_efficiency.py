@@ -7,8 +7,8 @@ Three measurements, none of which a BLAS-backed routing stack can offer:
      corpus, computed on BOTH dispatch paths (``MIND_NERVE_BLAS=1`` AVX2 and
      ``=0`` scalar). Both must equal the x86 reference hash pinned in
      ``tests/python/test_blas_byte_identity.py``. This run records the x86
-     reference; the printed hash is the cross-arch oracle for future
-     ARM / CUDA / photonic comparison.
+     reference; the printed hash is the cross-arch oracle for the ARM64
+     CPU comparison.
 
   2. L1 / L2 / L∞ metric matrix: top-5 under each reduction (L2 = dot, the
      current cosine flavor; L1 = sum-abs; L∞ = max-abs), computed in numpy
@@ -278,8 +278,8 @@ def _run(rt: Any) -> dict[str, Any]:
             "scalar_matches_reference": h_scalar == REFERENCE_HASH_X86_AVX2,
             "avx2_matches_scalar": h_avx2 == h_scalar,
             "note": (
-                "this hash is the cross-arch oracle for future ARM / CUDA / "
-                "photonic backends — they must reproduce it byte-for-byte"
+                "this hash is the cross-arch oracle for the ARM64 CPU backend — "
+                "it must reproduce it byte-for-byte"
             ),
         }
 

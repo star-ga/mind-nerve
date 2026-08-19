@@ -20,6 +20,7 @@ is a first-party trust root.
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -34,9 +35,10 @@ import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import IO, Any, Callable, Literal
 
 from . import discovery, ensure
+from .inference import _DEFAULT_RUNTIME_DIR
 from .security_scan import scan_path
 
 NETWORK_TIMEOUT = 30.0
@@ -174,13 +176,45 @@ def load_sources(runtime_dir: str | Path | None = None) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
+class _HttpsOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Re-apply the https allowlist to EVERY redirect hop (fable#6/codex#8):
+    urllib's default handler would follow a 302 to http:// silently, and
+    forward Authorization (GITHUB_TOKEN) across hosts.
+    """
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: IO[bytes],
+        code: int,
+        msg: str,
+        headers: http.client.HTTPMessage,
+        newurl: str,
+    ) -> urllib.request.Request | None:  # noqa: D102
+        if not str(newurl).startswith("https://"):
+            raise FetchError(f"refusing redirect to non-https URL: {_redact_url(newurl)!r}")
+        new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new_req is not None:
+            old_host = urllib.parse.urlsplit(req.full_url).hostname
+            new_host = urllib.parse.urlsplit(str(newurl)).hostname
+            if new_host != old_host:
+                new_req.headers.pop("Authorization", None)
+        return new_req
+
+
 def _http_get(url: str, headers: dict[str, str] | None = None) -> bytes:
     hdrs = {"User-Agent": "mind-nerve-acquire/1"}
     hdrs.update(headers or {})
     req = urllib.request.Request(url, headers=hdrs)
-    # nosec B310: url scheme is allowlisted https-only before this call
-    # (registry candidates refuse file:/http:; regression-tested).
-    with urllib.request.urlopen(req, timeout=NETWORK_TIMEOUT) as resp:  # noqa: S310  # nosec B310
+    # nosec B310: url scheme is allowlisted https-only before this call, and
+    # every redirect hop is re-validated by the handler below (an https URL
+    # 302-ing to http:// is refused; Authorization never crosses hosts).
+    opener = urllib.request.build_opener(_HttpsOnlyRedirectHandler)
+    # `OpenerDirector.open` is typed `Any` in typeshed (it fans out to
+    # protocol-specific handlers); the https path always yields a real
+    # `http.client.HTTPResponse`, whose `.read()` is `bytes`-typed.
+    resp: http.client.HTTPResponse
+    with opener.open(req, timeout=NETWORK_TIMEOUT) as resp:  # noqa: S310  # nosec B310
         # Read cap must cover the largest legitimate payload — the 25 MB
         # quarantine byte cap, not the smaller JSON-API cap — or a valid
         # 16-25 MB tarball arrives truncated and fails to extract.
@@ -298,7 +332,8 @@ def _search_mcp_registry(
     for entry in servers:
         if not isinstance(entry, dict):
             continue
-        body = entry.get("server") if isinstance(entry.get("server"), dict) else entry
+        server_val = entry.get("server")
+        body = server_val if isinstance(server_val, dict) else entry
         name = str(body.get("name") or "").strip()
         if not name:
             continue
@@ -531,6 +566,11 @@ def _copy_local(src: Path, dest: Path, max_bytes: int, max_files: int) -> None:
         if p.is_dir():
             (dest / rel).mkdir(parents=True, exist_ok=True)
             continue
+        if not p.is_file():
+            # FIFOs/devices/sockets: copy2 (and the scanner's open) would
+            # block forever on a FIFO (qwen Q14). No distributable skill
+            # content is a non-regular file — skip it.
+            continue
         total_files += 1
         total_bytes += p.stat().st_size
         _check_caps(total_bytes, total_files, max_bytes, max_files)
@@ -544,7 +584,9 @@ def _check_member_safe(m: tarfile.TarInfo) -> None:
     parts = re.split(r"[/\\]", name)
     if (
         name.startswith(("/", "\\"))
-        or re.match(r"^[A-Za-z]:[\\/]", name)  # Windows drive-qualified
+        # Any drive-qualified form — `C:\x`, `C:/x`, AND drive-relative
+        # `C:x` (joins outside the destination drive; codex round-4 #3).
+        or re.match(r"^[A-Za-z]:", name)
         or ".." in parts
     ):
         raise FetchError(f"archive member escapes extraction root: {name!r}")
@@ -557,7 +599,7 @@ def _check_member_safe(m: tarfile.TarInfo) -> None:
         raise FetchError(f"unsupported archive member type: {name!r}")
     if (m.issym() or m.islnk()) and (
         m.linkname.startswith(("/", "\\"))
-        or re.match(r"^[A-Za-z]:[\\/]", m.linkname)
+        or re.match(r"^[A-Za-z]:", m.linkname)
         or ".." in re.split(r"[/\\]", m.linkname)
     ):
         raise FetchError(f"archive link escapes extraction root: {name!r}")
@@ -578,7 +620,7 @@ def _skipped_member(name: str) -> bool:
 # early patch releases lack the kwarg entirely. Feature-detect instead of
 # version-sniffing; on the unpatched floor our own per-member escape
 # checks + byte/file caps still guard the extraction.
-_TAR_FILTER: str | None = "data" if hasattr(tarfile, "data_filter") else None
+_TAR_FILTER: Literal["data"] | None = "data" if hasattr(tarfile, "data_filter") else None
 
 
 def _fetch_tarball(url: str, dest: Path, max_bytes: int, max_files: int, http_get: HttpGet) -> None:
@@ -590,7 +632,6 @@ def _fetch_tarball(url: str, dest: Path, max_bytes: int, max_files: int, http_ge
     try:
         with tarfile.open(blob) as tf:
             members: list[tarfile.TarInfo] = []
-            files = 0
             uncompressed = 0
             # Stream members (tarfile iteration) instead of getmembers(): the
             # caps trip DURING the read, so a bomb of millions of tiny headers
@@ -600,10 +641,12 @@ def _fetch_tarball(url: str, dest: Path, max_bytes: int, max_files: int, http_ge
                 if _skipped_member(m.name):
                     continue
                 members.append(m)
+                # EVERY member counts toward the file cap, not just regular
+                # files — unlimited dir/link headers are an inode/memory bomb
+                # on their own (codex round-4 #14).
+                if len(members) > max_files:
+                    raise FetchError(f"file-count cap exceeded ({len(members)} > {max_files})")
                 if m.isfile():
-                    files += 1
-                    if files > max_files:
-                        raise FetchError(f"file-count cap exceeded ({files} > {max_files})")
                     # Cap the UNCOMPRESSED payload: a tar bomb is tiny on the
                     # wire and huge on disk. Member size headers are
                     # authoritative for extraction, so the running sum is an
@@ -613,11 +656,13 @@ def _fetch_tarball(url: str, dest: Path, max_bytes: int, max_files: int, http_ge
                         raise FetchError(
                             f"uncompressed size cap exceeded ({uncompressed} > {max_bytes} bytes)"
                         )
-            kwargs = {"filter": _TAR_FILTER} if _TAR_FILTER is not None else {}
             # nosec B202: members are pre-validated by _check_member_safe
             # (dotdot/drive-qualified/absolute refused) and _skipped_member;
             # tarfile data_filter is applied whenever the runtime offers it.
-            tf.extractall(dest, members=members, **kwargs)  # nosec B202
+            if _TAR_FILTER is not None:
+                tf.extractall(dest, members=members, filter=_TAR_FILTER)  # nosec B202
+            else:
+                tf.extractall(dest, members=members)  # nosec B202
     except tarfile.TarError as e:
         raise FetchError(f"not a readable tarball: {e}") from e
     except KeyError as e:
@@ -676,7 +721,10 @@ def _clone_monitored(argv: list[str], dest: Path, max_bytes: int) -> str | None:
             time.sleep(0.1)
         stderr = proc.stderr.read() if proc.stderr is not None else b""
         if proc.returncode:
-            return stderr.decode("utf-8", "replace").strip()[:200]
+            # NOT truncated here: the caller redacts the operational URL
+            # first, and truncating before redaction would leak a partial
+            # credential (codex round-4 #9).
+            return stderr.decode("utf-8", "replace").strip()
         return None
     finally:
         if proc.poll() is None:
@@ -716,7 +764,7 @@ def _git_clone(
             # git echoes the full URL (userinfo included) in its errors —
             # scrub the operational URL from the detail before propagating.
             detail = (
-                e.stderr.decode("utf-8", "replace").strip()[:200].replace(url, _redact_url(url))
+                e.stderr.decode("utf-8", "replace").strip().replace(url, _redact_url(url))[:200]
             )
             raise FetchError(
                 f"git clone failed for {_redact_url(url)!r}"
@@ -726,7 +774,7 @@ def _git_clone(
     else:
         stderr = _clone_monitored(argv, Path(dest), max_bytes)
         if stderr is not None:
-            detail = stderr.replace(url, _redact_url(url))
+            detail = stderr.replace(url, _redact_url(url))[:200]
             raise FetchError(
                 f"git clone failed for {_redact_url(url)!r}"
                 + (f" at ref {ref!r}" if ref and ref != "HEAD" else "")
@@ -879,8 +927,22 @@ def fetch(
             try:
                 commit_sha = _git_clone(repo_url, scratch, ref=ref, max_bytes=max_bytes)
                 pkg_root = scratch / subdir if subdir else scratch
+                if pkg_root.is_symlink():
+                    # A tree subdir that is itself a symlink would be
+                    # dereferenced by _copy_local BEFORE vetting — copying
+                    # whatever it points at into quarantine as regular files
+                    # (codex round-4 #11). Refuse outright.
+                    raise FetchError(f"subdir {subdir!r} is a symlink; refusing")
                 if subdir and not pkg_root.is_dir():
                     raise FetchError(f"subdir {subdir!r} not found in {repo_url}")
+                # Canonical containment: the resolved package root must stay
+                # below the resolved clone root.
+                resolved_root = pkg_root.resolve()
+                scratch_resolved = scratch.resolve()
+                if resolved_root != scratch_resolved and scratch_resolved not in (
+                    resolved_root.parents
+                ):
+                    raise FetchError(f"subdir escapes the clone: {subdir!r}")
                 _copy_local(pkg_root, qdir, max_bytes, max_files)
             finally:
                 shutil.rmtree(scratch, ignore_errors=True)
@@ -1149,9 +1211,7 @@ def install(
             target,
             source_repo=f"acquire:{candidate.source}",
             trusted=False,
-            runtime_dir=str(runtime_dir)
-            if runtime_dir is not None
-            else discovery._DEFAULT_RUNTIME_DIR,
+            runtime_dir=str(runtime_dir) if runtime_dir is not None else _DEFAULT_RUNTIME_DIR,
         )
         out["reindexed"] = True
     except Exception as e:  # noqa: BLE001 — install stands, but the CLI must
@@ -1212,14 +1272,51 @@ def install(
 try:
     import tomllib as _tomllib
 except ImportError:  # pragma: no cover - exercised only on Python 3.10
-    _tomllib = None  # type: ignore[assignment]
+    _tomllib = None
 
 MCP_JSON_TARGETS: dict[str, str] = {
-    "claude-code": "~/.claude/settings.json",
+    "claude-code": "~/.claude.json",
     "cursor": "~/.cursor/mcp.json",
     "gemini": "~/.gemini/settings.json",
     "qwen": "~/.qwen/settings.json",
 }
+
+
+# A console-script reference must be a plain dotted module path with an
+# optional :callable — anything else (leading dash, whitespace, flags) is
+# option injection waiting for a shell (grok#4).
+_MODULE_REF = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*(?::[A-Za-z_][A-Za-z0-9_.]*)?$")
+
+
+def _console_script_entry(pkg_dir: Path, module_ref: str) -> dict[str, Any] | None:
+    """Resolve a [project.scripts] reference to an in-tree interpreter argv.
+
+    The module file must exist as a regular file strictly below the vetted
+    package root (flat or src/ layout); anything else is refused (None).
+    """
+    if not _MODULE_REF.match(module_ref):
+        return None
+    module = module_ref.split(":", 1)[0]
+    rel = module.replace(".", "/")
+    for candidate in (
+        pkg_dir / f"{rel}.py",
+        pkg_dir / rel / "__main__.py",
+        pkg_dir / "src" / f"{rel}.py",
+        pkg_dir / "src" / rel / "__main__.py",
+    ):
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if (
+            resolved.is_file()
+            and not resolved.is_symlink()
+            and (resolved == pkg_dir or pkg_dir in resolved.parents)
+        ):
+            import sys
+
+            return {"command": sys.executable, "args": [str(resolved)]}
+    return None
 
 
 def _atomic_replace_preserving_mode(path: Path, content: str) -> None:
@@ -1261,7 +1358,11 @@ def _mcp_entry_point(pkg_dir: Path) -> dict[str, Any] | None:
     are therefore refused outright (audit finding, 2026-08 r3).
     """
     pkg_dir = pkg_dir.resolve()
-    # 1. pyproject.toml with a console script -> FLEET-standard uvx argv
+    # 1. pyproject.toml with a console script -> the interpreter on the
+    #    IN-TREE module file. NEVER `uvx --from <dir>`: uvx resolves and
+    #    installs the package's PyPI dependencies at run time — code that
+    #    was never quarantined or vetted — and an unsanitized script/module
+    #    name is option injection (audit finding, 2026-08 r4 / grok#4).
     pyproject = pkg_dir / "pyproject.toml"
     if pyproject.is_file() and _tomllib is not None:
         try:
@@ -1269,10 +1370,12 @@ def _mcp_entry_point(pkg_dir: Path) -> dict[str, Any] | None:
         except (ValueError, OSError):
             data = None
         if isinstance(data, dict):
-            scripts = data.get("project", {}).get("scripts")
+            project = data.get("project")
+            scripts = project.get("scripts") if isinstance(project, dict) else None
             if isinstance(scripts, dict) and scripts:
-                script = sorted(scripts)[0]
-                return {"command": "uvx", "args": ["--from", str(pkg_dir), script]}
+                entry = _console_script_entry(pkg_dir, str(scripts[sorted(scripts)[0]]))
+                if entry is not None:
+                    return entry
 
     # 3. package.json bin -> direct node argv on the installed file
     package_json = pkg_dir / "package.json"
@@ -1290,8 +1393,11 @@ def _mcp_entry_point(pkg_dir: Path) -> dict[str, Any] | None:
                 bin_path = str(bin_field[sorted(bin_field)[0]])
             if bin_path:
                 target = (pkg_dir / bin_path).resolve()
-                # The bin must live INSIDE the installed package.
-                if target == pkg_dir or pkg_dir in target.parents:
+                # The bin must be an existing regular file strictly BELOW the
+                # package root — `"bin": "."` resolves to the package dir
+                # itself, after which node follows "main" anywhere
+                # (codex round-4 #7).
+                if target != pkg_dir and pkg_dir in target.parents and target.is_file():
                     return {"command": "node", "args": [str(target)]}
     return None
 
@@ -1336,6 +1442,15 @@ def register_mcp_server(
             servers = cfg.setdefault("mcpServers", {})
             if not isinstance(servers, dict):
                 raise ValueError("mcpServers is not a JSON object")
+            existing_entry = servers.get(server_name)
+            if isinstance(existing_entry, dict) and (
+                existing_entry.get("x-managed-by") != "mind-nerve-acquire"
+            ):
+                # A hand-written (or foreign-tool) entry with our name is
+                # NEVER overwritten (qwen Q7); docs promise existing entries
+                # are preserved.
+                results[cli] = "skipped (entry exists, not managed by mind-nerve-acquire)"
+                continue
             servers[server_name] = entry
             _atomic_replace_preserving_mode(cfg_path, json.dumps(cfg, indent=2) + "\n")
             results[cli] = "registered"
@@ -1384,14 +1499,19 @@ def _prune_routes_for_path(runtime_dir: Path, removed_dir: Path) -> dict[str, An
     if not (emb_path.is_file() and meta_path.is_file()):
         return {"pruned": 0, "reason": "no route table"}
     emb, meta = discovery._load_table(runtime_dir)
-    prefix = str(removed_dir)
+    # Canonicalize BOTH spellings before comparing: installing through a
+    # relative hub path and reinstalling through its absolute spelling must
+    # prune the same rows (codex round-4 #10). resolve() is non-strict, so
+    # this also works after remove() deleted the directory.
+    prefix = str(Path(removed_dir).resolve())
     # Exact-or-boundary match: "/hub/pdf-tools-2/x" startswith "/hub/pdf-tools"
     # as a string but is NOT under it — a bare startswith prune would delete a
     # sibling package's routes when its name extends the removed one.
     boundary = prefix + os.sep
 
     def _under_removed(source_path: str) -> bool:
-        return source_path == prefix or source_path.startswith(boundary)
+        sp = str(Path(source_path).resolve())
+        return sp == prefix or sp.startswith(boundary)
 
     keep = [i for i, m in enumerate(meta) if not _under_removed(str(m.get("source_path", "")))]
     pruned = len(meta) - len(keep)

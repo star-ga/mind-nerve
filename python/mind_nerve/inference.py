@@ -263,6 +263,34 @@ def _default_user_runtime_dir() -> Path:
 
 _USER_RUNTIME_DIR = _default_user_runtime_dir()
 
+# Emit the "no runtime pin" warning at most once per process so a long-lived
+# daemon/CLI does not spam it on every route() call.
+_WARNED_NO_PIN = False
+
+
+def _warn_unpinned_runtime(resolved: Path) -> None:
+    """Loudly warn that no runtime dir was pinned (bug: silent OSS fallback).
+
+    Without ``MIND_NERVE_RUNTIME_DIR`` (or an explicit ``runtime_dir``) the
+    resolver falls through to the default user runtime dir, which — when the
+    curated STARGA table is absent — is auto-seeded from the *generic* public
+    catalog. Routing then silently answers from the wrong (much larger, less
+    relevant) table. This was previously invisible; surface it once, on stderr,
+    without changing the returned routes.
+    """
+    global _WARNED_NO_PIN
+    if _WARNED_NO_PIN:
+        return
+    _WARNED_NO_PIN = True
+    print(
+        "mind-nerve: WARNING — MIND_NERVE_RUNTIME_DIR is not set; falling back to "
+        f"the default runtime dir {resolved}. If the curated table is not present "
+        "there this serves the generic public catalog (irrelevant routes). Pin the "
+        "runtime with `export MIND_NERVE_RUNTIME_DIR=<curated-table-dir>` — see the "
+        "README (search MIND_NERVE_RUNTIME_DIR).",
+        file=sys.stderr,
+    )
+
 
 def _seed_from_hf(target: Path) -> None:
     """Snapshot-download the Phase-1 weights from Hugging Face into *target*.
@@ -289,6 +317,10 @@ def _seed_from_hf(target: Path) -> None:
                 "route_table*.npy",
                 "route_table.jsonl",
                 "stride_thresholds.json",
+                # Native-backend weights (present from the Phase-2 revision
+                # onward; absent in older pinned revisions — the native
+                # runtime then fails closed into the PyTorch fallback).
+                "encoder_weights.q16.bin",
             ],
         )
     )
@@ -331,6 +363,11 @@ def _resolve_runtime_dir(runtime_dir: str | None = None) -> Path:
         if not p.is_dir():
             raise FileNotFoundError(f"MIND_NERVE_RUNTIME_DIR={env_dir} does not exist")
         return p
+    # No explicit runtime_dir and no MIND_NERVE_RUNTIME_DIR pin: the resolver is
+    # about to fall through to the default user runtime dir, which may be the
+    # generic public catalog. Warn once, loudly, so an operator does not route
+    # against the wrong table without noticing (the pin is load-bearing).
+    _warn_unpinned_runtime(_USER_RUNTIME_DIR)
     if not (_USER_RUNTIME_DIR / "manifest.json").exists():
         _seed_from_hf(_USER_RUNTIME_DIR)
     return _USER_RUNTIME_DIR
@@ -362,7 +399,7 @@ class _Runtime:
         from sentence_transformers import SentenceTransformer
 
         self.dir = runtime_dir
-        self.manifest = json.loads((runtime_dir / "manifest.json").read_text())
+        self.manifest = json.loads((runtime_dir / "manifest.json").read_text(encoding="utf-8"))
 
         # Device selection. `MIND_NERVE_DEVICE=cpu` forces CPU even if a GPU
         # is visible — useful when sharing the GPU with another resident
@@ -401,7 +438,7 @@ class _Runtime:
                 f"Run mind_nerve.installer.precompute_routes() first."
             )
         self.embeddings: "np.ndarray" = np.load(emb_path)
-        with meta_path.open("r") as _f:
+        with meta_path.open("r", encoding="utf-8") as _f:
             self.routes: list[dict[str, Any]] = [json.loads(ln) for ln in _f]
         if self.embeddings.shape[0] != len(self.routes):
             raise RuntimeError("Route table embeddings/meta length mismatch")
@@ -451,7 +488,9 @@ class _Runtime:
         # it's load-only metadata for forward compatibility.
         stride_path = runtime_dir / "stride_thresholds.json"
         if stride_path.exists():
-            self.stride_thresholds: "dict[str, Any] | None" = json.loads(stride_path.read_text())
+            self.stride_thresholds: "dict[str, Any] | None" = json.loads(
+                stride_path.read_text(encoding="utf-8")
+            )
         else:
             self.stride_thresholds = None
 
@@ -491,7 +530,7 @@ class _NativeEncoderRuntime:
 
     def __init__(self, runtime_dir: Path) -> None:
         self.dir = runtime_dir
-        self.manifest = json.loads((runtime_dir / "manifest.json").read_text())
+        self.manifest = json.loads((runtime_dir / "manifest.json").read_text(encoding="utf-8"))
 
         # Load the native encoder binding. If the .so is not present the
         # import will raise FileNotFoundError with a build instruction.
@@ -509,9 +548,10 @@ class _NativeEncoderRuntime:
         # Produced offline by tools/quantize_encoder_to_q16.py. Resolution:
         #   1. $MIND_NERVE_ENCODER_WEIGHTS (explicit override)
         #   2. <runtime_dir>/encoder_weights.q16.bin (default)
-        # When absent, the handle is initialised with a zero-length blob so
-        # mn_encoder_init still allocates scratch buffers; encode then yields
-        # an all-zero embedding (caller can detect via the missing blob).
+        # A missing blob must FAIL CONSTRUCTION (codex final #1): init(0,0)
+        # "succeeds" and encode then yields an all-zero embedding — or, with
+        # an incompatible .so, crashes — while routing silently degrades.
+        # Raising here activates the caller's PyTorch fallback.
         self._handle: int = 0
         env_blob = os.environ.get("MIND_NERVE_ENCODER_WEIGHTS")
         if env_blob:
@@ -519,25 +559,30 @@ class _NativeEncoderRuntime:
         else:
             q16_blob_path = runtime_dir / "encoder_weights.q16.bin"
         self._encoder_weights_path = q16_blob_path
-        self._encoder_weights_loaded = q16_blob_path.exists()
-        if q16_blob_path.exists():
-            import ctypes as _ct
-
-            # Pin the blob for the lifetime of the handle; the native side
-            # stores the raw address and reads it on every encode call.
-            self._weights = np.fromfile(str(q16_blob_path), dtype=np.int64)
-            self._weights_pinned = np.ascontiguousarray(self._weights, dtype=np.int64)
-            blob_addr = (
-                _ct.cast(
-                    self._weights_pinned.ctypes.data_as(_ct.POINTER(_ct.c_int64)),
-                    _ct.c_void_p,
-                ).value
-                or 0
+        if not q16_blob_path.exists():
+            raise FileNotFoundError(
+                f"native encoder weights not found at {q16_blob_path} "
+                "(set MIND_NERVE_ENCODER_WEIGHTS or re-seed the runtime)"
             )
-            self._handle = self._native.init(blob_addr, self._weights_pinned.nbytes)
-        else:
-            # Placeholder handle: no valid weights yet.
-            self._handle = self._native.init(0, 0)
+        self._encoder_weights_loaded = True
+        if q16_blob_path.stat().st_size == 0:
+            raise OSError(f"native encoder weights blob is empty: {q16_blob_path}")
+        import ctypes as _ct
+
+        # Pin the blob for the lifetime of the handle; the native side
+        # stores the raw address and reads it on every encode call.
+        self._weights = np.fromfile(str(q16_blob_path), dtype=np.int64)
+        self._weights_pinned = np.ascontiguousarray(self._weights, dtype=np.int64)
+        blob_addr = (
+            _ct.cast(
+                self._weights_pinned.ctypes.data_as(_ct.POINTER(_ct.c_int64)),
+                _ct.c_void_p,
+            ).value
+            or 0
+        )
+        self._handle = self._native.init(blob_addr, self._weights_pinned.nbytes)
+        if self._handle == 0:
+            raise OSError(f"mn_encoder_init failed for {q16_blob_path}")
 
         # Catalog embeddings (float32 from .npy, Q16.16 quantised at load).
         emb_path = runtime_dir / "route_table.npy"
@@ -560,7 +605,7 @@ class _NativeEncoderRuntime:
         # Store as Q16.16 int64 for native scoring path.
         self._catalog_q16: np.ndarray = np.ascontiguousarray(self._f32_to_q16(embeddings_f32))
 
-        with meta_path.open("r") as _f:
+        with meta_path.open("r", encoding="utf-8") as _f:
             self.routes: list[dict[str, Any]] = [json.loads(ln) for ln in _f]
         if self._catalog_q16.shape[0] != len(self.routes):
             raise RuntimeError("Native catalog embeddings/meta length mismatch")
@@ -1032,7 +1077,7 @@ def precompute_routes(
             "calibration": "default-uncalibrated",
         }
         stride_path = rdir / "stride_thresholds.json"
-        stride_path.write_text(json.dumps(stride_table, indent=2))
+        stride_path.write_text(json.dumps(stride_table, indent=2), encoding="utf-8")
         result["bytes_stride_thresholds"] = stride_path.stat().st_size
 
     return result

@@ -70,14 +70,6 @@ export function sharedHookPath(homeDir: string = os.homedir()): string {
   return path.join(homeDir, ".mind-nerve", "bin", "mind-nerve-hook");
 }
 
-/** Default JSONL log path for the hook. */
-export function hookLogPath(
-  clientName: string,
-  homeDir: string = os.homedir(),
-): string {
-  return path.join(homeDir, ".mind-nerve", "logs", `${clientName}-hook.log`);
-}
-
 // ---------------------------------------------------------------------------
 // Install
 // ---------------------------------------------------------------------------
@@ -109,7 +101,6 @@ export async function wireClient(
     hubDir: opts.hubDir,
     socketPath: opts.socketPath,
     agentDirs: opts.agentDirs,
-    logPath: hookLogPath(spec.name, homeDir),
   });
   const wrapper = buildHookWrapper(shared, env);
   await fs.mkdir(path.dirname(surface.hookScriptPath), { recursive: true });

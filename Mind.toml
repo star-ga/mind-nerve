@@ -49,13 +49,16 @@ ir-consumer   = "mind-runtime >= 0.2.4"
 # Anything that breaks this is a Phase 1 ship-blocker.
 fixed-point         = "Q16.16"
 weight-quantization = "INT8 (per-output-channel, Q16.16 scales)"
-reduction-order     = "Pinned at compile time by mindc lowering passes"
+reduction-order     = "Pinned by construction: every reduction is a sequential while-loop in the .mind source (no reassociation freedom)"
 softmax-strategy    = "Lookup table, no polynomial approximation"
 tie-break           = "SHA-256(route_id) ascending"
 envelope-version    = "v2 (212 bytes packed)"
 
-# E_NERVE_001..005 lint codes enforce these at compile time; see
-# spec/numerics.md §"mindc lint rules".
+# Reduction order is pinned BY CONSTRUCTION, not by a compiler lint: every
+# accumulation in the .mind sources is written as a sequential `while`-loop,
+# so no backend has reassociation freedom to exploit. No shipped mindc
+# implements the once-envisioned E_NERVE_001..005 lint codes; the determinism
+# guarantee here is structural (source shape), not a compile-time check.
 
 [build]
 entry         = "cli/main.mind"
@@ -67,6 +70,17 @@ backend = "cpu"
 # Lowering target: AVX2 (x86) + NEON (ARM). The INT8×i32 saturating MAC
 # primitive lowers to VPDPBUSD on x86 and SDOT on ARM. Cross-arch
 # bit-identity is enforced by a final scalar saturation step.
+#
+# The two mind/luts modules are listed EXPLICITLY: src/q16_16.mind does
+# `import mind.luts.exp_q16;` / `import mind.luts.sqrt_q16;`, and mindc
+# 0.10.2 project mode resolves a user-module call ONLY if the module is in
+# the declared sources list (an undeclared import is E2003 at the call site,
+# which then cascades to `undefined reference to q16_*` at link because
+# q16_16.mind drops to JIT fallback). The module path is the file path with
+# `/`→`.`, so "mind/luts/exp_q16.mind" registers as `mind.luts.exp_q16`.
+# These two luts are self-contained (no `__mind_nerve_*` C-shim calls; the
+# only import is std.vec) — the wordpiece/tanh/softmax/recip luts are NOT
+# needed on the pre-tokenized preselect path.
 sources = [
     "cli/main.mind",
     "src/lib.mind",
@@ -78,12 +92,66 @@ sources = [
     "src/model.mind",
     "src/encoder_kernels.mind",
     "src/inference.mind",
+    "src/mcp.mind",
     "src/evidence.mind",
     "src/sha256.mind",
     "src/top_k.mind",
     "src/q16_16.mind",
+    "mind/luts/exp_q16.mind",
+    "mind/luts/sqrt_q16.mind",
+]
+# Native C-ABI host-I/O shims. These DEFINE the eight `__mind_nerve_rt_*`
+# symbols declared in src/runtime_ffi.mind's `extern "C"` block (registered
+# in mindc's STD_SURFACE_INTRINSICS). Without them the native link fails with
+# `undefined reference to __mind_nerve_rt_*` and mindc emits a launcher
+# instead of a real ELF. Compiled + statically linked through mindc's
+# deterministic clang invocation, mirroring mind/Mind.toml's native_sources.
+native_sources = [
+    "mind/runtime/nerve_rt_shims.c",
 ]
 
+# Windows-native PE target. SAME cpu-backend lowering + the SAME source list as
+# [targets.cpu] — the deterministic Q16.16 payload code is byte-for-byte identical
+# across substrates (the wedge). Only two things differ: the LLVM target triple
+# (selected via the [targets.*].target seam) and the host-I/O shims, which are the
+# Win32/MSVCRT variant (binary-mode stdio, BCryptGenRandom, QueryPerformanceCounter).
+# Cross-built from Linux via the MinGW-w64 sysroot — no Windows box to build.
+[targets.windows]
+backend = "cpu"
+target = "x86_64-w64-windows-gnu"
+sources = [
+    "cli/main.mind",
+    "src/lib.mind",
+    "src/runtime_ffi.mind",
+    "src/clock.mind",
+    "src/chain_log.mind",
+    "src/tokenizer.mind",
+    "src/loader.mind",
+    "src/model.mind",
+    "src/encoder_kernels.mind",
+    "src/inference.mind",
+    "src/mcp.mind",
+    "src/evidence.mind",
+    "src/sha256.mind",
+    "src/top_k.mind",
+    "src/q16_16.mind",
+    "mind/luts/exp_q16.mind",
+    "mind/luts/sqrt_q16.mind",
+]
+native_sources = [
+    "mind/runtime/nerve_rt_shims_win.c",
+]
+
+# RESERVED — NOT BUILT. No GPU target ships in the OSS release, and no GPU
+# emitter exists in this repo or in ~/mind today (the MLIR GPU path asserts
+# *fallback*, not identity). Per the GPU-tier architecture constraint in
+# ROADMAP.md (2026-08-17): if a GPU tier is ever built it MUST emit MIND-native
+# kernels through our own emitter, NOT a lowering to PTX/NVVM against the CUDA
+# toolchain — a vendor lowering would make byte-identity a per-vendor result to
+# verify and reintroduce the proprietary-toolchain dependency the
+# LLVM-independence track exists to shed. `backend = "cuda"` below is a
+# placeholder name for that future MIND-native GPU emitter; it is NOT a sanction
+# to lower to the CUDA toolchain.
 [targets.cuda]
 backend = "cuda"
 # Phase 1: throughput-mode batch ≥ 32 only; not budgeted for p95 latency.
@@ -98,6 +166,7 @@ sources = [
     "src/model.mind",
     "src/encoder_kernels.mind",
     "src/inference.mind",
+    "src/mcp.mind",
     "src/evidence.mind",
     "src/sha256.mind",
     "src/top_k.mind",
@@ -121,5 +190,8 @@ sources = [
 # CI gate: same model_hash + same catalog_hash + same request_hash
 # MUST produce the same result_hash on every backend. Zero divergence
 # tolerated.
+# `cuda` here is the RESERVED future MIND-native GPU backend (see [targets.cuda]
+# above), NOT a CUDA lowering — not built or gated today; cpu_x86 ↔ cpu_arm is
+# the live cross-substrate byte-identity pair.
 backends-phase1 = ["cpu_x86", "cpu_arm", "cuda"]
 backends-phase2 = ["webgpu", "npu"]

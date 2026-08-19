@@ -4,10 +4,11 @@
 //
 // ABI version: 1 (mn_encoder_version returns build-id string addr).
 //
-// All six pub fn symbols map directly to C-callable exports when compiled
-// with `mindc --emit-shared`. The mindc cdylib seam (RFC 0003, D2–D5 of
-// RFC 0002 from mindc 0.2.6) lowers `pub fn` to a C symbol with identical
-// name, no name-mangling.
+// All six encoder pub fn symbols map directly to C-callable exports when
+// compiled with `mindc --emit-shared`; the three mn_tokenize_* symbols
+// (BERT WordPiece tokenizer, Task 1) follow the same convention. The
+// mindc cdylib seam (RFC 0003, D2–D5 of RFC 0002 from mindc 0.2.6) lowers
+// `pub fn` to a C symbol with identical name, no name-mangling.
 //
 // Parameter convention (i64 throughout):
 //   - All buffer parameters are i64 values holding a flat heap address.
@@ -52,6 +53,10 @@
 //                           int64_t out_idx, int64_t out_scores);
 //   int64_t mn_encoder_free(int64_t handle);
 //   int64_t mn_encoder_version(void);
+//   int64_t mn_tokenize_tables_init(void);
+//   int64_t mn_tokenize(int64_t tables, int64_t text_addr, int64_t text_len,
+//                       int64_t out_ids, int64_t out_cap);
+//   int64_t mn_tokenize_tables_free(int64_t tables);
 //
 // No f32. No while. Cross-module imports resolved at --emit-shared link time.
 
@@ -60,6 +65,7 @@ import kernels.encode;
 import kernels.matmul_q16;
 import kernels.matmul_blas;
 import kernels.topk_q16;
+import kernels.wordpiece;
 
 // ---------------------------------------------------------------------------
 // Handle record layout (flat heap blob, 8 bytes per field):
@@ -180,6 +186,36 @@ pub fn hf_tid() -> i64 {
 }
 // type_ids (all-zero)
 
+// ── Phase A1.6 mt-kernel score path: packed-i32 scratch (slots 23..27). ──
+// The multithreaded Q16.16 GEMV intrinsic __mind_blas_gemv_q16_mt reads
+// PACKED i32 stride-4 operands and writes i32 stride-4 scores (contrast the
+// i64 stride-8 heap layout every other buffer uses). These five slots hold
+// the packed-catalog cache (rebuilt only when the catalog address/row count
+// changes — the catalog is immutable for the handle lifetime), the per-call
+// packed query, and the i32 score buffer. Packing is byte-identical to the
+// former C shim's mind_nerve_blas_get_packed_catalog: (int32_t)value, which
+// is lossless because a Q16.16 value always fits in 32 bits.
+pub fn hf_pcat() -> i64 {
+    184
+}
+// packed catalog (i32 stride-4), 0 = not yet built
+pub fn hf_pcat_src() -> i64 {
+    192
+}
+// catalog src addr the packed cache was built from
+pub fn hf_pcat_n() -> i64 {
+    200
+}
+// n_rows the packed cache was built for
+pub fn hf_pqv() -> i64 {
+    208
+}
+// packed query (384 i32), allocated once at init
+pub fn hf_psc() -> i64 {
+    216
+}
+// i32 score buffer (n_rows i32), sized with the packed catalog
+
 // ---------------------------------------------------------------------------
 // Scratch buffer sizes (in bytes, each i64 element = 8 bytes):
 //   (T,H)        = 256*384*8 = 786432
@@ -214,9 +250,9 @@ pub fn sz_T() -> i64 {
 }
 // (256,)
 pub fn sz_handle() -> i64 {
-    184
+    224
 }
-// 23 × 8
+// 28 × 8 (23 encoder scratch slots + 5 mt-kernel packed-i32 slots)
 
 // ── Minimum weight-blob length (bytes) the encoder is allowed to read. ──
 // The encode path gathers from the embedding block (word/pos/type tables +
@@ -229,6 +265,15 @@ pub fn sz_handle() -> i64 {
 // fail-loud before the first dereference (task #52).
 pub fn min_blob_bytes() -> i64 {
     emb_block_bytes() + n_layers() * layer_stride_bytes()
+}
+
+// Upper bound on catalog rows accepted by the .so embedder surface. Matches
+// src/loader.mind MAX_ROUTES (65536) — well above the 12,468-route production
+// catalog. ensure_packed_catalog rejects an out-of-range n_rows before sizing
+// __mind_alloc(n_rows*384*4) / __mind_alloc(n_rows*4), a cheap C-ABI trust-
+// boundary guard against an over-count / negative n_rows.
+pub fn max_cat_rows() -> i64 {
+    65536
 }
 
 // ---------------------------------------------------------------------------
@@ -300,6 +345,16 @@ pub fn mn_encoder_init(weights_blob: i64, len: i64) -> i64 {
     let tid_buf: i64 = __mind_alloc(sz_T());
     zero_fill(tid_buf, 256, 0);
     hset(h, hf_tid(), tid_buf);
+
+    // mt-kernel score path (Phase A1.6): packed query buffer is fixed size
+    // (384 i32 = 1536 bytes), allocated once. The packed catalog + i32 score
+    // buffers are sized from n_rows on the first mn_encoder_score call and
+    // cached (0 = not yet built).
+    hset(h, hf_pqv(), __mind_alloc(384 * 4));
+    hset(h, hf_pcat(), 0);
+    hset(h, hf_pcat_src(), 0);
+    hset(h, hf_pcat_n(), 0);
+    hset(h, hf_psc(), 0);
 
     h
 }
@@ -401,12 +456,114 @@ pub fn mn_encoder_score(handle: i64, qv: i64, catalog: i64, n_rows: i64, out_sco
     if handle == 0 {
         return -1;
     }
-    // Phase A1.5: route through the BLAS-backed score kernel. The C-side
-    // dispatcher in mind/runtime/blas_shims_i64.c picks scalar vs AVX2 at
-    // .so load time honouring MIND_NERVE_BLAS (1/avx2 = auto-detect AVX2,
-    // 0/scalar = force the byte-identical oracle path). The Q16.16 SIMD
-    // path is byte-identical to scalar by construction — task #57 gate.
-    matmul_score_blas(catalog, qv, out_scores, n_rows)
+    // Phase A1.6: pure-MIND score path over the compiler-emitted
+    // multithreaded Q16.16 GEMV intrinsic __mind_blas_gemv_q16_mt. The
+    // intrinsic consumes PACKED i32 stride-4 operands and returns i32
+    // scores; it is byte-for-byte identical to the per-row scalar dot
+    // oracle Σ_k (catalog[i,k]*query[k])>>16 and thread-count-independent,
+    // so the top-K order and emitted route ids are unchanged (task #57
+    // f4524b gate holds). The i64→i32 pack is (int32_t)value — lossless
+    // because a Q16.16 value always fits in 32 bits — and reproduces the
+    // former blas_shims_i64.c pack byte-for-byte. The i32 scores are
+    // widened back to the caller's i64 out_scores buffer via load_i32
+    // (sign-extending), which equals the old (int64_t)(int32_t)score.
+    let pcat: i64 = ensure_packed_catalog(handle, catalog, n_rows);
+    let pqv: i64 = hget(handle, hf_pqv());
+    let psc: i64 = hget(handle, hf_psc());
+    // Pack the query (384 elements) fresh every call — negligible cost.
+    pack_i64_to_i32(qv, pqv, 384, 0);
+    __mind_blas_gemv_q16_mt(pcat, pqv, psc, n_rows, 384);
+    widen_i32_to_i64(psc, out_scores, n_rows, 0)
+}
+
+// ---------------------------------------------------------------------------
+// Pack n consecutive i64-stride-8 Q16.16 values into a contiguous i32
+// stride-4 buffer. __mind_store_i32 writes the low 32 bits of the loaded
+// i64; a Q16.16 value always fits in 32 bits, so this is lossless and
+// byte-identical to the C shim's (int32_t)src[i] pack. Tail-recursive over
+// i (caller bounds the depth: 384 for the query, cols for a catalog row).
+// ---------------------------------------------------------------------------
+pub fn pack_i64_to_i32(src: i64, dst: i64, n: i64, i: i64) -> i64 {
+    if i >= n {
+        return 0;
+    }
+    __mind_store_i32(dst + i * 4, __mind_load_i64(src + i * 8));
+    pack_i64_to_i32(src, dst, n, i + 1)
+}
+
+// Pack an (n_rows × cols) i64-stride-8 catalog into a contiguous i32
+// stride-4 row-major buffer, one row at a time. Nested tail-recursion keeps
+// the per-call depth bounded (cols=384 inner, n_rows outer — the same
+// recursion regime as the shipped scalar matmul_score), never the flat
+// n_rows*cols depth.
+pub fn pack_cat_rows(src: i64, dst: i64, n_rows: i64, cols: i64, r: i64) -> i64 {
+    if r >= n_rows {
+        return 0;
+    }
+    pack_i64_to_i32(src + r * cols * 8, dst + r * cols * 4, cols, 0);
+    pack_cat_rows(src, dst, n_rows, cols, r + 1)
+}
+
+// Widen n i32-stride-4 Q16.16 scores into an i64-stride-8 buffer.
+// __mind_load_i32 sign-extends the 32-bit value to i64, reproducing the
+// former C shim's (int64_t)(int32_t)score exactly — so out_scores is
+// byte-identical to the pre-A1.6 path. Tail-recursive over i (depth n_rows).
+pub fn widen_i32_to_i64(src: i64, dst: i64, n: i64, i: i64) -> i64 {
+    if i >= n {
+        return 0;
+    }
+    // Sign-extend the low 32 bits explicitly: mask to 32 bits then shift
+    // left/arithmetic-right so a negative Q16.16 score (top bit set) becomes
+    // a negative i64, reproducing the old (int64_t)(int32_t)score. A bare
+    // load_i32 zero-extends here, which would map -903 to 2^32-903.
+    let raw: i64 = __mind_load_i32(src + i * 4);
+    let lo: i64 = raw & 4294967295;
+    let signed: i64 = (lo << 32) >> 32;
+    __mind_store_i64(dst + i * 8, signed);
+    widen_i32_to_i64(src, dst, n, i + 1)
+}
+
+// ---------------------------------------------------------------------------
+// Ensure the handle's packed-i32 catalog cache matches (catalog, n_rows),
+// rebuilding it only on a miss. The catalog is immutable for the handle
+// lifetime and is passed at the same address every call, so this packs the
+// ~18 MB catalog exactly once (mirrors the former C shim's single-slot
+// packed-catalog cache). Returns the packed catalog address.
+// ---------------------------------------------------------------------------
+pub fn ensure_packed_catalog(handle: i64, catalog: i64, n_rows: i64) -> i64 {
+    // Bound n_rows before any allocation: pack_cat_rows / pack_i64_to_i32
+    // recurse n_rows deep (relying on tail-call elimination) and the buffers
+    // are sized n_rows*384*4 / n_rows*4, so an over-count or negative n_rows is
+    // a heap-blowup / negative-alloc primitive on this C-ABI boundary. Refuse
+    // fail-loud with -1 (the caller mn_encoder_score returns it up the FFI).
+    if n_rows < 0 || n_rows > max_cat_rows() {
+        return -1;
+    }
+    let cur: i64 = hget(handle, hf_pcat());
+    if cur != 0 {
+        if hget(handle, hf_pcat_src()) == catalog {
+            if hget(handle, hf_pcat_n()) == n_rows {
+                return cur;
+            }
+        }
+    }
+    // Miss: free any prior packed catalog + score buffers and rebuild sized
+    // to n_rows. packed catalog = n_rows*384 i32; score buffer = n_rows i32.
+    if cur != 0 {
+        __mind_free(cur)
+    }
+    let oldsc: i64 = hget(handle, hf_psc());
+    if oldsc != 0 {
+        __mind_free(oldsc)
+    }
+    let pcat: i64 = __mind_alloc(n_rows * 384 * 4);
+    let psc: i64 = __mind_alloc(n_rows * 4);
+    pack_cat_rows(catalog, pcat, n_rows, 384, 0);
+    hset(handle, hf_pcat(), pcat);
+    hset(handle, hf_pcat_src(), catalog);
+    hset(handle, hf_pcat_n(), n_rows);
+    hset(handle, hf_psc(), psc);
+    pcat
 }
 
 // ---------------------------------------------------------------------------
@@ -441,6 +598,18 @@ pub fn mn_encoder_free(handle: i64) -> i64 {
     if handle == 0 {
         return 0;
     }
+    // Free the mt-kernel packed-i32 buffers (Phase A1.6). The packed catalog
+    // and i32 score buffers are lazily built (0 until the first score call),
+    // so guard them; the packed query is always allocated at init.
+    let pcat: i64 = hget(handle, hf_pcat());
+    if pcat != 0 {
+        __mind_free(pcat)
+    }
+    let psc: i64 = hget(handle, hf_psc());
+    if psc != 0 {
+        __mind_free(psc)
+    }
+    __mind_free(hget(handle, hf_pqv()));
     // Free scratch buffers in reverse allocation order.
     __mind_free(hget(handle, hf_tid()));
     __mind_free(hget(handle, hf_wty()));
@@ -464,6 +633,63 @@ pub fn mn_encoder_free(handle: i64) -> i64 {
     __mind_free(hget(handle, hf_lo()));
     __mind_free(hget(handle, hf_x()));
     __mind_free(handle)
+}
+
+// ---------------------------------------------------------------------------
+// mn_tokenize_tables_init / mn_tokenize / mn_tokenize_tables_free —
+// BERT WordPiece tokenization (Task 1, 2026-08-15), delegating to
+// kernels.wordpiece over the pinned tables in luts.vocab_wp.
+//
+// Token-id output is byte-identical to the HF fast tokenizer for the
+// runtime checkpoint (including [CLS]/[SEP], [UNK], non-ASCII
+// normalization, and 256-id truncation) — proven by
+// tests/python/test_tokenize_corpus.py on a >=500-query corpus.
+//
+// Tables handle: build once via mn_tokenize_tables_init() and reuse (the
+// vocab + normalizer tables are ~500 KB of pinned heap). Passing 0 builds
+// and frees the tables per call — correct but slow; for embedders only.
+//
+//   int64_t mn_tokenize_tables_init(void);
+//   int64_t mn_tokenize(int64_t tables, int64_t text_addr, int64_t text_len,
+//                       int64_t out_ids, int64_t out_cap);
+//   int64_t mn_tokenize_tables_free(int64_t tables);
+//
+// mn_tokenize parameters follow the same pointer+length convention as the
+// encoder exports: text_addr is the address of text_len UTF-8 bytes (one
+// byte per offset); out_ids is a caller buffer of out_cap i64 lanes.
+// Returns the id count (>= 2 — [CLS]/[SEP] always present), or a negative
+// error: -1 tables handle could not be built, -2 out_cap exceeded,
+// -3 negative text_len.
+// ---------------------------------------------------------------------------
+pub fn mn_tokenize_tables_init() -> i64 {
+    wp_tables_init()
+}
+
+pub fn mn_tokenize(tables: i64, text_addr: i64, text_len: i64, out_ids: i64, out_cap: i64) -> i64 {
+    if text_len < 0 {
+        return -3;
+    }
+    let mut own: i64 = 0;
+    let mut t: i64 = tables;
+    if t == 0 {
+        t = wp_tables_init();
+        own = 1;
+    }
+    if t == 0 {
+        return -1;
+    }
+    let rc: i64 = wp_tokenize(t, text_addr, text_len, out_ids, out_cap);
+    if own == 1 {
+        wp_tables_free(t)
+    }
+    rc
+}
+
+pub fn mn_tokenize_tables_free(tables: i64) -> i64 {
+    if tables == 0 {
+        return 0;
+    }
+    wp_tables_free(tables)
 }
 
 // ---------------------------------------------------------------------------

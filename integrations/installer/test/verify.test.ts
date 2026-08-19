@@ -501,7 +501,11 @@ describe("verifyClient — gemini-like JSON failure classes", () => {
     ) as Record<string, unknown>;
     const servers = parsed["mcpServers"] as Record<string, unknown>;
     const entry = servers["mind-nerve"] as Record<string, unknown>;
-    delete entry["_comment"];
+    // gemini's managed marker lives in env (MIND_NERVE_MANAGED), not
+    // `_comment` — its settings.json schema has no room for the latter on
+    // an MCP server entry (b10 live-integration).
+    const env = entry["env"] as Record<string, string>;
+    delete env["MIND_NERVE_MANAGED"];
     await fs.writeFile(spec.configPath, JSON.stringify(parsed, null, 2), "utf8");
     const report = await verifyClient(spec, { workspace: home });
     const check = checkByName(report.checks, "mcp-entry");

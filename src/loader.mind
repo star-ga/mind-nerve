@@ -60,6 +60,22 @@ pub const LD_ERR_UTF8:         i64 = -9;
 // index is a single right-shift on every backend).
 pub const GROUP_SIZE: i64 = 32;
 
+// DoS caps — reject pathological inputs BEFORE allocation / the O(n^2)
+// uniqueness scan. Sized to the on-disk format with generous headroom over
+// the real fixtures (largest catalog ~4.7 MiB / 4400 routes; weights ~32.5
+// MiB), NOT to the fixtures exactly, so a hostile file cannot drive an
+// unbounded __mind_alloc or a quadratic route scan.
+//   - MAX_CATALOG_BYTES / MAX_WEIGHTS_BYTES gate the file size returned by
+//     rt_file_size before loader_load_* allocates the read buffer.
+//   - MAX_ROUTES bounds the audit-A3 uniqueness check (now an O(n log n)
+//     merge-sort of an index copy — see loader_parse_catalog) and its
+//     num_routes*8 scratch allocations: with the size cap already blocking
+//     small-file/huge-count truncation, this closes the moderate-file
+//     CPU/memory-exhaustion path.
+pub const MAX_CATALOG_BYTES: i64 = 67108864;   // 64 MiB
+pub const MAX_WEIGHTS_BYTES: i64 = 268435456;  // 256 MiB
+pub const MAX_ROUTES:        i64 = 65536;       // >> 4400/12k real catalogs
+
 // Catalog handle slot layout (single source of truth).
 pub const LOADER_CAT_SLOTS: i64 = 5;
 pub const LOADER_CAT_N:     i64 = 0;
@@ -114,6 +130,23 @@ fn ld_hash_eq(a: i64, b: i64) -> i64 {
         i = i + 1;
     }
     if diff == 0 { return 1; }
+    0
+}
+
+// Byte-lexicographic (unsigned) compare of two 32-byte route ids.
+// Returns -1 if a<b, 1 if a>b, 0 if equal. NOT constant-time (used only for
+// the O(n log n) duplicate-detection sort of an index copy, never on secrets).
+// The `& 255` normalises __mind_load_i8's sign-extension to an unsigned byte
+// so ordering is a pure byte comparison — deterministic across substrates.
+fn ld_id_cmp(a: i64, b: i64) -> i64 {
+    let mut i: i64 = 0;
+    while i < 32 {
+        let x: i64 = __mind_load_i8(a + i) & 255;
+        let y: i64 = __mind_load_i8(b + i) & 255;
+        if x < y { return -1; }
+        if x > y { return 1; }
+        i = i + 1;
+    }
     0
 }
 
@@ -217,6 +250,9 @@ pub fn loader_parse_catalog(bytes: i64, len: i64, cat: i64) -> i64 {
     if ld_u16(bytes, 6) != 0 { return LD_ERR_RESERVED; }
 
     let num_routes: i64 = ld_u32(bytes, 8);
+    // DoS cap (audit A3 scan is O(num_routes^2)) — reject an over-count
+    // header before allocating `ids` or entering the uniqueness scan.
+    if num_routes > MAX_ROUTES { return LD_ERR_SHAPE; }
     let embedding_dim: i64 = ld_u32(bytes, 12);
     if embedding_dim != ROUTE_EMBEDDING_DIM { return LD_ERR_SHAPE; }
 
@@ -232,18 +268,84 @@ pub fn loader_parse_catalog(bytes: i64, len: i64, cat: i64) -> i64 {
         i = i + 1;
     }
 
-    // Uniqueness (audit A3): first-duplicate-wins over (p, q < p) ascending.
-    let mut p: i64 = 0;
-    while p < num_routes {
-        let mut q: i64 = 0;
-        while q < p {
-            if ld_hash_eq(ids + p * 32, ids + q * 32) == 1 {
+    // Uniqueness (audit A3): reject any duplicate route id with LD_ERR_DUP_ROUTE.
+    // The former check was O(num_routes^2) (nested p,q<p scan) — gated only by
+    // MAX_ROUTES=65536, a ~2.1e9-compare CPU-DoS on a marketplace catalog well
+    // under MAX_CATALOG_BYTES. This is O(n log n): bottom-up merge-sort an INDEX
+    // permutation (a COPY) by byte-lexicographic route id, then scan adjacent
+    // pairs for equality. The accept/reject decision is identical (a duplicate
+    // exists iff two equal ids are adjacent after a total-order sort), and the
+    // sort touches only the `idx`/`tmp` scratch — the loaded `ids`/`emb`/`prior`
+    // rows keep FILE ORDER, so the catalog bytes and the canonical hash below
+    // are byte-identical. Deterministic: pure byte comparison, no data-dependent
+    // reordering beyond the total order. Guarded by num_routes>1 (0/1 rows can
+    // hold no duplicate and would otherwise trigger a zero-size scratch alloc).
+    if num_routes > 1 {
+        let idx: i64 = __mind_alloc(num_routes * 8);
+        let mut f: i64 = 0;
+        while f < num_routes {
+            __mind_store_i64(idx + f * 8, f);
+            f = f + 1;
+        }
+        let tmp: i64 = __mind_alloc(num_routes * 8);
+        let mut width: i64 = 1;
+        while width < num_routes {
+            let mut lo: i64 = 0;
+            while lo < num_routes {
+                let mut mid: i64 = lo + width;
+                if mid > num_routes { mid = num_routes; }
+                let mut hi: i64 = lo + width + width;
+                if hi > num_routes { hi = num_routes; }
+                let mut il: i64 = lo;
+                let mut ir: i64 = mid;
+                let mut w: i64 = lo;
+                while il < mid {
+                    if ir < hi {
+                        let li: i64 = __mind_load_i64(idx + il * 8);
+                        let ri: i64 = __mind_load_i64(idx + ir * 8);
+                        // <=: stable merge (deterministic; irrelevant to the
+                        // equality decision, retained for clarity).
+                        if ld_id_cmp(ids + li * 32, ids + ri * 32) <= 0 {
+                            __mind_store_i64(tmp + w * 8, li);
+                            il = il + 1;
+                        } else {
+                            __mind_store_i64(tmp + w * 8, ri);
+                            ir = ir + 1;
+                        }
+                    } else {
+                        __mind_store_i64(tmp + w * 8, __mind_load_i64(idx + il * 8));
+                        il = il + 1;
+                    }
+                    w = w + 1;
+                }
+                while ir < hi {
+                    __mind_store_i64(tmp + w * 8, __mind_load_i64(idx + ir * 8));
+                    ir = ir + 1;
+                    w = w + 1;
+                }
+                lo = lo + width + width;
+            }
+            let mut c: i64 = 0;
+            while c < num_routes {
+                __mind_store_i64(idx + c * 8, __mind_load_i64(tmp + c * 8));
+                c = c + 1;
+            }
+            width = width + width;
+        }
+        let mut d: i64 = 1;
+        while d < num_routes {
+            let a0: i64 = __mind_load_i64(idx + (d - 1) * 8);
+            let a1: i64 = __mind_load_i64(idx + d * 8);
+            if ld_id_cmp(ids + a0 * 32, ids + a1 * 32) == 0 {
+                __mind_free(tmp);
+                __mind_free(idx);
                 __mind_free(ids);
                 return LD_ERR_DUP_ROUTE;
             }
-            q = q + 1;
+            d = d + 1;
         }
-        p = p + 1;
+        __mind_free(tmp);
+        __mind_free(idx);
     }
 
     // Embeddings section (row-major i32 LE → i64 lanes).
@@ -511,6 +613,9 @@ pub fn loader_parse_weights(bytes: i64, len: i64, wtab: i64,
 pub fn loader_load_catalog(path: i64, path_len: i64, cat: i64) -> i64 {
     let size: i64 = rt_file_size(path, path_len);
     if size < 0 { return LD_ERR_IO; }
+    // Allocation-bomb guard: reject an oversize file before __mind_alloc so a
+    // hostile catalog cannot drive an unbounded allocation.
+    if size > MAX_CATALOG_BYTES { return LD_ERR_IO; }
     let buf: i64 = __mind_alloc(size);
     let got: i64 = rt_read_file(path, path_len, buf, size);
     if got != size {
@@ -526,6 +631,9 @@ pub fn loader_load_weights(path: i64, path_len: i64, wtab: i64,
                            model_hash_out: i64, tokenizer_hash_out: i64) -> i64 {
     let size: i64 = rt_file_size(path, path_len);
     if size < 0 { return LD_ERR_IO; }
+    // Allocation-bomb guard: reject an oversize file before __mind_alloc so a
+    // hostile weights file cannot drive an unbounded allocation.
+    if size > MAX_WEIGHTS_BYTES { return LD_ERR_IO; }
     let buf: i64 = __mind_alloc(size);
     let got: i64 = rt_read_file(path, path_len, buf, size);
     if got != size {

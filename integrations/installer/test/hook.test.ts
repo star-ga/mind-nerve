@@ -141,6 +141,7 @@ function baseEnv(args: {
     MIND_NERVE_PROJECTED_DIR: args.projected,
     MIND_NERVE_SOCKET: args.socket,
     MIND_NERVE_LOG: args.log,
+    MIND_NERVE_STATE_DIR: path.dirname(args.log),
     MIND_NERVE_AGENT_DIRS: "",
     MIND_NERVE_MIN_SCORE: args.minScore ?? "0.35",
     MIND_NERVE_TOP_K: args.topK ?? "8",
@@ -1117,6 +1118,76 @@ describe("hook daemon-provided kind/source_path", () => {
       const ctx = contextOf(run) ?? "";
       expect(ctx).not.toContain(outside);
       expect(ctx).not.toContain("escapee");
+    } finally {
+      await daemon.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Privacy defaults (codex final #30): logging/telemetry opt-in, no prompt bytes
+// ---------------------------------------------------------------------------
+
+describe("hook privacy defaults", () => {
+  it("writes nothing when MIND_NERVE_LOG / MIND_NERVE_TELEMETRY are unset", async () => {
+    const root = await makeTmp();
+    const hub = await makeHub(root, ["mind-nerve-router", "alpha"]);
+    const daemon = await startDaemon(root, {
+      kind: "reply",
+      body: JSON.stringify({ routes: [route("alpha", 0.9)] }),
+    });
+    try {
+      const env = baseEnv({
+        hub,
+        projected: path.join(root, "skills"),
+        socket: daemon.socketPath,
+        log: path.join(root, "hook.log"),
+      });
+      env.MIND_NERVE_LOG = "";
+      env.MIND_NERVE_TELEMETRY = "";
+      const run = await runHook(JSON.stringify({ prompt: "alpha work" }), env);
+      expect(run.code).toBe(0);
+      // Routing still works; nothing was persisted anywhere under root.
+      expect(contextOf(run) ?? "").toContain("alpha");
+      const files = (await fs.readdir(root)).filter(
+        (f) => f.includes("log") || f.includes("telemetry"),
+      );
+      expect(files).toEqual([]);
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  it("never persists prompt bytes even when logging is enabled", async () => {
+    const root = await makeTmp();
+    const hub = await makeHub(root, ["mind-nerve-router", "alpha"]);
+    const daemon = await startDaemon(root, {
+      kind: "reply",
+      body: JSON.stringify({ routes: [route("alpha", 0.9)] }),
+    });
+    const logPath = path.join(root, "hook.log");
+    const telemetryPath = path.join(root, "telemetry.jsonl");
+    const SECRET = "s3cr3t-c0de-phr4se-xyzzy";
+    try {
+      const env = {
+        ...baseEnv({
+          hub,
+          projected: path.join(root, "skills"),
+          socket: daemon.socketPath,
+          log: logPath,
+        }),
+        MIND_NERVE_TELEMETRY: telemetryPath,
+      };
+      const run = await runHook(
+        JSON.stringify({ prompt: `alpha work with ${SECRET} inside` }),
+        env,
+      );
+      expect(run.code).toBe(0);
+      const logBody = await fs.readFile(logPath, "utf8");
+      const telemetryBody = await fs.readFile(telemetryPath, "utf8");
+      expect(logBody).not.toContain(SECRET);
+      expect(telemetryBody).not.toContain(SECRET);
+      expect(telemetryBody).toContain("query_sha");
     } finally {
       await daemon.close();
     }

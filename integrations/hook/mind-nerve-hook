@@ -246,14 +246,14 @@ SOCKET_TIMEOUT = _env_float("MIND_NERVE_SOCKET_TIMEOUT", 2.0)
 CORE_ALWAYS_ON = tuple(
     _env_list("MIND_NERVE_CORE_SKILLS", ROUTER_NAME, ",")
 ) or (ROUTER_NAME,)
-LOG_PATH = Path(
-    os.environ.get("MIND_NERVE_LOG", os.path.join(_HOME, ".mind-nerve", "hook.log"))
+STATE_DIR = Path(
+    os.environ.get("MIND_NERVE_STATE_DIR", os.path.join(_HOME, ".mind-nerve"))
 )
-TELEMETRY_PATH = Path(
-    os.environ.get(
-        "MIND_NERVE_TELEMETRY", os.path.join(_HOME, ".mind-nerve", "telemetry.jsonl")
-    )
-)
+# Logging and telemetry are OPT-IN (privacy contract: "prompt persistence
+# none", "logging opt-in"): empty path = disabled. The installer no longer
+# exports MIND_NERVE_LOG into hook wrappers (codex final #30).
+LOG_PATH = os.environ.get("MIND_NERVE_LOG", "")
+TELEMETRY_PATH = os.environ.get("MIND_NERVE_TELEMETRY", "")
 
 _slug_re = re.compile(r"[^a-z0-9]+")
 
@@ -271,29 +271,36 @@ PROMPT_EVENTS = {
 
 
 def log(record: dict) -> None:
-    """Best-effort JSONL log. Never raises."""
+    """Best-effort JSONL log. Opt-in: no-op unless MIND_NERVE_LOG is set."""
+    if not LOG_PATH:
+        return
     try:
-        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        p = Path(LOG_PATH)
+        p.parent.mkdir(parents=True, exist_ok=True)
         record["ts"] = time.time()
-        with LOG_PATH.open("a") as f:
+        with p.open("a") as f:
             f.write(json.dumps(record) + "\n")
     except Exception:
         pass
 
 
 def telemetry(record: dict) -> None:
-    """Append one routing-decision line. Local file, no network. Never raises.
+    """Append one routing-decision line. Opt-in: no-op unless
+    MIND_NERVE_TELEMETRY is set. Local file, no network. Never raises.
 
     Nothing previously recorded what was injected versus what was actually
     used, so no change to the router could be measured and there was no
     labelled data to calibrate against. This is that record; the companion
     `mind-nerve-observe` hook appends the `skill_read` half.
     """
+    if not TELEMETRY_PATH:
+        return
     try:
-        TELEMETRY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        p = Path(TELEMETRY_PATH)
+        p.parent.mkdir(parents=True, exist_ok=True)
         record.setdefault("ts", time.time())
         record.setdefault("v", 1)
-        with TELEMETRY_PATH.open("a") as f:
+        with p.open("a") as f:
             f.write(json.dumps(record) + "\n")
     except Exception:
         pass
@@ -1103,14 +1110,15 @@ SESSION_START_CONTEXT = (
 def _session_banner_due() -> bool:
     """Throttle the SessionStart banner; the projection runs regardless.
 
-    The sentinel lives next to the hook log so a redirected MIND_NERVE_LOG
-    (tests, per-CLI state) gets an independent banner clock. Best-effort: any
+    The sentinel lives in the state dir (MIND_NERVE_STATE_DIR, default
+    ~/.mind-nerve) so tests and per-CLI state get an independent banner
+    clock. Best-effort: any
     filesystem error means 'due' — a spurious banner costs a few tokens, a
     spuriously suppressed one costs orientation.
     """
     if SESSION_BANNER_MIN_INTERVAL_S <= 0:
         return True
-    sentinel = LOG_PATH.parent / "last_session_banner"
+    sentinel = STATE_DIR / "last_session_banner"
     try:
         last = float(sentinel.read_text().strip())
     except Exception:
@@ -1160,7 +1168,7 @@ def main() -> None:
         # Emit nothing and touch nothing. The previous projection stays exactly
         # as it was, which is the correct state: the user did not ask for
         # anything new, so the skills from their actual last request remain.
-        log({"event": "intent_skip", "reason": reason, "prompt_head": raw_prompt[:80]})
+        log({"event": "intent_skip", "reason": reason, "query_sha": query_digest(raw_prompt)})
         telemetry(
             {
                 "event": "route_decision",
@@ -1178,7 +1186,7 @@ def main() -> None:
     routes = query_daemon(prompt, OVERFETCH)
     if routes is None:
         # Daemon absent / timed out / malformed — pass through untouched.
-        log({"event": "passthrough", "prompt_head": prompt[:80]})
+        log({"event": "passthrough", "query_sha": query_digest(prompt)})
         telemetry(
             {
                 "event": "route_decision",
@@ -1216,7 +1224,7 @@ def main() -> None:
             "kept": len(kept),
             "projected": n,
             "top": [r.get("name") for r in kept[:5]],
-            "prompt_head": prompt[:100],
+            "query_sha": query_digest(prompt),
             "ms": int((time.time() - t0) * 1000),
         }
     )

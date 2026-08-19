@@ -1,0 +1,950 @@
+// src/mcp.mind — native `mcp` subcommand (stdio JSON-RPC MCP server).
+//
+// PURE-MIND PORT (track B, step 1): folds python/mind_nerve/mcp_server.py
+// (218 lines) into the mind-nerve single binary as a content-sniffed `mcp`
+// mode. cli/main.mind dispatches here when stdin's first byte is `{` (0x7B);
+// mic@2 preselect frames start with `m` (0x6D), so the frozen preselect path
+// is byte-for-byte unaffected.
+//
+// PROTOCOL (JSON-RPC 2.0 over line-delimited stdin, matching the Python
+// server's shapes):
+//   initialize                 -> protocolVersion/serverInfo/capabilities
+//   notifications/initialized  -> no reply (notification)
+//   tools/list                 -> the single `mind_nerve_route` tool
+//   tools/call name=mind_nerve_route args={query,top_k}
+//                              -> top-K in-process route ids + Q16.16 scores
+//   <anything else>            -> JSON-RPC error -32601
+//   <malformed line>           -> JSON-RPC error -32700 (id null)
+//
+// DoS-HARDENING BY CONSTRUCTION:
+//   - stdin is capped at MN_MAX_STDIN_BYTES (64 KiB) by cli/main.mind before
+//     a single byte reaches this module.
+//   - the JSON scanner is DEPTH-CAPPED (MCP_MAX_JSON_DEPTH) and its value-skip
+//     is ITERATIVE (no recursion, so no stack-depth attack) and string-aware
+//     (brackets inside strings never move the depth counter).
+//   - the query unescape buffer is LENGTH-CAPPED (MCP_QUERY_CAP); an
+//     over-long query is rejected as -32602, never a heap blowup.
+//
+// TWO DELIBERATE LIMITS OF STEP 1 (each flagged for U1 to lift):
+//   1. BATCH-ONLY LOOP. src/runtime_ffi.mind's rt_read_stdin loops until the
+//      buffer is full OR EOF (see mind/runtime/nerve_rt_shims.c) — it cannot
+//      return one line at a time, so a LIVE interactive client that waits for
+//      each response before sending the next would block. This module
+//      therefore processes a whole buffered batch (all newline-delimited
+//      messages up to EOF), which is exactly what the golden-transcript replay
+//      and any client that half-closes stdin need. A live interactive server
+//      needs a NEW streaming shim (rt_read_line / rt_read_avail) — flagged.
+//   2. tools/call ROUTE PATH is fully wired (tokenize -> load -> infer ->
+//      format) in mcp_route_compute, but model/catalog paths cannot be
+//      resolved without a getenv/argv shim (none exists — adding an extern
+//      would break the native link and fail the compile gate). Until that
+//      shim lands, MN_MCP_PATHS_READY stays 0 and tools/call FAILS CLOSED with
+//      an explicit `unavailable` payload (mirrors the Python daemon-down
+//      branch). No machine-specific path is baked into the OSS binary.
+//
+// NATIVE-vs-PYTHON SEMANTICS (intentional divergence — see the gate spec in
+// tests/harness/mcp_golden.sh): the native tool ranks IN-PROCESS with the
+// deterministic Q16.16 preselector, so its `tools/list` description carries no
+// daemon/fail-closed/Windows-fallback language, and `tools/call` returns route
+// *ids* (32-byte SHA-256, hex) with fixed-point scores rather than the
+// daemon's route metadata. The JSON-RPC framing, protocolVersion, error codes,
+// and id-echo ARE identical to Python and are the byte-compared subset.
+
+import src.lib;
+import src.runtime_ffi;
+import src.tokenizer;
+import src.loader;
+import src.inference;
+import mind.luts.exp_q16;
+import mind.luts.sqrt_q16;
+
+// ---------------------------------------------------------------------------
+// Tunables
+// ---------------------------------------------------------------------------
+
+const MCP_MAX_JSON_DEPTH: i64 = 32;
+const MCP_QUERY_CAP:      i64 = 8192;   // unescaped query bytes; > => -32602
+const MCP_RESP_CAP:       i64 = 16384;  // per-response scratch (64 routes fit)
+// Max bytes of the request `id` token echoed verbatim into a MCP_RESP_CAP
+// response buffer. The id is copied byte-for-byte by mcp_put_id, so an
+// uncapped id (attacker sends {"id":<40000 digits>,...}, which fits the 64 KiB
+// stdin cap) would overrun the 16 KiB response buffer. 512 >> any real
+// JSON-RPC client id (ints, uuids); an over-long id echoes null (see
+// mcp_handle_line). Mirrors the MCP_QUERY_CAP guard on the sibling query field.
+const MCP_ID_CAP:         i64 = 512;
+const MCP_DEFAULT_TOP_K:  i64 = 5;
+const MCP_PATH_CAP:       i64 = 4096;   // constructed bundle-path byte cap
+
+// WIRED (2026-08-17): tools/call resolves the model + catalog bundle from
+// $MIND_NERVE_RUNTIME_DIR via rt_getenv (src/runtime_ffi.mind) and ranks
+// in-process. Still FAILS CLOSED (explicit `unavailable` payload, never a
+// crash, no baked path) when the env var is unset (rt_getenv => -2) or the
+// bundle is absent / not the native MNC1/MNW1 format the loader requires.
+const MN_MCP_PATHS_READY: i64 = 1;
+
+// JSON-RPC error codes (match the Python server).
+const MCP_ERR_PARSE:      i64 = -32700;
+const MCP_ERR_METHOD:     i64 = -32601;
+const MCP_ERR_PARAMS:     i64 = -32602;
+
+// AUTO-GENERATED literal blob (gen_lit.py). 1100 bytes.
+const MCP_LIT: [i64; 1100] = [
+    123,34,106,115,111,110,114,112,99,34,58,34,50,46,48,34,44,34,105,100,
+    34,58,44,34,114,101,115,117,108,116,34,58,123,34,112,114,111,116,111,99,
+    111,108,86,101,114,115,105,111,110,34,58,34,50,48,50,52,45,49,49,45,
+    48,53,34,44,34,115,101,114,118,101,114,73,110,102,111,34,58,123,34,110,
+    97,109,101,34,58,34,109,105,110,100,45,110,101,114,118,101,45,109,99,112,
+    34,44,34,118,101,114,115,105,111,110,34,58,34,48,46,51,46,48,98,57,
+    34,125,44,34,99,97,112,97,98,105,108,105,116,105,101,115,34,58,123,34,
+    116,111,111,108,115,34,58,123,34,108,105,115,116,67,104,97,110,103,101,100,
+    34,58,102,97,108,115,101,125,125,125,125,10,44,34,114,101,115,117,108,116,
+    34,58,123,34,116,111,111,108,115,34,58,91,123,34,110,97,109,101,34,58,
+    34,109,105,110,100,95,110,101,114,118,101,95,114,111,117,116,101,34,44,34,
+    100,101,115,99,114,105,112,116,105,111,110,34,58,34,82,101,116,117,114,110,
+    32,116,104,101,32,116,111,112,45,75,32,109,111,115,116,32,114,101,108,101,
+    118,97,110,116,32,115,107,105,108,108,47,116,111,111,108,47,97,103,101,110,
+    116,32,114,111,117,116,101,115,32,102,111,114,32,97,32,113,117,101,114,121,
+    44,32,114,97,110,107,101,100,32,105,110,45,112,114,111,99,101,115,115,32,
+    98,121,32,116,104,101,32,109,105,110,100,45,110,101,114,118,101,32,112,114,
+    101,115,101,108,101,99,116,111,114,32,40,100,101,116,101,114,109,105,110,105,
+    115,116,105,99,32,81,49,54,46,49,54,44,32,98,105,116,45,105,100,101,
+    110,116,105,99,97,108,32,97,99,114,111,115,115,32,67,80,85,47,65,82,
+    77,41,46,32,82,101,116,117,114,110,115,32,114,111,117,116,101,32,105,100,
+    115,32,119,105,116,104,32,102,105,120,101,100,45,112,111,105,110,116,32,115,
+    99,111,114,101,115,46,34,44,34,105,110,112,117,116,83,99,104,101,109,97,
+    34,58,123,34,116,121,112,101,34,58,34,111,98,106,101,99,116,34,44,34,
+    112,114,111,112,101,114,116,105,101,115,34,58,123,34,113,117,101,114,121,34,
+    58,123,34,116,121,112,101,34,58,34,115,116,114,105,110,103,34,44,34,100,
+    101,115,99,114,105,112,116,105,111,110,34,58,34,84,104,101,32,117,115,101,
+    114,32,114,101,113,117,101,115,116,32,47,32,105,110,116,101,110,116,46,34,
+    125,44,34,116,111,112,95,107,34,58,123,34,116,121,112,101,34,58,34,105,
+    110,116,101,103,101,114,34,44,34,100,101,102,97,117,108,116,34,58,53,44,
+    34,109,105,110,105,109,117,109,34,58,49,44,34,109,97,120,105,109,117,109,
+    34,58,54,52,125,125,44,34,114,101,113,117,105,114,101,100,34,58,91,34,
+    113,117,101,114,121,34,93,125,125,93,125,125,10,44,34,101,114,114,111,114,
+    34,58,123,34,99,111,100,101,34,58,44,34,109,101,115,115,97,103,101,34,
+    58,34,34,125,125,10,44,34,114,101,115,117,108,116,34,58,123,34,99,111,
+    110,116,101,110,116,34,58,91,123,34,116,121,112,101,34,58,34,116,101,120,
+    116,34,44,34,116,101,120,116,34,58,34,123,92,34,116,111,112,95,107,92,
+    34,58,44,92,34,114,111,117,116,101,115,92,34,58,91,123,92,34,105,100,
+    92,34,58,92,34,92,34,44,92,34,115,99,111,114,101,95,113,49,54,92,
+    34,58,125,93,44,92,34,115,101,114,118,101,100,95,98,121,92,34,58,92,
+    34,105,110,45,112,114,111,99,101,115,115,32,40,110,97,116,105,118,101,41,
+    92,34,125,34,125,93,125,125,10,44,92,34,114,111,117,116,101,115,92,34,
+    58,91,93,44,92,34,115,101,114,118,101,100,95,98,121,92,34,58,92,34,
+    117,110,97,118,97,105,108,97,98,108,101,92,34,44,92,34,101,114,114,111,
+    114,92,34,58,92,34,114,111,117,116,101,32,98,117,110,100,108,101,32,110,
+    111,116,32,99,111,110,102,105,103,117,114,101,100,92,34,125,34,125,93,125,
+    125,10,110,117,108,108,105,110,105,116,105,97,108,105,122,101,110,111,116,105,
+    102,105,99,97,116,105,111,110,115,47,105,110,105,116,105,97,108,105,122,101,
+    100,116,111,111,108,115,47,108,105,115,116,116,111,111,108,115,47,99,97,108,
+    108,109,101,116,104,111,100,105,100,112,97,114,97,109,115,110,97,109,101,97,
+    114,103,117,109,101,110,116,115,113,117,101,114,121,116,111,112,95,107,109,105,
+    110,100,95,110,101,114,118,101,95,114,111,117,116,101,109,101,116,104,111,100,
+    32,110,111,116,32,102,111,117,110,100,117,110,107,110,111,119,110,32,116,111,
+    111,108,109,105,115,115,105,110,103,32,113,117,101,114,121,113,117,101,114,121,
+    32,116,111,111,32,108,111,110,103,112,97,114,115,101,32,101,114,114,111,114,
+];
+
+const LIT_PREFIX_OFF: i64 = 0;
+const LIT_PREFIX_LEN: i64 = 22;
+const LIT_INIT_SUFFIX_OFF: i64 = 22;
+const LIT_INIT_SUFFIX_LEN: i64 = 150;
+const LIT_TOOLS_SUFFIX_OFF: i64 = 172;
+const LIT_TOOLS_SUFFIX_LEN: i64 = 481;
+const LIT_ERR_MID_OFF: i64 = 653;
+const LIT_ERR_MID_LEN: i64 = 17;
+const LIT_ERR_MID2_OFF: i64 = 670;
+const LIT_ERR_MID2_LEN: i64 = 12;
+const LIT_ERR_SUFFIX_OFF: i64 = 682;
+const LIT_ERR_SUFFIX_LEN: i64 = 4;
+const LIT_CALL_A_OFF: i64 = 686;
+const LIT_CALL_A_LEN: i64 = 56;
+const LIT_CALL_B_OFF: i64 = 742;
+const LIT_CALL_B_LEN: i64 = 13;
+const LIT_ROUTE_A_OFF: i64 = 755;
+const LIT_ROUTE_A_LEN: i64 = 10;
+const LIT_ROUTE_B_OFF: i64 = 765;
+const LIT_ROUTE_B_LEN: i64 = 17;
+const LIT_ROUTE_C_OFF: i64 = 782;
+const LIT_ROUTE_C_LEN: i64 = 1;
+const LIT_CALL_C_OFF: i64 = 783;
+const LIT_CALL_C_LEN: i64 = 46;
+const LIT_UNAVAIL_TAIL_OFF: i64 = 829;
+const LIT_UNAVAIL_TAIL_LEN: i64 = 93;
+const LIT_NULL_OFF: i64 = 922;
+const LIT_NULL_LEN: i64 = 4;
+const LIT_M_INIT_OFF: i64 = 926;
+const LIT_M_INIT_LEN: i64 = 10;
+const LIT_M_NOTIF_OFF: i64 = 936;
+const LIT_M_NOTIF_LEN: i64 = 25;
+const LIT_M_TLIST_OFF: i64 = 961;
+const LIT_M_TLIST_LEN: i64 = 10;
+const LIT_M_TCALL_OFF: i64 = 971;
+const LIT_M_TCALL_LEN: i64 = 10;
+const LIT_K_METHOD_OFF: i64 = 981;
+const LIT_K_METHOD_LEN: i64 = 6;
+const LIT_K_ID_OFF: i64 = 987;
+const LIT_K_ID_LEN: i64 = 2;
+const LIT_K_PARAMS_OFF: i64 = 989;
+const LIT_K_PARAMS_LEN: i64 = 6;
+const LIT_K_NAME_OFF: i64 = 995;
+const LIT_K_NAME_LEN: i64 = 4;
+const LIT_K_ARGS_OFF: i64 = 999;
+const LIT_K_ARGS_LEN: i64 = 9;
+const LIT_K_QUERY_OFF: i64 = 1008;
+const LIT_K_QUERY_LEN: i64 = 5;
+const LIT_K_TOPK_OFF: i64 = 1013;
+const LIT_K_TOPK_LEN: i64 = 5;
+const LIT_T_ROUTE_OFF: i64 = 1018;
+const LIT_T_ROUTE_LEN: i64 = 16;
+const LIT_EM_METHOD_OFF: i64 = 1034;
+const LIT_EM_METHOD_LEN: i64 = 16;
+const LIT_EM_TOOL_OFF: i64 = 1050;
+const LIT_EM_TOOL_LEN: i64 = 12;
+const LIT_EM_QMISS_OFF: i64 = 1062;
+const LIT_EM_QMISS_LEN: i64 = 13;
+const LIT_EM_QLONG_OFF: i64 = 1075;
+const LIT_EM_QLONG_LEN: i64 = 14;
+const LIT_EM_PARSE_OFF: i64 = 1089;
+const LIT_EM_PARSE_LEN: i64 = 11;
+
+// AUTO-GENERATED literal blob #2 (gen_lit2.py). 128 bytes.
+// Env var name + bundle filenames + the catalog_size field fragments that the
+// getenv-wired tools/call success payload emits.
+const MCP_LIT2: [i64; 128] = [
+    77,73,78,68,95,78,69,82,86,69,95,82,85,78,84,73,77,69,95,68,
+    73,82,47,101,110,99,111,100,101,114,95,119,101,105,103,104,116,115,46,113,
+    49,54,46,98,105,110,47,114,111,117,116,101,95,116,97,98,108,101,46,106,
+    115,111,110,108,93,44,92,34,99,97,116,97,108,111,103,95,115,105,122,101,
+    92,34,58,44,92,34,115,101,114,118,101,100,95,98,121,92,34,58,92,34,
+    105,110,45,112,114,111,99,101,115,115,32,40,110,97,116,105,118,101,41,92,
+    34,125,34,125,93,125,125,10,
+];
+
+const L2_ENV_OFF: i64 = 0;
+const L2_ENV_LEN: i64 = 22;
+const L2_FMODEL_OFF: i64 = 22;
+const L2_FMODEL_LEN: i64 = 24;
+const L2_FCAT_OFF: i64 = 46;
+const L2_FCAT_LEN: i64 = 18;
+const L2_CC1_OFF: i64 = 64;
+const L2_CC1_LEN: i64 = 19;
+const L2_CC2_OFF: i64 = 83;
+const L2_CC2_LEN: i64 = 45;
+
+// ---------------------------------------------------------------------------
+// Byte / builder helpers (mirrors cli/main.mind; kept local so main.mind's
+// private helpers stay private and this module is self-contained).
+// ---------------------------------------------------------------------------
+
+fn mcp_byte(addr: i64) -> i64 {
+    __mind_load_i8(addr) & 255
+}
+
+fn mcp_put(buf: i64, off: i64, val: i64) -> i64 {
+    __mind_store_i8(buf + off, val & 255);
+    off + 1
+}
+
+// Copy MCP_LIT[lit_off .. lit_off+lit_len) into buf at off; return new off.
+fn mcp_put_lit(buf: i64, off: i64, lit_off: i64, lit_len: i64) -> i64 {
+    let mut o: i64 = off;
+    let mut i: i64 = 0;
+    while i < lit_len {
+        o = mcp_put(buf, o, MCP_LIT[lit_off + i]);
+        i = i + 1;
+    }
+    o
+}
+
+// Copy MCP_LIT2[lit_off .. lit_off+lit_len) into buf at off; return new off.
+fn mcp_put_lit2(buf: i64, off: i64, lit_off: i64, lit_len: i64) -> i64 {
+    let mut o: i64 = off;
+    let mut i: i64 = 0;
+    while i < lit_len {
+        o = mcp_put(buf, o, MCP_LIT2[lit_off + i]);
+        i = i + 1;
+    }
+    o
+}
+
+// Signed decimal (id codes, top_k, token counts, scores).
+fn mcp_put_dec(buf: i64, off: i64, val: i64) -> i64 {
+    let mut o: i64 = off;
+    let mut v: i64 = val;
+    if v < 0 { o = mcp_put(buf, o, 45); v = -v; }
+    if v == 0 { return mcp_put(buf, o, 48); }
+    let scratch: i64 = __mind_alloc(24);
+    let mut n: i64 = v;
+    let mut d: i64 = 0;
+    while n > 0 {
+        __mind_store_i8(scratch + d, 48 + (n % 10));
+        n = n / 10;
+        d = d + 1;
+    }
+    let mut j: i64 = d - 1;
+    while j >= 0 {
+        o = mcp_put(buf, o, __mind_load_i8(scratch + j) & 255);
+        j = j - 1;
+    }
+    __mind_free(scratch);
+    o
+}
+
+fn mcp_hexdig(v: i64) -> i64 {
+    if v < 10 { return 48 + v; }
+    97 + (v - 10)
+}
+
+// 32 raw bytes at src -> 64 lowercase hex chars.
+fn mcp_put_hex32(buf: i64, off: i64, src: i64) -> i64 {
+    let mut o: i64 = off;
+    let mut i: i64 = 0;
+    while i < 32 {
+        let b: i64 = __mind_load_i8(src + i) & 255;
+        o = mcp_put(buf, o, mcp_hexdig((b >> 4) & 15));
+        o = mcp_put(buf, o, mcp_hexdig(b & 15));
+        i = i + 1;
+    }
+    o
+}
+
+// [addr, addr+len) == MCP_LIT[loff, loff+llen) ?
+fn mcp_eq_lit(addr: i64, len: i64, loff: i64, llen: i64) -> i64 {
+    if len != llen { return 0; }
+    let mut i: i64 = 0;
+    while i < len {
+        if mcp_byte(addr + i) != MCP_LIT[loff + i] { return 0; }
+        i = i + 1;
+    }
+    1
+}
+
+// ---------------------------------------------------------------------------
+// JSON scanner (operates on absolute addresses into the stdin buffer).
+// ---------------------------------------------------------------------------
+
+fn json_skip_ws(p: i64, end: i64) -> i64 {
+    let mut i: i64 = p;
+    let mut go: i64 = 1;
+    while go == 1 {
+        if i >= end { go = 0; }
+        else {
+            let c: i64 = mcp_byte(i);
+            if c == 32 || c == 9 || c == 13 || c == 10 { i = i + 1; }
+            else { go = 0; }
+        }
+    }
+    i
+}
+
+// p at opening '"'. Return index PAST the closing quote, or -1 if unterminated.
+fn json_skip_string(p: i64, end: i64) -> i64 {
+    let mut i: i64 = p + 1;
+    let mut res: i64 = -1;
+    let mut go: i64 = 1;
+    while go == 1 {
+        if i >= end { go = 0; }
+        else {
+            let c: i64 = mcp_byte(i);
+            if c == 92 { i = i + 2; }        // escaped char (skip both)
+            else if c == 34 { res = i + 1; go = 0; }
+            else { i = i + 1; }
+        }
+    }
+    res
+}
+
+// p at opening '"'. Return index OF the closing quote (span = [p+1, ret)), or
+// -1 if unterminated. Used for raw key comparison.
+fn json_string_close(p: i64, end: i64) -> i64 {
+    let mut i: i64 = p + 1;
+    let mut res: i64 = -1;
+    let mut go: i64 = 1;
+    while go == 1 {
+        if i >= end { go = 0; }
+        else {
+            let c: i64 = mcp_byte(i);
+            if c == 92 { i = i + 2; }
+            else if c == 34 { res = i; go = 0; }
+            else { i = i + 1; }
+        }
+    }
+    res
+}
+
+// Skip an object/array starting AT p (p == '{' or '['). Iterative + string-
+// aware + depth-capped. Returns index past the matching close, or -1
+// (unterminated OR depth > maxdepth). No recursion => no stack attack.
+fn json_skip_container(p: i64, end: i64, maxdepth: i64) -> i64 {
+    let mut i: i64 = p;
+    let mut depth: i64 = 0;
+    let mut instr: i64 = 0;
+    let mut res: i64 = -1;
+    let mut go: i64 = 1;
+    while go == 1 {
+        if i >= end { go = 0; }
+        else {
+            let c: i64 = mcp_byte(i);
+            if instr == 1 {
+                if c == 92 { i = i + 1; }     // escaped char inside string
+                else if c == 34 { instr = 0; }
+            } else {
+                if c == 34 { instr = 1; }
+                else if c == 123 || c == 91 {
+                    depth = depth + 1;
+                    if depth > maxdepth { res = -1; go = 0; }
+                } else if c == 125 || c == 93 {
+                    depth = depth - 1;
+                    if depth == 0 { res = i + 1; go = 0; }
+                }
+            }
+            if go == 1 { i = i + 1; }
+        }
+    }
+    res
+}
+
+// Skip any JSON value (after optional ws). Returns index past the value, or -1.
+fn json_skip_value(p: i64, end: i64, maxdepth: i64) -> i64 {
+    let q: i64 = json_skip_ws(p, end);
+    if q >= end { return -1; }
+    let c: i64 = mcp_byte(q);
+    if c == 123 || c == 91 { return json_skip_container(q, end, maxdepth); }
+    if c == 34 { return json_skip_string(q, end); }
+    // scalar: number / true / false / null — up to a delimiter.
+    let mut i: i64 = q;
+    let mut go: i64 = 1;
+    while go == 1 {
+        if i >= end { go = 0; }
+        else {
+            let d: i64 = mcp_byte(i);
+            if d == 44 || d == 125 || d == 93 || d == 32 || d == 9 || d == 13 || d == 10 {
+                go = 0;
+            } else { i = i + 1; }
+        }
+    }
+    i
+}
+
+// Find `key` in the object at objp (objp == '{'). Returns the address of the
+// value (after ws), or -1 if absent/malformed. Keys are compared RAW (no
+// unescape): a hostile \u-escaped key simply fails to match and its member is
+// skipped — safe, never a crash. The known MCP keys are plain ASCII.
+fn json_obj_find(objp: i64, end: i64, koff: i64, klen: i64) -> i64 {
+    let q: i64 = json_skip_ws(objp, end);
+    if q >= end { return -1; }
+    if mcp_byte(q) != 123 { return -1; }
+    let mut i: i64 = q + 1;
+    let mut result: i64 = -1;
+    let mut go: i64 = 1;
+    while go == 1 {
+        i = json_skip_ws(i, end);
+        if i >= end { go = 0; }
+        else if mcp_byte(i) == 125 { go = 0; }        // '}'
+        else if mcp_byte(i) != 34 { go = 0; }         // expected key string
+        else {
+            let ke: i64 = json_string_close(i, end);
+            if ke < 0 { go = 0; }
+            else {
+                let ks: i64 = i + 1;
+                let kl: i64 = ke - ks;
+                let colon: i64 = json_skip_ws(ke + 1, end);
+                if colon >= end { go = 0; }
+                else if mcp_byte(colon) != 58 { go = 0; }   // ':'
+                else {
+                    let vp: i64 = json_skip_ws(colon + 1, end);
+                    if mcp_eq_lit(ks, kl, koff, klen) == 1 {
+                        result = vp;
+                        go = 0;
+                    } else {
+                        let ve: i64 = json_skip_value(vp, end, MCP_MAX_JSON_DEPTH);
+                        if ve < 0 { go = 0; }
+                        else {
+                            let nx: i64 = json_skip_ws(ve, end);
+                            if nx >= end { go = 0; }
+                            else if mcp_byte(nx) == 44 { i = nx + 1; }  // ',' next
+                            else { go = 0; }                            // '}' / bad
+                        }
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+
+// Parse a 4-hex-digit sequence at addr into a value, or -1 on a non-hex digit.
+fn json_hex4(addr: i64, end: i64) -> i64 {
+    if addr + 4 > end { return -1; }
+    let mut v: i64 = 0;
+    let mut i: i64 = 0;
+    while i < 4 {
+        let c: i64 = mcp_byte(addr + i);
+        let mut d: i64 = -1;
+        if c >= 48 && c <= 57 { d = c - 48; }
+        else if c >= 97 && c <= 102 { d = c - 97 + 10; }
+        else if c >= 65 && c <= 70 { d = c - 65 + 10; }
+        if d < 0 { return -1; }
+        v = v * 16 + d;
+        i = i + 1;
+    }
+    v
+}
+
+// Encode a Unicode scalar as UTF-8 into out at o (cap-bounded). Returns new o,
+// or -1 on overflow.
+fn json_utf8_put(out: i64, o: i64, cap: i64, cp: i64) -> i64 {
+    if cp < 128 {
+        if o >= cap { return -1; }
+        __mind_store_i8(out + o, cp);
+        return o + 1;
+    }
+    if cp < 2048 {
+        if o + 2 > cap { return -1; }
+        __mind_store_i8(out + o, 192 + (cp >> 6));
+        __mind_store_i8(out + o + 1, 128 + (cp & 63));
+        return o + 2;
+    }
+    if cp < 65536 {
+        if o + 3 > cap { return -1; }
+        __mind_store_i8(out + o, 224 + (cp >> 12));
+        __mind_store_i8(out + o + 1, 128 + ((cp >> 6) & 63));
+        __mind_store_i8(out + o + 2, 128 + (cp & 63));
+        return o + 3;
+    }
+    if o + 4 > cap { return -1; }
+    __mind_store_i8(out + o, 240 + (cp >> 18));
+    __mind_store_i8(out + o + 1, 128 + ((cp >> 12) & 63));
+    __mind_store_i8(out + o + 2, 128 + ((cp >> 6) & 63));
+    __mind_store_i8(out + o + 3, 128 + (cp & 63));
+    o + 4
+}
+
+// Unescape the JSON string at p (p == '"') into out (cap bytes). Returns the
+// byte length written (>= 0), or -1 on overflow / malformed escape. Handles
+// \" \\ \/ \b \f \n \r \t and \uXXXX (incl. surrogate pairs; a lone/broken
+// surrogate becomes U+FFFD).
+fn json_unescape(p: i64, end: i64, out: i64, cap: i64) -> i64 {
+    let mut i: i64 = p + 1;
+    let mut o: i64 = 0;
+    let mut err: i64 = 0;
+    let mut go: i64 = 1;
+    while go == 1 {
+        if i >= end { err = 1; go = 0; }
+        else {
+            let c: i64 = mcp_byte(i);
+            if c == 34 { go = 0; }                    // closing quote
+            else if c == 92 {                         // backslash
+                if i + 1 >= end { err = 1; go = 0; }
+                else {
+                    let e: i64 = mcp_byte(i + 1);
+                    i = i + 2;
+                    if e == 34 || e == 92 || e == 47 {
+                        if o >= cap { err = 1; go = 0; } else { __mind_store_i8(out + o, e); o = o + 1; }
+                    } else if e == 110 {
+                        if o >= cap { err = 1; go = 0; } else { __mind_store_i8(out + o, 10); o = o + 1; }
+                    } else if e == 116 {
+                        if o >= cap { err = 1; go = 0; } else { __mind_store_i8(out + o, 9); o = o + 1; }
+                    } else if e == 114 {
+                        if o >= cap { err = 1; go = 0; } else { __mind_store_i8(out + o, 13); o = o + 1; }
+                    } else if e == 98 {
+                        if o >= cap { err = 1; go = 0; } else { __mind_store_i8(out + o, 8); o = o + 1; }
+                    } else if e == 102 {
+                        if o >= cap { err = 1; go = 0; } else { __mind_store_i8(out + o, 12); o = o + 1; }
+                    } else if e == 117 {
+                        let cp1: i64 = json_hex4(i, end);
+                        if cp1 < 0 { err = 1; go = 0; }
+                        else {
+                            i = i + 4;
+                            let mut cp: i64 = cp1;
+                            if cp1 >= 55296 && cp1 <= 56319 {         // high surrogate
+                                if i + 1 < end && mcp_byte(i) == 92 && mcp_byte(i + 1) == 117 {
+                                    let cp2: i64 = json_hex4(i + 2, end);
+                                    if cp2 >= 56320 && cp2 <= 57343 {
+                                        cp = 65536 + ((cp1 - 55296) * 1024) + (cp2 - 56320);
+                                        i = i + 6;
+                                    } else { cp = 65533; }             // U+FFFD
+                                } else { cp = 65533; }
+                            } else if cp1 >= 56320 && cp1 <= 57343 {   // lone low surrogate
+                                cp = 65533;
+                            }
+                            let no: i64 = json_utf8_put(out, o, cap, cp);
+                            if no < 0 { err = 1; go = 0; } else { o = no; }
+                        }
+                    } else { err = 1; go = 0; }        // invalid escape
+                }
+            } else {
+                if o >= cap { err = 1; go = 0; } else { __mind_store_i8(out + o, c); o = o + 1; i = i + 1; }
+            }
+        }
+    }
+    if err == 1 { return -1; }
+    o
+}
+
+// Parse a JSON integer at p (after ws) with a default. Clamps overflow.
+fn json_int_default(p: i64, end: i64, defv: i64) -> i64 {
+    let q: i64 = json_skip_ws(p, end);
+    if q >= end { return defv; }
+    let mut i: i64 = q;
+    let mut neg: i64 = 0;
+    if mcp_byte(i) == 45 { neg = 1; i = i + 1; }
+    if i >= end { return defv; }
+    if mcp_byte(i) < 48 || mcp_byte(i) > 57 { return defv; }
+    let mut acc: i64 = 0;
+    let mut go: i64 = 1;
+    while go == 1 {
+        if i >= end { go = 0; }
+        else {
+            let c: i64 = mcp_byte(i);
+            if c < 48 || c > 57 { go = 0; }
+            else {
+                acc = acc * 10 + (c - 48);
+                if acc > 1000000000 { acc = 1000000000; }   // clamp; caller re-clamps
+                i = i + 1;
+            }
+        }
+    }
+    if neg == 1 { return -acc; }
+    acc
+}
+
+// ---------------------------------------------------------------------------
+// Response emitters. Each builds one line into a scratch buffer and writes it
+// (Python appends "\n"; every literal suffix here already ends in 0x0A).
+// `id_off/id_len` echo the request id VERBATIM (int or string), or -1 => null.
+// ---------------------------------------------------------------------------
+
+fn mcp_put_id(buf: i64, off: i64, id_off: i64, id_len: i64) -> i64 {
+    if id_len < 0 {
+        return mcp_put_lit(buf, off, LIT_NULL_OFF, LIT_NULL_LEN);
+    }
+    let mut o: i64 = off;
+    let mut i: i64 = 0;
+    while i < id_len {
+        o = mcp_put(buf, o, mcp_byte(id_off + i));
+        i = i + 1;
+    }
+    o
+}
+
+fn mcp_emit(buf: i64, len: i64) -> i64 {
+    let _w: i64 = rt_write_stdout(buf, len);
+    0
+}
+
+// {"jsonrpc":"2.0","id":<id>,<suffix-lit>}
+fn mcp_emit_framed(id_off: i64, id_len: i64, suf_off: i64, suf_len: i64) -> i64 {
+    let buf: i64 = __mind_alloc(MCP_RESP_CAP);
+    let mut o: i64 = 0;
+    o = mcp_put_lit(buf, o, LIT_PREFIX_OFF, LIT_PREFIX_LEN);
+    o = mcp_put_id(buf, o, id_off, id_len);
+    o = mcp_put_lit(buf, o, suf_off, suf_len);
+    mcp_emit(buf, o);
+    __mind_free(buf);
+    0
+}
+
+// {"jsonrpc":"2.0","id":<id>,"error":{"code":<code>,"message":"<msg-lit>"}}
+fn mcp_emit_error(id_off: i64, id_len: i64, code: i64, msg_off: i64, msg_len: i64) -> i64 {
+    let buf: i64 = __mind_alloc(MCP_RESP_CAP);
+    let mut o: i64 = 0;
+    o = mcp_put_lit(buf, o, LIT_PREFIX_OFF, LIT_PREFIX_LEN);
+    o = mcp_put_id(buf, o, id_off, id_len);
+    o = mcp_put_lit(buf, o, LIT_ERR_MID_OFF, LIT_ERR_MID_LEN);   // ,"error":{"code":
+    o = mcp_put_dec(buf, o, code);
+    o = mcp_put_lit(buf, o, LIT_ERR_MID2_OFF, LIT_ERR_MID2_LEN); // ,"message":"
+    o = mcp_put_lit(buf, o, msg_off, msg_len);
+    o = mcp_put_lit(buf, o, LIT_ERR_SUFFIX_OFF, LIT_ERR_SUFFIX_LEN); // "}}\n
+    mcp_emit(buf, o);
+    __mind_free(buf);
+    0
+}
+
+// tools/call fail-closed payload (bundle not configured / load failed).
+fn mcp_emit_unavailable(id_off: i64, id_len: i64, k: i64) -> i64 {
+    let buf: i64 = __mind_alloc(MCP_RESP_CAP);
+    let mut o: i64 = 0;
+    o = mcp_put_lit(buf, o, LIT_PREFIX_OFF, LIT_PREFIX_LEN);
+    o = mcp_put_id(buf, o, id_off, id_len);
+    o = mcp_put_lit(buf, o, LIT_CALL_A_OFF, LIT_CALL_A_LEN);   // ...text":"{\"top_k\":
+    o = mcp_put_dec(buf, o, k);
+    o = mcp_put_lit(buf, o, LIT_UNAVAIL_TAIL_OFF, LIT_UNAVAIL_TAIL_LEN);
+    mcp_emit(buf, o);
+    __mind_free(buf);
+    0
+}
+
+// tools/call success payload: top-K route ids (hex) + Q16.16 scores +
+// catalog_size (num_routes in the loaded catalog). out_ids: k32 raw route-id
+// bytes; out_scores: k i64 lanes (low 32 = Q16.16).
+fn mcp_emit_routes(id_off: i64, id_len: i64, k: i64, out_ids: i64, out_scores: i64,
+                   catalog_size: i64) -> i64 {
+    let buf: i64 = __mind_alloc(MCP_RESP_CAP);
+    let mut o: i64 = 0;
+    o = mcp_put_lit(buf, o, LIT_PREFIX_OFF, LIT_PREFIX_LEN);
+    o = mcp_put_id(buf, o, id_off, id_len);
+    o = mcp_put_lit(buf, o, LIT_CALL_A_OFF, LIT_CALL_A_LEN);   // ...text":"{\"top_k\":
+    o = mcp_put_dec(buf, o, k);
+    o = mcp_put_lit(buf, o, LIT_CALL_B_OFF, LIT_CALL_B_LEN);   // ,\"routes\":[
+    let mut r: i64 = 0;
+    while r < k {
+        if r > 0 { o = mcp_put(buf, o, 44); }                  // ','
+        o = mcp_put_lit(buf, o, LIT_ROUTE_A_OFF, LIT_ROUTE_A_LEN);  // {\"id\":\"
+        o = mcp_put_hex32(buf, o, out_ids + r * 32);
+        o = mcp_put_lit(buf, o, LIT_ROUTE_B_OFF, LIT_ROUTE_B_LEN);  // \",\"score_q16\":
+        // low 32 bits, sign-extended (Q16.16 signed).
+        let lane: i64 = __mind_load_i64(out_scores + r * 8);
+        let mut v: i64 = lane & 4294967295;
+        if v >= 2147483648 { v = v - 4294967296; }
+        o = mcp_put_dec(buf, o, v);
+        o = mcp_put_lit(buf, o, LIT_ROUTE_C_OFF, LIT_ROUTE_C_LEN);  // }
+        r = r + 1;
+    }
+    o = mcp_put_lit2(buf, o, L2_CC1_OFF, L2_CC1_LEN);          // ],\"catalog_size\":
+    o = mcp_put_dec(buf, o, catalog_size);
+    o = mcp_put_lit2(buf, o, L2_CC2_OFF, L2_CC2_LEN);          // ,\"served_by\":...
+    mcp_emit(buf, o);
+    __mind_free(buf);
+    0
+}
+
+// ---------------------------------------------------------------------------
+// In-process route computation (fully wired; gated by MN_MCP_PATHS_READY).
+// Loads the catalog + weights from (model,cat) paths, tokenizes the query,
+// runs the SAME deterministic preselector inference, and emits the routes.
+// Reuses cli/main.mind's exact load+infer sequence — the score kernel /
+// catalog layout are untouched (a separate MT-kernel change is in flight).
+// ---------------------------------------------------------------------------
+fn mcp_route_compute(model_off: i64, model_len: i64, cat_off: i64, cat_len: i64,
+                     qbuf: i64, qlen: i64, k: i64,
+                     id_off: i64, id_len: i64) -> i64 {
+    // Tokenize the query with the BPE tokenizer (byte-level base + merges).
+    let tokens: i64 = __mind_alloc(MAX_REQUEST_TOKENS * 8);
+    let n_tokens: i64 = tokenize_bpe(qbuf, qlen, tokens);
+    if n_tokens < 0 {
+        __mind_free(tokens);
+        return mcp_emit_unavailable(id_off, id_len, k);
+    }
+
+    // Load catalog (5-slot table) + weights (18-slot table + 2 hashes).
+    let cat: i64 = __mind_alloc(LOADER_CAT_SLOTS * 8);
+    if loader_load_catalog(cat_off, cat_len, cat) != LD_OK {
+        __mind_free(tokens); __mind_free(cat);
+        return mcp_emit_unavailable(id_off, id_len, k);
+    }
+    let wtab: i64 = __mind_alloc(18 * 8);
+    let mh: i64 = __mind_alloc(32);
+    let th: i64 = __mind_alloc(32);
+    if loader_load_weights(model_off, model_len, wtab, mh, th) != LD_OK {
+        __mind_free(tokens); __mind_free(cat);
+        __mind_free(wtab); __mind_free(mh); __mind_free(th);
+        return mcp_emit_unavailable(id_off, id_len, k);
+    }
+
+    let exp_h: i64 = exp_q16_init();
+    let rsqrt_h: i64 = rsqrt_q16_init();
+    // Envelope timestamp is stripped before hashing (see evidence.mind); a
+    // monotonic clock here never enters any hash preimage.
+    let ts: i64 = rt_monotonic_ns() / 1000000;
+
+    let out_ids: i64 = __mind_alloc(k * 32);
+    let out_scores: i64 = __mind_alloc(k * 8);
+    let out_env: i64 = __mind_alloc(ATTESTATION_BYTES);
+    let rc: i64 = infer_preselect_pre_tokenized_stateless(
+        tokens, n_tokens, cat, wtab, mh, th, k, ts,
+        0, 0, exp_h, rsqrt_h, out_ids, out_scores, out_env);
+
+    let mut done: i64 = 0;
+    if rc > 0 {
+        let catalog_size: i64 = __mind_load_i64(cat + LOADER_CAT_N * 8);
+        mcp_emit_routes(id_off, id_len, rc, out_ids, out_scores, catalog_size);
+        done = 1;
+    }
+    __mind_free(tokens); __mind_free(cat);
+    __mind_free(wtab); __mind_free(mh); __mind_free(th);
+    __mind_free(out_ids); __mind_free(out_scores); __mind_free(out_env);
+    if done == 0 { return mcp_emit_unavailable(id_off, id_len, k); }
+    0
+}
+
+// Resolve $MIND_NERVE_RUNTIME_DIR, construct the model + catalog bundle paths
+// (<dir>/encoder_weights.q16.bin, <dir>/route_table.jsonl — the loader probes
+// the native MNW1/MNC1 magic and fails closed on any other format), and route.
+// Fails closed (unavailable payload) when the env var is unset (rt_getenv
+// returns RT_ERR_UNSUPPORTED = -2) or the constructed path would overflow.
+// No path is ever baked into the binary.
+fn mcp_route_env(qbuf: i64, qlen: i64, k: i64, id_off: i64, id_len: i64) -> i64 {
+    let namebuf: i64 = __mind_alloc(64);
+    let mut i: i64 = 0;
+    while i < L2_ENV_LEN {
+        __mind_store_i8(namebuf + i, MCP_LIT2[L2_ENV_OFF + i]);
+        i = i + 1;
+    }
+    let dirbuf: i64 = __mind_alloc(MCP_PATH_CAP);
+    let dirlen: i64 = rt_getenv(namebuf, L2_ENV_LEN, dirbuf, MCP_PATH_CAP);
+    __mind_free(namebuf);
+    // Unset (-2), error (-1), or empty => fail closed.
+    if dirlen <= 0 {
+        __mind_free(dirbuf);
+        return mcp_emit_unavailable(id_off, id_len, k);
+    }
+    // Overflow guard (FMODEL is the longer of the two filenames).
+    if dirlen + L2_FMODEL_LEN > MCP_PATH_CAP {
+        __mind_free(dirbuf);
+        return mcp_emit_unavailable(id_off, id_len, k);
+    }
+    let modelbuf: i64 = __mind_alloc(MCP_PATH_CAP);
+    let catbuf: i64 = __mind_alloc(MCP_PATH_CAP);
+    // model = dir + "/encoder_weights.q16.bin"
+    let mut mo: i64 = 0;
+    let mut j: i64 = 0;
+    while j < dirlen { __mind_store_i8(modelbuf + mo, __mind_load_i8(dirbuf + j) & 255); mo = mo + 1; j = j + 1; }
+    let mut m: i64 = 0;
+    while m < L2_FMODEL_LEN { __mind_store_i8(modelbuf + mo, MCP_LIT2[L2_FMODEL_OFF + m]); mo = mo + 1; m = m + 1; }
+    // catalog = dir + "/route_table.jsonl"
+    let mut co: i64 = 0;
+    j = 0;
+    while j < dirlen { __mind_store_i8(catbuf + co, __mind_load_i8(dirbuf + j) & 255); co = co + 1; j = j + 1; }
+    m = 0;
+    while m < L2_FCAT_LEN { __mind_store_i8(catbuf + co, MCP_LIT2[L2_FCAT_OFF + m]); co = co + 1; m = m + 1; }
+    let rc: i64 = mcp_route_compute(modelbuf, mo, catbuf, co, qbuf, qlen, k, id_off, id_len);
+    __mind_free(modelbuf);
+    __mind_free(catbuf);
+    __mind_free(dirbuf);
+    rc
+}
+
+// ---------------------------------------------------------------------------
+// tools/call dispatch.
+// ---------------------------------------------------------------------------
+fn mcp_handle_call(objp: i64, end: i64, id_off: i64, id_len: i64) -> i64 {
+    let params_p: i64 = json_obj_find(objp, end, LIT_K_PARAMS_OFF, LIT_K_PARAMS_LEN);
+    if params_p < 0 || mcp_byte(json_skip_ws(params_p, end)) != 123 {
+        return mcp_emit_error(id_off, id_len, MCP_ERR_METHOD, LIT_EM_TOOL_OFF, LIT_EM_TOOL_LEN);
+    }
+    // name must be the string "mind_nerve_route".
+    let name_p: i64 = json_obj_find(params_p, end, LIT_K_NAME_OFF, LIT_K_NAME_LEN);
+    if name_p < 0 || mcp_byte(name_p) != 34 {
+        return mcp_emit_error(id_off, id_len, MCP_ERR_METHOD, LIT_EM_TOOL_OFF, LIT_EM_TOOL_LEN);
+    }
+    let nclose: i64 = json_string_close(name_p, end);
+    if nclose < 0 {
+        return mcp_emit_error(id_off, id_len, MCP_ERR_METHOD, LIT_EM_TOOL_OFF, LIT_EM_TOOL_LEN);
+    }
+    if mcp_eq_lit(name_p + 1, nclose - (name_p + 1), LIT_T_ROUTE_OFF, LIT_T_ROUTE_LEN) == 0 {
+        return mcp_emit_error(id_off, id_len, MCP_ERR_METHOD, LIT_EM_TOOL_OFF, LIT_EM_TOOL_LEN);
+    }
+    // arguments.query (required).
+    let args_p: i64 = json_obj_find(params_p, end, LIT_K_ARGS_OFF, LIT_K_ARGS_LEN);
+    if args_p < 0 || mcp_byte(json_skip_ws(args_p, end)) != 123 {
+        return mcp_emit_error(id_off, id_len, MCP_ERR_PARAMS, LIT_EM_QMISS_OFF, LIT_EM_QMISS_LEN);
+    }
+    let query_p: i64 = json_obj_find(args_p, end, LIT_K_QUERY_OFF, LIT_K_QUERY_LEN);
+    if query_p < 0 || mcp_byte(query_p) != 34 {
+        return mcp_emit_error(id_off, id_len, MCP_ERR_PARAMS, LIT_EM_QMISS_OFF, LIT_EM_QMISS_LEN);
+    }
+    let qbuf: i64 = __mind_alloc(MCP_QUERY_CAP);
+    let qlen: i64 = json_unescape(query_p, end, qbuf, MCP_QUERY_CAP);
+    if qlen < 0 {
+        __mind_free(qbuf);
+        return mcp_emit_error(id_off, id_len, MCP_ERR_PARAMS, LIT_EM_QLONG_OFF, LIT_EM_QLONG_LEN);
+    }
+    if qlen == 0 {
+        __mind_free(qbuf);
+        return mcp_emit_error(id_off, id_len, MCP_ERR_PARAMS, LIT_EM_QMISS_OFF, LIT_EM_QMISS_LEN);
+    }
+    // top_k: default 5, clamp to [1, MAX_TOP_K].
+    let mut k: i64 = MCP_DEFAULT_TOP_K;
+    let tk_p: i64 = json_obj_find(args_p, end, LIT_K_TOPK_OFF, LIT_K_TOPK_LEN);
+    if tk_p >= 0 { k = json_int_default(tk_p, end, MCP_DEFAULT_TOP_K); }
+    if k < 1 { k = 1; }
+    if k > MAX_TOP_K { k = MAX_TOP_K; }
+
+    // Route in-process via the $MIND_NERVE_RUNTIME_DIR bundle. Fails closed
+    // (unavailable payload) when the env var is unset or the bundle is absent /
+    // not the native MNC1/MNW1 format — never a crash, never a baked path.
+    let mut rc: i64 = 0;
+    if MN_MCP_PATHS_READY == 1 {
+        rc = mcp_route_env(qbuf, qlen, k, id_off, id_len);
+    } else {
+        rc = mcp_emit_unavailable(id_off, id_len, k);
+    }
+    __mind_free(qbuf);
+    rc
+}
+
+// ---------------------------------------------------------------------------
+// One JSON-RPC message.
+// ---------------------------------------------------------------------------
+fn mcp_handle_line(line: i64, llen: i64) -> i64 {
+    let end: i64 = line + llen;
+    let p: i64 = json_skip_ws(line, end);
+    if p >= end { return 0; }                    // blank line
+    if mcp_byte(p) != 123 {                       // not an object
+        return mcp_emit_error(-1, -1, MCP_ERR_PARSE, LIT_EM_PARSE_OFF, LIT_EM_PARSE_LEN);
+    }
+
+    // id (echoed verbatim; absent => null). Capture the raw value token span.
+    let mut id_off: i64 = -1;
+    let mut id_len: i64 = -1;
+    let idv: i64 = json_obj_find(p, end, LIT_K_ID_OFF, LIT_K_ID_LEN);
+    if idv >= 0 {
+        let ide: i64 = json_skip_value(idv, end, MCP_MAX_JSON_DEPTH);
+        if ide > idv { id_off = idv; id_len = ide - idv; }
+        // Reject an over-long id AT CAPTURE: mcp_put_id copies id_len bytes
+        // verbatim into the MCP_RESP_CAP scratch, so an id longer than the cap
+        // would overflow every response buffer. An out-of-range id echoes null
+        // (a legal JSON-RPC id — mcp_put_id emits null for id_len<0). Short ids
+        // are unaffected, so the happy path stays byte-identical.
+        if id_len > MCP_ID_CAP { id_off = -1; id_len = -1; }
+    }
+
+    // method (string).
+    let mp: i64 = json_obj_find(p, end, LIT_K_METHOD_OFF, LIT_K_METHOD_LEN);
+    if mp < 0 || mcp_byte(mp) != 34 {
+        return mcp_emit_error(id_off, id_len, MCP_ERR_METHOD, LIT_EM_METHOD_OFF, LIT_EM_METHOD_LEN);
+    }
+    let mclose: i64 = json_string_close(mp, end);
+    if mclose < 0 {
+        return mcp_emit_error(id_off, id_len, MCP_ERR_METHOD, LIT_EM_METHOD_OFF, LIT_EM_METHOD_LEN);
+    }
+    let ms: i64 = mp + 1;
+    let ml: i64 = mclose - ms;
+
+    if mcp_eq_lit(ms, ml, LIT_M_INIT_OFF, LIT_M_INIT_LEN) == 1 {
+        return mcp_emit_framed(id_off, id_len, LIT_INIT_SUFFIX_OFF, LIT_INIT_SUFFIX_LEN);
+    }
+    if mcp_eq_lit(ms, ml, LIT_M_NOTIF_OFF, LIT_M_NOTIF_LEN) == 1 {
+        return 0;                                 // notification: no reply
+    }
+    if mcp_eq_lit(ms, ml, LIT_M_TLIST_OFF, LIT_M_TLIST_LEN) == 1 {
+        return mcp_emit_framed(id_off, id_len, LIT_TOOLS_SUFFIX_OFF, LIT_TOOLS_SUFFIX_LEN);
+    }
+    if mcp_eq_lit(ms, ml, LIT_M_TCALL_OFF, LIT_M_TCALL_LEN) == 1 {
+        return mcp_handle_call(p, end, id_off, id_len);
+    }
+    mcp_emit_error(id_off, id_len, MCP_ERR_METHOD, LIT_EM_METHOD_OFF, LIT_EM_METHOD_LEN)
+}
+
+// ---------------------------------------------------------------------------
+// mcp_run — driver. Splits the buffered stdin into newline-delimited JSON-RPC
+// messages and handles each in order. Returns MN_EXIT_OK (0): per-message
+// failures are JSON-RPC errors, never a process exit code. Called by
+// cli/main.mind when stdin's first byte is `{`.
+// ---------------------------------------------------------------------------
+pub fn mcp_run(sbuf: i64, slen: i64) -> i64 {
+    let mut line_start: i64 = 0;
+    let mut i: i64 = 0;
+    while i <= slen {
+        if i == slen || mcp_byte(sbuf + i) == 10 {
+            let llen: i64 = i - line_start;
+            if llen > 0 { let _r: i64 = mcp_handle_line(sbuf + line_start, llen); }
+            line_start = i + 1;
+        }
+        i = i + 1;
+    }
+    0
+}

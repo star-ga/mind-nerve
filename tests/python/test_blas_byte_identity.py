@@ -15,8 +15,8 @@ test-only hook (exposed by ``mind/runtime/blas_shims_i64.c``).
 
 The test also records the SHA-256 of the concatenated ``(route_idx, q16_score)``
 top-5 stream for 100 deterministic queries. This becomes the cross-arch
-reference hash for task #57 (Q16.16 cross-arch bit-identity gate) when ARM /
-CUDA / photonic backends come online.
+reference hash for task #57 (Q16.16 cross-arch bit-identity gate) for the
+ARM64 CPU backend.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ from mind_nerve._native import _f32_to_q16, _NativeRuntime
 # catalog seed or the score reduction order changes (both of which would
 # legitimately break this hash).
 #
-# Cross-arch verification (task #57): ARM / CUDA / photonic backends must
+# Cross-arch verification (task #57): the ARM64 CPU backend must
 # reproduce this exact hash when fed the same seed + catalog shape.
 REFERENCE_HASH_X86_AVX2 = "f4524bd56fd74e9dfbfb17b5b1f56fafda0e7e99321ef75ebce777219cda45fc"
 
@@ -176,8 +176,8 @@ def test_score_topk_reference_hash(
 
     On the first run this test prints the computed hash so it can be pinned
     in REFERENCE_HASH_X86_AVX2 above. Subsequent runs assert the hash is
-    stable across both AVX2 and scalar paths (and, eventually, across ARM /
-    CUDA / photonic backends per task #57).
+    stable across both AVX2 and scalar paths and across the ARM64 CPU
+    backend (task #57).
     """
     rt = native_runtime
     handle = rt.init(0, 0)

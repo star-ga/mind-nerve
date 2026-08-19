@@ -169,15 +169,26 @@ def _running_daemon_pids() -> list[int]:
             raw = (entry / "cmdline").read_bytes()
         except OSError:
             continue
-        for arg in raw.split(b"\0"):
-            if not arg:
-                continue
-            base = os.path.basename(arg.decode("utf-8", "replace"))
-            # Match the console script and `python -m mind_nerve.daemon`.
-            if base == "mind-nerve-routed" or base == "mind_nerve.daemon":
-                pids.append(pid)
-                break
+        if _is_daemon_cmdline(raw):
+            pids.append(pid)
     return sorted(pids)
+
+
+def _is_daemon_cmdline(raw: bytes) -> bool:
+    """True only for the daemon's own invocation shapes (qwen Q15).
+
+    Matching any argv TOKEN's basename would SIGTERM an innocent
+    `vim mind-nerve-routed` — only argv[0] (console script) or
+    `python* -m mind_nerve.daemon` count.
+    """
+    args = [a for a in raw.split(b"\0") if a]
+    if not args:
+        return False
+    base = os.path.basename(args[0].decode("utf-8", "replace"))
+    if base == "mind-nerve-routed":
+        return True
+    rest = [a.decode("utf-8", "replace") for a in args[1:3]]
+    return base.startswith("python") and rest == ["-m", "mind_nerve.daemon"]
 
 
 def _pid_alive(pid: int) -> bool:
@@ -257,7 +268,7 @@ def main() -> int:
     lock_path = _lock_path_for(sock_path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        lock_fp = lock_path.open("a")
+        lock_fp = lock_path.open("a", encoding="utf-8")
     except OSError:
         # Can't even open the lock — fall through fail-open without spawning
         # to avoid the broken behaviour where ensure spams the system.

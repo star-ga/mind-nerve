@@ -130,6 +130,7 @@ function prodEnv(args: {
     MIND_NERVE_SOCKET: args.socket,
     MIND_NERVE_LOG: args.log,
     MIND_NERVE_TELEMETRY: path.join(path.dirname(args.log), "telemetry.jsonl"),
+    MIND_NERVE_STATE_DIR: path.dirname(args.log),
     MIND_NERVE_AGENT_DIRS: "",
     MIND_NERVE_SOCKET_TIMEOUT: "2.0",
     MIND_NERVE_CORE_SKILLS: "mind-nerve-router",

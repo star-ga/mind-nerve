@@ -171,10 +171,31 @@ class TestMcpServerIsAThinClient:
         assert '"routes": []' in text
         assert '"served_by": "unavailable"' in text
 
-    def test_has_no_in_process_catalog_left(self) -> None:
-        # The in-process path is DELETED, not kept as a fallback: a fallback
-        # re-creates the split silently, at the one moment nobody is watching.
+    def test_no_in_process_catalog_on_linux(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The in-process ranker exists ONLY as a Windows (no-AF_UNIX) fallback,
+        # where there is no daemon and therefore no second catalog for it to
+        # disagree with. On any platform WITH AF_UNIX (Linux) it MUST be
+        # unreachable: with the socket down the server still fails closed rather
+        # than quietly answering from a second brain. Proven behaviourally —
+        # inference.route() is booby-trapped and must never fire on this path.
+        assert hasattr(socket, "AF_UNIX")  # this suite is POSIX-gated (skipif above)
+
+        import mind_nerve.inference as _inf
+
+        def _forbidden(*_a: object, **_k: object) -> None:
+            raise AssertionError("in-process route() must never run when AF_UNIX exists")
+
+        monkeypatch.setattr(_inf, "route", _forbidden, raising=False)
+
+        monkeypatch.setenv("MIND_NERVE_SOCKET", str(tmp_path / "absent.sock"))
+        text = self._call("fix my build")["result"]["content"][0]["text"]
+        assert "router unavailable" in text.lower()
+        assert '"served_by": "unavailable"' in text
+
+        # The retired eager-load shim stays gone, and the server never resolves a
+        # runtime itself (that was the second-catalog resolver).
+        assert not hasattr(mcp_server, "_ensure_loaded")
         src = Path(mcp_server.__file__).read_text(encoding="utf-8")
         assert "load_default_runtime" not in src
-        assert "from .inference import" not in src
-        assert not hasattr(mcp_server, "_ensure_loaded")

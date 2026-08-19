@@ -19,8 +19,8 @@ This test, mirroring ``tests/python/test_blas_byte_identity.py``:
     calls and from a freshly re-built table — the handle cache is
     idempotent, so a re-built table reproduces the lookups bit-for-bit);
   * records the SHA-256 of the Q16.16 output stream over a fixed input
-    sweep as the cross-arch reference for task #57 (ARM / CUDA /
-    photonic backends must reproduce these exact hashes — the path is
+    sweep as the cross-arch reference for task #57 (the ARM64 CPU
+    backend must reproduce these exact hashes — the path is
     integer-only, so the hash cannot drift across substrates);
   * measures and asserts the max-abs / max-rel error of each wrapper vs
     the true real-valued reference over its representable domain,

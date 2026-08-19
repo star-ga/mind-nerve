@@ -311,6 +311,9 @@ async function writeTextFile(filePath: string, content: string): Promise<void> {
 
 /**
  * Checks if a config file already contains a mind-nerve marker (idempotency).
+ * gemini's MCP entry carries the marker as an env var instead of the
+ * `_comment: "mind-nerve managed"` string every other client uses (its
+ * settings.json schema has no room for an unknown top-level key).
  */
 async function checkConfigManaged(
   configPath: string,
@@ -318,7 +321,11 @@ async function checkConfigManaged(
 ): Promise<boolean> {
   try {
     const content = await fs.readFile(configPath, "utf8");
-    return content.includes(BLOCK_MARKER) || content.includes("mind-nerve managed");
+    return (
+      content.includes(BLOCK_MARKER) ||
+      content.includes("mind-nerve managed") ||
+      content.includes("MIND_NERVE_MANAGED")
+    );
   } catch {
     return false;
   }

@@ -10,15 +10,19 @@ const TOTAL_CLIENTS = 20;
 
 /**
  * The six CLIs that announce a skills directory, with the shapes verified on
- * disk. Each entry is `[client, skillsDir, hookConfigPath, hookWireFmt]`.
+ * disk. Each entry is
+ * `[client, skillsDir, hookConfigPath, hookWireFmt, hookEvents]`.
+ *
+ * gemini is the one outlier: its bundle maps UserPromptSubmit -> BeforeAgent
+ * and has no separate UserPromptSubmit event (b10 live-integration).
  */
 const SKILL_SURFACE_CLIS = [
-  ["claude-code", ".claude/skills", ".claude/settings.json", "json-hooks"],
-  ["codex", ".codex/skills", ".codex/config.toml", "toml-hooks"],
-  ["gemini", ".gemini/skills", ".gemini/settings.json", "json-hooks"],
-  ["grok", ".grok/skills", ".grok/config.toml", "toml-hooks"],
-  ["kimi", ".kimi-code/skills", ".kimi-code/config.toml", "toml-hooks-kimi"],
-  ["qwen", ".qwen/skills", ".qwen/settings.json", "json-hooks"],
+  ["claude-code", ".claude/skills", ".claude/settings.json", "json-hooks", ["UserPromptSubmit", "SessionStart"]],
+  ["codex", ".codex/skills", ".codex/config.toml", "toml-hooks", ["UserPromptSubmit", "SessionStart"]],
+  ["gemini", ".gemini/skills", ".gemini/settings.json", "json-hooks", ["BeforeAgent", "SessionStart"]],
+  ["grok", ".grok/skills", ".grok/config.toml", "toml-hooks", ["UserPromptSubmit", "SessionStart"]],
+  ["kimi", ".kimi-code/skills", ".kimi-code/config.toml", "toml-hooks-kimi", ["UserPromptSubmit", "SessionStart"]],
+  ["qwen", ".qwen/skills", ".qwen/settings.json", "json-hooks", ["UserPromptSubmit", "SessionStart"]],
 ] as const;
 
 const home = os.homedir();
@@ -201,7 +205,7 @@ describe("AGENT_REGISTRY skill surfaces", () => {
     );
   });
 
-  for (const [name, skillsRel, configRel, fmt] of SKILL_SURFACE_CLIS) {
+  for (const [name, skillsRel, configRel, fmt, events] of SKILL_SURFACE_CLIS) {
     describe(name, () => {
       const spec = AGENT_REGISTRY.get(name);
 
@@ -224,11 +228,8 @@ describe("AGENT_REGISTRY skill surfaces", () => {
         expect(spec!.skillSurface!.hookWireFmt).toBe(fmt);
       });
 
-      it("registers on UserPromptSubmit and SessionStart", () => {
-        expect([...spec!.skillSurface!.hookEvents]).toEqual([
-          "UserPromptSubmit",
-          "SessionStart",
-        ]);
+      it(`registers on ${events.join(" and ")}`, () => {
+        expect([...spec!.skillSurface!.hookEvents]).toEqual([...events]);
       });
 
       it("installs its hook wrapper under the CLI's own directory", () => {

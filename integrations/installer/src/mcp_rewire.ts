@@ -76,6 +76,15 @@ export function buildMcpSpec(
 // ---------------------------------------------------------------------------
 const MANAGED_MARKER = "mind-nerve managed";
 
+/**
+ * gemini-cli's settings.json schema is closed (unknown top-level keys on an
+ * MCP server entry are rejected/stripped — b10 live-integration), so it
+ * cannot carry a `_comment` field the way the other `mcpServers`-shaped
+ * clients do. Its managed marker instead lives inside `env`, a field every
+ * MCP client already accepts arbitrary keys in.
+ */
+const MANAGED_ENV_KEY = "MIND_NERVE_MANAGED";
+
 // ---------------------------------------------------------------------------
 // JSON-based mergers
 // ---------------------------------------------------------------------------
@@ -83,20 +92,32 @@ const MANAGED_MARKER = "mind-nerve managed";
 /**
  * Generic { "mcpServers": { "mind-nerve": {...} } } format.
  * Used by: gemini, continue, cursor, cline, roo, windsurf, openclaw, nanoclaw, nemoclaw.
+ *
+ * `clientName` selects the managed-marker shape: every client gets a
+ * `_comment` field EXCEPT gemini, which gets an env-var marker instead (see
+ * `MANAGED_ENV_KEY`).
  */
 function mergeJsonServers(
   existing: Record<string, unknown>,
   srv: McpServerSpec,
+  clientName: string | null = null,
 ): { updated: Record<string, unknown>; changed: boolean } {
   const out: Record<string, unknown> = JSON.parse(JSON.stringify(existing));
   const servers = (out["mcpServers"] ?? {}) as Record<string, unknown>;
 
-  const target = {
-    command: srv.command,
-    args: [...srv.args],
-    env: { ...srv.env },
-    _comment: MANAGED_MARKER,
-  };
+  const target: Record<string, unknown> =
+    clientName === "gemini"
+      ? {
+          command: srv.command,
+          args: [...srv.args],
+          env: { ...srv.env, [MANAGED_ENV_KEY]: "1" },
+        }
+      : {
+          command: srv.command,
+          args: [...srv.args],
+          env: { ...srv.env },
+          _comment: MANAGED_MARKER,
+        };
 
   const existing_entry = servers["mind-nerve"];
   if (existing_entry !== undefined && JSON.stringify(existing_entry) === JSON.stringify(target)) {
@@ -322,11 +343,11 @@ export function mergeJsonMcp(
 ): MergeJsonResult {
   switch (fmt) {
     case "mcp-json-servers":
-      return mergeJsonServers(existing, srv);
+      return mergeJsonServers(existing, srv, clientName);
     case "mcp-json-cursor":
-      return mergeJsonServers(existing, srv);
+      return mergeJsonServers(existing, srv, clientName);
     case "mcp-json-windsurf":
-      return mergeJsonServers(existing, srv);
+      return mergeJsonServers(existing, srv, clientName);
     case "mcp-json-zed":
       return mergeJsonZed(existing, srv);
     default:

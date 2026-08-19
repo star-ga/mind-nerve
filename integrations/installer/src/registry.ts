@@ -49,6 +49,16 @@ export type McpFmt =
 export type HookWireFmt = "json-hooks" | "toml-hooks" | "toml-hooks-kimi";
 
 /**
+ * The unit `hookTimeoutSecs` is actually serialised in for a given CLI.
+ * Every CLI reads seconds EXCEPT gemini-cli, whose hook timeout field is
+ * milliseconds (bundle-verified, b10 live-integration) — writing the raw
+ * value there would under-time the hook by 1000x. Optional and defaults to
+ * "seconds" so every hand-built fixture surface in the test suite keeps
+ * working unchanged.
+ */
+export type HookTimeoutUnit = "seconds" | "milliseconds";
+
+/**
  * The skill-announce surface of a CLI: where its skills directory lives, and
  * how the generic mind-nerve hook gets registered.
  *
@@ -66,8 +76,10 @@ export interface SkillSurface {
   readonly hookWireFmt: HookWireFmt;
   /** Hook events to register the router on. */
   readonly hookEvents: readonly string[];
-  /** Per-invocation hook timeout in seconds. */
+  /** Per-invocation hook timeout, in `hookTimeoutUnit` (default seconds). */
   readonly hookTimeoutSecs: number;
+  /** Unit `hookTimeoutSecs` is serialised in. Defaults to "seconds". */
+  readonly hookTimeoutUnit?: HookTimeoutUnit;
   /** How this shape was verified on disk — kept honest, not guessed. */
   readonly verified: string;
 }
@@ -121,12 +133,14 @@ function h(): string {
   return os.homedir();
 }
 
-/** Both hook events every skill-surface CLI is wired on. */
+/** Hook events most skill-surface CLIs are wired on (gemini differs — see below). */
 const HOOK_EVENTS: readonly string[] = ["UserPromptSubmit", "SessionStart"];
 
 /**
  * Builds a SkillSurface from the parts that actually differ per CLI.
  * `hookTimeoutSecs` of 8 matches the live, working Grok wiring.
+ * `hookEvents`/`hookTimeoutUnit` default to the common shape and are
+ * overridable for a CLI whose bundle maps events/units differently (gemini).
  */
 function surface(args: {
   readonly skillsDir: string;
@@ -134,14 +148,17 @@ function surface(args: {
   readonly hookConfigPath: string;
   readonly hookWireFmt: HookWireFmt;
   readonly verified: string;
+  readonly hookEvents?: readonly string[];
+  readonly hookTimeoutUnit?: HookTimeoutUnit;
 }): SkillSurface {
   return {
     skillsDir: args.skillsDir,
     hookScriptPath: args.hookScriptPath,
     hookConfigPath: args.hookConfigPath,
     hookWireFmt: args.hookWireFmt,
-    hookEvents: HOOK_EVENTS,
+    hookEvents: args.hookEvents ?? HOOK_EVENTS,
     hookTimeoutSecs: 8,
+    hookTimeoutUnit: args.hookTimeoutUnit ?? "seconds",
     verified: args.verified,
   };
 }
@@ -254,6 +271,11 @@ export const AGENT_REGISTRY: ReadonlyMap<string, AgentSpec> = new Map<
         hookScriptPath: path.join(h(), ".gemini", "hooks", "mind-nerve-hook"),
         hookConfigPath: path.join(h(), ".gemini", "settings.json"),
         hookWireFmt: "json-hooks",
+        // gemini-cli maps UserPromptSubmit -> BeforeAgent and has no
+        // separate UserPromptSubmit event; its hook timeout field is
+        // milliseconds, not seconds, unlike every other json-hooks CLI.
+        hookEvents: ["BeforeAgent", "SessionStart"],
+        hookTimeoutUnit: "milliseconds",
         verified:
           "~/.gemini/settings.json read live; ~/.gemini/skills is a real dir " +
           "(2 entries); gemini-cli bundle maps UserPromptSubmit -> BeforeAgent " +

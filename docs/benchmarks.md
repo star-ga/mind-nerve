@@ -101,10 +101,12 @@ SHA-256 of the concatenated top-5 `(idx, q16_score)` stream over the
 
 All three are identical. The integer-domain SIMD reduction with explicit
 per-lane i64 widening is associative, so the AVX2 path is byte-identical to
-the scalar oracle. **This hash is the cross-arch oracle**: a future ARM,
-CUDA, or photonic Q16.16 backend must reproduce it byte-for-byte to pass the
+the scalar oracle. **This hash is the cross-arch oracle**: the ARM64
+Q16.16 CPU backend must reproduce it byte-for-byte to pass the
 task #57 gate. A float BLAS GEMV cannot make this guarantee — its reduction
-order is implementation- and architecture-dependent.
+order is implementation- and architecture-dependent. (Scope decision
+2026-08-15: the open-source release is CPU-only — no OSS GPU tier to
+verify; a GPU tier is reserved for a potential private/enterprise line.)
 
 ### 2. Metric-flavor matrix (L1 / L2 / L∞)
 

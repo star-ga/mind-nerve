@@ -29,10 +29,15 @@ fine.
 
 from __future__ import annotations
 
+import bz2
+import gzip
+import io
+import lzma
 import math
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tarfile
 import zipfile
@@ -40,10 +45,18 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-# Directories that never carry distributable skill content (mirrors
-# discovery.SKIP_DIRS semantics — kept local so this module stays
-# dependency-free and deterministic).
-_SKIP_DIRS = {".git", "node_modules", "dist", "build", "target", "__pycache__"}
+# Directories that never carry distributable skill content. THIS is the
+# canonical set — discovery.SKIP_DIRS is derived from it (the two drifted
+# apart once, leaving .system content vetted by neither side; fable#5).
+_SKIP_DIRS = {
+    ".git",
+    "node_modules",
+    "dist",
+    "build",
+    "target",
+    "__pycache__",
+    ".system",
+}
 
 # Files larger than this are scanned only partially; a WARN finding records
 # the truncation so the verdict never silently claims full coverage.
@@ -139,7 +152,7 @@ class ScanReport:
     scanner: str
     clamav: str  # "not-run" | "clean" | "infected" | "error"
 
-    def as_dict(self) -> dict:
+    def as_dict(self) -> dict[str, Any]:
         return {
             "verdict": self.verdict,
             "scanner": self.scanner,
@@ -168,20 +181,26 @@ _LINE_RULES: tuple[tuple[str, str, re.Pattern[str]], ...] = (
         "shell-pipe-installer",
         FAIL,
         re.compile(
-            # curl/wget piped into a shell OR an interpreter. The pipe target
-            # may carry sudo (with flags, e.g. `sudo -E bash`), an absolute
-            # path prefix (/bin/sh), or be a non-shell interpreter (python3,
-            # ruby, perl, node) — all execute the downloaded payload.
+            # curl/wget piped through an optional tee chain into a shell OR an
+            # interpreter. The pipe target may carry env-var assignments
+            # (`| FOO=1 bash`), sudo (with flags), an absolute path prefix
+            # (/bin/sh), /usr/bin/env, or be a non-shell interpreter
+            # (python3, ruby, perl, node) — all execute the downloaded payload.
             r"\b(?:curl|wget)\b[^|\n]*\|\s*"
+            r"(?:tee\s+[^|\n]*?\|\s*)*"
+            r"(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*"
             r"(?:sudo\s+(?:-[A-Za-z]+\s+)*)?"
-            r"(?:/[A-Za-z0-9_.-]+/)*"
+            r"(?:(?:/[A-Za-z0-9_.-]+)+/)?(?:env\s+)?"
             r"(?:(?:ba|z|fi|da|a)?sh|python[0-9.]*|ruby|perl|node)\b"
             r"|\b(?:iwr|irm|Invoke-WebRequest|Invoke-RestMethod)\b[^|\n]*"
             r"\|\s*(?:iex|Invoke-Expression)\b"
-            # eval $(curl …) — command-substitution dropper.
+            # eval $(curl …) / eval `curl …` — substitution droppers.
             r"|\beval\s+[\"']?\$\(\s*[\"']?(?:curl|wget)\b"
-            # bash <(curl …) — process-substitution dropper.
-            r"|\b(?:ba|z|fi|da|a)?sh\s+<\(\s*(?:curl|wget)\b",
+            r"|\beval\s+[\"']?`\s*(?:curl|wget)\b"
+            # bash -c "$(curl …)" / sh -c `curl …`
+            r"|\b(?:ba|z|fi|da|a)?sh\s+-c\s+[\"']?(?:\$\(|`)\s*[\"']?(?:curl|wget)\b"
+            # bash <(curl …) / source <(curl …) / . <(curl …)
+            r"|(?:(?:ba|z|fi|da|a)?sh|source|\.)\s+<\(\s*(?:curl|wget)\b",
             re.IGNORECASE,
         ),
     ),
@@ -290,6 +309,12 @@ _LINE_RULES: tuple[tuple[str, str, re.Pattern[str]], ...] = (
 _BASE64_BLOB = re.compile(r"[A-Za-z0-9+/]{160,}={0,2}(?![A-Za-z0-9+/=])")
 _HEX_BLOB = re.compile(r"\b[0-9a-fA-F]{256,}\b")
 _CONTINUATION_FOLD = re.compile(r"\\\r?\n")
+# A pipe at end-of-line is a line continuation in every POSIX shell —
+# including across blank lines (`curl url |` <newline> <newline> `bash`).
+_TRAILING_PIPE_FOLD = re.compile(r"\|[ \t]*\r?\n(?:[ \t]*\r?\n)*[ \t]*")
+# JSON whitespace escapes (\n \t \r) as LITERAL two-char sequences in the raw
+# file — hosts decode them when parsing JSON/TOML string values.
+_JSON_WS_ESCAPE = re.compile(r"\\[ntr]")
 _WHITESPACE_RUN = re.compile(r"\s+")
 # Rules whose patterns are SELF-BOUNDING (a fixed handful of adjacent tokens,
 # no [^|]*-style spans) get a whole-file whitespace-normalized pass: splitting
@@ -325,7 +350,7 @@ def _excerpt(line: str) -> str:
 
 def _is_escape(name: str) -> bool:
     """True for archive member names that escape the extraction root."""
-    if name.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:[\\/]", name):
+    if name.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:", name):
         return True
     parts = re.split(r"[/\\]", name)
     return ".." in parts
@@ -362,6 +387,39 @@ def _has_archive_magic(data: bytes) -> bool:
         or data.startswith(b"\xfd7zXZ\x00")  # xz
         or data[257:262] == b"ustar"  # tar
     )
+
+
+# Suffixes that name an archive outright — a file carrying one that parses
+# as NEITHER zip nor tar (and is not a decompressable single stream) cannot
+# be vetted and fails closed.
+_ARCHIVE_FILE_SUFFIXES = {".zip", ".tar", ".tgz", ".gz", ".bz2", ".xz"}
+
+_SINGLE_STREAM_MAGICS = ((b"\x1f\x8b", "gzip"), (b"BZh", "bzip2"), (b"\xfd7zXZ\x00", "xz"))
+
+
+def _decompress_single_stream(data: bytes) -> tuple[str, bytes | None]:
+    """Bounded decompress of a gz/bz2/xz single stream, by magic bytes.
+
+    Returns ("", None) when no magic matches; (name, payload) on success;
+    (name, None) on a corrupt stream. A plain gzip of a dropper is NOT an
+    archive — tarfile/zipfile both refuse it — but it always contains NULs
+    (the ISIZE trailer), so without this it slipped past every check
+    (round-4 audit; qwen Q1). Payload capped like any scanned file.
+    """
+    for magic, name in _SINGLE_STREAM_MAGICS:
+        if not data.startswith(magic):
+            continue
+        try:
+            if name == "gzip":
+                out = gzip.GzipFile(fileobj=io.BytesIO(data)).read(_MAX_FILE_BYTES + 1)
+            elif name == "bzip2":
+                out = bz2.BZ2Decompressor().decompress(data, max_length=_MAX_FILE_BYTES + 1)
+            else:
+                out = lzma.LZMADecompressor().decompress(data, max_length=_MAX_FILE_BYTES + 1)
+        except Exception:  # noqa: BLE001 — corrupt stream is a WARN, not a crash
+            return name, None
+        return name, out
+    return "", None
 
 
 def _scan_archive_members(
@@ -404,6 +462,11 @@ def _scan_archive_members(
             findings.append(Finding("scanner-error", FAIL, rel, 0, _excerpt(f"{name}: {e}")))
             continue
         total += len(data)
+        if _has_archive_magic(data):
+            # A nested archive detected by CONTENT, not suffix — a zip member
+            # renamed `.png` is just as opaque (codex final #6).
+            findings.append(Finding("nested-archive-opaque", WARN, rel, 0, _excerpt(name)))
+            continue
         # NUL probe covers the WHOLE member buffer, not just the first
         # 8 KiB: bash strips NUL bytes, so a mid-buffer `cu\0rl … | bash`
         # executes fine while a prefix-only probe scans it clean (codex
@@ -459,17 +522,54 @@ def _scan_archive(path: Path, rel: str) -> list[Finding]:
                     )
                     return findings
                 members: list[tuple[str, int]] = []
+                seen_files: set[str] = set()
                 for info in infos:
                     if _is_escape(info.filename):
                         findings.append(
                             Finding("path-escape", FAIL, rel, 0, _excerpt(info.filename))
                         )
+                    # A zip stores a symlink as a regular entry whose Unix
+                    # mode lives in external_attr; the TARGET is the member
+                    # content. It was never inspected (codex final #12).
+                    if stat.S_ISLNK(info.external_attr >> 16):
+                        try:
+                            linkname = zf.read(info.filename)[:4096].decode("utf-8", "replace")
+                        except Exception as e:  # noqa: BLE001 — fail closed
+                            findings.append(
+                                Finding("scanner-error", FAIL, rel, 0, _excerpt(str(e)))
+                            )
+                            continue
+                        if _is_escape(linkname):
+                            findings.append(
+                                Finding(
+                                    "symlink-escape",
+                                    FAIL,
+                                    rel,
+                                    0,
+                                    _excerpt(f"{info.filename} -> {linkname}"),
+                                )
+                            )
+                        continue
                     if not info.is_dir():
+                        # Duplicate member names mask earlier entries: reading
+                        # by name resolves to ONE of them (codex final #20).
+                        if info.filename in seen_files:
+                            findings.append(
+                                Finding(
+                                    "duplicate-member",
+                                    FAIL,
+                                    rel,
+                                    0,
+                                    _excerpt(f"duplicate member name: {info.filename}"),
+                                )
+                            )
+                        seen_files.add(info.filename)
                         members.append((info.filename, info.file_size))
                 _scan_archive_members(zf.read, members, rel, findings)
         elif tarfile.is_tarfile(path):
             with tarfile.open(path) as tf:
                 members = []
+                seen_files = set()
                 count = 0
                 capped = False
                 # Iterate the tar stream — getmembers() would materialise the
@@ -503,6 +603,17 @@ def _scan_archive(path: Path, rel: str) -> list[Finding]:
                                 )
                             )
                     elif member.isfile():
+                        if member.name in seen_files:
+                            findings.append(
+                                Finding(
+                                    "duplicate-member",
+                                    FAIL,
+                                    rel,
+                                    0,
+                                    _excerpt(f"duplicate member name: {member.name}"),
+                                )
+                            )
+                        seen_files.add(member.name)
                         members.append((member.name, member.size))
 
                 def _read_member(name: str, _tf: tarfile.TarFile = tf) -> bytes:
@@ -545,8 +656,8 @@ def _scan_text(path: Path, rel: str, data: bytes) -> list[Finding]:
             findings.append(Finding("obfuscated-blob", WARN, rel, lineno, _excerpt(line)))
             continue
         # High-entropy token check only when no blob already fired here.
-        for m in _TOKEN_RUN.finditer(line):
-            if _shannon_entropy(m.group(0)) >= _ENTROPY_THRESHOLD:
+        for tok_match in _TOKEN_RUN.finditer(line):
+            if _shannon_entropy(tok_match.group(0)) >= _ENTROPY_THRESHOLD:
                 findings.append(Finding("high-entropy-string", WARN, rel, lineno, _excerpt(line)))
                 break
 
@@ -560,6 +671,21 @@ def _scan_text(path: Path, rel: str, data: bytes) -> list[Finding]:
     folded = _CONTINUATION_FOLD.sub(" ", text)
     if folded != text:
         for lineno, line in enumerate(folded.splitlines(), 1):
+            _apply_rules(line, lineno)
+    # 1b. Trailing-pipe fold: `curl url |` <newline> (<blank>) `bash` is a
+    #     continuation in every POSIX shell (grok#2, round 4).
+    pipefolded = _TRAILING_PIPE_FOLD.sub("| ", text)
+    if pipefolded != text:
+        for lineno, line in enumerate(pipefolded.splitlines(), 1):
+            _apply_rules(line, lineno)
+    # 1c. JSON-escape fold: a banned phrase hidden behind JSON whitespace
+    #     escapes ("Ignore all previous\ninstructions" as literal backslash-n
+    #     inside a JSON string) reconstructs when the host parses the file
+    #     (codex final #5). Decode only the whitespace escapes — enough for
+    #     the \s+-based rules — and re-run per-line.
+    unescaped = _JSON_WS_ESCAPE.sub(" ", text)
+    if unescaped != text:
+        for lineno, line in enumerate(unescaped.splitlines(), 1):
             _apply_rules(line, lineno)
     # 2. Sliding 2-line window: phrases split across a PLAIN newline
     #    ("ignore all previous\ninstructions", MCP poisoning broken over two
@@ -692,6 +818,19 @@ def scan_path(root: str | Path, *, use_clamav: bool = False) -> ScanReport:
             if p.is_symlink():
                 _check_symlink(p, rel, root_resolved, findings)
                 continue
+            if not p.is_file():
+                # FIFO/device/socket: open() would block forever (qwen Q14).
+                # It cannot be vetted, so it cannot pass.
+                findings.append(
+                    Finding(
+                        "scanner-error",
+                        FAIL,
+                        rel,
+                        0,
+                        "not a regular file (FIFO/device/socket); cannot be vetted",
+                    )
+                )
+                continue
             with p.open("rb") as fh:
                 data = fh.read(_MAX_FILE_BYTES + 1)
             truncated = len(data) > _MAX_FILE_BYTES
@@ -710,24 +849,82 @@ def scan_path(root: str | Path, *, use_clamav: bool = False) -> ScanReport:
             files_scanned += 1
             suffix = p.suffix.lower()
             # Archive dispatch is by MAGIC BYTES, not suffix: a zip renamed
-            # `.jar` must still get the escape/member-content checks.
-            is_archive = suffix in {
-                ".zip",
-                ".tar",
-                ".tgz",
-                ".gz",
-                ".bz2",
-                ".xz",
-            } or _has_archive_magic(data)
-            if is_archive:
-                findings.extend(_scan_archive(p, rel))
+            # `.jar` must still get the escape/member-content checks. But
+            # magic is a HINT, never coverage (round-4 audit, reproduced by
+            # both auditors): only an archive that actually PARSES is covered
+            # by the archive checks — a fake PK\x03\x04 header or a `ustar`
+            # string at offset 257 used to suppress ALL line rules and the
+            # opaque-binary WARN.
+            archive_hint = suffix in _ARCHIVE_FILE_SUFFIXES or _has_archive_magic(data)
+            if archive_hint:
+                if zipfile.is_zipfile(p) or tarfile.is_tarfile(p):
+                    # A parsed archive: the member checks are the coverage.
+                    findings.extend(_scan_archive(p, rel))
+                    continue
+                stream_name, payload = _decompress_single_stream(data)
+                if stream_name:
+                    if payload is None:
+                        findings.append(
+                            Finding(
+                                "unscanned-binary",
+                                WARN,
+                                rel,
+                                0,
+                                f"{stream_name} stream failed to decompress; content not scanned",
+                            )
+                        )
+                        continue
+                    srel = f"{rel}!{stream_name}"
+                    if len(payload) > _MAX_FILE_BYTES:
+                        payload = payload[:_MAX_FILE_BYTES]
+                        findings.append(
+                            Finding(
+                                "file-truncated",
+                                WARN,
+                                srel,
+                                0,
+                                f"decompressed stream exceeds {_MAX_FILE_BYTES} "
+                                "bytes; scanned partially",
+                            )
+                        )
+                    if b"\x00" in payload:
+                        findings.append(
+                            Finding(
+                                "binary-content-in-text-file",
+                                WARN,
+                                srel,
+                                0,
+                                "NUL bytes in decompressed stream; scanned with NULs stripped",
+                            )
+                        )
+                        payload = payload.replace(b"\x00", b"")
+                    findings.extend(_scan_text(Path(srel), srel, payload))
+                    continue
+                if suffix in _ARCHIVE_FILE_SUFFIXES:
+                    # Named like an archive, parses as none: cannot be vetted.
+                    findings.append(
+                        Finding(
+                            "scanner-error",
+                            FAIL,
+                            rel,
+                            0,
+                            "file named like an archive but parses as neither zip nor tar",
+                        )
+                    )
+                    continue
+                # Magic-only hint that parses as nothing: fall THROUGH to the
+                # NUL/text scan below.
             # The NUL probe covers the WHOLE scanned buffer, not just the
             # first 8 KiB: bash strips NUL bytes, so a mid-buffer
             # `cu\0rl … | bash` executes fine while a prefix-only probe
             # scans it clean (codex audit, 2026-08 r4).
             if b"\x00" in data:
-                if is_archive:
-                    continue  # the archive checks above are the coverage
+                # A binary suffix is not a hiding place for a REAL archive:
+                # reader recognition is independent of the name and of
+                # byte-0 magic (SFX stubs carry a prefix) — codex final #6.
+                if suffix in _BINARY_SUFFIXES and (zipfile.is_zipfile(p) or tarfile.is_tarfile(p)):
+                    findings.extend(_scan_archive(p, rel))
+                    continue
                 if suffix in _OPAQUE_BINARY_SUFFIXES:
                     findings.append(
                         Finding(

@@ -5,7 +5,12 @@
 // router twice per prompt.
 
 import { describe, it, expect } from "vitest";
+import { spawn } from "node:child_process";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import TOML from "@iarna/toml";
+import { mergeJsonMcp } from "../src/mcp_rewire.js";
 import {
   mergeJsonHooks,
   removeJsonHooks,
@@ -302,13 +307,13 @@ describe("buildHookWrapper", () => {
     hubDir: "/home/u/.agents/skills-hub",
     socketPath: "/run/user/1000/mind-nerve.sock",
     agentDirs: ["/home/u/.claude/agents"],
-    logPath: "/home/u/.mind-nerve/logs/x.log",
   });
 
   it("exports only the path/socket pins that parameterise the shared hook", () => {
+    // MIND_NERVE_LOG is deliberately absent: hook disk logging is opt-in
+    // (privacy contract, codex final #30).
     expect(Object.keys(env).sort()).toEqual([
       "MIND_NERVE_AGENT_DIRS",
-      "MIND_NERVE_LOG",
       "MIND_NERVE_PROJECTED_DIR",
       "MIND_NERVE_SOCKET",
       "MIND_NERVE_SOURCE_DIR",
@@ -382,5 +387,74 @@ describe("registry surfaces are wirable", () => {
         expect(removeTomlHooks(first.updated).updated, spec.name).toBe("");
       }
     }
+  });
+});
+
+describe("buildHookWrapper — fail-open (qwen Q6)", () => {
+  it("emits {} and exits 0 when the real hook is missing", async () => {
+    // `exec missing || { ... }` under POSIX sh exits 127 on exec failure —
+    // the || list NEVER runs. The wrapper must guard with [ -x ] instead.
+    const env = buildHookEnv({
+      surface: SURFACE,
+      hubDir: "/home/u/.agents/skills-hub",
+      socketPath: "/run/user/1000/mind-nerve.sock",
+      agentDirs: [],
+    });
+    const wrapper = buildHookWrapper("/nonexistent/dir/mind-nerve-hook", env);
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "mn-wrap-"));
+    const wrapperPath = path.join(dir, "wrapper.sh");
+    try {
+      await fs.writeFile(wrapperPath, wrapper, { mode: 0o755 });
+      const out = await new Promise<{ stdout: string; code: number | null }>(
+        (resolve) => {
+          const child = spawn("sh", [wrapperPath]);
+          let stdout = "";
+          child.stdout.on("data", (d: Buffer) => (stdout += d.toString()));
+          child.on("close", (code) => resolve({ stdout, code }));
+          child.stdin.end();
+        },
+      );
+      expect(out.code).toBe(0);
+      expect(out.stdout.trim()).toBe("{}");
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("gemini wiring (b10 live-integration)", () => {
+  const gemini = AGENT_REGISTRY.get("gemini")!;
+  const surface = gemini.skillSurface!;
+
+  it("registers BeforeAgent + SessionStart (gemini has NO UserPromptSubmit)", () => {
+    expect([...surface.hookEvents].sort()).toEqual(["BeforeAgent", "SessionStart"]);
+    const { updated } = mergeJsonHooks({}, surface);
+    const hooks = updated["hooks"] as Record<string, unknown>;
+    expect(Object.keys(hooks).sort()).toEqual(["BeforeAgent", "SessionStart"]);
+  });
+
+  it("writes the hook timeout in MILLISECONDS (gemini unit)", () => {
+    const { updated } = mergeJsonHooks({}, surface);
+    const hooks = updated["hooks"] as Record<
+      string,
+      Array<{ hooks: Array<{ timeout: number }> }>
+    >;
+    expect(hooks["BeforeAgent"]![0]!.hooks[0]!.timeout).toBe(8000);
+  });
+
+  it("gemini MCP entry carries the env managed marker, NOT _comment", () => {
+    const { updated } = mergeJsonMcp(
+      gemini.mcpFmt,
+      {},
+      { command: "/bin/mind-nerve-mcp", args: [], env: { X: "1" } },
+      "gemini",
+    );
+    const servers = updated["mcpServers"] as Record<
+      string,
+      Record<string, unknown>
+    >;
+    const entry = servers["mind-nerve"]!;
+    expect(entry).not.toHaveProperty("_comment");
+    expect((entry["env"] as Record<string, string>)["MIND_NERVE_MANAGED"]).toBe("1");
   });
 });

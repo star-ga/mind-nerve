@@ -1,0 +1,467 @@
+// wordpiece.mind — BERT WordPiece tokenizer, pure MIND (mindc 0.10.2).
+// Matches the HF fast tokenizer (tokenizers.json: BertNormalizer +
+// BertPreTokenizer + WordPiece + TemplateProcessing) byte-for-byte; the
+// corpus gate (tests/python/test_tokenize_corpus.py) proves it.
+//
+// Pipeline (identical to the HF fast tokenizer for bert-*-uncased):
+//   1. BertNormalizer: clean-text drop set, CJK space-padding, lowercase,
+//      strip-accents — via the pinned per-codepoint tables in
+//      luts/vocab_wp.mind (generated from the real normalizer, exact by
+//      construction; see tools/gen_vocab_wp.py).
+//   2. BertPreTokenizer: split on (normalized) spaces; every punctuation
+//      codepoint (Unicode P*) becomes its own word.
+//   3. WordPiece: per word, greedy longest-match from the left with the
+//      '##' continuation prefix; words over 100 codepoints, or with no
+//      applicable rule, map to [UNK] (id 100).
+//   4. TemplateProcessing: [CLS] (101) prepended, [SEP] (102) appended;
+//      truncation to 256 total ids (tokens truncated to 254 first), the
+//      routing path's max_length=256 contract.
+//
+// Determinism: integer-only; binary searches over pinned sorted tables;
+// no floats, no clocks. Bit-identical on every substrate.
+//
+// ABI: text crosses as a raw i64 buffer address + byte length (UTF-8, one
+// byte per offset); token ids are written as i64 lanes. Tables are built
+// once by wp_tables_init() and threaded as an opaque handle.
+
+import luts.vocab_wp;
+
+// Header slots of the wp_tables handle.
+pub const WP_T_VOCAB_ARENA: i64 = 0;
+pub const WP_T_VOCAB_OFF:   i64 = 1;
+pub const WP_T_VOCAB_LEN:   i64 = 2;
+pub const WP_T_VOCAB_ID:    i64 = 3;
+pub const WP_T_VOCAB_N:     i64 = 4;
+pub const WP_T_DROP:        i64 = 5;
+pub const WP_T_NDROP:       i64 = 6;
+pub const WP_T_DEC_CP:      i64 = 7;
+pub const WP_T_DEC_TGT:     i64 = 8;
+pub const WP_T_NDEC:        i64 = 9;
+pub const WP_T_MAP_CP:      i64 = 10;
+pub const WP_T_MAP_OFF:     i64 = 11;
+pub const WP_T_MAP_LEN:     i64 = 12;
+pub const WP_T_MAP_ARENA:   i64 = 13;
+pub const WP_T_NMAP:        i64 = 14;
+pub const WP_T_PUNCT:       i64 = 15;
+pub const WP_T_NPUNCT:      i64 = 16;
+pub const WP_T_LANES:       i64 = 17;
+
+// Token ids (vocab-pinned).
+pub const WP_ID_UNK: i64 = 100;
+pub const WP_ID_CLS: i64 = 101;
+pub const WP_ID_SEP: i64 = 102;
+
+// HF WordPiece max_input_chars_per_word.
+pub const WP_MAX_WORD_CHARS: i64 = 100;
+
+// Routing-path cap: max_length=256 including the two special tokens.
+pub const WP_MAX_OUT: i64 = 256;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Table construction / teardown
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub fn wp_tables_init() -> i64 {
+    let t: i64 = __mind_alloc(WP_T_LANES * 8);
+    __mind_store_i64(t + WP_T_VOCAB_ARENA * 8, wp_vocab_arena_init());
+    __mind_store_i64(t + WP_T_VOCAB_OFF * 8, wp_vocab_off_init());
+    __mind_store_i64(t + WP_T_VOCAB_LEN * 8, wp_vocab_len_init());
+    __mind_store_i64(t + WP_T_VOCAB_ID * 8, wp_vocab_id_init());
+    __mind_store_i64(t + WP_T_VOCAB_N * 8, 30522);
+    __mind_store_i64(t + WP_T_DROP * 8, wp_drop_ranges_init());
+    __mind_store_i64(t + WP_T_NDROP * 8, 288);
+    __mind_store_i64(t + WP_T_DEC_CP * 8, wp_decomp_cp_init());
+    __mind_store_i64(t + WP_T_DEC_TGT * 8, wp_decomp_tgt_init());
+    __mind_store_i64(t + WP_T_NDEC * 8, 1002);
+    __mind_store_i64(t + WP_T_MAP_CP * 8, wp_map_cp_init());
+    __mind_store_i64(t + WP_T_MAP_OFF * 8, wp_map_off_init());
+    __mind_store_i64(t + WP_T_MAP_LEN * 8, wp_map_len_init());
+    __mind_store_i64(t + WP_T_MAP_ARENA * 8, wp_map_arena_init());
+    __mind_store_i64(t + WP_T_NMAP * 8, 13339);
+    __mind_store_i64(t + WP_T_PUNCT * 8, wp_punct_init());
+    __mind_store_i64(t + WP_T_NPUNCT * 8, 842);
+    t
+}
+
+pub fn wp_tables_free(t: i64) -> i64 {
+    let mut i: i64 = 0;
+    while i < WP_T_LANES {
+        __mind_free(__mind_load_i64(t + i * 8));
+        i = i + 1;
+    }
+    __mind_free(t);
+    0
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Primitive helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Byte at packed-arena index idx (8 bytes per i64 lane, little-endian).
+fn wp_byte(arena: i64, idx: i64) -> i64 {
+    let lane: i64 = __mind_load_i64(arena + (idx / 8) * 8);
+    (lane >> ((idx % 8) * 8)) & 255
+}
+
+// UTF-8 encode cp at out+pos (one byte per offset); returns the new pos.
+fn wp_emit_cp(out: i64, pos: i64, cp: i64) -> i64 {
+    if cp < 128 {
+        __mind_store_i8(out + pos, cp);
+        return pos + 1;
+    }
+    if cp < 2048 {
+        __mind_store_i8(out + pos, 192 + cp / 64);
+        __mind_store_i8(out + pos + 1, 128 + cp % 64);
+        return pos + 2;
+    }
+    if cp < 65536 {
+        __mind_store_i8(out + pos, 224 + cp / 4096);
+        __mind_store_i8(out + pos + 1, 128 + (cp / 64) % 64);
+        __mind_store_i8(out + pos + 2, 128 + cp % 64);
+        return pos + 3;
+    }
+    __mind_store_i8(out + pos, 240 + cp / 262144);
+    __mind_store_i8(out + pos + 1, 128 + (cp / 4096) % 64);
+    __mind_store_i8(out + pos + 2, 128 + (cp / 64) % 64);
+    __mind_store_i8(out + pos + 3, 128 + cp % 64);
+    pos + 4
+}
+
+// Decode the UTF-8 codepoint at text+pos; writes the cp to box and
+// returns the next position. Malformed bytes decode as U+FFFD-sized
+// single-byte steps (input is Python-str UTF-8 in practice).
+fn wp_next_cp(text: i64, pos: i64, len: i64, box: i64) -> i64 {
+    let b0: i64 = __mind_load_i8(text + pos) & 255;
+    if b0 < 128 {
+        __mind_store_i64(box, b0);
+        return pos + 1;
+    }
+    if b0 < 224 {
+        let b1: i64 = __mind_load_i8(text + pos + 1) & 255;
+        __mind_store_i64(box, (b0 - 192) * 64 + (b1 - 128));
+        return pos + 2;
+    }
+    if b0 < 240 {
+        let b1: i64 = __mind_load_i8(text + pos + 1) & 255;
+        let b2: i64 = __mind_load_i8(text + pos + 2) & 255;
+        __mind_store_i64(box, (b0 - 224) * 4096 + (b1 - 128) * 64 + (b2 - 128));
+        return pos + 3;
+    }
+    let b1: i64 = __mind_load_i8(text + pos + 1) & 255;
+    let b2: i64 = __mind_load_i8(text + pos + 2) & 255;
+    let b3: i64 = __mind_load_i8(text + pos + 3) & 255;
+    __mind_store_i64(box, (b0 - 240) * 262144 + (b1 - 128) * 4096 + (b2 - 128) * 64 + (b3 - 128));
+    pos + 4
+}
+
+// Binary search a sorted i64 cp table for cp; returns the index or -1.
+fn wp_find_cp(arr: i64, n: i64, cp: i64) -> i64 {
+    let mut lo: i64 = 0;
+    let mut hi: i64 = n;
+    while lo < hi {
+        let mid: i64 = (lo + hi) / 2;
+        let v: i64 = __mind_load_i64(arr + mid * 8);
+        if v == cp { return mid; }
+        if v < cp { lo = mid + 1; } else { hi = mid; }
+    }
+    -1
+}
+
+// 1 iff cp is inside any (lo, hi) drop range (ranges sorted, non-overlapping).
+fn wp_in_drop(t: i64, cp: i64) -> i64 {
+    let ranges: i64 = __mind_load_i64(t + WP_T_DROP * 8);
+    let n: i64 = __mind_load_i64(t + WP_T_NDROP * 8);
+    let mut lo: i64 = 0;
+    let mut hi: i64 = n;
+    while lo < hi {
+        let mid: i64 = (lo + hi) / 2;
+        let rlo: i64 = __mind_load_i64(ranges + mid * 16);
+        let rhi: i64 = __mind_load_i64(ranges + mid * 16 + 8);
+        if cp < rlo { hi = mid; } else {
+            if cp > rhi { lo = mid + 1; } else { return 1; }
+        }
+    }
+    0
+}
+
+fn wp_is_cjk(cp: i64) -> i64 {
+    if cp >= 19968 { if cp <= 40959 { return 1; } }
+    if cp >= 13312 { if cp <= 19903 { return 1; } }
+    if cp >= 131072 { if cp <= 173791 { return 1; } }
+    if cp >= 173824 { if cp <= 177983 { return 1; } }
+    if cp >= 177984 { if cp <= 178207 { return 1; } }
+    if cp >= 178208 { if cp <= 183983 { return 1; } }
+    if cp >= 63744 { if cp <= 64255 { return 1; } }
+    if cp >= 194560 { if cp <= 195103 { return 1; } }
+    0
+}
+
+fn wp_is_punct(t: i64, cp: i64) -> i64 {
+    let arr: i64 = __mind_load_i64(t + WP_T_PUNCT * 8);
+    let n: i64 = __mind_load_i64(t + WP_T_NPUNCT * 8);
+    if wp_find_cp(arr, n, cp) >= 0 { return 1; }
+    0
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Normalization: text (UTF-8, len bytes) -> out (one byte per offset).
+// Returns the normalized byte length. out must have len*8 + 64 bytes.
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub fn wp_normalize(t: i64, text: i64, len: i64, out: i64) -> i64 {
+    let dec_cp: i64 = __mind_load_i64(t + WP_T_DEC_CP * 8);
+    let dec_tgt: i64 = __mind_load_i64(t + WP_T_DEC_TGT * 8);
+    let ndec: i64 = __mind_load_i64(t + WP_T_NDEC * 8);
+    let map_cp: i64 = __mind_load_i64(t + WP_T_MAP_CP * 8);
+    let map_off: i64 = __mind_load_i64(t + WP_T_MAP_OFF * 8);
+    let map_len: i64 = __mind_load_i64(t + WP_T_MAP_LEN * 8);
+    let map_arena: i64 = __mind_load_i64(t + WP_T_MAP_ARENA * 8);
+    let nmap: i64 = __mind_load_i64(t + WP_T_NMAP * 8);
+
+    let box: i64 = __mind_alloc(8);
+    let mut pos: i64 = 0;
+    let mut wpos: i64 = 0;
+    while pos < len {
+        let next: i64 = wp_next_cp(text, pos, len, box);
+        let cp: i64 = __mind_load_i64(box);
+        pos = next;
+        if wp_in_drop(t, cp) == 1 {
+            // drop
+        } else {
+            let di: i64 = wp_find_cp(dec_cp, ndec, cp);
+            if di >= 0 {
+                wpos = wp_emit_cp(out, wpos, 32);
+                wpos = wp_emit_cp(out, wpos, __mind_load_i64(dec_tgt + di * 8));
+                wpos = wp_emit_cp(out, wpos, 32);
+            } else {
+                let mi: i64 = wp_find_cp(map_cp, nmap, cp);
+                if mi >= 0 {
+                    let moff: i64 = __mind_load_i64(map_off + mi * 8);
+                    let mlen: i64 = __mind_load_i64(map_len + mi * 8);
+                    let mut b: i64 = 0;
+                    while b < mlen {
+                        __mind_store_i8(out + wpos, wp_byte(map_arena, moff + b));
+                        wpos = wpos + 1;
+                        b = b + 1;
+                    }
+                } else {
+                    if wp_is_cjk(cp) == 1 {
+                        wpos = wp_emit_cp(out, wpos, 32);
+                        wpos = wp_emit_cp(out, wpos, cp);
+                        wpos = wp_emit_cp(out, wpos, 32);
+                    } else {
+                        wpos = wp_emit_cp(out, wpos, cp);
+                    }
+                }
+            }
+        }
+    }
+    __mind_free(box);
+    wpos
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Vocab probing. The probe is (hash2 ? "##" : "") + word[start..end) and is
+// compared against vocab entries without materialising: position p of the
+// probe reads '#' while p < 2*hash2, then word bytes.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// -1 / 0 / +1 comparator: probe vs vocab entry e.
+fn wp_probe_cmp(t: i64, word: i64, start: i64, end: i64, hash2: i64, e: i64) -> i64 {
+    let arena: i64 = __mind_load_i64(t + WP_T_VOCAB_ARENA * 8);
+    let offs: i64 = __mind_load_i64(t + WP_T_VOCAB_OFF * 8);
+    let lens: i64 = __mind_load_i64(t + WP_T_VOCAB_LEN * 8);
+    let eoff: i64 = __mind_load_i64(offs + e * 8);
+    let elen: i64 = __mind_load_i64(lens + e * 8);
+    let plen: i64 = hash2 * 2 + (end - start);
+    let mut p: i64 = 0;
+    let mut limit: i64 = plen;
+    if elen < limit { limit = elen; }
+    while p < limit {
+        let mut pb: i64 = 0;
+        if hash2 == 1 { if p < 2 { pb = 35; } }
+        if hash2 == 0 { pb = __mind_load_i8(word + start + p) & 255; } else {
+            if p >= 2 { pb = __mind_load_i8(word + start + p - 2) & 255; }
+        }
+        let eb: i64 = wp_byte(arena, eoff + p);
+        if pb < eb { return -1; }
+        if pb > eb { return 1; }
+        p = p + 1;
+    }
+    if plen < elen { return -1; }
+    if plen > elen { return 1; }
+    0
+}
+
+// Binary search for the probe; returns the token id or -1.
+fn wp_vocab_lookup(t: i64, word: i64, start: i64, end: i64, hash2: i64) -> i64 {
+    let ids: i64 = __mind_load_i64(t + WP_T_VOCAB_ID * 8);
+    let n: i64 = __mind_load_i64(t + WP_T_VOCAB_N * 8);
+    let mut lo: i64 = 0;
+    let mut hi: i64 = n;
+    while lo < hi {
+        let mid: i64 = (lo + hi) / 2;
+        let c: i64 = wp_probe_cmp(t, word, start, end, hash2, mid);
+        if c == 0 { return __mind_load_i64(ids + mid * 8); }
+        if c < 0 { hi = mid; } else { lo = mid + 1; }
+    }
+    -1
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// wp_tokenize — full pipeline. Writes token ids as i64 lanes to out_ids
+// (capacity cap lanes), returns the count (>= 2: [CLS] .. [SEP]).
+// Errors: -1 null tables; -2 out capacity exceeded.
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub fn wp_tokenize(t: i64, text: i64, len: i64, out_ids: i64, cap: i64) -> i64 {
+    if t == 0 { return -1; }
+
+    let norm: i64 = __mind_alloc(len * 8 + 64);
+    let nlen: i64 = wp_normalize(t, text, len, norm);
+
+    // ids scratch: at most one token per normalized byte, + specials.
+    let ids: i64 = __mind_alloc((nlen + 8) * 8);
+    let mut n_ids: i64 = 0;
+
+    let box: i64 = __mind_alloc(8);
+
+    // Word-split + WordPiece per word.
+    let mut pos: i64 = 0;
+    while pos < nlen {
+        // Skip spaces.
+        let mut skip: i64 = 1;
+        while skip == 1 {
+            if pos >= nlen {
+                skip = 0;
+            } else {
+                if __mind_load_i8(norm + pos) == 32 {
+                    pos = pos + 1;
+                } else {
+                    skip = 0;
+                }
+            }
+        }
+        if pos < nlen {
+            // Word span [ws, we): a punctuation cp is its own word; a
+            // non-punct word ends at the next space or punct cp.
+            let ws: i64 = pos;
+            let first_cp_end: i64 = wp_next_cp(norm, pos, nlen, box);
+            let first_cp: i64 = __mind_load_i64(box);
+            let mut we: i64 = first_cp_end;
+            let mut ncp: i64 = 1;
+            if wp_is_punct(t, first_cp) == 0 {
+                // extend to the full word
+                let mut cont: i64 = 1;
+                while cont == 1 {
+                    if we >= nlen {
+                        cont = 0;
+                    } else {
+                        if __mind_load_i8(norm + we) == 32 {
+                            cont = 0;
+                        } else {
+                            let nend: i64 = wp_next_cp(norm, we, nlen, box);
+                            let cp2: i64 = __mind_load_i64(box);
+                            if wp_is_punct(t, cp2) == 1 {
+                                cont = 0;
+                            } else {
+                                we = nend;
+                                ncp = ncp + 1;
+                            }
+                        }
+                    }
+                }
+            }
+            pos = we;
+
+            if ncp > WP_MAX_WORD_CHARS {
+                // over-long word -> single [UNK]
+                __mind_store_i64(ids + n_ids * 8, WP_ID_UNK);
+                n_ids = n_ids + 1;
+            } else {
+                // Greedy longest-match from the left.
+                let mut wstart: i64 = ws;
+                let mut unk: i64 = 0;
+                let mut wcont: i64 = 1;
+                let ids_mark: i64 = n_ids;
+                while wcont == 1 {
+                    if wstart >= we {
+                        wcont = 0;
+                    } else {
+                        let mut hash2: i64 = 0;
+                        if wstart > ws { hash2 = 1; }
+                        let mut wend: i64 = we;
+                        let mut found_id: i64 = -1;
+                        let mut found_end: i64 = wstart;
+                        let mut searching: i64 = 1;
+                        while searching == 1 {
+                            if wend <= wstart {
+                                searching = 0;
+                            } else {
+                                let vid: i64 = wp_vocab_lookup(t, norm, wstart, wend, hash2);
+                                if vid >= 0 {
+                                    found_id = vid;
+                                    found_end = wend;
+                                    searching = 0;
+                                } else {
+                                    // shrink to the previous cp boundary
+                                    wend = wend - 1;
+                                    let mut align: i64 = 1;
+                                    while align == 1 {
+                                        if wend <= wstart {
+                                            align = 0;
+                                        } else {
+                                            if (__mind_load_i8(norm + wend) & 192) == 128 {
+                                                wend = wend - 1;
+                                            } else {
+                                                align = 0;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if found_id < 0 {
+                            unk = 1;
+                            wcont = 0;
+                        } else {
+                            __mind_store_i64(ids + n_ids * 8, found_id);
+                            n_ids = n_ids + 1;
+                            wstart = found_end;
+                        }
+                    }
+                }
+                if unk == 1 {
+                    // No applicable rule at some position: the WHOLE word
+                    // is [UNK]. Rewind the partial subwords emitted for it
+                    // and emit a single [UNK].
+                    n_ids = ids_mark;
+                    __mind_store_i64(ids + n_ids * 8, WP_ID_UNK);
+                    n_ids = n_ids + 1;
+                }
+            }
+        }
+    }
+
+    __mind_free(box);
+
+    // Truncate to 254 tokens, then wrap with [CLS]/[SEP].
+    if n_ids > 254 { n_ids = 254; }
+    let total: i64 = n_ids + 2;
+    if total > cap {
+        __mind_free(ids);
+        __mind_free(norm);
+        return -2;
+    }
+    __mind_store_i64(out_ids + 0, WP_ID_CLS);
+    let mut i: i64 = 0;
+    while i < n_ids {
+        __mind_store_i64(out_ids + (i + 1) * 8, __mind_load_i64(ids + i * 8));
+        i = i + 1;
+    }
+    __mind_store_i64(out_ids + (n_ids + 1) * 8, WP_ID_SEP);
+
+    __mind_free(ids);
+    __mind_free(norm);
+    total
+}

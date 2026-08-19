@@ -492,11 +492,11 @@ part that legitimately lives in this repo and belongs on this roadmap.
 
 The thesis that makes this worth building (vs. wrapping ClamAV/Semgrep):
 signature/rule scanners match *known* patterns. The MIND-ecosystem edge is
-**deterministic semantic analysis with a signed evidence chain** — analyze
+**deterministic semantic analysis with a tamper-evident evidence chain** — analyze
 the code's actual computed behavior (data-flow, capability use, obfuscation
 unfolding) reproducibly and bit-identically across substrates, and emit an
 **attested verdict** (request hash → artifact hash → verdict hash into the
-evidence envelope). A reproducible, signed, semantics-level verdict is
+evidence envelope). A reproducible, tamper-evident, semantics-level verdict is
 something signature engines structurally cannot produce. This reuses the
 exact wedge mind-nerve already carries (Q16.16 determinism + attestation),
 applied to a detection target instead of a routing target.
@@ -706,7 +706,7 @@ wedge applied to ourselves.
 - **Approach:** port via the `mind-migrator` path — to the executable MIND subset, verifying every
   emitted symbol actually runs and reusing `std` primitives; no silent AOT-only stubs.
 - **Invariant:** migration preserves behavior and the cross-substrate byte-identity gate — no
-  regression in determinism or the signed evidence chain.
+  regression in determinism or the tamper-evident evidence chain.
 - **Status:** Core .mind surface COMPLETE (2026-08-15) — kernel tree + all 13
   front-end files compile and execute on mindc 0.10.2 under the fail-closed
   gate. Remaining migration legs (CLI → daemon → MCP server → hook →

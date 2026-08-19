@@ -2,6 +2,11 @@
 /target/
 /mind/target/
 /build/
+# Native binary outputs (mindc --out / project build; CI and users build these
+# locally — a committed binary goes stale against source and bloats the repo).
+/mind-nerve
+/mind-nerve-cpu
+/mind-nerve-win.exe
 *.o
 *.so
 *.dylib

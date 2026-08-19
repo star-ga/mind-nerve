@@ -91,6 +91,16 @@ extern "C" {
     // in Phase 1 — no write_file primitive exists by design.
     unsafe fn __mind_nerve_rt_read_file(path: i64, path_len: i64, buf: i64, cap: i64) -> i64;
 
+    // Read the value of environment variable `name` (UTF-8 name bytes,
+    // `name_len` long, no NUL) into `buf` (up to `cap` bytes). Returns the
+    // value length in bytes (>= 0) when the variable is set, RT_ERR_UNSUPPORTED
+    // (-2) when it is unset, or RT_ERR_IO (-1) on a malformed name or a buffer
+    // smaller than the value. The `mcp` subcommand uses it to resolve
+    // MIND_NERVE_RUNTIME_DIR at runtime instead of baking a machine-specific
+    // path into the OSS binary. Read-only host state — not bit-identical by
+    // definition, and never on a hash preimage path.
+    unsafe fn __mind_nerve_rt_getenv(name: i64, name_len: i64, buf: i64, cap: i64) -> i64;
+
     // Write `len` bytes of cryptographic-quality host entropy into `buf`.
     // Returns RT_OK, or RT_ERR_UNSUPPORTED on a backend without an RNG —
     // callers then fall back to the chain_log test-fixture constructor
@@ -139,6 +149,24 @@ pub fn rt_read_file(path: i64, path_len: i64, buf: i64, cap: i64) -> i64 {
 
 pub fn rt_os_entropy(buf: i64, len: i64) -> i64 {
     return __mind_nerve_rt_os_entropy(buf, len);
+}
+
+// Read env var `name` (name_len bytes) into `buf` (cap). Returns the value
+// length (>= 0) when set, RT_ERR_UNSUPPORTED (-2) when unset, RT_ERR_IO (-1)
+// on a too-small buffer or malformed name. Config-resolution only; the value
+// never enters any hash/evidence preimage (host state is not bit-identical).
+//
+// deferred/BLOCKED: `__mind_nerve_rt_getenv` is NOT yet in mindc's
+// STD_SURFACE_INTRINSICS table (src/type_checker/mod.rs, alongside the other
+// eight __mind_nerve_rt_* entries), so the MLIR backend emits E2024 and drops
+// THIS WHOLE MODULE to a runtime-JIT fallback — which makes every rt_* wrapper
+// an undefined reference at native link (launcher stub, not an ELF). The C
+// impl (nerve_rt_shims.c) and this extern decl are necessary but NOT
+// sufficient. UPGRADE PATH (mind-compiler / ~/mind, one line):
+//   ("__mind_nerve_rt_getenv", 4),   // insert after rt_file_size, arity 4
+// Once registered, this wrapper compiles natively and tools/call routes.
+pub fn rt_getenv(name: i64, name_len: i64, buf: i64, cap: i64) -> i64 {
+    return __mind_nerve_rt_getenv(name, name_len, buf, cap);
 }
 
 pub fn rt_exit(code: i64) -> i64 {

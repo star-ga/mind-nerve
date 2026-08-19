@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -867,7 +868,13 @@ def test_http_get_read_cap_covers_quarantine_cap(monkeypatch):
             seen.append(n)
             return b""
 
-    monkeypatch.setattr(acquire.urllib.request, "urlopen", lambda req, timeout=None: _FakeResp())
+    monkeypatch.setattr(
+        acquire.urllib.request,
+        "build_opener",
+        lambda *handlers: type(
+            "_Opener", (), {"open": lambda self, req, timeout=None: _FakeResp()}
+        )(),
+    )
     acquire._http_get("https://example.com/x")
     assert seen == [acquire.MAX_QUARANTINE_BYTES + 1]
 
@@ -1311,18 +1318,14 @@ def test_mcp_entry_point_server_json_leading_dash_identifier_refused(tmp_path):
 
 
 @pytest.mark.skipif(acquire._tomllib is None, reason="tomllib requires Python 3.11+")
-def test_mcp_entry_point_pyproject_console_script(tmp_path):
+def test_mcp_entry_point_non_table_project_refused(tmp_path):
+    """codex round-4 #31: `project = "not-a-table"` must refuse, not crash."""
     pkg = tmp_path / "pkg"
     pkg.mkdir()
     (pkg / "pyproject.toml").write_text(
-        '[project]\nname = "fs-mcp"\n[project.scripts]\nfs-mcp = "fs_mcp:main"\n',
-        encoding="utf-8",
+        'project = "not-a-table"\n', encoding="utf-8"
     )
-    entry = acquire._mcp_entry_point(pkg)
-    assert entry is not None
-    assert entry["command"] == "uvx"
-    assert entry["args"][0] == "--from"
-    assert entry["args"][2] == "fs-mcp"
+    assert acquire._mcp_entry_point(pkg) is None
 
 
 def test_mcp_entry_point_bin_escape_refused(tmp_path):
@@ -1333,6 +1336,95 @@ def test_mcp_entry_point_bin_escape_refused(tmp_path):
         json.dumps({"bin": {"evil": "../outside.js"}}), encoding="utf-8"
     )
     assert acquire._mcp_entry_point(pkg) is None
+
+
+def test_mcp_entry_point_bin_directory_refused(tmp_path):
+    """codex round-4 #7: "bin": "." resolves to the package DIR, after which
+    node would follow "main" outside the vetted package."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "package.json").write_text(
+        json.dumps({"bin": {"evil": "."}, "main": "../outside.js"}), encoding="utf-8"
+    )
+    assert acquire._mcp_entry_point(pkg) is None
+
+
+def test_tarball_member_cap_counts_dirs_and_links(tmp_path):
+    """codex round-4 #14: the streaming cap must count EVERY member — dir
+    and link headers alone are an inode/memory bomb."""
+    import io
+    import tarfile
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        for i in range(4):
+            tf.addfile(tarfile.TarInfo(f"pkg/dir{i}"))
+        info = tarfile.TarInfo("pkg/ok.txt")
+        data = b"hi\n"
+        info.size = len(data)
+        tf.addfile(info, io.BytesIO(data))
+    with pytest.raises(FetchError, match="file-count cap"):
+        acquire.fetch(
+            Candidate(name="p", source="t", url="https://example.com/p.tar.gz"),
+            runtime_dir=tmp_path / "rt",
+            max_files=3,
+            http_get=lambda url, headers: buf.getvalue(),
+        )
+
+
+def test_tree_url_symlink_subdir_refused(tmp_path, monkeypatch):
+    """codex round-4 #11: a tree subdir that is itself a symlink would be
+    dereferenced before vetting."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("top secret\n", encoding="utf-8")
+    repo = tmp_path / "repo"
+    (repo / "skills").mkdir(parents=True)
+    (repo / "skills" / "linked").symlink_to(outside)
+
+    def fake_clone(url: str, dest, ref=None, max_bytes=None):
+        import shutil as _sh
+
+        _sh.copytree(repo, dest, symlinks=True)
+        return "deadbeef"
+
+    monkeypatch.setattr(acquire, "_git_clone", fake_clone)
+    with pytest.raises(FetchError, match="symlink"):
+        acquire.fetch(
+            Candidate(
+                name="p",
+                source="t",
+                url="https://github.com/a/b/tree/HEAD/skills/linked",
+            ),
+            runtime_dir=tmp_path / "rt",
+        )
+
+
+def test_prune_routes_canonicalizes_relative_and_absolute(tmp_path):
+    """codex round-4 #10: relative-vs-absolute hub spellings must prune the
+    same rows."""
+    import os as _os
+
+    hub = tmp_path / "hub"
+    target = hub / "pdf-tools"
+    target.mkdir(parents=True)
+    rt = tmp_path / "rt"
+    rt.mkdir()
+    with (rt / "route_table.npy").open("wb") as fh:
+        np.save(fh, np.zeros((2, 4), dtype=np.float32))
+    (rt / "route_table.jsonl").write_text(
+        json.dumps(
+            {"name": "pdf-tools", "sha256": "a", "source_path": str(target / "SKILL.md")}
+        )
+        + "\n"
+        + json.dumps({"name": "other", "sha256": "b", "source_path": "/elsewhere/SKILL.md"})
+        + "\n",
+        encoding="utf-8",
+    )
+    # Prune using a RELATIVE spelling of the same directory.
+    rel = _os.path.relpath(target, _os.getcwd())
+    out = acquire._prune_routes_for_path(rt, Path(rel))
+    assert out["pruned"] == 1
 
 
 def test_register_mcp_server_never_clobbers_non_object_config(tmp_path):
@@ -1783,3 +1875,155 @@ def test_fetch_raw_file_rejects_dotdot(tmp_path):
             runtime_dir=tmp_path / "rt",
             http_get=lambda url, headers: b"x",
         )
+
+
+# ---------------------------------------------------------------------------
+# Audit findings (2026-08, round 4): SKIP_DIRS drift, FIFO hang, uvx--from
+# removal, redirect allowlist, register-mcp overwrite, daemon PID match,
+# runtime-dir UID check
+# ---------------------------------------------------------------------------
+
+
+def test_scanner_and_discovery_skip_dirs_are_one_set():
+    """fable#5: scanner pruned a DIFFERENT set than discovery/install
+    (.system) — one constant now."""
+    from mind_nerve import discovery, security_scan
+
+    assert security_scan._SKIP_DIRS == discovery.SKIP_DIRS
+    assert ".system" in security_scan._SKIP_DIRS
+
+
+def test_copy_local_skips_fifo(tmp_path):
+    """qwen Q14: a FIFO in an operator-typed local source used to hang
+    copy2 (and the scanner's open()) forever."""
+    pkg = _make_pkg(tmp_path / "src")
+    os.mkfifo(pkg / "pipe")
+    out = acquire.fetch(
+        Candidate(name="pdf-tools", source="test", url=str(pkg)),
+        runtime_dir=tmp_path / "rt",
+        allow_local=True,
+    )
+    qdir = Path(out["quarantine_dir"])
+    assert (qdir / "SKILL.md").is_file()
+    assert not (qdir / "pipe").exists()
+
+
+def test_scanner_refuses_nonregular_file(tmp_path):
+    """A FIFO reaching the scanner directly (acquire vet <dir>) fails closed
+    instead of blocking on open()."""
+    root = _make_pkg(tmp_path / "src")
+    os.mkfifo(root / "pipe")
+    report = acquire.vet(root, use_clamav=False)
+    assert report["verdict"] == "FAIL"
+    rules = {f["rule"] for f in report["security"]["findings"]}
+    assert "scanner-error" in rules
+
+
+@pytest.mark.skipif(acquire._tomllib is None, reason="tomllib requires Python 3.11+")
+def test_mcp_entry_point_pyproject_runs_in_tree(tmp_path):
+    """grok#4: `uvx --from <dir>` resolves PyPI deps at run time (unvetted
+    code). The console script now registers as the interpreter on the
+    in-tree module file."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "pyproject.toml").write_text(
+        '[project]\nname = "fs-mcp"\n[project.scripts]\nfs-mcp = "fs_mcp:main"\n',
+        encoding="utf-8",
+    )
+    (pkg / "fs_mcp.py").write_text("def main():\n    pass\n", encoding="utf-8")
+    entry = acquire._mcp_entry_point(pkg)
+    assert entry is not None
+    import sys
+
+    assert entry["command"] == sys.executable
+    assert entry["args"] == [str((pkg / "fs_mcp.py").resolve())]
+
+
+@pytest.mark.skipif(acquire._tomllib is None, reason="tomllib requires Python 3.11+")
+def test_mcp_entry_point_rejects_hostile_script_ref(tmp_path):
+    """grok#4: leading-dash / whitespace module refs are option injection."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "pyproject.toml").write_text(
+        '[project]\nname = "x"\n[project.scripts]\nx = "--load-extension=/evil:main"\n',
+        encoding="utf-8",
+    )
+    assert acquire._mcp_entry_point(pkg) is None
+
+
+@pytest.mark.skipif(acquire._tomllib is None, reason="tomllib requires Python 3.11+")
+def test_mcp_entry_point_missing_module_file_refused(tmp_path):
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "pyproject.toml").write_text(
+        '[project]\nname = "x"\n[project.scripts]\nx = "ghost_module:main"\n',
+        encoding="utf-8",
+    )
+    assert acquire._mcp_entry_point(pkg) is None
+
+
+def test_http_redirect_to_http_refused():
+    """fable#6: the https-only rule must be re-applied per redirect hop."""
+    req = acquire.urllib.request.Request("https://a.example/x")
+    handler = acquire._HttpsOnlyRedirectHandler()
+    with pytest.raises(FetchError, match="non-https"):
+        handler.redirect_request(req, None, 302, "", {}, "http://a.example/y")
+
+
+def test_http_redirect_cross_host_drops_auth_header():
+    """fable#6: GITHUB_TOKEN must not follow a redirect to another host."""
+    req = acquire.urllib.request.Request(
+        "https://a.example/x", headers={"Authorization": "Bearer tok"}
+    )
+    handler = acquire._HttpsOnlyRedirectHandler()
+    new = handler.redirect_request(req, None, 302, "", {}, "https://b.example/y")
+    assert new is not None and "Authorization" not in new.headers
+    same = handler.redirect_request(req, None, 302, "", {}, "https://a.example/y")
+    assert same is not None and same.headers.get("Authorization") == "Bearer tok"
+
+
+def test_register_mcp_never_overwrites_foreign_entry(tmp_path):
+    """qwen Q7: a pre-existing same-named server entry not written by us is
+    preserved — registration skips that CLI instead of clobbering."""
+    pkg = _make_mcp_pkg(tmp_path / "src")
+    cfg = tmp_path / "claude.json"
+    cfg.write_text(
+        json.dumps({"mcpServers": {"fs-mcp": {"command": "/hand/written"}}}) + "\n",
+        encoding="utf-8",
+    )
+    out = acquire.register_mcp_server("fs-mcp", pkg, targets={"claude-code": cfg})
+    assert out["registered"] is False
+    assert "not managed" in out["targets"]["claude-code"]
+    servers = json.loads(cfg.read_text(encoding="utf-8"))["mcpServers"]
+    assert servers["fs-mcp"] == {"command": "/hand/written"}
+
+
+def test_daemon_cmdline_matching_is_argv0_only():
+    """qwen Q15: `vim mind-nerve-routed` must not be SIGTERMed."""
+    from mind_nerve import ensure
+
+    assert ensure._is_daemon_cmdline(b"/home/x/.venv/bin/mind-nerve-routed\0") is True
+    assert ensure._is_daemon_cmdline(b"/usr/bin/python3\0-m\0mind_nerve.daemon\0") is True
+    assert ensure._is_daemon_cmdline(b"/usr/bin/vim\0mind-nerve-routed\0") is False
+    assert ensure._is_daemon_cmdline(b"/bin/cat\0/home/x/mind_nerve.daemon\0") is False
+
+
+def test_runtime_socket_dir_rejects_foreign_owned_xdg(tmp_path, monkeypatch):
+    """qwen Q13: SECURITY.md claims the same-UID rule is enforced — make it
+    true. A writable but root-owned XDG_RUNTIME_DIR must not be used."""
+    from mind_nerve._runtime_dir import runtime_socket_dir
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/tmp")  # root-owned, writable
+    got = runtime_socket_dir()
+    assert got == tmp_path / ".cache" / "mind-nerve" / "run"
+    assert (got.stat().st_mode & 0o777) == 0o700
+
+
+def test_runtime_socket_dir_uses_owned_xdg(tmp_path, monkeypatch):
+    from mind_nerve._runtime_dir import runtime_socket_dir
+
+    xdg = tmp_path / "xdg"
+    xdg.mkdir()
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(xdg))
+    assert runtime_socket_dir() == xdg

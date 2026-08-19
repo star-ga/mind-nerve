@@ -189,3 +189,29 @@ def test_daemon_exits_cleanly_without_af_unix(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.delattr(_socket, "AF_UNIX", raising=False)
     rc = daemon_mod.main()
     assert rc == 1  # clean refusal, not a crash
+
+
+def test_missing_encoder_weights_fail_construction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """codex final #1: a missing weights blob used to construct an init(0,0)
+    placeholder — encode then returned all-zero embeddings (or crashed on an
+    incompatible .so). Construction must fail so the PyTorch fallback in
+    _load_cached activates."""
+    import mind_nerve._native as nat_mod
+    import mind_nerve.inference as inf_mod
+
+    rt = tmp_path / "rt"
+    rt.mkdir()
+    (rt / "manifest.json").write_text("{}", encoding="utf-8")
+
+    class _FakeNative:
+        def init(self, addr: int, nbytes: int) -> int:
+            raise AssertionError("init must not be reached without weights")
+
+    monkeypatch.setattr(nat_mod, "_NativeRuntime", _FakeNative)
+    monkeypatch.setattr(
+        inf_mod._NativeEncoderRuntime, "_load_tokenizer", lambda self, d: None
+    )
+    with pytest.raises(FileNotFoundError, match="encoder weights"):
+        inf_mod._NativeEncoderRuntime(rt)

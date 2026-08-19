@@ -34,10 +34,9 @@ import luts.sqrt_q16;
 // Constants
 // ---------------------------------------------------------------------------
 
-// Q16.16 ONE = 65536
-pub fn q16_one() -> i64 {
-    65536
-}
+// Q16.16 ONE (65536) is defined once, in kernels/gelu_q16.mind, and never
+// called here — its former duplicate definition collided at native link
+// (multiple definition of `q16_one`). Removed to keep a single owning TU.
 
 // Q16.16 clamp-to-1 sentinel for zero variance.
 pub fn var_clamp_min() -> i64 {

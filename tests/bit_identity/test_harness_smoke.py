@@ -14,7 +14,7 @@ Tests:
   5. Top-K indices are within valid catalog bounds.
   6. Sliding-window invariant holds for all T > 256 corpus entries.
   7. Reproducing the corpus produces the same result (determinism).
-  8. Sentinel hashes are well-formed for native and cuda backends.
+  8. Sentinel hashes are well-formed for the native backend.
   9. Comparison report runs without error on pytorch-vs-pytorch (100% pass).
   10. Token IDs from different queries differ (no hash collision on trivial inputs).
 """
@@ -52,7 +52,6 @@ TOTAL_HASHES = CORPUS_SIZE * HASHES_PER_QUERY
 SENTINELS = frozenset(
     [
         "BACKEND_STUB_NOT_BUILT",
-        "CUDA_DEFERRED_TO_V0_4_1",
     ]
 )
 
@@ -464,18 +463,6 @@ class TestSentinelBackends:
             assert rec["backend"] == "native"
             for key in RUNNER_HASH_KEYS:
                 assert rec["hashes"][key] == SENTINEL_NATIVE_STUB
-
-    def test_cuda_sentinel_blob_structure(self, corpus: list[dict]) -> None:
-        """CUDA backend emits deferred sentinel per §3.2."""
-        sys.path.insert(0, str(THIS_DIR))
-        from runner import SENTINEL_CUDA, _sentinel_records  # type: ignore[import-not-found]
-
-        records = _sentinel_records(corpus[:5], "cuda", SENTINEL_CUDA)
-        assert len(records) == 5
-        for rec in records:
-            assert rec["backend"] == "cuda"
-            for key in HASH_KEYS:
-                assert rec["hashes"][key] == SENTINEL_CUDA
 
     def test_compare_with_sentinel_does_not_fail(self, corpus: list[dict]) -> None:
         """

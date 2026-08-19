@@ -369,7 +369,7 @@ def _emit_run_json(
         "manifest": manifest_payload,
     }
     run_path = output_dir / "run.json"
-    run_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    run_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return run_path
 
 
@@ -381,8 +381,7 @@ def _train_python_backend(config: TrainConfig) -> TrainResult:
     produce an equivalent checkpoint.
     """
     import torch
-    from sentence_transformers import InputExample, SentenceTransformer
-    from sentence_transformers.sentence_transformer import losses
+    from sentence_transformers import InputExample, SentenceTransformer, losses
     from torch.utils.data import DataLoader
 
     started_at_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -473,8 +472,12 @@ def _train_python_backend(config: TrainConfig) -> TrainResult:
         "dataset_manifest_sha256": dataset_manifest_sha256,
     }
     manifest_path = config.output_dir / "manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-    (config.output_dir / "eval.json").write_text(json.dumps(final, indent=2, sort_keys=True) + "\n")
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    (config.output_dir / "eval.json").write_text(
+        json.dumps(final, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     _emit_run_json(
         output_dir=config.output_dir,
         config=config,

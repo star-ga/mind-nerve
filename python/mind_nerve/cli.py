@@ -94,6 +94,19 @@ def cmd_learn(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_prune(args: argparse.Namespace) -> int:
+    """Reconcile route_table.npy and route_table.jsonl to identical length.
+
+    Repairs the drift that otherwise surfaces as a load-time
+    ``Route table embeddings/meta length mismatch`` RuntimeError.
+    """
+    from .discovery import reconcile_table
+
+    out = reconcile_table(args.runtime_dir or _DEFAULT_RUNTIME_DIR)
+    print(json.dumps(out, indent=2))
+    return 0
+
+
 def cmd_scan_repo(args: argparse.Namespace) -> int:
     from .scan_repo import scan_repo
 
@@ -573,6 +586,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_learn.set_defaults(func=cmd_learn)
 
+    p_prune = sub.add_parser(
+        "prune",
+        help="Reconcile route_table.npy and route_table.jsonl to identical row "
+        "count (repairs drift that otherwise dies at load with a "
+        "'Route table embeddings/meta length mismatch').",
+    )
+    p_prune.set_defaults(func=cmd_prune)
+
     p_scan = sub.add_parser(
         "scan-repo",
         help="Scan a target repo and recommend a capability bundle "
@@ -826,8 +847,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--register-mcp",
         action="store_true",
         help="Also register a kind=mcp package's server entry point into the "
-        "active CLIs' MCP configs (opt-in; refuses without a recognizable "
-        "entry point: server.json, pyproject [project.scripts], package.json bin).",
+        "active CLIs' MCP configs (opt-in; LOCAL entry points only: "
+        "pyproject [project.scripts] or package.json bin, both resolved "
+        "inside the vetted package directory).",
     )
     p_acq_install.add_argument(
         "--hub",

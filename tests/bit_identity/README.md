@@ -8,13 +8,14 @@ Phase 1 exit criterion: "One byte of divergence fails the build."
 
 ## Scope by phase
 
-| Phase | Backends in scope |
+| Scope | Backends |
 |---|---|
-| Phase 1 | x86 CPU, CUDA |
-| Phase 2 | x86 CPU, ARM CPU, CUDA, WebGPU, NPU |
+| Shipped | x86_64 CPU, ARM64 CPU |
 
-A backend not in scope for the current phase is allowed to diverge. A
-backend in scope that diverges by even one byte fails the build.
+the open-source release ships CPU backends only (scope decision
+2026-08-15): CUDA/WebGPU are reserved for a potential private/enterprise
+tier, and this harness carries no GPU leg. A
+shipped backend that diverges by even one byte fails the build.
 
 ## Directory layout
 
@@ -52,8 +53,8 @@ two envelope fields that are intentionally backend-specific:
 - `timestamp_ms` (envelope bytes 8-15, 8 bytes): wall-clock value, not
   bit-identical across runs. The harness pins this via
   `MIND_NERVE_TEST_INJECT_MS` (default: 1000000).
-- `architecture` (envelope byte 16, 1 byte): encodes `x86_64=1 / aarch64=2 /
-  cuda=3`. Naturally differs per backend.
+- `architecture` (envelope byte 16, 1 byte): encodes `x86_64=1 / aarch64=2`
+  (3-5 reserved, not shipped backends). Naturally differs per backend.
 
 The masked frame SHA-256 must be identical across every in-scope backend.
 
@@ -87,7 +88,6 @@ bash tests/bit_identity/run.sh
 
 Requires:
 - `./mind-nerve-cpu` executable (compiled for x86/ARM CPU)
-- `./mind-nerve-cuda` executable (compiled for CUDA) — only if `nvidia-smi` succeeds
 - `./fixtures/model.weights` — or set `MIND_NERVE_MODEL` env var
 - All golden hashes populated in `fixtures/expected/`
 
@@ -102,8 +102,6 @@ Exits 4 if fixture files are missing.
 # Run only the CPU backend, skip pairwise comparison:
 bash tests/bit_identity/run.sh --backend cpu
 
-# Run only CUDA:
-bash tests/bit_identity/run.sh --backend cuda
 ```
 
 In single-backend mode, the harness still compares against the golden hash
@@ -114,7 +112,6 @@ but skips pairwise cross-backend comparison.
 | Variable | Default | Purpose |
 |---|---|---|
 | `MIND_NERVE_CPU` | `./mind-nerve-cpu` | Path to x86/ARM cpu binary |
-| `MIND_NERVE_CUDA` | `./mind-nerve-cuda` | Path to CUDA binary |
 | `MIND_NERVE_ARM` | `./mind-nerve-arm` | Path to ARM binary |
 | `MIND_NERVE_MODEL` | `fixtures/model.weights` | Path to weights file |
 | `MIND_NERVE_TEST_INJECT_MS` | `1000000` | Pinned timestamp (ms) |
@@ -153,7 +150,7 @@ bytes diverged:
 python3 tests/bit_identity/verify.py /tmp/frame_cpu.bin
 
 # Compare two frames (shows byte-level diff after masking):
-python3 tests/bit_identity/verify.py /tmp/frame_cpu.bin /tmp/frame_cuda.bin
+python3 tests/bit_identity/verify.py /tmp/frame_cpu.bin /tmp/frame_arm.bin
 ```
 
 Output includes:

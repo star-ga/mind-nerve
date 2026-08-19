@@ -29,7 +29,7 @@ entry = "exports/c_abi.mind"
 
 [targets.cpu]
 backend = "cpu"
-# Explicit, sorted-by-tree module list. ALL 17 CI-gated files. Adding a
+# Explicit, sorted-by-tree module list. ALL 19 CI-gated files. Adding a
 # module to mind/{luts,kernels,exports}/ without listing it here means
 # the module table never sees it — the gate fails closed in that case.
 sources = [
@@ -44,10 +44,24 @@ sources = [
     "kernels/matmul_q16.mind",
     "kernels/sliding_window.mind",
     "kernels/topk_q16.mind",
+    "kernels/wordpiece.mind",
     "luts/exp_q16.mind",
     "luts/recip_q32.mind",
     "luts/rsqrt_q16.mind",
     "luts/softmax_q16.mind",
     "luts/sqrt_q16.mind",
     "luts/tanh_q16.mind",
+    "luts/vocab_wp.mind",
+]
+# Native C-ABI runtime shims compiled + statically linked into the executable.
+# These DEFINE the `__mind_nerve_blas_*` / `__mind_nerve_lut_*` symbols that the
+# kernel/LUT modules call (registered in mindc's STD_SURFACE_INTRINSICS, so the
+# MLIR backend emits a plain `func.call @__mind_nerve_*` and the modules compile
+# NATIVELY — no E2024 self-host-only advisory + runtime-JIT fallback). Without
+# this the native link fails with `undefined reference` and drops to a launcher.
+# Compiled through mindc's deterministic clang invocation (fixed-basename STT_FILE
+# + -ffile-prefix-map, no -g, -ffp-contract=off) so no path leaks into .symtab.
+native_sources = [
+    "runtime/blas_shims_i64.c",
+    "runtime/lut_cache.c",
 ]

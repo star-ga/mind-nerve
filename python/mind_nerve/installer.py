@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -197,14 +198,76 @@ STUB_CLIS = [
 ]
 
 
+def _populated_runtime_dir() -> str | None:
+    """Return the mind-nerve runtime dir to pin, or ``None`` when unpopulated.
+
+    Mirrors ``existingRuntimeDir()`` in
+    ``integrations/installer/src/install.ts``: a runtime dir is only worth
+    pinning via ``MIND_NERVE_RUNTIME_DIR`` when it is actually populated
+    (``manifest.json`` or ``route_table.jsonl`` present). A fresh install
+    never creates ``~/.local/share/mind-nerve-runtime`` (the "dash" path,
+    STARGA's curated table) up front — the HF auto-seed target is the
+    "slash" path ``~/.local/share/mind-nerve/runtime``
+    (``inference._default_user_runtime_dir``). Pinning the dash path
+    unconditionally on a fresh install points every generated MCP config at
+    a directory that does not exist; ``inference._resolve_runtime_dir``
+    raises ``FileNotFoundError`` for an explicitly-pinned dir that is
+    missing, so `mind-nerve-mcp` would crash on first use instead of
+    auto-seeding. Checks ``$MIND_NERVE_RUNTIME_DIR`` first (an operator's
+    existing pin), then the dash path.
+    """
+    import os as _os
+
+    candidate = _os.environ.get("MIND_NERVE_RUNTIME_DIR") or str(
+        HOME / ".local" / "share" / "mind-nerve-runtime"
+    )
+    d = Path(candidate)
+    if (d / "manifest.json").is_file() or (d / "route_table.jsonl").is_file():
+        return candidate
+    return None
+
+
 def _mcp_entry(
-    command: str = "mind-nerve-mcp", env: dict[str, str] | None = None
+    command: str = "mind-nerve-mcp",
+    env: dict[str, str] | None = None,
+    *,
+    pin_runtime_dir: bool = True,
 ) -> dict[str, Any]:
-    """Generic MCP server registration entry, used by every CLI."""
+    """Generic MCP server registration entry, used by every MCP-based CLI.
+
+    Cross-platform: resolves the launcher to its real path (``.exe`` on Windows,
+    where a spawning CLI cannot resolve bare ``mind-nerve-mcp``), and — only for
+    the mind-nerve entry itself (``pin_runtime_dir=True``, the default) — pins
+    MIND_NERVE_RUNTIME_DIR when a populated runtime dir already exists (see
+    :func:`_populated_runtime_dir`). An unpinned MCP server silently falls back
+    to the ~11.9k OSS catalog instead of the local routed table, but pinning a
+    dir that does not exist yet is worse — it crashes the server outright — so
+    the pin is opportunistic, not unconditional. Unrelated servers (e.g.
+    ``mind-mem-mcp``) must pass ``pin_runtime_dir=False`` — this is a
+    mind-nerve-specific env var and must not leak into another server's env.
+    """
+    import os as _os
+    import shutil as _shutil
+
+    # POSIX: the spawning CLI searches PATH itself, so keep the bare command
+    # (existing configs + tests expect the literal "mind-nerve-mcp"). Windows:
+    # a spawning CLI cannot resolve a bare name, so resolve to the real
+    # launcher and append ".exe" when needed.
+    if _os.name == "nt":
+        resolved = _shutil.which(command) or (
+            command if command.lower().endswith(".exe") else command + ".exe"
+        )
+    else:
+        resolved = command
+    merged_env = dict(env or {})
+    if pin_runtime_dir:
+        populated = _populated_runtime_dir()
+        if populated is not None:
+            merged_env.setdefault("MIND_NERVE_RUNTIME_DIR", populated)
     return {
-        "command": command,
+        "command": resolved,
         "args": [],
-        "env": env or {},
+        "env": merged_env,
     }
 
 
@@ -244,7 +307,7 @@ def _install_claude_code_manual() -> dict[str, Any]:
     existing: dict[str, Any] = {}
     if cfg_path.exists():
         try:
-            existing = json.loads(cfg_path.read_text())
+            existing = json.loads(cfg_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             existing = {}
     servers = existing.setdefault("mcpServers", {})
@@ -264,7 +327,7 @@ def install_claude_desktop(cfg: dict[str, Any]) -> dict[str, Any]:
     existing: dict[str, Any] = {}
     if cfg_path.exists():
         try:
-            existing = json.loads(cfg_path.read_text())
+            existing = json.loads(cfg_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             existing = {}
     servers = existing.setdefault("mcpServers", {})
@@ -280,13 +343,29 @@ def install_cursor(cfg: dict[str, Any]) -> dict[str, Any]:
     existing: dict[str, Any] = {}
     if cfg_path.exists():
         try:
-            existing = json.loads(cfg_path.read_text())
+            existing = json.loads(cfg_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             existing = {}
     servers = existing.setdefault("mcpServers", {})
     servers["mind-nerve"] = _mcp_entry()
     safe_write(cfg_path, json.dumps(existing, indent=2) + "\n")
     return {"installed": True, "method": "json_mcp_servers", "path": str(cfg_path)}
+
+
+def _upsert_toml_block(existing: str, pattern: re.Pattern[str], block: str) -> str:
+    """Insert *block*, collapsing ALL pre-existing matches of *pattern* to one.
+
+    ``re.sub`` with its default ``count=0`` replaces every match independently:
+    re-running against a config already left with two duplicate
+    ``[mcp_servers.mind-nerve]`` headers (by the old non-idempotent bug, before
+    the lazy-``[\\s\\S]*?`` body fix) normalized each of the two in place and
+    still produced two headers — TOML then rejects the file for a duplicate
+    table (codex refuses to start). Stripping every match first, then
+    appending a single fresh block, makes one re-run self-heal an
+    already-corrupted config down to exactly one block. When *pattern* has no
+    match at all (first install) this reduces to a plain append.
+    """
+    return pattern.sub("", existing).rstrip() + block
 
 
 def install_codex(cfg: dict[str, Any]) -> dict[str, Any]:
@@ -297,22 +376,48 @@ def install_codex(cfg: dict[str, Any]) -> dict[str, Any]:
     """
     cfg_path = HOME / ".codex" / "config.toml"
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
-    block = '\n[mcp_servers.mind-nerve]\ncommand = "mind-nerve-mcp"\nargs = []\nenv = {}\n'
+    # Cross-platform MCP block. On Windows the launcher is `mind-nerve-mcp.exe`
+    # (bare `mind-nerve-mcp` does not resolve). The runtime dir is pinned in
+    # env ONLY when a populated runtime dir already exists (see
+    # _populated_runtime_dir) — an unpinned server silently falls back to the
+    # ~11.9k OSS catalog instead of the local routed table, but pinning a dir
+    # that a fresh install never created is worse: it crashes the MCP server
+    # outright (inference._resolve_runtime_dir raises FileNotFoundError for an
+    # explicitly-pinned, nonexistent dir). Backslashes in Windows paths are
+    # escaped for TOML.
+    import os as _os
+    import shutil as _shutil
+
+    # POSIX keeps the bare command (PATH-resolved by the spawner); only Windows
+    # needs the resolved ".exe" launcher.
+    if _os.name == "nt":
+        mcp_cmd = _shutil.which("mind-nerve-mcp") or "mind-nerve-mcp.exe"
+    else:
+        mcp_cmd = "mind-nerve-mcp"
+    cmd_toml = mcp_cmd.replace("\\", "\\\\")
+    populated_runtime_dir = _populated_runtime_dir()
+    if populated_runtime_dir is not None:
+        rt_toml = populated_runtime_dir.replace("\\", "\\\\")
+        env_toml = f'{{ MIND_NERVE_RUNTIME_DIR = "{rt_toml}" }}'
+    else:
+        env_toml = "{}"
+    block = f'\n[mcp_servers.mind-nerve]\ncommand = "{cmd_toml}"\nargs = []\nenv = {env_toml}\n'
     existing = ""
     if cfg_path.exists():
-        existing = cfg_path.read_text()
+        existing = cfg_path.read_text(encoding="utf-8")
 
-    # If a [mcp_servers.mind-nerve] block already exists, replace it.
-    import re
-
+    # If a [mcp_servers.mind-nerve] block already exists, replace it. NB: the
+    # matched body MUST accept '[' — the block we write contains the literal
+    # '[' in `args = []`, so an earlier `[^\[]` class could never re-match a
+    # file we previously wrote (it stopped at that bracket), making install
+    # NON-idempotent: a second run appended a duplicate table and produced
+    # unparseable TOML. `[\s\S]*?` matches any char lazily and the lookahead
+    # stops at the next `\n[` section header or end-of-file.
     pattern = re.compile(
-        r"\n?\[mcp_servers\.mind-nerve\][^\[]*?(?=\n\[|\Z)",
+        r"\n?\[mcp_servers\.mind-nerve\][\s\S]*?(?=\n\[|\Z)",
         re.DOTALL,
     )
-    if pattern.search(existing):
-        updated = pattern.sub(block, existing)
-    else:
-        updated = existing.rstrip() + block
+    updated = _upsert_toml_block(existing, pattern, block)
 
     safe_write(cfg_path, updated)
     return {"installed": True, "method": "toml_mcp_servers", "path": str(cfg_path)}
@@ -330,7 +435,7 @@ def install_claude_code_hook(cfg: dict[str, Any]) -> dict[str, Any]:
     existing: dict[str, Any] = {}
     if cfg_path.exists():
         try:
-            existing = json.loads(cfg_path.read_text())
+            existing = json.loads(cfg_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             existing = {}
     hooks = existing.setdefault("hooks", {})
@@ -391,7 +496,7 @@ def install_vibe(cfg: dict[str, Any]) -> dict[str, Any]:
     existing: dict[str, Any] = {}
     if cfg_path.exists():
         try:
-            existing = json.loads(cfg_path.read_text())
+            existing = json.loads(cfg_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             existing = {}
     servers = existing.setdefault("mcpServers", {})
@@ -412,7 +517,7 @@ def _install_claw(claw_name: str) -> dict[str, Any]:
     existing: dict[str, Any] = {}
     if cfg_path.exists():
         try:
-            existing = json.loads(cfg_path.read_text())
+            existing = json.loads(cfg_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             existing = {}
     servers = existing.setdefault("mcpServers", {})
@@ -551,7 +656,7 @@ def _install_preselect_hook(layout: dict[str, Any]) -> dict[str, Any]:
     existing: dict[str, Any] = {}
     if cfg_path.exists():
         try:
-            existing = json.loads(cfg_path.read_text())
+            existing = json.loads(cfg_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             existing = {}
 
@@ -660,33 +765,36 @@ def install_claude_code_preselect() -> dict[str, Any]:
 
 
 def _register_mind_mem_in(cfg_path: Path, fmt: str) -> dict[str, Any]:
-    """Idempotent mind-mem MCP entry write into a JSON or TOML CLI config."""
+    """Idempotent mind-mem MCP entry write into a JSON or TOML CLI config.
+
+    ``pin_runtime_dir=False`` on the JSON branch's ``_mcp_entry`` call: mind-mem
+    is an unrelated server (durable memory, not intent routing) and must never
+    inherit mind-nerve's ``MIND_NERVE_RUNTIME_DIR`` env var.
+    """
     if fmt == "json":
         existing: dict[str, Any] = {}
         if cfg_path.exists():
             try:
-                existing = json.loads(cfg_path.read_text())
+                existing = json.loads(cfg_path.read_text(encoding="utf-8"))
             except json.JSONDecodeError:
                 existing = {}
         servers = existing.setdefault("mcpServers", {})
-        servers["mind-mem"] = _mcp_entry("mind-mem-mcp")
+        servers["mind-mem"] = _mcp_entry("mind-mem-mcp", pin_runtime_dir=False)
         safe_write(cfg_path, json.dumps(existing, indent=2) + "\n")
         return {"installed": True, "path": str(cfg_path), "fmt": fmt}
 
     if fmt == "toml":
-        import re
-
         block = '\n[mcp_servers.mind-mem]\ncommand = "mind-mem-mcp"\nargs = []\nenv = {}\n'
-        existing_text = cfg_path.read_text() if cfg_path.exists() else ""
+        existing_text = cfg_path.read_text(encoding="utf-8") if cfg_path.exists() else ""
+        # Same idempotency fix as install_codex: the written block contains
+        # `args = []`, so `[^\[]` could never re-match it → duplicate table on
+        # re-run. `[\s\S]*?` accepts '[' and the lookahead stops at the next
+        # section header or EOF.
         pattern = re.compile(
-            r"\n?\[mcp_servers\.mind-mem\][^\[]*?(?=\n\[|\Z)",
+            r"\n?\[mcp_servers\.mind-mem\][\s\S]*?(?=\n\[|\Z)",
             re.DOTALL,
         )
-        updated = (
-            pattern.sub(block, existing_text)
-            if pattern.search(existing_text)
-            else (existing_text.rstrip() + block)
-        )
+        updated = _upsert_toml_block(existing_text, pattern, block)
         safe_write(cfg_path, updated)
         return {"installed": True, "path": str(cfg_path), "fmt": fmt}
 
@@ -896,7 +1004,7 @@ def install_systemd_user_unit() -> dict[str, Any]:
     try:
         unit_dst_dir.mkdir(parents=True, exist_ok=True)
         log_dir.mkdir(parents=True, exist_ok=True)
-        safe_write(unit_dst, unit_src.read_text())
+        safe_write(unit_dst, unit_src.read_text(encoding="utf-8"))
     except OSError as exc:
         return {"installed": False, "reason": f"could not write unit: {exc}"}
 

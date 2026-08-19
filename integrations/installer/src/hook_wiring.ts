@@ -74,7 +74,7 @@ export function mergeJsonHooks(
           {
             type: "command" as const,
             command,
-            timeout: surface.hookTimeoutSecs,
+            timeout: hookTimeoutValue(surface),
           },
         ],
       },
@@ -153,7 +153,7 @@ export function buildTomlHookBlock(surface: SkillSurface): string {
         "[[hooks]]",
         `event = ${JSON.stringify(event)}`,
         `command = ${JSON.stringify(surface.hookScriptPath)}`,
-        `timeout = ${surface.hookTimeoutSecs}`,
+        `timeout = ${hookTimeoutValue(surface)}`,
         "",
       );
     }
@@ -163,7 +163,7 @@ export function buildTomlHookBlock(surface: SkillSurface): string {
         `[[hooks.${event}]]`,
         "hooks = [",
         `  { type = "command", command = ${JSON.stringify(surface.hookScriptPath)}, ` +
-          `timeout = ${surface.hookTimeoutSecs} },`,
+          `timeout = ${hookTimeoutValue(surface)} },`,
         "]",
         "",
       );
@@ -229,20 +229,22 @@ export function removeTomlHooks(existingText: string): MergeResult<string> {
  * hook is their single source of truth, and a pinned copy goes stale — the
  * wrapper used to pin MIN_SCORE=0.35, silently overriding the hook's
  * recalibrated 0.40 default (2026-08-08).
+ *
+ * MIND_NERVE_LOG is likewise NOT exported: hook disk logging is opt-in
+ * (privacy contract — codex final #30), so the wrapper must not enable it
+ * for every prompt.
  */
 export function buildHookEnv(args: {
   readonly surface: SkillSurface;
   readonly hubDir: string;
   readonly socketPath: string;
   readonly agentDirs: readonly string[];
-  readonly logPath: string;
 }): Record<string, string> {
   return {
     MIND_NERVE_SOCKET: args.socketPath,
     MIND_NERVE_SOURCE_DIR: args.hubDir,
     MIND_NERVE_PROJECTED_DIR: args.surface.skillsDir,
     MIND_NERVE_AGENT_DIRS: args.agentDirs.join(":"),
-    MIND_NERVE_LOG: args.logPath,
   };
 }
 
@@ -264,7 +266,15 @@ export function buildHookWrapper(
     "# Parameterises the shared CLI-agnostic router for this client.",
     "# Fail-open: if anything here breaks, emit {} and exit 0 so the prompt is never blocked.",
     exports,
-    `exec ${shQuote(realHookPath)} "$@" || { echo '{}'; exit 0; }`,
+    // `exec missing || fallback` NEVER runs the fallback: under POSIX sh a
+    // failed exec (command not found) terminates the shell with code 127
+    // before the `||` list is reached (qwen Q6). Guard with `[ -x ]` first
+    // so a missing/non-executable real hook falls open instead.
+    `if [ -x ${shQuote(realHookPath)} ]; then`,
+    `  exec ${shQuote(realHookPath)} "$@"`,
+    "fi",
+    "echo '{}'",
+    "exit 0",
     "",
   ].join("\n");
 }
@@ -304,6 +314,16 @@ export function assertKnownHookFmt(
 function groupRunsCommand(group: JsonHookMatcher, command: string): boolean {
   if (!Array.isArray(group.hooks)) return false;
   return group.hooks.some((hk) => hk?.command === command);
+}
+
+/**
+ * Renders `hookTimeoutSecs` in the unit the CLI actually reads. Every CLI
+ * reads seconds except gemini-cli (milliseconds — see `HookTimeoutUnit`).
+ */
+function hookTimeoutValue(surface: SkillSurface): number {
+  return surface.hookTimeoutUnit === "milliseconds"
+    ? surface.hookTimeoutSecs * 1000
+    : surface.hookTimeoutSecs;
 }
 
 function isRecord(v: unknown): v is Record<string, unknown> {

@@ -53,10 +53,9 @@ import kernels.matmul_blas;
 // Q16.16 / Q32.32 constants
 // ---------------------------------------------------------------------------
 
-// Q16.16 ONE = 1 << 16 = 65536
-pub fn q16_one() -> i64 {
-    65536
-}
+// Q16.16 ONE (1 << 16 = 65536) is defined once, in kernels/gelu_q16.mind, and
+// never called here — its former duplicate definition collided at native link
+// (multiple definition of `q16_one`). Removed to keep a single owning TU.
 
 // Multiply two Q16.16 values, accumulate into Q32.32 (i64).
 // Result is Q32.32: (a * b) without narrowing.

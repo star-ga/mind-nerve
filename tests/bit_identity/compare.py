@@ -47,7 +47,6 @@ HASH_KEYS = (
 SENTINELS = frozenset(
     [
         "BACKEND_STUB_NOT_BUILT",
-        "CUDA_DEFERRED_TO_V0_4_1",
     ]
 )
 

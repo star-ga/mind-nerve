@@ -19,14 +19,16 @@
 #   bash tests/bit_identity/run.sh              -- normal gate mode
 #   bash tests/bit_identity/run.sh --generate-golden  -- populate goldens
 #   bash tests/bit_identity/run.sh --backend cpu      -- cpu only (skips pairwise)
-#   bash tests/bit_identity/run.sh --backend cuda     -- cuda only
 #
 # Environment:
 #   MIND_NERVE_CPU    path to x86/ARM cpu binary (default: ./mind-nerve-cpu)
-#   MIND_NERVE_CUDA   path to cuda binary         (default: ./mind-nerve-cuda)
 #   MIND_NERVE_ARM    path to ARM cpu binary       (default: ./mind-nerve-arm)
 #   MIND_NERVE_MODEL  path to weights file         (default: fixtures/model.weights)
-#   MIND_NERVE_TEST_INJECT_MS  fixed timestamp to pin clock (default: 1000000)
+#
+# Determinism does NOT depend on pinning the clock: the harness zeroes the
+# envelope's timestamp_ms field (offset 8) before hashing, so the wall value
+# the binary writes is irrelevant to the golden. (There is deliberately no
+# clock-injection knob — the mask is the guarantee.)
 #
 # Exit codes:
 #   0   all backends agree with golden and pairwise
@@ -48,10 +50,8 @@ MANIFEST="${FIXTURE_DIR}/MANIFEST"
 WORK_DIR="/tmp/mind-nerve-bit-identity-$$"
 
 MIND_NERVE_CPU="${MIND_NERVE_CPU:-${SCRIPT_DIR}/../../mind-nerve-cpu}"
-MIND_NERVE_CUDA="${MIND_NERVE_CUDA:-${SCRIPT_DIR}/../../mind-nerve-cuda}"
 MIND_NERVE_ARM="${MIND_NERVE_ARM:-${SCRIPT_DIR}/../../mind-nerve-arm}"
 MIND_NERVE_MODEL="${MIND_NERVE_MODEL:-${FIXTURE_DIR}/model.weights}"
-MIND_NERVE_TEST_INJECT_MS="${MIND_NERVE_TEST_INJECT_MS:-1000000}"
 
 # Byte offsets in the mic-b output frame for the timestamp_ms field.
 # mic-b layout:
@@ -99,7 +99,7 @@ for arg in "$@"; do
         --backend)
             # next arg is backend name, handled below
             ;;
-        cpu|cuda|arm)
+        cpu|arm)
             FORCE_BACKEND="$arg"
             SINGLE_BACKEND_MODE=1
             ;;
@@ -220,13 +220,6 @@ detect_backends() {
     # CPU: always in scope for Phase 1.
     detected="cpu"
 
-    # CUDA: present iff nvidia-smi exits 0.
-    if nvidia-smi >/dev/null 2>&1; then
-        detected="${detected} cuda"
-    else
-        info "nvidia-smi not found or failed — CUDA backend skipped"
-    fi
-
     # ARM: present iff running on aarch64.
     arch_name="$(uname -m)"
     if [ "$arch_name" = "aarch64" ]; then
@@ -248,7 +241,6 @@ log "Detected backends: ${DETECTED_BACKENDS}"
 backend_binary() {
     case "$1" in
         cpu)  echo "$MIND_NERVE_CPU"  ;;
-        cuda) echo "$MIND_NERVE_CUDA" ;;
         arm)  echo "$MIND_NERVE_ARM"  ;;
         *)    echo "" ;;
     esac
@@ -357,9 +349,9 @@ run_inference() {
         -e "s|__MIND_NERVE_CATALOG__|${catalog_bin}|g" \
         "$request_file" > "$request_patched"
 
-    # Run the binary.
-    MIND_NERVE_TEST_INJECT_MS="${MIND_NERVE_TEST_INJECT_MS}" \
-        "$bin" < "$request_patched" > "$raw_out" 2>/dev/null
+    # Run the binary. The clock the binary reads is irrelevant — mask_frame
+    # zeroes timestamp_ms before hashing.
+    "$bin" < "$request_patched" > "$raw_out" 2>/dev/null
     LAST_RUN_EXIT=$?
 
     if [ "$LAST_RUN_EXIT" -ne 0 ]; then
@@ -386,7 +378,7 @@ mkdir -p "$WORK_DIR"
 trap 'rm -rf "$WORK_DIR"' EXIT INT TERM
 
 log "=== Bit-identity gate starting ==="
-log "  Timestamp pin: MIND_NERVE_TEST_INJECT_MS=${MIND_NERVE_TEST_INJECT_MS}"
+log "  Timestamp handling: envelope offset 8 masked before hashing"
 log "  Generate golden: ${GENERATE_GOLDEN}"
 log "  Single backend mode: ${SINGLE_BACKEND_MODE}"
 

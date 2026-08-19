@@ -87,7 +87,7 @@ Single target: **≥92% top-5 accuracy** on held-out test set, **p95 ≤30ms** o
 5. Best checkpoint by validation top-5 accuracy
 6. INT8 quantization (per-channel symmetric)
 7. Q16.16 activation export via the torch-to-bundle conversion path
-8. Cross-arch bit-identity verification gate (x86 vs CUDA)
+8. Cross-arch bit-identity verification gate (x86_64 vs ARM64 CPU)
 ```
 
 ### Data splits

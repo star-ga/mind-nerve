@@ -52,7 +52,7 @@ ENVELOPE_SIZE = 212
 #    2      2    wire_version (u16 LE)
 #    4      4    k            (u32 LE)
 #    8      8    timestamp_ms (i64 LE)
-#   16      1    architecture (1=x86_64, 2=aarch64, 3=cuda)
+#   16      1    architecture (1=x86_64, 2=aarch64; 3-5 reserved, not shipped)
 #   17      1    reserved
 #   18      2    chain_reset_reason (u16 LE)
 #   20     32    model_hash
@@ -64,7 +64,18 @@ ENVELOPE_SIZE = 212
 #  ===    ===
 #  TOTAL  212
 
-ARCH_NAMES = {1: "x86_64", 2: "aarch64", 3: "cuda", 4: "webgpu", 5: "npu"}
+# Architecture byte values 3/4/5 are RESERVED in the wire format but are not
+# shipped backends: the open-source release is x86_64/aarch64 CPU-only
+# (scope decision 2026-08-15 — a GPU tier is reserved for a potential
+# private/enterprise offering). They stay mapped so a
+# recorded frame carrying one renders honestly instead of as "unknown".
+ARCH_NAMES = {
+    1: "x86_64",
+    2: "aarch64",
+    3: "cuda (reserved — not a shipped backend)",
+    4: "webgpu (reserved — not a shipped backend)",
+    5: "npu (reserved — not a shipped backend)",
+}
 ENTRY_KIND_NAMES = {1: "Inference", 2: "ModelLoad", 3: "CatalogLoad"}
 CHAIN_RESET_NAMES = {
     0: "Continuation",

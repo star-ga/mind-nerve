@@ -23,12 +23,10 @@ Backend selection:
                       BACKEND_STUB_NOT_BUILT only when the encoder-weights
                       blob (encoder_weights.q16.bin) is genuinely absent.
   --backend pytorch   Uses sentence-transformers FP32 reference path (ground truth).
-  --backend cuda      Emits CUDA_DEFERRED_TO_V0_4_1 sentinel per query (§3.2).
 
 Usage:
     python tests/bit_identity/runner.py --backend pytorch --out /tmp/hashes_pytorch.json
     python tests/bit_identity/runner.py --backend native  --out /tmp/hashes_native.json
-    python tests/bit_identity/runner.py --backend cuda    --out /tmp/hashes_cuda.json
 """
 
 from __future__ import annotations
@@ -47,7 +45,6 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 SENTINEL_NATIVE_STUB = "BACKEND_STUB_NOT_BUILT"
-SENTINEL_CUDA = "CUDA_DEFERRED_TO_V0_4_1"
 
 # Q16.16 scale factor (2^16)
 Q16_SCALE = 65536.0
@@ -436,20 +433,6 @@ def _run_native_backend(corpus: list[dict], runtime_dir: Path) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# CUDA backend — deferred to v0.4.1 (§3.2)
-# ---------------------------------------------------------------------------
-
-
-def _run_cuda_backend(corpus: list[dict], runtime_dir: Path) -> list[dict]:
-    """CUDA bit-identity gate deferred to A2 (v0.4.1). Emits sentinels."""
-    print(
-        "  cuda: CUDA bit-identity gate deferred to v0.4.1 per §3.2 — emitting sentinels.",
-        file=sys.stderr,
-    )
-    return _sentinel_records(corpus, "cuda", SENTINEL_CUDA)
-
-
-# ---------------------------------------------------------------------------
 # Sentinel helpers
 # ---------------------------------------------------------------------------
 
@@ -504,10 +487,8 @@ def run_backend(
         return _run_pytorch_backend(corpus, runtime_dir)
     elif backend == "native":
         return _run_native_backend(corpus, runtime_dir)
-    elif backend == "cuda":
-        return _run_cuda_backend(corpus, runtime_dir)
     else:
-        raise ValueError(f"Unknown backend: {backend!r}. Choose: pytorch, native, cuda")
+        raise ValueError(f"Unknown backend: {backend!r}. Choose: pytorch, native")
 
 
 def main() -> None:
@@ -517,7 +498,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--backend",
-        choices=["pytorch", "native", "cuda"],
+        choices=["pytorch", "native"],
         default="pytorch",
         help="Backend to run (default: pytorch)",
     )

@@ -25,11 +25,8 @@ import time
 from pathlib import Path
 
 _HOME = os.path.expanduser("~")
-TELEMETRY_PATH = Path(
-    os.environ.get(
-        "MIND_NERVE_TELEMETRY", os.path.join(_HOME, ".mind-nerve", "telemetry.jsonl")
-    )
-)
+# Opt-in (privacy contract): empty path = telemetry disabled.
+TELEMETRY_PATH = os.environ.get("MIND_NERVE_TELEMETRY", "")
 PROJECTED_DIR = Path(os.environ.get("MIND_NERVE_PROJECTED_DIR", ""))
 SOURCE_DIR = Path(
     os.environ.get("MIND_NERVE_SOURCE_DIR", os.path.join(_HOME, ".agents", "skills-hub"))
@@ -106,9 +103,13 @@ def main() -> None:
     gen, projected = current_generation()
     in_hub = str(SOURCE_DIR) in path or str(PROJECTED_DIR) in path
 
+    if not TELEMETRY_PATH:
+        emit_and_exit()
+        return
     try:
-        TELEMETRY_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with TELEMETRY_PATH.open("a") as f:
+        tp = Path(TELEMETRY_PATH)
+        tp.parent.mkdir(parents=True, exist_ok=True)
+        with tp.open("a") as f:
             f.write(
                 json.dumps(
                     {

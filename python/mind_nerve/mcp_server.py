@@ -124,6 +124,34 @@ def handle(msg: dict[str, Any]) -> dict[str, Any] | None:
         try:
             payload = route_via_daemon(query, top_k=top_k)
         except DaemonUnavailable as exc:
+            # Windows fallback: when AF_UNIX is structurally unavailable there is
+            # NO daemon on this box, hence no second catalog for an in-process
+            # answer to disagree with. The two-catalog split this tool guards
+            # against is a Linux-only failure (daemon pinned to one table, an
+            # unpinned in-process resolver landing on another); on Windows the
+            # in-process table IS the only catalog, and the fleet pins it via
+            # MIND_NERVE_RUNTIME_DIR (a missing pin now warns loudly — see
+            # inference._resolve_runtime_dir). Gated on AF_UNIX absence so the
+            # Linux path below is byte-identical (Linux always has AF_UNIX and
+            # never takes this branch).
+            # deferred: a 127.0.0.1 AF_INET daemon would restore the warm-socket
+            # latency win on Windows too — upgrade path if per-call cold ranking
+            # proves too slow on the Windows fleet nodes.
+            import socket as _socket
+
+            if not hasattr(_socket, "AF_UNIX"):
+                from .inference import route as _inproc_route
+
+                sys.stderr.write(
+                    "[mind-nerve-mcp] no AF_UNIX on this platform; ranking "
+                    "in-process (the daemon optimisation is Linux-only)\n"
+                )
+                result = _inproc_route(query, top_k=top_k)
+                payload = result.as_dict()
+                payload["served_by"] = "in-process (no-daemon platform)"
+                body = json.dumps(payload, indent=2)
+                return _ok(req_id, {"content": [{"type": "text", "text": body}]})
+
             # Fail CLOSED and LOUD. Returning zero routes with a visible reason
             # is strictly better than returning plausible routes from a
             # different catalog: the caller can see the router is down, whereas

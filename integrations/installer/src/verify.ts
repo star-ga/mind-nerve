@@ -911,12 +911,20 @@ function extractMcpEntry(
       return null;
     }
     const rec = entry as Record<string, unknown>;
+    const env = stringRecord(rec["env"]);
+    // gemini's settings.json schema has no room for a `_comment` field on an
+    // MCP server entry — its managed marker lives in env instead (mcp_rewire
+    // MANAGED_ENV_KEY, b10 live-integration).
+    const managed =
+      spec.name === "gemini"
+        ? env["MIND_NERVE_MANAGED"] === "1"
+        : rec["_comment"] === "mind-nerve managed";
     return {
       command: typeof rec["command"] === "string" ? rec["command"] : "",
       args: stringArray(rec["args"]),
-      env: stringRecord(rec["env"]),
+      env,
       transport: typeof rec["transport"] === "string" ? rec["transport"] : null,
-      managed: rec["_comment"] === "mind-nerve managed",
+      managed,
     };
   }
 

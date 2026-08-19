@@ -4,3 +4,5 @@
 !catalog_44.bin
 !catalog_440.bin
 !catalog_4400.bin
+model.weights
+*.weights

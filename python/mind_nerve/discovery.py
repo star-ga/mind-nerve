@@ -40,6 +40,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 import threading
 import time
 from pathlib import Path
@@ -51,6 +52,7 @@ from .inference import (
     _skill_embedding_text,
     load_default_runtime,
 )
+from .security_scan import _SKIP_DIRS as _SCANNER_SKIP_DIRS
 
 
 def _embed_texts(rt: Any, texts: list[str]) -> "Any":
@@ -191,15 +193,8 @@ SKILL_PATTERNS = [
 # `<name>/SKILL.md`. Projection symlinks are keyed on name, so whichever row
 # the router returned would silently overwrite the other. Excluding at ingest
 # means the ambiguity cannot reach any consumer.
-SKIP_DIRS = {
-    ".git",
-    "node_modules",
-    "dist",
-    "build",
-    "target",
-    "__pycache__",
-    ".system",
-}
+# Canonical source: security_scan._SKIP_DIRS (single set; fable#5 drift).
+SKIP_DIRS = _SCANNER_SKIP_DIRS
 
 
 # ---------------------------------------------------------------------------
@@ -271,14 +266,67 @@ def _load_table(runtime_dir: Path) -> tuple[Any, list[dict[str, Any]]]:
     import numpy as np
 
     emb = np.load(runtime_dir / "route_table.npy")
-    with (runtime_dir / "route_table.jsonl").open() as _f:
+    with (runtime_dir / "route_table.jsonl").open(encoding="utf-8") as _f:
         meta = [json.loads(line) for line in _f]
     return emb, meta
+
+
+def _load_table_or_empty(runtime_dir: Path) -> tuple[Any, list[dict[str, Any]]]:
+    """Load the route table, or return ``(None, [])`` when NEITHER half exists.
+
+    A fresh runtime dir (own/seeded checkpoint but no precomputed table yet) has
+    no ``route_table.npy``/``.jsonl``. ``scan``/``learn`` then BOOTSTRAPS the
+    table directly from the scanned SKILL.md files rather than crashing on the
+    missing file — the chicken-and-egg fix: ``precompute-routes`` needs an
+    ``items.jsonl`` a fresh install lacks, but ``scan`` reads skills straight
+    off disk and can seed the very first table.
+
+    When EXACTLY ONE of the pair is present, this is NOT a fresh bootstrap —
+    it is a partial/corrupted table (interrupted write, incomplete restore, a
+    hand-deleted file). Treating that the same as "neither present" would let
+    the caller's next atomic write silently overwrite the surviving file with
+    an otherwise-empty table, permanently discarding a possibly large existing
+    route table with no error. Refuse instead, after warning which file is
+    missing.
+    """
+    emb_path = runtime_dir / "route_table.npy"
+    meta_path = runtime_dir / "route_table.jsonl"
+    emb_exists = emb_path.is_file()
+    meta_exists = meta_path.is_file()
+    if emb_exists and meta_exists:
+        return _load_table(runtime_dir)
+    if not emb_exists and not meta_exists:
+        return None, []
+    present = emb_path.name if emb_exists else meta_path.name
+    missing = meta_path.name if emb_exists else emb_path.name
+    print(
+        f"mind-nerve: WARNING — partial route table in {runtime_dir}: "
+        f"{present} is present but {missing} is missing (interrupted write, "
+        "partial restore, or manual deletion). Refusing to treat this as an "
+        f"empty table -- silently continuing would discard the existing "
+        f"{present} data on the next write.",
+        file=sys.stderr,
+    )
+    raise RuntimeError(
+        f"partial route table in {runtime_dir}: {present} present, {missing} missing "
+        "-- restore the missing file, or remove both to bootstrap fresh, before scanning"
+    )
 
 
 def _save_table_atomic(runtime_dir: Path, emb: Any, meta: list[dict[str, Any]]) -> None:
     import numpy as np
 
+    # Invariant: the embeddings matrix and the metadata list are row-aligned.
+    # Refuse to WRITE a drifted table — a mismatch here only surfaces later as a
+    # load-time "Route table embeddings/meta length mismatch" RuntimeError, far
+    # from the code that caused it. Callers repair an EXISTING drift via
+    # reconcile_table().
+    n_emb = int(np.asarray(emb).shape[0]) if emb is not None else 0
+    if n_emb != len(meta):
+        raise ValueError(
+            f"refusing to write a drifted route table: {n_emb} embeddings vs "
+            f"{len(meta)} meta rows (npy and jsonl must be row-aligned)"
+        )
     tmp_npy = runtime_dir / "route_table.tmp.npy"
     tmp_jsonl = runtime_dir / "route_table.jsonl.tmp"
     with tmp_npy.open("wb") as f:
@@ -288,6 +336,49 @@ def _save_table_atomic(runtime_dir: Path, emb: Any, meta: list[dict[str, Any]]) 
             f.write(json.dumps(m, separators=(",", ":")) + "\n")
     os.replace(tmp_npy, runtime_dir / "route_table.npy")
     os.replace(tmp_jsonl, runtime_dir / "route_table.jsonl")
+
+
+def reconcile_table(runtime_dir: str | Path = _DEFAULT_RUNTIME_DIR) -> dict[str, Any]:
+    """Realign ``route_table.npy`` and ``route_table.jsonl`` to identical length.
+
+    The two files are written together, but a crash between the two
+    ``os.replace`` calls — or a hand-edit — can leave them different lengths,
+    after which the runtime raises ``Route table embeddings/meta length
+    mismatch`` on every load and routing is dead. This truncates BOTH to their
+    common prefix (the rows present in both, on identical indices ``[0, n)``),
+    rewrites them atomically, and reports how many rows were dropped. A no-op
+    when they already match or when the table is absent. Deterministic.
+    """
+    import numpy as np
+
+    from .inference import _resolve_runtime_dir
+
+    rdir = _resolve_runtime_dir(str(runtime_dir) if runtime_dir is not None else None)
+    emb_path = rdir / "route_table.npy"
+    meta_path = rdir / "route_table.jsonl"
+    if not (emb_path.is_file() and meta_path.is_file()):
+        return {"reconciled": False, "reason": "no route table", "runtime_dir": str(rdir)}
+    emb, meta = _load_table(rdir)
+    n_emb = int(np.asarray(emb).shape[0])
+    n_meta = len(meta)
+    if n_emb == n_meta:
+        return {"reconciled": False, "aligned": n_emb, "runtime_dir": str(rdir)}
+    n = min(n_emb, n_meta)
+    print(
+        f"mind-nerve: WARNING — route table drift in {rdir}: npy={n_emb} rows, "
+        f"jsonl={n_meta} rows; truncating both to {n} "
+        f"(dropping {n_emb - n} embeddings, {n_meta - n} meta rows)",
+        file=sys.stderr,
+    )
+    _save_table_atomic(rdir, emb[:n], [meta[i] for i in range(n)])
+    load_default_runtime.cache_clear()  # type: ignore[attr-defined]
+    return {
+        "reconciled": True,
+        "aligned": n,
+        "dropped_embeddings": n_emb - n,
+        "dropped_meta": n_meta - n,
+        "runtime_dir": str(rdir),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -340,7 +431,12 @@ def _walk_dir(root: Path, source_repo: str, trusted: bool = False) -> Iterable[d
         parts = set(p.relative_to(root).parts)
         if parts & SKIP_DIRS:
             continue
-        rel = str(p.relative_to(root))
+        # SKILL_PATTERNS require literal '/' separators; on Windows
+        # str(p.relative_to(root)) is backslash-separated, which would make
+        # _detect_kind silently return None for every nested file (skills/,
+        # commands/, agents/ entries never match). as_posix() normalizes to
+        # forward slashes on every platform.
+        rel = p.relative_to(root).as_posix()
         kind = _detect_kind(rel)
         if not kind and p.name == "SKILL.md":
             kind = "skill"
@@ -374,14 +470,21 @@ def scan(
     """
     import numpy as np
 
-    rt = load_default_runtime(runtime_dir)
     # Resolve through the canonical resolver so the lazy _DEFAULT_RUNTIME_DIR
     # proxy ("<lazy:mind-nerve-runtime>") is unwrapped before table I/O —
     # route_table.npy lives under the REAL dir, not the literal proxy string.
     from .inference import _resolve_runtime_dir
 
     rdir = _resolve_runtime_dir(str(runtime_dir) if runtime_dir is not None else None)
-    seen_ids = {m["sha256"] for m in rt.routes}
+
+    # Bootstrap-friendly load: a fresh runtime dir has no route_table.npy yet, so
+    # load_default_runtime() would raise FileNotFoundError before we ever reach
+    # table I/O. Only load the full runtime when the table exists; otherwise
+    # start from an empty index and let _embed_texts(None, ...) pull the
+    # embedding model from the default resolver (chicken-and-egg fix).
+    table_exists = (rdir / "route_table.npy").is_file() and (rdir / "route_table.jsonl").is_file()
+    rt: Any = load_default_runtime(runtime_dir) if table_exists else None
+    seen_ids = {m["sha256"] for m in rt.routes} if rt is not None else set()
     if trusted is None:
         trusted = _is_trusted_dir(directory, rdir)
 
@@ -405,7 +508,7 @@ def scan(
         return {
             "added": 0,
             "skipped": skipped,
-            "total_routes_after": len(rt.routes),
+            "total_routes_after": len(rt.routes) if rt is not None else 0,
             "trusted": trusted,
         }
 
@@ -417,16 +520,32 @@ def scan(
             "dry_run": True,
         }
 
-    # Embed the new items using the same model the route table was built with
+    # Embed the new items using the same model the route table was built with.
+    # (_embed_texts tolerates rt=None — it resolves the reference model itself.)
     texts = [i["_embedded_text"] for i in new_items]
     new_emb = _embed_texts(rt, texts)
 
-    # Load raw table (rt.embeddings is the *normalised* in-memory copy)
-    raw_emb, meta = _load_table(rdir)
-    combined_emb = np.concatenate([raw_emb, new_emb], axis=0)
-    combined_meta = list(meta) + [
-        {k: v for k, v in i.items() if not k.startswith("_")} for i in new_items
-    ]
+    # Load raw table (rt.embeddings is the *normalised* in-memory copy). On a
+    # fresh runtime dir there is no table yet → bootstrap from empty.
+    raw_emb, meta = _load_table_or_empty(rdir)
+    # Repair any pre-existing npy/jsonl drift BEFORE appending, so a mismatch
+    # already on disk is healed here rather than surfacing later as a load-time
+    # RuntimeError — and so _save_table_atomic's row-alignment assert can never
+    # trip on inherited drift.
+    if raw_emb is not None and int(raw_emb.shape[0]) != len(meta):
+        n = min(int(raw_emb.shape[0]), len(meta))
+        print(
+            f"mind-nerve: WARNING — healing route table drift before append "
+            f"(npy={raw_emb.shape[0]}, jsonl={len(meta)} → {n})",
+            file=sys.stderr,
+        )
+        raw_emb, meta = raw_emb[:n], [meta[i] for i in range(n)]
+    new_meta_rows = [{k: v for k, v in i.items() if not k.startswith("_")} for i in new_items]
+    if raw_emb is None:
+        combined_emb = new_emb
+    else:
+        combined_emb = np.concatenate([raw_emb, new_emb], axis=0)
+    combined_meta = list(meta) + new_meta_rows
     _save_table_atomic(rdir, combined_emb, combined_meta)
 
     # Invalidate the in-memory cache so the next route() call reloads

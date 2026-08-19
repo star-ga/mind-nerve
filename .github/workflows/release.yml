@@ -1,7 +1,9 @@
 name: Release
 
-# Publish mind-nerve to PyPI via trusted publishing (OIDC, no token secret)
-# and attach SLSA-style build provenance plus a SHA256SUMS checksum file.
+# Publish mind-nerve to PyPI using a project-scoped API token (secret
+# PYPI_API_TOKEN) and attach SLSA-style build provenance plus a SHA256SUMS
+# checksum file. (Trusted publishing / OIDC is the more secure end-state —
+# see the note on the publish step for how to switch.)
 #
 # Triggered by a release published in the repository's GitHub Releases
 # UI, or by manual dispatch. The wheel and sdist are built from the
@@ -90,7 +92,7 @@ jobs:
             dist/*.tar.gz
 
   publish:
-    name: Publish to PyPI (trusted publishing)
+    name: Publish to PyPI (API token)
     needs: [build, attest]
     runs-on: ubuntu-latest
     environment:
@@ -121,7 +123,14 @@ jobs:
         with:
           packages-dir: dist/
           print-hash: true
-          skip-existing: false
+          # Idempotent: re-publishing an already-uploaded version is a no-op,
+          # not an error (lets a Release be (re)cut on an already-published tag).
+          skip-existing: true
+          # Project-scoped API token (secret PYPI_API_TOKEN). Trusted-publishing
+          # (OIDC) is the more secure end-state; switch by removing this line and
+          # configuring the publisher on PyPI (owner star-ga, repo mind-nerve,
+          # workflow release.yml, environment pypi).
+          password: ${{ secrets.PYPI_API_TOKEN }}
 
       - name: Attach SHA256SUMS to the GitHub Release
         if: github.event_name == 'release'

@@ -136,6 +136,10 @@ jobs:
         if: github.event_name == 'release'
         env:
           GH_TOKEN: ${{ github.token }}
+          # This job never checks out the repo (it only downloads the dist
+          # artifact), so gh has no git remote to infer the repo from — pin it
+          # explicitly, else `gh release upload` fails "not a git repository".
+          GH_REPO: ${{ github.repository }}
         run: |
           gh release upload "${{ github.event.release.tag_name }}" \
             release-assets/SHA256SUMS \

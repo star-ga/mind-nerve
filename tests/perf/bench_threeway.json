@@ -1,0 +1,41 @@
+{
+  "host": {
+    "node": "U1",
+    "machine": "x86_64",
+    "processor": "x86_64",
+    "online_cpus": 12,
+    "python": "3.12.3",
+    "numpy": "2.4.3",
+    "blas_env": {
+      "OMP_NUM_THREADS": "12",
+      "OPENBLAS_NUM_THREADS": "12",
+      "MKL_NUM_THREADS": "12"
+    }
+  },
+  "iters": 2000,
+  "results": {
+    "mind": {
+      "mean_ms": 0.5775,
+      "p50_ms": 0.5186,
+      "p95_ms": 0.9693,
+      "p99_ms": 1.4998,
+      "qps": 1725.5
+    },
+    "numpy": {
+      "mean_ms": 1.3038,
+      "p50_ms": 0.298,
+      "p95_ms": 5.9982,
+      "p99_ms": 15.3618,
+      "qps": 765.9
+    },
+    "torch": {
+      "mean_ms": 1.5238,
+      "p50_ms": 0.4102,
+      "p95_ms": 3.7651,
+      "p99_ms": 4.8302,
+      "qps": 655.1,
+      "torch_version": "2.6.0+cu124",
+      "torch_threads": 12
+    }
+  }
+}

@@ -87,14 +87,14 @@ const MCP_ERR_PARSE:      i64 = -32700;
 const MCP_ERR_METHOD:     i64 = -32601;
 const MCP_ERR_PARAMS:     i64 = -32602;
 
-// AUTO-GENERATED literal blob (gen_lit.py). 1100 bytes.
-const MCP_LIT: [i64; 1100] = [
+// AUTO-GENERATED literal blob (gen_lit.py). 1098 bytes.
+const MCP_LIT: [i64; 1098] = [
     123,34,106,115,111,110,114,112,99,34,58,34,50,46,48,34,44,34,105,100,
     34,58,44,34,114,101,115,117,108,116,34,58,123,34,112,114,111,116,111,99,
     111,108,86,101,114,115,105,111,110,34,58,34,50,48,50,52,45,49,49,45,
     48,53,34,44,34,115,101,114,118,101,114,73,110,102,111,34,58,123,34,110,
     97,109,101,34,58,34,109,105,110,100,45,110,101,114,118,101,45,109,99,112,
-    34,44,34,118,101,114,115,105,111,110,34,58,34,48,46,51,46,48,98,57,
+    34,44,34,118,101,114,115,105,111,110,34,58,34,48,46,51,46,49,
     34,125,44,34,99,97,112,97,98,105,108,105,116,105,101,115,34,58,123,34,
     116,111,111,108,115,34,58,123,34,108,105,115,116,67,104,97,110,103,101,100,
     34,58,102,97,108,115,101,125,125,125,125,10,44,34,114,101,115,117,108,116,
@@ -149,64 +149,64 @@ const MCP_LIT: [i64; 1100] = [
 const LIT_PREFIX_OFF: i64 = 0;
 const LIT_PREFIX_LEN: i64 = 22;
 const LIT_INIT_SUFFIX_OFF: i64 = 22;
-const LIT_INIT_SUFFIX_LEN: i64 = 150;
-const LIT_TOOLS_SUFFIX_OFF: i64 = 172;
+const LIT_INIT_SUFFIX_LEN: i64 = 148;
+const LIT_TOOLS_SUFFIX_OFF: i64 = 170;
 const LIT_TOOLS_SUFFIX_LEN: i64 = 481;
-const LIT_ERR_MID_OFF: i64 = 653;
+const LIT_ERR_MID_OFF: i64 = 651;
 const LIT_ERR_MID_LEN: i64 = 17;
-const LIT_ERR_MID2_OFF: i64 = 670;
+const LIT_ERR_MID2_OFF: i64 = 668;
 const LIT_ERR_MID2_LEN: i64 = 12;
-const LIT_ERR_SUFFIX_OFF: i64 = 682;
+const LIT_ERR_SUFFIX_OFF: i64 = 680;
 const LIT_ERR_SUFFIX_LEN: i64 = 4;
-const LIT_CALL_A_OFF: i64 = 686;
+const LIT_CALL_A_OFF: i64 = 684;
 const LIT_CALL_A_LEN: i64 = 56;
-const LIT_CALL_B_OFF: i64 = 742;
+const LIT_CALL_B_OFF: i64 = 740;
 const LIT_CALL_B_LEN: i64 = 13;
-const LIT_ROUTE_A_OFF: i64 = 755;
+const LIT_ROUTE_A_OFF: i64 = 753;
 const LIT_ROUTE_A_LEN: i64 = 10;
-const LIT_ROUTE_B_OFF: i64 = 765;
+const LIT_ROUTE_B_OFF: i64 = 763;
 const LIT_ROUTE_B_LEN: i64 = 17;
-const LIT_ROUTE_C_OFF: i64 = 782;
+const LIT_ROUTE_C_OFF: i64 = 780;
 const LIT_ROUTE_C_LEN: i64 = 1;
-const LIT_CALL_C_OFF: i64 = 783;
+const LIT_CALL_C_OFF: i64 = 781;
 const LIT_CALL_C_LEN: i64 = 46;
-const LIT_UNAVAIL_TAIL_OFF: i64 = 829;
+const LIT_UNAVAIL_TAIL_OFF: i64 = 827;
 const LIT_UNAVAIL_TAIL_LEN: i64 = 93;
-const LIT_NULL_OFF: i64 = 922;
+const LIT_NULL_OFF: i64 = 920;
 const LIT_NULL_LEN: i64 = 4;
-const LIT_M_INIT_OFF: i64 = 926;
+const LIT_M_INIT_OFF: i64 = 924;
 const LIT_M_INIT_LEN: i64 = 10;
-const LIT_M_NOTIF_OFF: i64 = 936;
+const LIT_M_NOTIF_OFF: i64 = 934;
 const LIT_M_NOTIF_LEN: i64 = 25;
-const LIT_M_TLIST_OFF: i64 = 961;
+const LIT_M_TLIST_OFF: i64 = 959;
 const LIT_M_TLIST_LEN: i64 = 10;
-const LIT_M_TCALL_OFF: i64 = 971;
+const LIT_M_TCALL_OFF: i64 = 969;
 const LIT_M_TCALL_LEN: i64 = 10;
-const LIT_K_METHOD_OFF: i64 = 981;
+const LIT_K_METHOD_OFF: i64 = 979;
 const LIT_K_METHOD_LEN: i64 = 6;
-const LIT_K_ID_OFF: i64 = 987;
+const LIT_K_ID_OFF: i64 = 985;
 const LIT_K_ID_LEN: i64 = 2;
-const LIT_K_PARAMS_OFF: i64 = 989;
+const LIT_K_PARAMS_OFF: i64 = 987;
 const LIT_K_PARAMS_LEN: i64 = 6;
-const LIT_K_NAME_OFF: i64 = 995;
+const LIT_K_NAME_OFF: i64 = 993;
 const LIT_K_NAME_LEN: i64 = 4;
-const LIT_K_ARGS_OFF: i64 = 999;
+const LIT_K_ARGS_OFF: i64 = 997;
 const LIT_K_ARGS_LEN: i64 = 9;
-const LIT_K_QUERY_OFF: i64 = 1008;
+const LIT_K_QUERY_OFF: i64 = 1006;
 const LIT_K_QUERY_LEN: i64 = 5;
-const LIT_K_TOPK_OFF: i64 = 1013;
+const LIT_K_TOPK_OFF: i64 = 1011;
 const LIT_K_TOPK_LEN: i64 = 5;
-const LIT_T_ROUTE_OFF: i64 = 1018;
+const LIT_T_ROUTE_OFF: i64 = 1016;
 const LIT_T_ROUTE_LEN: i64 = 16;
-const LIT_EM_METHOD_OFF: i64 = 1034;
+const LIT_EM_METHOD_OFF: i64 = 1032;
 const LIT_EM_METHOD_LEN: i64 = 16;
-const LIT_EM_TOOL_OFF: i64 = 1050;
+const LIT_EM_TOOL_OFF: i64 = 1048;
 const LIT_EM_TOOL_LEN: i64 = 12;
-const LIT_EM_QMISS_OFF: i64 = 1062;
+const LIT_EM_QMISS_OFF: i64 = 1060;
 const LIT_EM_QMISS_LEN: i64 = 13;
-const LIT_EM_QLONG_OFF: i64 = 1075;
+const LIT_EM_QLONG_OFF: i64 = 1073;
 const LIT_EM_QLONG_LEN: i64 = 14;
-const LIT_EM_PARSE_OFF: i64 = 1089;
+const LIT_EM_PARSE_OFF: i64 = 1087;
 const LIT_EM_PARSE_LEN: i64 = 11;
 
 // AUTO-GENERATED literal blob #2 (gen_lit2.py). 122 bytes.
@@ -249,39 +249,48 @@ fn mcp_byte(addr: i64) -> i64 {
     __mind_load_i8(addr) & 255
 }
 
-fn mcp_put(buf: i64, off: i64, val: i64) -> i64 {
+// Store one byte into buf at off, fail-closed against `cap`: once the write
+// cursor reaches cap, STOP writing (return off unchanged) rather than store
+// past the fixed MCP_RESP_CAP scratch. Mirrors the per-write `if w >= cap`
+// bound in loader_manifest_export (src/loader.mind). Safety no longer depends
+// solely on the MAX_TOP_K / MCP_ID_CAP invariants: any future constant change
+// that would drive a response past the buffer truncates the tail instead of
+// overrunning the heap. Valid responses (<= 64 routes, capped id) never reach
+// the cap, so the emitted bytes are byte-identical and the goldens are unmoved.
+fn mcp_put(buf: i64, off: i64, cap: i64, val: i64) -> i64 {
+    if off >= cap { return off; }
     __mind_store_i8(buf + off, val & 255);
     off + 1
 }
 
 // Copy MCP_LIT[lit_off .. lit_off+lit_len) into buf at off; return new off.
-fn mcp_put_lit(buf: i64, off: i64, lit_off: i64, lit_len: i64) -> i64 {
+fn mcp_put_lit(buf: i64, off: i64, cap: i64, lit_off: i64, lit_len: i64) -> i64 {
     let mut o: i64 = off;
     let mut i: i64 = 0;
     while i < lit_len {
-        o = mcp_put(buf, o, MCP_LIT[lit_off + i]);
+        o = mcp_put(buf, o, cap, MCP_LIT[lit_off + i]);
         i = i + 1;
     }
     o
 }
 
 // Copy MCP_LIT2[lit_off .. lit_off+lit_len) into buf at off; return new off.
-fn mcp_put_lit2(buf: i64, off: i64, lit_off: i64, lit_len: i64) -> i64 {
+fn mcp_put_lit2(buf: i64, off: i64, cap: i64, lit_off: i64, lit_len: i64) -> i64 {
     let mut o: i64 = off;
     let mut i: i64 = 0;
     while i < lit_len {
-        o = mcp_put(buf, o, MCP_LIT2[lit_off + i]);
+        o = mcp_put(buf, o, cap, MCP_LIT2[lit_off + i]);
         i = i + 1;
     }
     o
 }
 
 // Signed decimal (id codes, top_k, token counts, scores).
-fn mcp_put_dec(buf: i64, off: i64, val: i64) -> i64 {
+fn mcp_put_dec(buf: i64, off: i64, cap: i64, val: i64) -> i64 {
     let mut o: i64 = off;
     let mut v: i64 = val;
-    if v < 0 { o = mcp_put(buf, o, 45); v = -v; }
-    if v == 0 { return mcp_put(buf, o, 48); }
+    if v < 0 { o = mcp_put(buf, o, cap, 45); v = -v; }
+    if v == 0 { return mcp_put(buf, o, cap, 48); }
     let scratch: i64 = __mind_alloc(24);
     let mut n: i64 = v;
     let mut d: i64 = 0;
@@ -292,7 +301,7 @@ fn mcp_put_dec(buf: i64, off: i64, val: i64) -> i64 {
     }
     let mut j: i64 = d - 1;
     while j >= 0 {
-        o = mcp_put(buf, o, __mind_load_i8(scratch + j) & 255);
+        o = mcp_put(buf, o, cap, __mind_load_i8(scratch + j) & 255);
         j = j - 1;
     }
     __mind_free(scratch);
@@ -305,13 +314,13 @@ fn mcp_hexdig(v: i64) -> i64 {
 }
 
 // 32 raw bytes at src -> 64 lowercase hex chars.
-fn mcp_put_hex32(buf: i64, off: i64, src: i64) -> i64 {
+fn mcp_put_hex32(buf: i64, off: i64, cap: i64, src: i64) -> i64 {
     let mut o: i64 = off;
     let mut i: i64 = 0;
     while i < 32 {
         let b: i64 = __mind_load_i8(src + i) & 255;
-        o = mcp_put(buf, o, mcp_hexdig((b >> 4) & 15));
-        o = mcp_put(buf, o, mcp_hexdig(b & 15));
+        o = mcp_put(buf, o, cap, mcp_hexdig((b >> 4) & 15));
+        o = mcp_put(buf, o, cap, mcp_hexdig(b & 15));
         i = i + 1;
     }
     o
@@ -624,14 +633,14 @@ fn json_int_default(p: i64, end: i64, defv: i64) -> i64 {
 // `id_off/id_len` echo the request id VERBATIM (int or string), or -1 => null.
 // ---------------------------------------------------------------------------
 
-fn mcp_put_id(buf: i64, off: i64, id_off: i64, id_len: i64) -> i64 {
+fn mcp_put_id(buf: i64, off: i64, cap: i64, id_off: i64, id_len: i64) -> i64 {
     if id_len < 0 {
-        return mcp_put_lit(buf, off, LIT_NULL_OFF, LIT_NULL_LEN);
+        return mcp_put_lit(buf, off, cap, LIT_NULL_OFF, LIT_NULL_LEN);
     }
     let mut o: i64 = off;
     let mut i: i64 = 0;
     while i < id_len {
-        o = mcp_put(buf, o, mcp_byte(id_off + i));
+        o = mcp_put(buf, o, cap, mcp_byte(id_off + i));
         i = i + 1;
     }
     o
@@ -646,9 +655,9 @@ fn mcp_emit(buf: i64, len: i64) -> i64 {
 fn mcp_emit_framed(id_off: i64, id_len: i64, suf_off: i64, suf_len: i64) -> i64 {
     let buf: i64 = __mind_alloc(MCP_RESP_CAP);
     let mut o: i64 = 0;
-    o = mcp_put_lit(buf, o, LIT_PREFIX_OFF, LIT_PREFIX_LEN);
-    o = mcp_put_id(buf, o, id_off, id_len);
-    o = mcp_put_lit(buf, o, suf_off, suf_len);
+    o = mcp_put_lit(buf, o, MCP_RESP_CAP, LIT_PREFIX_OFF, LIT_PREFIX_LEN);
+    o = mcp_put_id(buf, o, MCP_RESP_CAP, id_off, id_len);
+    o = mcp_put_lit(buf, o, MCP_RESP_CAP, suf_off, suf_len);
     mcp_emit(buf, o);
     __mind_free(buf);
     0
@@ -658,13 +667,13 @@ fn mcp_emit_framed(id_off: i64, id_len: i64, suf_off: i64, suf_len: i64) -> i64 
 fn mcp_emit_error(id_off: i64, id_len: i64, code: i64, msg_off: i64, msg_len: i64) -> i64 {
     let buf: i64 = __mind_alloc(MCP_RESP_CAP);
     let mut o: i64 = 0;
-    o = mcp_put_lit(buf, o, LIT_PREFIX_OFF, LIT_PREFIX_LEN);
-    o = mcp_put_id(buf, o, id_off, id_len);
-    o = mcp_put_lit(buf, o, LIT_ERR_MID_OFF, LIT_ERR_MID_LEN);   // ,"error":{"code":
-    o = mcp_put_dec(buf, o, code);
-    o = mcp_put_lit(buf, o, LIT_ERR_MID2_OFF, LIT_ERR_MID2_LEN); // ,"message":"
-    o = mcp_put_lit(buf, o, msg_off, msg_len);
-    o = mcp_put_lit(buf, o, LIT_ERR_SUFFIX_OFF, LIT_ERR_SUFFIX_LEN); // "}}\n
+    o = mcp_put_lit(buf, o, MCP_RESP_CAP, LIT_PREFIX_OFF, LIT_PREFIX_LEN);
+    o = mcp_put_id(buf, o, MCP_RESP_CAP, id_off, id_len);
+    o = mcp_put_lit(buf, o, MCP_RESP_CAP, LIT_ERR_MID_OFF, LIT_ERR_MID_LEN);   // ,"error":{"code":
+    o = mcp_put_dec(buf, o, MCP_RESP_CAP, code);
+    o = mcp_put_lit(buf, o, MCP_RESP_CAP, LIT_ERR_MID2_OFF, LIT_ERR_MID2_LEN); // ,"message":"
+    o = mcp_put_lit(buf, o, MCP_RESP_CAP, msg_off, msg_len);
+    o = mcp_put_lit(buf, o, MCP_RESP_CAP, LIT_ERR_SUFFIX_OFF, LIT_ERR_SUFFIX_LEN); // "}}\n
     mcp_emit(buf, o);
     __mind_free(buf);
     0
@@ -674,11 +683,11 @@ fn mcp_emit_error(id_off: i64, id_len: i64, code: i64, msg_off: i64, msg_len: i6
 fn mcp_emit_unavailable(id_off: i64, id_len: i64, k: i64) -> i64 {
     let buf: i64 = __mind_alloc(MCP_RESP_CAP);
     let mut o: i64 = 0;
-    o = mcp_put_lit(buf, o, LIT_PREFIX_OFF, LIT_PREFIX_LEN);
-    o = mcp_put_id(buf, o, id_off, id_len);
-    o = mcp_put_lit(buf, o, LIT_CALL_A_OFF, LIT_CALL_A_LEN);   // ...text":"{\"top_k\":
-    o = mcp_put_dec(buf, o, k);
-    o = mcp_put_lit(buf, o, LIT_UNAVAIL_TAIL_OFF, LIT_UNAVAIL_TAIL_LEN);
+    o = mcp_put_lit(buf, o, MCP_RESP_CAP, LIT_PREFIX_OFF, LIT_PREFIX_LEN);
+    o = mcp_put_id(buf, o, MCP_RESP_CAP, id_off, id_len);
+    o = mcp_put_lit(buf, o, MCP_RESP_CAP, LIT_CALL_A_OFF, LIT_CALL_A_LEN);   // ...text":"{\"top_k\":
+    o = mcp_put_dec(buf, o, MCP_RESP_CAP, k);
+    o = mcp_put_lit(buf, o, MCP_RESP_CAP, LIT_UNAVAIL_TAIL_OFF, LIT_UNAVAIL_TAIL_LEN);
     mcp_emit(buf, o);
     __mind_free(buf);
     0
@@ -691,28 +700,28 @@ fn mcp_emit_routes(id_off: i64, id_len: i64, k: i64, out_ids: i64, out_scores: i
                    catalog_size: i64) -> i64 {
     let buf: i64 = __mind_alloc(MCP_RESP_CAP);
     let mut o: i64 = 0;
-    o = mcp_put_lit(buf, o, LIT_PREFIX_OFF, LIT_PREFIX_LEN);
-    o = mcp_put_id(buf, o, id_off, id_len);
-    o = mcp_put_lit(buf, o, LIT_CALL_A_OFF, LIT_CALL_A_LEN);   // ...text":"{\"top_k\":
-    o = mcp_put_dec(buf, o, k);
-    o = mcp_put_lit(buf, o, LIT_CALL_B_OFF, LIT_CALL_B_LEN);   // ,\"routes\":[
+    o = mcp_put_lit(buf, o, MCP_RESP_CAP, LIT_PREFIX_OFF, LIT_PREFIX_LEN);
+    o = mcp_put_id(buf, o, MCP_RESP_CAP, id_off, id_len);
+    o = mcp_put_lit(buf, o, MCP_RESP_CAP, LIT_CALL_A_OFF, LIT_CALL_A_LEN);   // ...text":"{\"top_k\":
+    o = mcp_put_dec(buf, o, MCP_RESP_CAP, k);
+    o = mcp_put_lit(buf, o, MCP_RESP_CAP, LIT_CALL_B_OFF, LIT_CALL_B_LEN);   // ,\"routes\":[
     let mut r: i64 = 0;
     while r < k {
-        if r > 0 { o = mcp_put(buf, o, 44); }                  // ','
-        o = mcp_put_lit(buf, o, LIT_ROUTE_A_OFF, LIT_ROUTE_A_LEN);  // {\"id\":\"
-        o = mcp_put_hex32(buf, o, out_ids + r * 32);
-        o = mcp_put_lit(buf, o, LIT_ROUTE_B_OFF, LIT_ROUTE_B_LEN);  // \",\"score_q16\":
+        if r > 0 { o = mcp_put(buf, o, MCP_RESP_CAP, 44); }                  // ','
+        o = mcp_put_lit(buf, o, MCP_RESP_CAP, LIT_ROUTE_A_OFF, LIT_ROUTE_A_LEN);  // {\"id\":\"
+        o = mcp_put_hex32(buf, o, MCP_RESP_CAP, out_ids + r * 32);
+        o = mcp_put_lit(buf, o, MCP_RESP_CAP, LIT_ROUTE_B_OFF, LIT_ROUTE_B_LEN);  // \",\"score_q16\":
         // low 32 bits, sign-extended (Q16.16 signed).
         let lane: i64 = __mind_load_i64(out_scores + r * 8);
         let mut v: i64 = lane & 4294967295;
         if v >= 2147483648 { v = v - 4294967296; }
-        o = mcp_put_dec(buf, o, v);
-        o = mcp_put_lit(buf, o, LIT_ROUTE_C_OFF, LIT_ROUTE_C_LEN);  // }
+        o = mcp_put_dec(buf, o, MCP_RESP_CAP, v);
+        o = mcp_put_lit(buf, o, MCP_RESP_CAP, LIT_ROUTE_C_OFF, LIT_ROUTE_C_LEN);  // }
         r = r + 1;
     }
-    o = mcp_put_lit2(buf, o, L2_CC1_OFF, L2_CC1_LEN);          // ],\"catalog_size\":
-    o = mcp_put_dec(buf, o, catalog_size);
-    o = mcp_put_lit2(buf, o, L2_CC2_OFF, L2_CC2_LEN);          // ,\"served_by\":...
+    o = mcp_put_lit2(buf, o, MCP_RESP_CAP, L2_CC1_OFF, L2_CC1_LEN);          // ],\"catalog_size\":
+    o = mcp_put_dec(buf, o, MCP_RESP_CAP, catalog_size);
+    o = mcp_put_lit2(buf, o, MCP_RESP_CAP, L2_CC2_OFF, L2_CC2_LEN);          // ,\"served_by\":...
     mcp_emit(buf, o);
     __mind_free(buf);
     0
@@ -919,6 +928,24 @@ fn mcp_handle_line(line: i64, llen: i64) -> i64 {
         // (a legal JSON-RPC id — mcp_put_id emits null for id_len<0). Short ids
         // are unaffected, so the happy path stays byte-identical.
         if id_len > MCP_ID_CAP { id_off = -1; id_len = -1; }
+        // Reject a control-byte id AT CAPTURE (defense-in-depth): the raw id
+        // span is echoed VERBATIM by mcp_put_id, and json_skip_string accepts
+        // any byte except '"'/'\' inside a quoted string — INCLUDING control
+        // bytes < 0x20. A raw 0x0A in an echoed id would split one JSON-RPC
+        // reply into two frames (responses are '\n'-delimited in mcp_run); any
+        // other control byte injects into the line-delimited stream. Reject to
+        // null (a legal JSON-RPC id), exactly mirroring the over-length guard.
+        // A well-formed id (int digits, or a quoted string of printable bytes)
+        // contains no byte < 0x20, so the valid path stays byte-identical.
+        if id_len > 0 {
+            let mut ci: i64 = 0;
+            let mut ctrl: i64 = 0;
+            while ci < id_len {
+                if mcp_byte(id_off + ci) < 32 { ctrl = 1; }
+                ci = ci + 1;
+            }
+            if ctrl == 1 { id_off = -1; id_len = -1; }
+        }
     }
 
     // method (string).

@@ -256,6 +256,26 @@ pub fn loader_parse_catalog(bytes: i64, len: i64, cat: i64) -> i64 {
     let embedding_dim: i64 = ld_u32(bytes, 12);
     if embedding_dim != ROUTE_EMBEDDING_DIM { return LD_ERR_SHAPE; }
 
+    // Early plausibility reject (defense-in-depth, hash-gate amplification).
+    // Compute the minimum file size the header IMPLIES — fixed 48-byte prefix
+    // + route_ids (num_routes*32) + embeddings (num_routes*embedding_dim*4) +
+    // v2 route-prior (num_routes*4) + the 4-byte trailer-offset field — and
+    // reject a too-small declaration HERE, before allocating `ids`, running
+    // the O(n log n) uniqueness merge-sort, or building + SHA-256-hashing the
+    // full multi-MiB canonical preimage. num_routes is already bounded by
+    // MAX_ROUTES above and embedding_dim is pinned to ROUTE_EMBEDDING_DIM, so
+    // this product cannot overflow i64. This is a CONSERVATIVE lower bound —
+    // strictly <= what the per-section truncation checks below (ids_end,
+    // emb_end, prior_end, prior_end+4) enforce — so a valid catalog (len >=
+    // every section) is never rejected here: the accept path and canonical
+    // hash stay byte-identical. It only front-loads rejection of a hostile
+    // header that declares far more records than the file can hold, trimming
+    // the alloc + dup-sort + full-preimage-hash amplification on that path.
+    let min_prior_bytes: i64 = if has_prior == 1 { num_routes * 4 } else { 0 };
+    let min_len: i64 = 48 + num_routes * 32 + num_routes * embedding_dim * 4
+        + min_prior_bytes + 4;
+    if len < min_len { return LD_ERR_TRUNCATED; }
+
     // route_ids section.
     let ids_off: i64 = 48;
     let ids_end: i64 = ids_off + num_routes * 32;

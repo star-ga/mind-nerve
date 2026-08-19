@@ -17,7 +17,9 @@ shipped.
 3. **Single binary, shipped backends.** One `mind-nerve` CLI runs on x86_64
    and ARM64 CPU without rebuild. (Scope decision 2026-08-15: the
    open-source release ships CPU backends only; a GPU tier is reserved
-   for a potential private/enterprise offering.)
+   for a potential private/enterprise offering — the commercial **Pro
+   tier**. It is roadmap-only: never a hard dependency or a claim in the
+   OSS package, and no GPU latency numbers are published for OSS.)
 4. **Latency p95 ≤ 30 ms on CPU.** Architecture decisions that cannot meet
    this on commodity CPU are rejected.
 5. **Attestation on every inference.** Request hash, model hash, result hash
@@ -48,11 +50,11 @@ Three blockers were raised 2026-05-14. Status after the Phase 1 alpha sprint:
    native runtime bundled inside the wheel. The Phase-1 PyTorch
    inference path published in this repository works without it.
 
-**Release status (2026-08-19):** `v0.3.0` is the current PyPI stable
+**Release status (2026-08-19):** `v0.3.1` is the current PyPI stable
 release (wheel + sdist live at
-[pypi.org/project/mind-nerve/](https://pypi.org/project/mind-nerve/)),
-finalizing the `0.3.0b1`–`0.3.0b10` beta line — `0.3.0b10` was the final
-beta tag before the stable cut. Weights on Hugging Face under Apache-2.0
+[pypi.org/project/mind-nerve/](https://pypi.org/project/mind-nerve/)) — a
+security + dependency-floor + doc-honesty hardening on the `0.3.0` stable,
+which finalized the `0.3.0b1`–`0.3.0b10` beta line. Weights on Hugging Face under Apache-2.0
 (`star-ga/mind-nerve`). Since beta.2 the repo has shipped the integrations
 hook subsystem (per-prompt routing hook + structural skills-dir projection
 + npy-aligned hygiene), the **`mind-nerve acquire` subsystem** (curated
@@ -173,13 +175,16 @@ identity matching) deferred until first user-visible need.
 | Task | Blocker | mindc milestone | Status |
 |---|---|---|---|
 | Cross-arch bit-identity (x86-CPU vs ARM-CPU) | `pub fn` → C symbol export so the native MIND inference kernel is callable as a `cdylib` | **0.2.6** — `pub fn`-to-C, `[exports]`, `--profile` flag | **mindc-side SHIPPED** (RFC 0002 D2–D5 in `0a408e3`, `_v1` ABI lock in `de6cf18`, RFC 0003 cdylib seam); the **vector-path gate was closed upstream in mind v0.6.4** (2026-05-19, byte-identical to the Track A scalar oracle). **Task #57 CLOSED AS DESCOPED (2026-08-15):** it originally tracked an x86-CPU-vs-CUDA bit-identity leg — the harness carried a `CUDA_DEFERRED_TO_V0_4_1` sentinel because no CUDA emit path for the Q16.16 kernels existed. The product decision is that the open-source release ships x86_64/ARM64 CPU only; a GPU tier (CUDA/WebGPU) is reserved for a potential private/enterprise offering rather than this repo, the sentinel scaffolding is removed, and the shipped CPU pair already carries the byte-identity proof. |
-| p95 ≤ 30 ms on 4-core CPU | Native `cdylib` emit so the PyTorch encode-cost (~270 ms today) can be replaced by a Q16.16 native kernel | **0.3.0** — `--lib` cdylib, AOT codegen, MIC profile-locked headers | **CLOSED (2026-08-10 re-assessment).** The Q16.16 native encoder shipped: `libmind_nerve_encoder.so` has been bundled in the published wheel since 2026-05-19 with a real `encoder_weights.q16.bin` weight blob, and `MIND_NERVE_BACKEND=native` is the default routing path with PyTorch fallback (see CHANGELOG v0.3.0b7 "thesis-pure encode path" and the `_native` runtime). Task #59 is done; the remaining latency evidence lives in `docs/benchmarks.md`. |
+| p95 ≤ 30 ms on 4-core CPU | Native `cdylib` emit so the PyTorch-encode preprocessing cost can be replaced by a Q16.16 native kernel | **0.3.0** — `--lib` cdylib, AOT codegen, MIC profile-locked headers | **PARTIALLY CLOSED (revised 2026-08-19 — reconciles the prior 2026-08-10 "CLOSED" note against the target this row names).** What shipped and IS closed: the Q16.16 native encoder is bundled in the published wheel (`libmind_nerve_encoder.so` + `encoder_weights.q16.bin`, since 2026-05-19) and `MIND_NERVE_BACKEND=native` is the **default** routing path with PyTorch fallback (see CHANGELOG v0.3.0b7 "thesis-pure encode path" and the `_native` runtime). What is still open: the *routing/score step* wins deterministically and is the headline (2.6× faster than PyTorch, mean/QPS; ~3.9× at p95 — U1 bare-metal, `docs/benchmarks.md`), but **end-to-end/tail latency is encode-dominated**, microarch- and weight-dependent — the ≤ 30 ms figure is met at median on modern x86 but is a Phase-2 *target*, not a hard end-to-end number stable enough to publish as an achieved headline. The identified fix — wire the encode GEMM to the existing byte-identical `__mind_blas_matmul_mm_q16_mt_v` intrinsic, the same MT GEMM the score path already uses to win — is blocked only on repairing mindc 0.10.2's broken cdylib/`--emit-mlir` rebuild; it is the next release's headline, not this one's. Task #59 is done for "native encoder is the shipped default"; the tail-latency optimization sub-item stays open. |
 
 Task #57 is closed as descoped (2026-08-15): mind-nerve ships x86_64/ARM64
 CPU backends only, so the OSS CUDA leg it tracked will not be built
-   (a GPU tier, if it ever ships, belongs to a private/enterprise line,
-   not this repo). #59 is
-closed as of the 2026-08-10 re-assessment above.
+   (a GPU tier, if it ever ships, belongs to a private/enterprise Pro-tier
+   line, not this repo). #59 is **partially closed** as of the 2026-08-19
+revision above: native-encoder-as-default-backend shipped and is closed;
+the encode-path tail-latency optimization (wiring the MT GEMM intrinsic
+into the encoder, gated on the mindc cdylib rebuild fix) remains open —
+do not read the roadmap as 100% complete on this item.
 
 ### Architecture constraint on any future GPU tier (2026-08-17)
 
@@ -693,9 +698,8 @@ always matches the installed version** — the CLI serves the guide, not the pro
 > component as each MIND replacement is byte-proven against them — the Python
 > tree is the migration oracle and survives exactly until each proof lands,
 > never longer. Distribution becomes a single native binary per platform
-> (guiding constraint #3); the PyPI Python series ends at v0.3.0 — the
-> beta line ran through `0.3.0b10` before the stable finalize — with the
-> pure-MIND line shipping as binary releases thereafter.
+> (guiding constraint #3); the PyPI Python series ends with the `0.3.x`
+> line — with the pure-MIND line shipping as binary releases thereafter.
 
 Once the `mind` toolchain self-hosts (the open-core compiler builds itself byte-identically),
 this repository's **TypeScript + Python** implementation is migrated to **pure, executing MIND**, so the whole

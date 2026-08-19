@@ -90,7 +90,7 @@
 #      — completeness is load-bearing: an unresolved reference inside a
 #      CALLED function makes the 0.10.2 test interpreter report a
 #      misleading "unknown variable" in the caller; see leg-14 comment),
-#      then + tests/unit/test_loader.mind, exactly 12 tests.
+#      then + tests/unit/test_loader.mind, exactly 13 tests.
 #  15. src/inference.mind (wave-4 port): three parts. (a) `mindc check` on
 #      the complete merged src image. (b) `mindc test` on
 #      tests/unit/test_inference.mind, exactly 9 tests (gate surfaces plus
@@ -833,7 +833,7 @@ echo "   OK: src/model.mind merged image checks clean; 8/8 encoder composition +
 # incomplete image fails unrelated tests. HARD FAIL unless exactly 12 tests
 # run and pass.
 # ---------------------------------------------------------------------------
-echo "== Leg 14: src/loader.mind (merged check + mindc test, 12 tests)"
+echo "== Leg 14: src/loader.mind (merged check + mindc test, 13 tests)"
 
 LD_SRC_MERGED="${WORK_DIR}/ld_src_merged.mind"
 cat "${REPO_ROOT}/mind/luts/exp_q16.mind" \
@@ -867,15 +867,15 @@ if grep -q "running 0 tests" "${LD_TEST_LOG}"; then
     fail "mindc test discovered 0 tests for loader (silent-green trap). Output:
 $(cat "${LD_TEST_LOG}")"
 fi
-grep -q "running 12 tests" "${LD_TEST_LOG}" || \
-    fail "expected 'running 12 tests' for loader. Output:
+grep -q "running 13 tests" "${LD_TEST_LOG}" || \
+    fail "expected 'running 13 tests' for loader. Output:
 $(cat "${LD_TEST_LOG}")"
-grep -q "12 passed; 0 failed" "${LD_TEST_LOG}" || \
-    fail "expected '12 passed; 0 failed' for loader. Output:
+grep -q "13 passed; 0 failed" "${LD_TEST_LOG}" || \
+    fail "expected '13 passed; 0 failed' for loader. Output:
 $(cat "${LD_TEST_LOG}")"
 [ "${rc}" -eq 0 ] || fail "mindc test (loader) exited ${rc}. Output:
 $(cat "${LD_TEST_LOG}")"
-echo "   OK: src/loader.mind merged image checks clean; 12/12 parser gates + UTF-8 + dequantize + hashlib-oracle tests executed and passed"
+echo "   OK: src/loader.mind merged image checks clean; 13/13 parser gates + UTF-8 + dequantize + hashlib-oracle + early-plausibility tests executed and passed"
 
 # ---------------------------------------------------------------------------
 # Leg 15 — src/inference.mind (wave-4 port): check + gate suite + NATIVE
@@ -988,4 +988,4 @@ rc=0
 $(cat "${HARNESS_RUN_LOG}")"
 echo "   OK: native e2e harness — real ELF, exit 0 (stateful oracle + chain link, full-path bytes oracle, stateless chain-of-one)"
 
-echo "GATE PASS: mindc 0.10.2 — 19/19 kernel-tree modules natively compile + link into a real ELF (zero JIT/launcher fallback); 5/5 LUT smoke tests green; src/sha256.mind 16/16, src/q16_16.mind 86/86, src/lib.mind 12/12, src/top_k.mind 30/30, src/tokenizer.mind 18/18, src/chain_log.mind 5/5, src/runtime_ffi.mind 3/3, src/clock.mind 5/5, src/evidence.mind 36/36, src/encoder_kernels.mind 17/17, src/model.mind 8/8, src/loader.mind 12/12, src/inference.mind 9/9 + native e2e harness green"
+echo "GATE PASS: mindc 0.10.2 — 19/19 kernel-tree modules natively compile + link into a real ELF (zero JIT/launcher fallback); 5/5 LUT smoke tests green; src/sha256.mind 16/16, src/q16_16.mind 86/86, src/lib.mind 12/12, src/top_k.mind 30/30, src/tokenizer.mind 18/18, src/chain_log.mind 5/5, src/runtime_ffi.mind 3/3, src/clock.mind 5/5, src/evidence.mind 36/36, src/encoder_kernels.mind 17/17, src/model.mind 8/8, src/loader.mind 13/13, src/inference.mind 9/9 + native e2e harness green"

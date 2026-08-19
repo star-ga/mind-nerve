@@ -118,8 +118,6 @@ Subsequent calls: zero network.
 
 ## What does NOT get distributed
 
-- `libmindnerve.so` (the protected native runtime) — STARGA Commercial,
-  not part of the public OSS wheel. Phase 2.
 - Private MIND source (`src/*.mind`) — never in the wheel.
 - The STARGA-Inc skill catalog in private form (`catalog-v1.0`) — only
   the OSS-cleaned `catalog-v1.1-oss` ships.

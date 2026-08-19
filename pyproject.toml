@@ -33,13 +33,25 @@ classifiers = [
 dependencies = [
     "numpy>=1.24",
     "sentence-transformers>=5.7.0",
+    # CPU-only encoder backend. GPU/CUDA is the commercial Pro tier (roadmap),
+    # never a hard dep here — so keep torch's floor LOW for maximum install
+    # compatibility on CPU. The torch.load RCE (CVE-2025-32434) is NOT reachable:
+    # models load via SentenceTransformer from a local .safetensors, never
+    # torch.load on untrusted pickle. A `>=` resolver already installs the latest
+    # patched torch for fresh installs, so raising the floor adds only friction.
     "torch>=2.0",
     "huggingface_hub>=1.26.1",
-    "cryptography>=48.0.0",
+    # Security-critical dep (Ed25519 sign/verify) floored at its fully-patched
+    # release — standard best practice for a crypto lib regardless of current
+    # reachability (excludes CVE-2026-69247/69248/69249 + GHSA-537c-gmf6-5ccf).
+    "cryptography>=50.0.0",
 ]
 
 [project.optional-dependencies]
-mcp = ["mcp>=1.27.1"]
+# 1.28.1 covers the mind-nerve-mcp server transport CVEs (CVE-2026-52869/52870
+# auth, CVE-2026-59950 WebSocket Host/Origin) — reachable if the MCP server is
+# run network-exposed — without the compat-breaking 2.0 major bump.
+mcp = ["mcp>=1.28.1"]
 dev = [
     "pytest>=9.0.3",
     "ruff>=0.16.1",

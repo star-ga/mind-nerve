@@ -73,7 +73,17 @@ def main() -> int:
     )
 
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    srv.bind(str(sock_path))
+    # Bind under a restrictive umask so the socket inode is 0600 from creation.
+    # bind()-then-chmod() leaves a brief window where the socket carries
+    # umask-default perms and is world-connectable — only mitigated when it lives
+    # under XDG_RUNTIME_DIR's 0700, not for the /tmp fallback. The umask closes
+    # that gap without depending on the parent dir's mode; the chmod stays as a
+    # belt-and-suspenders exact-mode set regardless of the caller's prior umask.
+    _old_umask = os.umask(0o077)
+    try:
+        srv.bind(str(sock_path))
+    finally:
+        os.umask(_old_umask)
     os.chmod(sock_path, 0o600)
     srv.listen(8)
 

@@ -22,6 +22,17 @@ updates:
     commit-message:
       prefix: "deps"
       include: "scope"
+    ignore:
+      # mind-nerve is a LIBRARY with `>=` dependency floors. A MAJOR
+      # version-requirement floor bump (e.g. torch->2.13, mcp 1->2, setuptools
+      # 83->84) forces downstream upgrades and only reduces compatibility — a
+      # `>=` resolver already installs the latest patched version, so it never
+      # improves security. Suppress these; Dependabot SECURITY updates (a real
+      # advisory affecting the declared range) and the grouped minor/patch rolls
+      # below still open.
+      - dependency-name: "*"
+        update-types:
+          - "version-update:semver-major"
     groups:
       python-minor-patch:
         applies-to: version-updates

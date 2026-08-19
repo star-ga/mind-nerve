@@ -12,8 +12,8 @@ stdio.
 
 | Mode | When to use | Latency profile |
 | --- | --- | --- |
-| One-shot CLI (`mind-nerve route ...`) | Quick checks, scripts, CI smoke | cold load each call (~5 s warmup, then ~250 ms encode) |
-| Long-lived daemon (`mind-nerve-routed`) | Interactive editors, hot prompt path | warm: ~23 ms p95 GPU, ~90 ms p95 4-core CPU (Phase 1 PyTorch) |
+| One-shot CLI (`mind-nerve route ...`) | Quick checks, scripts, CI smoke | cold load each call (~5 s warmup, then a warm encode) |
+| Long-lived daemon (`mind-nerve-routed`) | Interactive editors, hot prompt path | warm daemon; native Q16.16 encoder by default on Linux, pure-Python/PyTorch fallback elsewhere — no hard end-to-end number published, see [`docs/benchmarks.md`](benchmarks.md) |
 | stdio MCP server (`mind-nerve-mcp`) | Any MCP-aware host (Claude Code, Cursor, Codex, ...) | bound by host's MCP transport |
 | Container (`mind-nerve:local`) | Headless services, reproducible local dev | matches daemon mode |
 

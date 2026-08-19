@@ -240,6 +240,48 @@ fn test_loader_catalog_trailer_validation() {
     __mind_free(buf);
 }
 
+// Fix 3 (hash-gate amplification): an early plausibility reject must trip on a
+// header that declares more records than the file can hold — BEFORE the `ids`
+// allocation, the O(n log n) uniqueness sort, or the full-preimage SHA-256.
+// num_routes = 66 with the 2172-byte fixture is the adversarial case: the
+// route_ids section (48 + 66*32 = 2160 bytes) FITS inside 2172, so the old
+// per-section `len < ids_end` guard passed and the parser proceeded to alloc +
+// sort before catching the truncated embeddings at emb_end; the new early
+// min_len check (which includes the embeddings + prior + trailer-offset field)
+// rejects up front. Behaviour is byte-identical to the old path (both reject
+// with LD_ERR_TRUNCATED); only the wasted work is removed. Under-declaring
+// (the valid num_routes = 2) is untouched — proven by every test above.
+#[test]
+fn test_loader_catalog_early_plausibility_reject() {
+    let buf: i64 = __mind_alloc(2172);
+    let total: i64 = ldt_catalog_fixture(buf);
+    let cat: i64 = __mind_alloc(5 * 8);
+
+    // Sanity: the honest header (num_routes = 2) still parses clean.
+    let r_ok: i64 = loader_parse_catalog(buf, total, cat);
+    assert r_ok == LD_OK, "honest 2-route header parses (early check is a no-op for valid files)";
+    __mind_free(__mind_load_i64(cat + LOADER_CAT_IDS * 8));
+    __mind_free(__mind_load_i64(cat + LOADER_CAT_EMB * 8));
+    __mind_free(__mind_load_i64(cat + LOADER_CAT_PRIOR * 8));
+    __mind_free(__mind_load_i64(cat + LOADER_CAT_HASH * 8));
+
+    // ids fit (48 + 66*32 = 2160 <= 2172) but the implied embeddings do not:
+    // min_len = 48 + 66*32 + 66*256*4 + 4 = 69748 > 2172 -> reject early.
+    ldw32(buf, 8, 66);
+    let r_impl: i64 = loader_parse_catalog(buf, total, cat);
+    assert r_impl == LD_ERR_TRUNCATED, "implausible over-declared record count rejected early";
+
+    // A record count still within MAX_ROUTES but wildly over the file size is
+    // likewise rejected (not an unbounded alloc / hash).
+    ldw32(buf, 8, 60000);
+    let r_huge: i64 = loader_parse_catalog(buf, total, cat);
+    assert r_huge == LD_ERR_TRUNCATED, "60000-route header over a 2 KiB file rejected early";
+
+    ldw32(buf, 8, 2);
+    __mind_free(cat);
+    __mind_free(buf);
+}
+
 // ── UTF-8 validator ─────────────────────────────────────────────────────────
 
 #[test]

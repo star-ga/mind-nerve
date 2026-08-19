@@ -4,6 +4,115 @@ All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](htt
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-08-19
+
+Security-hardening + documentation-honesty release. No behavior change to
+the routing algorithm, catalog format, or wire protocol — every item below
+is defense-in-depth or a corrected public claim ahead of the public release.
+
+### Security — dependency floors
+
+- **`cryptography>=50.0.0`** (was `>=48.0.0`): floors on the fully-patched
+  release, excluding CVE-2026-69247/69248/69249 and GHSA-537c-gmf6-5ccf.
+  Security-critical dependency (Ed25519 sign/verify for the evidence chain)
+  — floored regardless of current reachability, standard practice for a
+  crypto library.
+- **`mcp>=1.28.1`** (was `>=1.27.1`): covers the `mind-nerve-mcp` server's
+  transport CVEs — CVE-2026-52869/52870 (auth) and CVE-2026-59950
+  (WebSocket Host/Origin) — reachable if the MCP server runs
+  network-exposed. Stops short of the compat-breaking MCP 2.0 major bump.
+- **`torch>=2.0` kept LOW, deliberately**: the encoder backend is CPU-only;
+  GPU/CUDA is the commercial Pro tier (roadmap), never a hard dependency
+  here, so the floor stays low for install compatibility. `torch.load` RCE
+  (CVE-2025-32434) is not reachable — models load via `SentenceTransformer`
+  from a local `.safetensors` file, never `torch.load` on untrusted pickle
+  data.
+- `huggingface_hub` / `setuptools` / `build` floors unchanged — no open
+  advisory against the pinned ranges.
+
+### Security — `.mind` hardening (native MCP server + loader)
+
+- **MCP control-byte id reject** (`src/mcp.mind`): a raw JSON-RPC request
+  id is echoed verbatim into the response frame, and `json_skip_string`
+  accepted any byte other than `"`/`\` inside a quoted id — including
+  control bytes `< 0x20`. A raw `0x0A` in an echoed id could split one
+  JSON-RPC reply into two frames over the `\n`-delimited stdio transport.
+  The id is now scanned at capture and rejected to `null` (a legal id) if
+  it contains any control byte, mirroring the existing over-length
+  (`MCP_ID_CAP`) guard. Well-formed ids (digits, or a quoted string of
+  printable bytes) are unaffected; the golden transcript is unmoved.
+- **`MCP_RESP_CAP` per-write bounds**: every response-buffer writer
+  (`mcp_put`, `mcp_put_lit`, `mcp_put_lit2`, `mcp_put_dec`, `mcp_put_hex32`,
+  `mcp_put_id`) now takes an explicit `cap` and fail-closed truncates —
+  stops writing rather than overrunning the fixed scratch buffer — once
+  the cursor reaches it, instead of relying solely on the `MAX_TOP_K` /
+  `MCP_ID_CAP` invariants staying correct forever. A valid response never
+  reaches the cap, so emitted bytes stay byte-identical and existing
+  goldens hold.
+- **Catalog early-plausibility reject** (`src/loader.mind`,
+  `loader_parse_catalog`): computes the minimum file size the header
+  implies (48-byte prefix + route-id table + embeddings + optional v2
+  route-prior + trailer) and rejects a too-small declaration immediately —
+  before allocating the id array, running the O(n log n) uniqueness
+  merge-sort, or hashing the full canonical preimage. Closes a hash-gate
+  amplification path where a hostile header could drive multi-MiB of work
+  off a tiny file. The bound is conservative, so no valid catalog is ever
+  rejected; the accept path and canonical hash are unchanged.
+
+### Security — daemon UNIX socket umask race
+
+`python/mind_nerve/daemon.py`: the routing daemon's socket used to
+`bind()` then `chmod(0o600)` after the fact, leaving a brief window where
+the socket inode carried umask-default permissions and was connectable by
+any local user under the `/tmp` fallback path (not just
+`XDG_RUNTIME_DIR`'s 0700). The bind now happens under a temporary
+`os.umask(0o077)`, so the inode is `0600` from creation; the `chmod` stays
+as a belt-and-suspenders exact-mode set regardless of the caller's prior
+umask.
+
+### Chore — dependabot: stop chasing major floor-bumps
+
+`.github/dependabot.yml`: mind-nerve is a library with `>=` dependency
+floors, so a major version-requirement bump (e.g. `torch->2.13`,
+`mcp 1->2`) only forces downstream upgrades — a `>=` resolver already
+installs the latest patched version, so a major bump never improves
+security. Dependabot now ignores `semver-major` update PRs across the
+board; real security-advisory updates and the grouped minor/patch rolls
+still open. 5 open dependabot PRs proposing compat-hurting major
+floor-bumps with no security gain were closed under this policy.
+
+### Docs — honesty pass + version-sync
+
+Reconciled every doc surface against verified facts ahead of the public
+release:
+
+- `mindc 0.10.2` is the current compiler wherever docs cite a version (was
+  stale `0.4.x`/`0.6.x` in places; those remain only as historical
+  progression markers in `ROADMAP.md`, explicitly labeled as such).
+- **Native Q16.16 encoder is the DEFAULT backend** (`MIND_NERVE_BACKEND`
+  defaults to `native`, PyTorch is the fallback) — corrected everywhere
+  that implied otherwise.
+- **GPU/CUDA is the commercial Pro tier** (roadmap-only); removed the
+  stale "~23 ms on GPU" latency line — the open-source release is
+  CPU-only.
+- **Windows runs the pure-Python fallback.** No Windows PE binary exists
+  anywhere and mindc 0.10.2 cannot cross-compile to PE yet; corrected docs
+  that implied Windows-native.
+- **`ROADMAP.md`**: reconciled the p95 ≤ 30 ms "target" vs "CLOSED"
+  inconsistency. Native-encoder-as-default IS shipped and closed. What
+  remains open: the routing/score step wins deterministically and is the
+  headline (2.6× faster than PyTorch, mean/QPS; ~3.9× at p95, U1
+  bare-metal — scoped to the routing step, never implied end-to-end),
+  while end-to-end/tail latency is encode-dominated and still being
+  optimized, gated on repairing mindc 0.10.2's broken cdylib/`--emit-mlir`
+  rebuild so the encode GEMM can be wired to the existing
+  `__mind_blas_matmul_mm_q16_mt_v` intrinsic. The roadmap is not 100%
+  complete; this is a genuine remaining item, tracked as the next
+  release's headline.
+- `python/mind_nerve/__init__.py` `__version__` and the native MCP
+  `serverInfo.version` are synced to `0.3.1` (previously native lagged at
+  `0.3.0b9`); `tests/harness/mcp_golden.native.txt` re-frozen to match.
+
 ## [0.3.0] — 2026-08-19
 
 Stable release, finalizing the `0.3.0b1`–`0.3.0b10` beta line. Headline:

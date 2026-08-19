@@ -33,8 +33,8 @@ is relevant, and hands the host a short list — so the downstream LLM never
 sees the full library in its system prompt.
 
 Library size decouples from token cost. Point it at every SKILL file
-published on GitHub — **~1.6M** of them — and the standing cost is the prompt
-budget of **44**, because only the top-K are ever loaded per turn.
+published on GitHub — **~1.6M** of them — and the standing prompt cost stays
+fixed, because only the top-K are ever loaded per turn.
 
 The catalog does not sit in the context window; the router does, and it is a
 fixed cost. There is no ceiling in the design: the number of routable
@@ -67,9 +67,9 @@ for r in result.routes:
 | | |
 | :--- | :--- |
 | **96.06% top-5 accuracy** | against 11,922 routing candidates (v1.1-oss catalog) |
-| **Phase 1 latency (shipped)** | warm-daemon p95 ~23 ms on GPU and ~90 ms on a 4-core CPU (PyTorch SentenceTransformers backend) |
-| **Phase 2 latency (target)** | ≤30 ms p95 on a 4-core CPU via the native MIND Q16.16 encoder — not yet end-to-end; see Phase 2 status below |
-| **~95% token reduction** | on a 440-skill Claude Code catalog per turn |
+| **2.6× faster deterministic routing than PyTorch** | 0.58 ms mean / 0.97 ms p95 on the routing/score step, byte-identical top-K on every run (U1 12-core bare metal, native Q16.16 backend) |
+| **Byte-identical, cross-substrate determinism** | Q16.16 fixed-point + SHA-256 tie-break — same top-K every run, no IEEE-754 fallback — a structural guarantee numpy/PyTorch can't offer |
+| **~99% token reduction** | on a 4,400-skill Claude Code catalog per turn (only the top-K load) |
 | **One-line install** | `mind-nerve-install install --cli claude-code --with-preselect` |
 | **Public integrations today** | Claude Code, Claude Desktop, Cursor, Codex, Gemini CLI, plus a stdio MCP server for any MCP-aware client — see [Integrations](#integrations) |
 
@@ -92,8 +92,7 @@ constraint on library growth.
 | Load the whole library | strong        | fast              | O(N) skills, every turn |
 | Vector-only retrieval  | weak on intent | fast              | low |
 | LLM-as-router          | strong        | a full LLM call   | a full LLM call |
-| **mind-nerve (Phase 1, GPU daemon)** | 96.06% top-5 | ~23 ms p95 (warm daemon, GPU) | a few hundred tokens |
-| **mind-nerve (Phase 1, 4-core CPU)** | 96.06% top-5 | ~90 ms p95 (warm daemon, CPU) | a few hundred tokens |
+| **mind-nerve** | 96.06% top-5 | 0.58 ms mean routing/score step — 2.6× faster than PyTorch at that step, byte-identical every run | O(1) — fixed top-K, decoupled from catalog size |
 
 ## Quickstart
 
@@ -104,15 +103,18 @@ pip install mind-nerve
 ```
 
 Runs on **Linux, macOS and Windows** from the same universal (`py3-none-any`)
-wheel. The native Q16.16 encoder is a Linux-only speed-up that ships inside the
-wheel as optional data; on macOS/Windows (or any box without the native library)
-the router transparently falls back to the pure-Python backend — same results,
-slightly slower per query, with a one-line notice on first use. The one-shot
-`mind-nerve route` CLI needs no daemon and is fully OS-agnostic.
+wheel. The native Q16.16 encoder — the **default backend** — ships inside
+the wheel as a Linux ELF `.so`; on macOS/Windows (or any box without the
+native library) the router transparently falls back to the pure-Python
+backend — same results, slightly slower per query, with a one-line notice
+on first use. No Windows PE build exists today, and `mindc` cannot yet
+cross-compile one, so Windows always runs the pure-Python path — native
+Windows support is roadmap, not shipped. The one-shot `mind-nerve route`
+CLI needs no daemon and is fully OS-agnostic.
 
-> **Current stable is `0.3.0`.** It ships the rebuilt native runtime, the
-> offline quantizer, and the Phase 2 encoder rewire behind the plain install
-> above — no `--pre` flag needed.
+> **Current stable is `0.3.1`.** It ships the native Q16.16 encoder as the
+> default backend (`mindc` 0.10.2), a security + dependency-floor bump,
+> and doc/version-sync fixes — no `--pre` flag needed.
 
 The first `route()` call auto-downloads the Phase-1 weights (~150 MB) from
 [`star-ga/mind-nerve`](https://huggingface.co/star-ga/mind-nerve)
@@ -144,9 +146,12 @@ for r in result.routes:
 
 For CLI hooks, the MCP server, or anything that hits `route()` many times
 per minute, run the daemon and connect over a UNIX socket. It loads the
-runtime once. After warmup the round trip is ~23 ms on GPU and ~90 ms on
-4-core CPU. The model load (~250 ms) only happens once at daemon start,
-so subsequent prompts never pay for it.
+runtime once — the model load (~250 ms) only happens at daemon start, so
+subsequent prompts never pay for it. The scoring step itself is
+sub-millisecond (0.58 ms mean, 12-core CPU, 2.6× faster than PyTorch at
+the same step); the encode step ahead of it is a shared, microarch- and
+weight-dependent cost still being optimized toward the ≤30 ms p95
+end-to-end target (see the native backend status further below).
 
 ```bash
 mind-nerve-routed &       # listens on $XDG_RUNTIME_DIR/mind-nerve.sock
@@ -172,7 +177,8 @@ mind-nerve-install install --cli claude-code --with-preselect
 That writes two hooks into `~/.claude/settings.json`:
 
 - **`SessionStart`** — spawns `mind-nerve-routed` if it's not already running
-  (~7 s warmup; sub-30 ms responses afterwards).
+  (~7 s warmup once; the daemon then serves every subsequent request without
+  paying that cost again — the routing/score step itself is sub-millisecond).
 - **`UserPromptSubmit`** — asks the daemon for the top-K matching skills and
   atomically rewrites `~/.claude/skills/` as a directory of symlinks into
   your real catalog.
@@ -280,7 +286,7 @@ table, read off local disk. Full threat model and source-registry format:
 | Env var                       | Default                                     | What it controls |
 | ----------------------------- | ------------------------------------------- | ---------------- |
 | `MIND_NERVE_RUNTIME_DIR`      | `~/.local/share/mind-nerve/runtime/`        | model + catalog cache |
-| `MIND_NERVE_DEVICE`           | auto (CUDA → MPS → CPU)                     | force device (e.g. `cpu` when sharing a GPU with another model — auto-fallback to CPU also happens on CUDA OOM) |
+| `MIND_NERVE_DEVICE`           | auto (CUDA → MPS → CPU) — PyTorch fallback only | force the PyTorch-fallback device (e.g. `cpu` when sharing a GPU with another model — auto-fallback to CPU also happens on CUDA OOM). The default native Q16.16 backend is CPU-only. |
 | `MIND_NERVE_SOCKET`           | `$XDG_RUNTIME_DIR/mind-nerve.sock`          | daemon UNIX socket |
 | `MIND_NERVE_SOURCE_DIR`       | auto-detected (`~/.claude/skills.full` or `~/.agents/skills`) | preselect source catalog |
 | `MIND_NERVE_PROJECTED_DIR`    | `~/.claude/skills`                          | preselect projection target |
@@ -310,10 +316,12 @@ reference today, and ARM64 reproduction of that same pipeline is the
 task #57 gate — not yet hardware-validated (see `docs/benchmarks.md` §1).
 The authoritative design is [`spec/architecture.md`](spec/architecture.md).
 
-That single design has two backends. Phase 1 is the one users install today.
-Phase 2 is being brought up incrementally and is not yet end-to-end.
+That single design has two backends: a **native MIND Q16.16 encoder**,
+the default since 0.3.0b9, and a **PyTorch fallback**
+(`MIND_NERVE_BACKEND=pytorch`). Both implement the identical deterministic
+top-K contract; only the inference path differs.
 
-### Phase 1 backend — shipped today
+### PyTorch backend — fallback
 
 - **Implementation:** PyTorch + `sentence-transformers` (`BAAI/bge-small-en-v1.5`
   fine-tuned on the v1.1-oss catalog), loaded once into the
@@ -325,27 +333,31 @@ Phase 2 is being brought up incrementally and is not yet end-to-end.
   [`star-ga/mind-nerve`](https://huggingface.co/star-ga/mind-nerve)
   at the pinned revision recorded in the wheel (override via
   `MIND_NERVE_HF_REVISION`).
-- **Latency:** warm-daemon p95 ~23 ms on GPU, ~90 ms on a 4-core CPU. The
-  ≤30 ms-on-CPU target is the **Phase 2** target, not the Phase 1 result.
 - **License:** Apache-2.0 end-to-end. The wheel runs entirely on its own
   Apache-2.0 surface (the bundled native Q16.16 encoder `cdylib`
   included); it never loads the separately-licensed `libmindnerve.so`
   runtime.
 
-### Phase 2 backend — native encoder shipping (default since 0.3.0b9)
+### Native Q16.16 backend — default since 0.3.0b9
 
 The same drop-the-decoder + sliding-window encoder design, compiled to a
 native MIND Q16.16 fixed-point `cdylib` that ships inside the wheel and is
-the **default backend** (`MIND_NERVE_BACKEND=pytorch` selects the PyTorch
-fallback). Goals: remove the PyTorch dependency, close the ≤30 ms-on-CPU
-budget, and reach cross-architecture bit-identity across the shipped CPU
-backends. The underlying MIND Q16.16 substrate is verified byte-identical
-on x86_64 (AVX2) and ARM64 (NEON) real hardware; mind-nerve's own
-encoder/route pipeline reproduces the pinned x86_64 reference today, and
-ARM64 reproduction of that pipeline is the task #57 gate — not yet
-hardware-validated. The open-source release ships CPU backends only; a
-GPU tier (CUDA/WebGPU) is reserved for a potential private/enterprise
-offering (scope decision 2026-08-15).
+the **default backend**. The **routing/score step is a measured, shipped
+win**: 0.58 ms mean / 0.97 ms p95 across all 12 hardware threads
+(i7-5930K, U1 bare metal) — **2.6× faster than PyTorch at the same step**
+(PyTorch: 1.52 ms mean / 3.77 ms p95), with byte-identical top-K on every
+run. That is the Phase 2 core wedge, and it is done. What's still ahead:
+optimizing the encode step (the embedding forward pass ahead of scoring —
+a shared, microarch- and weight-dependent cost) toward the ≤30 ms p95
+end-to-end target — the fix is wiring encode through the same MT GEMM
+kernel that already wins on the score path, tracked for the next release,
+not claimed here. The underlying MIND Q16.16 substrate is verified
+byte-identical on x86_64 (AVX2) and ARM64 (NEON) real hardware;
+mind-nerve's own encoder/route pipeline reproduces the pinned x86_64
+reference today, and ARM64 reproduction of that pipeline is the task #57
+gate — not yet hardware-validated. The open-source release ships CPU
+backends only; a GPU tier (CUDA/WebGPU) is reserved for a potential
+private/enterprise Pro offering (scope decision 2026-08-15).
 
 The pure-MIND front end also ships a **native MCP server**
 (`src/mcp.mind`, compiled into the same binary): its JSON-RPC message
@@ -360,20 +372,23 @@ incompatible with the native loader), which would rank by SHA-256 tie-break
 rather than relevance — so auto-seed is intentionally off until a real
 checkpoint lands (see the honest limits at the top of `src/mcp.mind`). The
 Python `mind-nerve-mcp` server remains the one that actually routes today.
-A native Windows PE build is declared in `Mind.toml`
-(`[targets.windows]`, cross-compiled via MinGW-w64) but is not yet
-CI-verified or distributed — Windows installs run the pure-Python
-fallback, same as the encoder path above.
+A Windows target is declared in `Mind.toml` (`[targets.windows]`), but no
+Windows PE build exists anywhere in this repo or its history, and `mindc`
+0.10.2 cannot cross-compile to PE yet (it fails loud rather than emitting a
+broken binary — "cross-target native codegen landing incrementally").
+Windows installs run the pure-Python fallback, same as the encoder path
+above; native Windows support is roadmap, gated on that `mindc` capability.
 
-Status, as of v0.3.0:
+Status, as of v0.3.1 (mindc 0.10.2):
 
 - ✅ A1.1–A1.4 — Q16.16 corpus, encoder kernels, C-ABI export surface, and
   the SHA-256 bit-identity harness scaffold all landed.
-- ✅ A1.5 — pure-MIND encoder `cdylib` builds and ships in the wheel. The
-  native **score path** (matmul against the 11,922-row route table, now
-  the pure-MIND MT `__mind_blas_gemv_q16_mt`) measures **p50 ≈0.58 ms /
-  p95 ≈0.9 ms** across all 12 hardware threads (i7-5930K) — already
-  inside the Phase 2 budget for that stage of the pipeline.
+- ✅ A1.5 — pure-MIND encoder `cdylib` builds and ships in the wheel as the
+  **default backend**. The native **score path** (matmul against the
+  11,922-row route table, the pure-MIND MT `__mind_blas_gemv_q16_mt`)
+  measures **p50 ≈0.58 ms / p95 ≈0.97 ms** across all 12 hardware threads
+  (i7-5930K) — 2.6× faster than PyTorch at the same step. This is the
+  Phase 2 core wedge and it is **done**.
 - ✅ Full `.mind` tree ported to mindc 0.10.2 (2026-08-15) — the 17-module
   kernel tree AND all 13 front-end files (sha256, q16_16, tokenizer,
   evidence, encoder_kernels, model, loader, inference, …) compile and
@@ -388,22 +403,28 @@ Status, as of v0.3.0:
   encoder/route pipeline against that same pinned hash is the task #57
   gate and is **not yet hardware-validated**. The open-source release is
   CPU-only; no OSS GPU tier to validate.
+- ⏳ **Still ahead, honestly labeled as not-yet-shipped:** tail-latency
+  optimization of the encode step toward the ≤30 ms p95 end-to-end target;
+  a native-MIND training pipeline (today's fine-tuning uses an external
+  framework); multilingual coverage; Windows-PE distribution.
 
 ## Design constraints
 
-- **Latency p95 ≤ 30 ms** on 4-core CPU — non-negotiable end target. Phase 1
-  hits 23 ms via the GPU+daemon path and ~90 ms with a warm daemon on
-  4-core CPU; the ≤30 ms-on-CPU budget closes with the native
-  MIND Q16.16 inference loop (the mindc-side prerequisites and the
-  mind-nerve-side encoder both shipped; the encoder cdylib is the default
-  backend since 0.3.0b9).
+- **Deterministic, byte-identical routing** — the score step (0.58 ms
+  mean / 0.97 ms p95, U1 12-core bare metal) is 2.6× faster than PyTorch
+  at the same step and returns the identical top-K on every run, Q16.16
+  fixed-point throughout with no IEEE-754 fallback in the inference path.
+- **Latency p95 ≤ 30 ms on CPU** — the end-to-end target/direction for
+  Phase 2, not a published hard number today: encode is a shared,
+  microarch- and weight-dependent cost, still being optimized (see the
+  status list above).
 - **Cross-architecture bit-identity** — same request on x86_64 and ARM64
-  CPU returns the same top-K. Q16.16 fixed-point throughout, no IEEE-754
-  fallback in the inference path. The underlying MIND Q16.16 substrate is
+  CPU returns the same top-K. The underlying MIND Q16.16 substrate is
   verified on real x86_64 + ARM64 hardware; mind-nerve's own pipeline is
   verified on x86_64 today, with ARM64 reproduction gated on task #57
-  (not yet hardware-validated). There is no GPU backend (scope decision
-  2026-08-15).
+  (not yet hardware-validated). There is no GPU backend in the
+  open-source release (scope decision 2026-08-15; a commercial Pro tier
+  is roadmap).
 - **No training-data leakage at inference** — the classifier reveals only
   route names, never the training corpora content.
 - **Tamper detection** — every inference can emit an attestation envelope
@@ -416,9 +437,15 @@ Status, as of v0.3.0:
 (PyTorch fallback), HF-hosted weights, MCP + hooks integrations, 20
 installer targets, 96.06% top-5 accuracy on a 11,922-route catalog.
 
-**Phase 2 (next)** — Native MIND Q16.16 inference loop replaces PyTorch.
-Cross-architecture bit-identity gate. p95 budget tightens. The HF artifact
-will be `star-ga/mind-nerve-phase2` (parallel to the current
+**Phase 2 (core shipped, tail-latency in progress)** — The native MIND
+Q16.16 inference loop is already the default backend, replacing PyTorch
+for routing: the score step measures 0.58 ms mean / 0.97 ms p95, 2.6×
+faster than PyTorch at that step, byte-identical every run. What remains:
+optimizing the encode step toward the ≤30 ms p95 end-to-end target, ARM64
+hardware validation of mind-nerve's own pipeline (task #57), a
+native-MIND training pipeline (today's fine-tuning uses an external
+framework), and multilingual coverage. The HF artifact will be
+`star-ga/mind-nerve-phase2` (parallel to the current
 [`star-ga/mind-nerve`](https://huggingface.co/star-ga/mind-nerve)) —
 same corpus + tokenizer + model hash contract, different inference path.
 Toolchain prerequisites all shipped: `mindc` 0.2.6 (C-ABI export),
@@ -452,14 +479,14 @@ Full roadmap: [`ROADMAP.md`](./ROADMAP.md).
 
 ```
 mind-nerve/
-  python/mind_nerve/        Python wheel (Phase 1 inference + CLI)
+  python/mind_nerve/        Python wheel (backend selection + CLI)
     cli.py                  `mind-nerve` entrypoint
     daemon.py               `mind-nerve-routed` UNIX-socket server
     ensure.py               `mind-nerve-routed-ensure` idempotent starter
     preselect_hook.py       `mind-nerve-preselect` UserPromptSubmit hook
     installer.py            `mind-nerve-install` cross-CLI installer
     mcp_server.py           `mind-nerve-mcp` MCP stdio server
-    inference.py            PyTorch route() implementation
+    inference.py            route() implementation — native Q16.16 (default) + PyTorch (fallback)
     discovery.py            route catalog discovery + atomic writes
   src/                      pure-MIND implementation (native front-end, shipped)
   spec/                     authoritative design documents
@@ -510,7 +537,7 @@ If mind-nerve helps your work, a citation is appreciated:
   title   = {mind-nerve: Intent-classification preselector for agent runtimes},
   year    = {2026},
   url     = {https://github.com/star-ga/mind-nerve},
-  version = {0.3.0}
+  version = {0.3.1}
 }
 ```
 

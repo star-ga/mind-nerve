@@ -1,8 +1,12 @@
-# Model Card — mind-nerve Phase 1
+# Model Card — mind-nerve
 
-This card describes the Phase-1 shipped backend. The Phase-2 native MIND
-Q16.16 backend is in progress and not yet end-to-end (see
-[`README.md`](../README.md#phase-2-backend--in-progress-a15-partial)).
+This card describes the Phase-1 trained encoder and its two inference
+backends: the **native Q16.16 encoder** (compiled via `mindc`, the default
+backend since `0.3.0b9`) and the PyTorch `sentence-transformers` fallback
+(used on platforms without the native library, and selectable via
+`MIND_NERVE_BACKEND=pytorch`). Both backends serve the same trained weights
+and produce deterministic top-K route lists; see
+[`README.md`](../README.md) for the current backend status.
 
 ## Model details
 
@@ -13,7 +17,8 @@ Q16.16 backend is in progress and not yet end-to-end (see
 | Maintainer | STARGA, Inc. — <info@star.ga> |
 | Type | Sentence-encoder fine-tune for intent classification over a route catalog |
 | Base model | `BAAI/bge-small-en-v1.5` |
-| Backend | PyTorch + `sentence-transformers` |
+| Training backend | PyTorch + `sentence-transformers` (Phase 1; native-MIND training is on the roadmap) |
+| Inference backend (default) | Native Q16.16 encoder, compiled with `mindc 0.10.2` (Linux); pure-Python/PyTorch fallback elsewhere |
 | Training objective | `MultipleNegativesRankingLoss` over `(name, body)` positive pairs |
 | Catalog | `route_table.jsonl` v1.0 (11,922 routes, frozen; **draft-unsigned** — the `manifest.sig` HMAC is a placeholder, see [catalog_freezes/v1.0.md](./catalog_freezes/v1.0.md)) |
 | License (code) | Apache-2.0 |
@@ -80,33 +85,39 @@ the audit "Model and algorithm correctness" finding and
 
 ## Performance
 
-Phase 1 (shipped):
+The native Q16.16 encoder's **routing/score step** is **2.6x faster than
+PyTorch** on a fair, equal-thread-count comparison (0.58 ms mean / 0.97 ms
+p95 vs PyTorch's 1.52 ms mean / 3.77 ms p95, U1 bare metal, byte-identical
+output) — see [`docs/benchmarks.md`](benchmarks.md) for the full methodology
+and numbers. This is the deterministic top-K matmul-and-rank step, not
+end-to-end `route()`.
 
-- Warm-daemon p95 ~**23 ms** on GPU.
-- Warm-daemon p95 ~**90 ms** on a 4-core CPU.
-- Cold start: ~250 ms (model load) + ~7 s warmup for the daemon.
+End-to-end `route()` latency (encode + score) is encode-dominated,
+microarchitecture-dependent, and depends on the checkpoint size, so no hard
+end-to-end number is published here — see
+[`docs/benchmarks.md`](benchmarks.md#what-we-dont-publish). The
+**≤30 ms p95 on a 4-core CPU** figure documented in
+[`spec/architecture.md`](../spec/architecture.md) is a **Phase-2
+target/direction**, not a measured result being claimed as met.
 
-The ≤30 ms-on-CPU target documented in
-[`spec/architecture.md`](../spec/architecture.md) is the **Phase 2** target,
-not a Phase 1 result.
-
-Phase 2 (A1.5 PARTIAL):
-
-- Native MIND Q16.16 **score path** (matmul against the 11,922-row route
-  table) measures **p50 14.4 ms / p95 15.1 ms** on a 4-core CPU at
-  commit
-  [`b9b6401`](https://github.com/star-ga/mind-nerve/commit/b9b6401).
-- The full end-to-end native encoder forward is blocked on the `mindc`
-  Phase 6.2 quantizer + SIMD lowering. Until that lands, the wheel
-  routes through the Phase 1 PyTorch backend.
+The pure-Python/PyTorch fallback backend (used automatically wherever the
+native library is unavailable, e.g. non-Linux platforms, or via
+`MIND_NERVE_BACKEND=pytorch`) returns the same route results at a slower
+per-query cost; it is not independently benchmarked in this document.
 
 ## Known limitations
 
-- **English-only at Phase 1.** The encoder vocabulary is the
-  English-only BPE inherited from the base model. Multilingual support
-  is on the roadmap (see [`spec/quality_targets.md`](../spec/quality_targets.md)).
-- **CPU latency lags spec target.** Phase 1 warm-daemon p95 on a 4-core
-  CPU is ~90 ms; the ≤30 ms-on-CPU budget closes with Phase 2.
+- **English-only.** The encoder vocabulary is the English-only BPE
+  inherited from the base model. Multilingual support is on the roadmap
+  (see [`spec/quality_targets.md`](../spec/quality_targets.md)).
+- **No published end-to-end latency figure.** `route()` end-to-end latency
+  (encode + score) is not published as a hard number — it is
+  encode-dominated and microarchitecture- and weight-dependent. Only the
+  routing/score step is benchmarked; see
+  [`docs/benchmarks.md`](benchmarks.md).
+- **Windows has no native encoder.** The native Q16.16 `.so` is Linux-only;
+  Windows always runs the pure-Python fallback path today. Native Windows
+  support is on the roadmap, gated on `mindc` PE/COFF cross-compilation.
 - **Catalog-conditioned.** Accuracy numbers are reported on the v1.1-oss
   catalog. Routes added at runtime via `mind-nerve learn` are encoded
   with the same base model but are not re-evaluated against the eval

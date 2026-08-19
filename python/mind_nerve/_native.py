@@ -1,10 +1,11 @@
 """mind-nerve native Q16.16 encoder — ctypes binding.
 
 Binds the six mn_encoder_* entry points exported by libmind_nerve_encoder.so
-(compiled from mind/exports/c_abi.mind via mindc --emit-shared).
+on Linux/macOS, or mind_nerve_encoder.dll on Windows (both compiled from
+mind/exports/c_abi.mind via mindc --emit-shared / mindc build --emit cdylib).
 
 All data crosses the FFI boundary as flat i64 arrays in Q16.16 fixed-point
-little-endian. No f32 is passed to or from the .so.
+little-endian. No f32 is passed to or from the native library.
 
 Q16.16 encoding:
     python_float → q16 = int(round(value * 65536))
@@ -12,12 +13,18 @@ Q16.16 encoding:
 
 The WordPiece tokenizer stays Python-side (out of A1.3 scope); this module
 receives pre-tokenized int32 arrays and returns Q16.16 int32 arrays.
+
+Platform note: the ctypes binding (Q16.16 i64 ABI, the six mn_encoder_*
+entry points) is identical on every platform — only the library filename
+and the ctypes loader class (CDLL vs WinDLL) differ, handled by
+_find_native_lib() / _load_library() below.
 """
 
 from __future__ import annotations
 
 import ctypes
 import os
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -30,7 +37,7 @@ _Q16_MAX: int = 2_147_483_647
 _Q16_MIN: int = -2_147_483_648
 
 # ---------------------------------------------------------------------------
-# .so search order
+# Native library search order
 # ---------------------------------------------------------------------------
 _NATIVE_DIR = Path(__file__).parent / "_native"
 _SEARCH_PATHS: tuple[Path, ...] = (
@@ -38,23 +45,49 @@ _SEARCH_PATHS: tuple[Path, ...] = (
     Path(os.environ.get("MIND_NERVE_NATIVE_PATH", str(_NATIVE_DIR))),
 )
 _SO_NAME = "libmind_nerve_encoder.so"
+_DLL_NAME = "mind_nerve_encoder.dll"
+_IS_WINDOWS = sys.platform == "win32" or os.name == "nt"
+_LIB_NAME = _DLL_NAME if _IS_WINDOWS else _SO_NAME
 
 
-def _find_so() -> Path:
-    """Return the path to libmind_nerve_encoder.so, searching in order."""
+def _find_native_lib() -> Path:
+    """Return the path to the platform-native encoder library.
+
+    Searches for mind_nerve_encoder.dll on Windows and
+    libmind_nerve_encoder.so everywhere else (Linux/macOS — the .dylib
+    extension is not yet built, but ctypes.CDLL resolves .dylib/.so
+    interchangeably via the platform loader on macOS if ever added).
+    """
     seen: set[Path] = set()
     for directory in _SEARCH_PATHS:
-        candidate = Path(directory) / _SO_NAME
+        candidate = Path(directory) / _LIB_NAME
         if candidate in seen:
             continue
         seen.add(candidate)
         if candidate.exists():
             return candidate
-    searched = ", ".join(str(Path(d) / _SO_NAME) for d in _SEARCH_PATHS)
+    searched = ", ".join(str(Path(d) / _LIB_NAME) for d in _SEARCH_PATHS)
     raise FileNotFoundError(
-        f"libmind_nerve_encoder.so not found. Searched: {searched}. "
-        f"Run tools/build_native_encoder.sh to build the shared library."
+        f"{_LIB_NAME} not found. Searched: {searched}. "
+        f"On Linux/macOS, run tools/build_native_encoder.sh to build "
+        f"{_SO_NAME}; on Windows, build {_DLL_NAME} via the MinGW-w64 "
+        f"cross-toolchain (see tools/build_encoder_cdylib.py)."
     )
+
+
+def _load_library(path: Path) -> ctypes.CDLL:
+    """Load the native encoder library.
+
+    mindc's --emit-shared cdylib exports plain cdecl C-ABI symbols (no
+    stdcall decoration) on every platform, so ctypes.CDLL — not
+    ctypes.WinDLL, which defaults to the stdcall calling convention — is
+    the correct loader on Windows too. (On the x86-64 Microsoft calling
+    convention there is no cdecl/stdcall stack-cleanup distinction, so this
+    only matters if a 32-bit Windows target is ever added.) A missing
+    dependent DLL on Windows still surfaces as an OSError with a WinError
+    code embedded in str(exc), same as any other ctypes.CDLL load failure.
+    """
+    return ctypes.CDLL(str(path))
 
 
 # ---------------------------------------------------------------------------
@@ -110,8 +143,8 @@ class _NativeRuntime:
     """
 
     def __init__(self, so_path: Path | None = None) -> None:
-        path = so_path or _find_so()
-        self._lib = ctypes.CDLL(str(path))
+        path = so_path or _find_native_lib()
+        self._lib = _load_library(path)
         self._bind_symbols()
         self._so_path = path
 

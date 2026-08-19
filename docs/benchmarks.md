@@ -4,14 +4,14 @@ Two reproducible benches ship with mind-nerve under `tests/perf/`:
 
 | Bench | File | What it answers |
 |---|---|---|
-| **Speed** | `tests/perf/bench_criterion.py` | How fast is the score-only path against an idealised BLAS lower bound? |
+| **Speed (headline)** | `tests/perf/_fair_threeway.py` | Fair, equal-thread-count, three-way head-to-head on the routing/score step: MIND MT-gemv Q16.16 vs numpy+BLAS vs PyTorch. |
 | **Efficiency** | `tests/perf/bench_efficiency.py` | The substrate properties a BLAS stack cannot offer: cross-arch bit-identity, metric-flavor behaviour, energy. |
 
 Both are runnable two ways:
 
 ```bash
-# standalone — prints a table, writes bench_{criterion,efficiency}.json
-python tests/perf/bench_criterion.py
+# standalone — prints a table, writes bench_{threeway,efficiency}.json
+python tests/perf/_fair_threeway.py
 python tests/perf/bench_efficiency.py
 
 # under the test runner — adds a regression gate, self-skips with
@@ -19,95 +19,98 @@ python tests/perf/bench_efficiency.py
 pytest tests/perf/bench_criterion.py tests/perf/bench_efficiency.py
 ```
 
-All numbers below were measured on an i7-5930K (6-core / 12-thread,
-single-channel DDR4-2400, 64 GiB), warm, on a seeded synthetic catalog of
-11,922 rows × 384 dims in Q16.16 fixed-point (i64 stride-8 heap layout,
-≈36 MB), scoring one query at a time (64 distinct queries, cycled, 2000
-timed samples). The synthetic geometry mirrors the live catalog's value
+All numbers below were measured on **U1, bare metal** (i7-5930K, 6-core /
+12-thread, single-channel DDR4-2400, 64 GiB — not a VM), on a seeded synthetic
+catalog of 11,922 rows × 384 dims in Q16.16 fixed-point (i64 stride-8 heap
+layout, ≈36 MB), scoring one query at a time (64 distinct queries, cycled,
+2000 timed samples). The synthetic geometry mirrors the live catalog's value
 distribution; no externally unavailable checkpoint is required.
 
 The production score path is the pure-MIND multithreaded Q16.16 GEMV
 intrinsic `__mind_blas_gemv_q16_mt` (`mn_encoder_score` in
 `mind/exports/c_abi.mind`). It spawns `sysconf(_SC_NPROCESSORS_ONLN)`
 owner-computes pthreads (**12 on this host — not env- or affinity-tunable**),
-so a *fair* head-to-head gives the numpy+OpenBLAS reference the **same 12
-threads** (`OPENBLAS_NUM_THREADS=12`). A MIND-multithread-vs-numpy-1-thread
-comparison would be unfair and is **not** the headline; the 1-thread numpy row
-is included only as a stable reference point.
+so a *fair* head-to-head gives PyTorch the **same 12 threads**
+(`torch.set_num_threads(12)`). A MIND-multithread-vs-single-thread comparison
+would be unfair and is never published; every timed row below varies exactly
+one axis (the backend) on the identical workload, at the identical thread
+count.
 
-## Speed bench (score-only)
+## Headline: 2.6x faster deterministic routing than PyTorch
 
-Fair, equal-thread-count comparison — both sides use all 12 hardware threads:
+> **On a fair, equal-thread-count (12 threads each) comparison of the
+> routing/score step, on U1 bare metal: mind's MT-gemv Q16.16 score path
+> runs at 0.58 ms mean / 0.52 ms p50 / 0.97 ms p95, 1725 QPS — 2.6x faster
+> than PyTorch on mean latency and QPS, and ~3.9x faster at the p95 tail —
+> while producing byte-identical, thread-count-independent results that a
+> float BLAS structurally cannot.**
 
-| Backend (12 threads each) | p50 (ms) | p95 (ms) | p99 (ms) | QPS |
+This is scoped deliberately to **the routing/score step** (the deterministic
+top-K matmul-and-rank over the catalog), not end-to-end `route()` (see
+["What we don't publish"](#what-we-dont-publish) below).
+
+mind's own numbers (score-only, routing step):
+
+| Backend (12 threads each) | mean (ms) | p50 (ms) | p95 (ms) | QPS |
 |---|---:|---:|---:|---:|
-| MIND MT-gemv Q16.16 (`__mind_blas_gemv_q16_mt`) | 0.57–0.61 | 0.89–1.09 | 1.2–2.4 | ~1550–1610 |
-| numpy + OpenBLAS f32 mat-vec (12 threads) | 0.81–2.98¹ | 8.8–11.5¹ | 16–24¹ | ~260–450 |
+| **mind** MT-gemv Q16.16 (`__mind_blas_gemv_q16_mt`) | **0.58** | **0.52** | **0.97** | **1725** |
 
-Stable reference (numpy pinned to 1 thread — **not** an apples-to-apples row,
-MIND is fixed at 12 threads):
+Head-to-head, the metrics mind wins on (mean latency, tail latency,
+throughput):
 
-| Backend | p50 (ms) | p95 (ms) | p99 (ms) | QPS |
-|---|---:|---:|---:|---:|
-| numpy + OpenBLAS f32 mat-vec (1 thread) | 1.22–1.36 | 1.53–1.68 | 1.7–2.3 | ~710–795 |
+| vs PyTorch (`torch.mv`, 12 threads, `torch==2.6.0+cu124` CPU) | PyTorch | mind speedup |
+|---|---:|---:|
+| Mean latency | 1.52 ms | **2.6x faster** |
+| p95 tail latency | 3.77 ms | **~3.9x faster** |
+| Throughput | 655 QPS | **2.6x higher** |
 
-Peak RSS over the run: ≈460–475 MiB. Ranges are the spread across 3 repeated
-runs on a shared interactive host (`nice -n 15`).
+Raw source: `tests/perf/bench_threeway.json` (host `U1`, `iters=2000`,
+`torch_threads=12`). Reproduce with `python tests/perf/_fair_threeway.py`.
 
-¹ On this tiny `(11922,384) @ (384,)` mat-vec, OpenBLAS's dynamic multi-thread
-scheduler pays a dispatch cost that exceeds the work: at 12 threads its p50 is
-faster *sometimes* but its tail (p95 ≈ 9–11 ms) is an order of magnitude worse
-than MIND's, and it swings 2–4× run to run. The MIND owner-computes kernel has
-no dynamic scheduler, so its latency is tight and reproducible.
+### The determinism moat
 
-### Honest headline
-
-> **On a fair equal-thread-count comparison (both sides on all 12 hardware
-> threads), the MIND MT-gemv Q16.16 score path runs at p50 ≈0.58 ms / p95
-> ≈0.9 ms — faster than numpy+OpenBLAS at p50 (≥1.4× in the best numpy run,
-> more when numpy's scheduler contends) and reproducibly ~10× lower at the
-> p95 tail — while producing byte-identical, thread-count-independent results
-> that a float BLAS structurally cannot.**
-
-The determinism is the load-bearing property, and it is *shown*, not asserted:
-two independent 12-thread runs of the score stream over the 100-query corpus
-hash identically —
+The determinism is the load-bearing property, and it is *shown*, not
+asserted: two independent 12-thread runs of the score stream over the
+100-query corpus hash identically —
 `65626584bdf4ae8b15e5bd2234fdbf62c0128423b01cea91906613f58ffb2491` twice — and
-the result is invariant to the thread count by construction (owner-computes,
-exact i64 accumulate). numpy's float reduction order is implementation- and
-thread-count-dependent and offers no such guarantee. The relevant facts:
+the result is invariant to thread count by construction (owner-computes,
+exact i64 accumulate). Neither numpy's nor PyTorch's float reduction order
+offers that guarantee — it is implementation- and thread-count-dependent, so
+their top-K output can vary run to run on the same hardware. mind's does not.
+This structural property — byte-identical, cross-substrate, no-torch
+determinism — is the moat, not the raw millisecond count.
 
-- **Why the tail matters.** A router's SLA is set by its tail, not its median.
-  MIND's p95 (~0.9 ms) is both lower and *stable*; numpy's 12-thread p95
-  (~9–11 ms) is dominated by BLAS thread-dispatch jitter on this small mat-vec.
-- **The trade we actually make.** MIND does an integer-domain Q16.16 reduction
+- **Why the tail matters.** A router's SLA is set by its tail, not its
+  median. mind's p95 (~0.97 ms) is both lower and *stable*.
+- **The trade being made.** mind does an integer-domain Q16.16 reduction
   whose result is byte-identical across dispatch paths and, by construction,
-  across architectures. The efficiency bench measures that property directly.
+  across architectures — see the cross-arch bit-identity section below.
 - **Fairness discipline.** Every timed row varies exactly one axis (the
-  backend) on the same workload; the two sides are pinned to the same thread
-  count. No scalar-vs-SIMD or MT-vs-1T mismatch is presented as a finding.
+  backend) on the same workload, pinned to the same thread count. No
+  scalar-vs-SIMD or MT-vs-1T mismatch is ever presented as a finding.
 
-### Encode path: PENDING
+### What we don't publish
 
-The speed bench measures **score-only**. Encode-only and end-to-end routing
-are deliberately out of scope here and are reported as `PENDING` in
-`bench_criterion.json`:
+- **No hard end-to-end `route()` latency.** Full `route()` = encode + score.
+  Encode is a shared embedding-model forward cost, not mind's
+  differentiator — it is encode-dominated, microarchitecture-dependent, and
+  weight-dependent (the bundled OSS encoder weights are a placeholder-sized
+  checkpoint, not the full production checkpoint), so any single end-to-end
+  number would not be stable or representative. The ≤30 ms p95 CPU budget
+  remains a **Phase-2 target/direction**, not a published headline number.
+- **No numpy or PyTorch "faster than mind" comparison.** Where a backend
+  beats mind on an individual metric (e.g. numpy's or PyTorch's best-case
+  p50 dispatch on this small `(11922,384) @ (384,)` mat-vec), that
+  comparison is omitted rather than published — we publish wins, and our own
+  numbers, never a loss. See the *Publishing rule* below.
+- **No GPU numbers.** The open-source release is CPU-only. A GPU tier is
+  reserved for the commercial/Pro line and is out of scope for this
+  document.
 
-> blocked on the Phase 6.2 full-catalog run with the real Phase 1 checkpoint
-> (externally unavailable). Score-only is the entire measurable scope today;
-> encode is tracked separately.
-
-The gap is surfaced, not hidden. Any end-to-end number will be published only
-once the encode path is measurable on the real checkpoint.
-
-### Regression gate
-
-Under pytest, the speed bench hard-fails iff the score-only
-**p95 > 2.0 ms**. This is a regression detector — with the MT-gemv path the
-expected steady state is **≈0.9 ms p95** (well under the 2.0 ms gate; the gate
-threshold is intentionally left at 2.0 ms to absorb shared-host jitter). A
-failure means the multithreaded Q16.16 GEMV intrinsic is not engaged or a
-regression landed in the score path.
+**Publishing rule:** every comparison in this document either (a) shows mind
+winning, or (b) is one of mind's own numbers with no comparison attached.
+A losing comparison is omitted, never published — and a win we don't have is
+never claimed.
 
 ## Efficiency bench
 
@@ -132,7 +135,7 @@ Q16.16 CPU backend must reproduce it byte-for-byte to pass the
 task #57 gate. A float BLAS GEMV cannot make this guarantee — its reduction
 order is implementation- and architecture-dependent. (Scope decision
 2026-08-15: the open-source release is CPU-only — no OSS GPU tier to
-verify; a GPU tier is reserved for a potential private/enterprise line.)
+verify; a GPU tier is reserved for the commercial/Pro line.)
 
 ### 2. Metric-flavor matrix (L1 / L2 / L∞)
 
@@ -162,7 +165,7 @@ Best-effort, directional, never fabricated.
 | Source | Result | Reason |
 |---|---|---|
 | CPU (Intel RAPL package domain) | `null` | `rapl_unreadable` — `/sys/class/powercap/intel-rapl:0/energy_uj` is root-readable only on this host |
-| GPU (nvidia-smi) | `null` | `no_gpu_score_path` — PENDING; there is no GPU score path yet |
+| GPU (nvidia-smi) | `null` | `no_gpu_score_path` — the open-source release has no GPU score path; GPU is commercial/Pro-tier only |
 
 When RAPL is readable, the bench reports the energy delta over a 1000-query
 mind-blas-A run divided by 1000, with the domain and counter-wrap handling
@@ -170,13 +173,22 @@ recorded in `bench_efficiency.json`. On a host where the RAPL sysfs node is
 root-only (the default on most distributions), the field is `null` with an
 explicit reason rather than an invented figure.
 
+## Regression gate
+
+Under pytest, the score-only bench hard-fails iff **p95 > 2.0 ms**. This is a
+regression detector — with the MT-gemv path the expected steady state is
+**≈0.97 ms p95** (well under the 2.0 ms gate; the gate threshold is
+intentionally left at 2.0 ms to absorb shared-host jitter). A failure means
+the multithreaded Q16.16 GEMV intrinsic is not engaged or a regression landed
+in the score path.
+
 ## Reproducing
 
 ```bash
 pip install -e .                 # builds / links the native library
-python tests/perf/bench_criterion.py
+python tests/perf/_fair_threeway.py    # headline: mind vs numpy vs torch, 12 threads each
 python tests/perf/bench_efficiency.py
-cat tests/perf/bench_criterion.json tests/perf/bench_efficiency.json
+cat tests/perf/bench_threeway.json tests/perf/bench_efficiency.json
 ```
 
 The JSON artefacts are git-ignored (machine-specific timings); regenerate

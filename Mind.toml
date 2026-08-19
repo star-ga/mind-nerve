@@ -1,6 +1,6 @@
 [package]
 name = "mind-nerve"
-version = "0.3.0"
+version = "0.3.1"
 authors = ["STARGA, Inc. <info@star.ga>"]
 description = "CPU-first intent-classification preselector for agent runtimes"
 license = "Apache-2.0"
@@ -127,12 +127,15 @@ native_sources = [
     "mind/runtime/nerve_rt_shims.c",
 ]
 
-# Windows-native PE target. SAME cpu-backend lowering + the SAME source list as
-# [targets.cpu] — the deterministic Q16.16 payload code is byte-for-byte identical
-# across substrates (the wedge). Only two things differ: the LLVM target triple
-# (selected via the [targets.*].target seam) and the host-I/O shims, which are the
-# Win32/MSVCRT variant (binary-mode stdio, BCryptGenRandom, QueryPerformanceCounter).
-# Cross-built from Linux via the MinGW-w64 sysroot — no Windows box to build.
+# DECLARED, NOT SHIPPED. This target expresses the Windows-native intent — SAME
+# cpu-backend lowering + the SAME source list as [targets.cpu], so that when it
+# lands the deterministic Q16.16 payload code is byte-for-byte identical across
+# substrates (the wedge). It is NOT buildable today: mindc 0.10.2 has no PE/COFF
+# object emitter (cross-target native codegen is landing incrementally in mindc,
+# not this repo) and fails loud rather than silently falling back. No Windows PE
+# binary exists anywhere for mind-nerve — Windows installs run the pure-Python
+# fallback path (see README.md). Native Windows PE distribution, cross-built from
+# Linux via a MinGW-w64 sysroot, is on the roadmap gated on that mindc feature.
 [targets.windows]
 backend = "cpu"
 target = "x86_64-w64-windows-gnu"
@@ -206,9 +209,13 @@ sources = [
 [bit-identity]
 # CI gate: same model_hash + same catalog_hash + same request_hash
 # MUST produce the same result_hash on every backend. Zero divergence
-# tolerated.
-# `cuda` here is the RESERVED future MIND-native GPU backend (see [targets.cuda]
-# above), NOT a CUDA lowering — not built or gated today; cpu_x86 ↔ cpu_arm is
-# the live cross-substrate byte-identity pair.
-backends-phase1 = ["cpu_x86", "cpu_arm", "cuda"]
+# tolerated. cpu_x86 (verified) ↔ cpu_arm (task #57, not yet closed) is the
+# only pair this OSS release builds and gates.
+backends-phase1 = ["cpu_x86", "cpu_arm"]
 backends-phase2 = ["webgpu", "npu"]
+# `cuda` is NOT a phase-1/phase-2 OSS gate — it is a RESERVED name for a future
+# MIND-native GPU backend (see [targets.cuda] above), not a CUDA/PTX lowering,
+# not built or gated in this repo today, and reserved for a potential private/
+# enterprise tier per README.md's licensing split. No GPU/CUDA determinism
+# claim is made by this OSS release.
+backends-reserved = ["cuda"]

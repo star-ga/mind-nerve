@@ -359,6 +359,29 @@ Q16.16 in flight, INT8 weights, cross-arch bit-identity, 30 ms p95).
    truth. (Prior-art shape: a declarative policy file with per-rule rationale,
    observed 2026-07-04 — adopted as an overlay, not a routing engine.)
 
+#### Deterministic int8 routing tier (deferred — gated on mind's `gemv_i8`)
+
+**Decision 2026-08-19 (Fable-measured): Q16.16 stays the default router; int8 is a
+future edge/batch tier, landed when the mind compiler matures.** Measured on U1:
+the Q16.16 score path is p95 ~1.10 ms (2× under the 2 ms budget) and ~1.5× faster
+than 1-thread numpy+OpenBLAS — already best-in-world for a *deterministic* router,
+with the full wedge numpy/pytorch cannot offer. Raw int8 flips top-1 on 1.7–3.3%
+of queries (mis-routes), so it cannot be the default; but a **two-stage exact**
+design (int8 coarse-scan → exact Q16.16 rescore of a Δ-bounded candidate set) is
+bit-identical top-k (recall@16 = 100% on 3,000 queries) and keeps the wedge.
+
+Why deferred, not dropped: the memory lever is real (int8 catalog ≈ 4.6 MB vs the
+36.6 MB Q16.16-i64 read; L3-resident), but a *scalar* `.mind` int8 gemv is ~2.4×
+slower than the live path — the win needs a **SIMD int8 gemv**. mind already has
+the int8 SIMD emitter (`emit_i8_microkernel_vnni` / VPDPBUSD / vpmaddwd, used by
+`det.igemm`); the delta is a `__mind_blas_gemv_i8` tier applying it to the matvec
+shape (owner: mind-blas / mind-det-gemm), plus a catalog-v3 int8 format. **Gate:
+lands only when that intrinsic ships in the mind compiler, byte-identity-canary'd,
+and the two-stage rescore is proven exact.** Value: edge/memory-constrained
+deployment (8× smaller resident catalog) and batch/high-QPS routing (where int8
+GEMM already beats OpenBLAS f32 2.02× byte-exact). Single-query routing does not
+benefit — Q16.16 remains default there.
+
 ## Phase 3 — Ecosystem (target: Q3 2027)
 
 **Exit criteria**:

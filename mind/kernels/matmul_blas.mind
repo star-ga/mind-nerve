@@ -1,12 +1,12 @@
 // mind-nerve/mind/kernels/matmul_blas.mind
 //
-// Phase A1.5 — BLAS-backed Q16.16 score path.
+// Phase A1.5 — BLAS-backed Q16.16 encode path.
 //
-// The default scoring kernel in kernels/matmul_q16.mind (matmul_score)
-// is a tail-recursive scalar reduction. On the 11,922-route catalog at
-// dim=384 it saturates around 15 ms p95 — bounded by 1 op/cycle scalar
-// FMA throughput. The substrate-honest comparison is AVX2 FMA at 16
-// ops/cycle on a single core.
+// The default encode kernels in kernels/matmul_q16.mind are tail-recursive
+// scalar reductions bounded by 1 op/cycle scalar FMA throughput. The
+// substrate-honest comparison is AVX2 FMA at 16 ops/cycle on a single core.
+// (The score path was retired to the pure-MIND __mind_blas_gemv_q16_mt
+// intrinsic in plan U2; this module now backs only the encode BLAS.)
 //
 // This module exposes a SIMD-backed alternative that calls into the
 // runtime-support shim mind/runtime/blas_shims_i64.c. The shim provides
@@ -31,36 +31,22 @@ import std.vec;
 // C-ABI calls into mind/runtime/blas_shims_i64.c (statically linked into
 // libmind_nerve_encoder.so at build time).
 //
-// The shims expose two symbols:
-//   __mind_nerve_blas_dot_q16_i64(a_addr, b_addr, len) -> q16_score (i64)
-//     Q16.16 dot product over two i64 buffers of length `len`. Low 32 bits
-//     of the i64 result carry the Q16.16 sum; high 32 bits are sign
-//     extension. Scalar-vs-AVX2 byte-identical at every length.
+// The shims expose the encode-path BLAS symbols:
+//   __mind_nerve_blas_matmul_q16_i64(a, b, c, M, K, N) -> i64 status
+//   __mind_nerve_blas_qkt_q16_i64(q, k, attn, H, T, D) -> i64 status
+//   __mind_nerve_blas_attnv_q16_i64(attn, v, out, H, T, D) -> i64 status
+// plus the shared AVX2 dispatch hooks __mind_nerve_blas_{get,set}_use_avx2.
 //
-//   __mind_nerve_blas_matmul_score_q16_i64(catalog, qv, out, n_rows, cols)
-//     Row-by-row Q16.16 score: out[r] = dot(catalog[r,:], qv).
-//     Returns 0 on success, -1 if any pointer is null.
+// (Plan U2: the former SIMD score-path symbols __mind_nerve_blas_dot_q16_i64
+// and __mind_nerve_blas_matmul_score_q16_i64 were deleted from the shim; the
+// score path now runs the pure-MIND __mind_blas_gemv_q16_mt intrinsic — see
+// mind/exports/c_abi.mind.)
 //
 // Per the MIND link contract (same pattern as kernels.gelu_q16 -> tanh_q16
 // in lut_shims.c), C symbols are referenced by their bare name from MIND
 // and resolved at .so link time — no `extern fn` declaration is needed.
 // ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// matmul_score_blas — drop-in replacement for matmul_score in matmul_q16.mind
-// for the mn_encoder_score path. Computes (n_rows × 384) · (384,) → (n_rows,)
-// Q16.16 scores.
-//
-// catalog: i64 address of an n_rows×384 row-major Q16.16 buffer (stride 8).
-// qv:      i64 address of a 384-element Q16.16 query vector.
-// out:     i64 address of an n_rows-element output buffer.
-// n_rows:  number of catalog rows N.
-//
-// Returns 0 on success.
-//
-// The reduction is delegated to the runtime-support C shim; this MIND
-// surface is a thin extern wrapper that lets c_abi.mind switch over by
-// changing a single call site.
 // ---------------------------------------------------------------------------
 // NOTE (Phase A1.6): the former score-path wrappers matmul_score_blas /
 // dot_q16_blas were removed. mn_encoder_score now runs a pure-MIND path over

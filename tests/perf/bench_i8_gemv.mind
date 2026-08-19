@@ -1,0 +1,78 @@
+// bench_i8_gemv.mind — int8-native gemv perf probe (NOT wired into the
+// product; measurement artifact for the int8-vs-Q16.16 routing decision).
+//
+// Deterministic integer math only: left-to-right accumulation, i64 adds,
+// no floats, no clocks. All buffers are flat heap addresses (the same
+// convention as mind/exports/c_abi.mind); the Python harness passes numpy
+// array base addresses and times the calls.
+//
+// Kernels:
+//   mn_q16_gemv  — baseline: Q16.16 i64-lane catalog (8 B/elem, 36.6 MB
+//                  stream at 11922x384), raw i64 dot per row.
+//   mn_i8_gemv   — int8 catalog (1 B/elem, 4.6 MB stream) x Q16.16 query,
+//                  i64 accumulate, per-row Q16.16 scale multiply (the
+//                  quality-winning variant from the routing-quality gate).
+//   mn_i8i8_gemv — int8 catalog x int8 query (the VNNI-shaped kernel),
+//                  per-row scale multiply.
+//   mn_i8_probe  — reports how __mind_load_i8 treats byte 0x80 so the
+//                  harness can verify sign-extension semantics before
+//                  trusting the kernels.
+
+pub fn mn_i8_probe(addr: i64) -> i64 {
+    return __mind_load_i8(addr);
+}
+
+pub fn mn_q16_gemv(cat: i64, q: i64, n: i64, d: i64, out: i64) -> i64 {
+    let mut r: i64 = 0;
+    while r < n {
+        let base: i64 = cat + r * d * 8;
+        let mut acc: i64 = 0;
+        let mut i: i64 = 0;
+        while i < d {
+            acc = acc + __mind_load_i64(base + i * 8) * __mind_load_i64(q + i * 8);
+            i = i + 1;
+        }
+        __mind_store_i64(out + r * 8, acc);
+        r = r + 1;
+    }
+    0
+}
+
+// int8 catalog x Q16.16 query. Sign handling is explicit + branchless
+// (((b & 255) ^ 128) - 128) so the kernel never depends on the host's
+// __mind_load_i8 extension behaviour.
+pub fn mn_i8_gemv(cat: i64, scales: i64, q: i64, n: i64, d: i64, out: i64) -> i64 {
+    let mut r: i64 = 0;
+    while r < n {
+        let base: i64 = cat + r * d;
+        let mut acc: i64 = 0;
+        let mut i: i64 = 0;
+        while i < d {
+            let w: i64 = ((__mind_load_i8(base + i) & 255) ^ 128) - 128;
+            acc = acc + w * __mind_load_i64(q + i * 8);
+            i = i + 1;
+        }
+        __mind_store_i64(out + r * 8, acc * __mind_load_i64(scales + r * 8));
+        r = r + 1;
+    }
+    0
+}
+
+// int8 catalog x int8 query (query as one int8 per byte).
+pub fn mn_i8i8_gemv(cat: i64, scales: i64, q8: i64, n: i64, d: i64, out: i64) -> i64 {
+    let mut r: i64 = 0;
+    while r < n {
+        let base: i64 = cat + r * d;
+        let mut acc: i64 = 0;
+        let mut i: i64 = 0;
+        while i < d {
+            let w: i64 = ((__mind_load_i8(base + i) & 255) ^ 128) - 128;
+            let x: i64 = ((__mind_load_i8(q8 + i) & 255) ^ 128) - 128;
+            acc = acc + w * x;
+            i = i + 1;
+        }
+        __mind_store_i64(out + r * 8, acc * __mind_load_i64(scales + r * 8));
+        r = r + 1;
+    }
+    0
+}

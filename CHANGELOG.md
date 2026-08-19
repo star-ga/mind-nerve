@@ -4,6 +4,32 @@ All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](htt
 
 ## [Unreleased]
 
+## [0.3.0b10] — 2026-08-19
+
+### Perf — scoring path is pure-MIND MT gemv; legacy C score-path retired (U2)
+
+The score path runs the deterministic `__mind_blas_gemv_q16_mt` (MT Q16.16 gemv
++ persistent thread pool). Retired the now-dead score-path symbols from
+`mind/runtime/blas_shims_i64.c` (nm caller-free proof; encode-path matmul/qkt/attnv
+kept). Measured on U1: score p95 **1.10 ms** on the 11,922-route catalog (2× under
+the 2 ms budget), **~1.5× faster than 1-thread numpy+OpenBLAS**, deterministic +
+cross-substrate byte-identical.
+
+### Fix — native `mcp` bundle filenames declare their format (U4a)
+
+`src/mcp.mind` constructs `route_table.cat` (MNC1) + `encoder_weights.mnw` (MNW1)
+instead of format-incoherent `.jsonl`/`.q16.bin`; native `tools/call` still
+fails-closed on real dirs until the binary-catalog producer lands (tracked; the
+Python MCP server routes today).
+
+### Roadmap — deterministic int8 routing tier (deferred)
+
+Fable-measured decision: Q16.16 stays the default router (perfect precision +
+wedge, already best-in-world for a deterministic router). int8 is a future
+edge/batch tier via a two-stage-exact design (int8 coarse-scan → Q16.16 rescore,
+recall@16 100%), gated on a `gemv_i8` SIMD intrinsic maturing in the mind compiler.
+See `ROADMAP.md` Phase 2 SOTA-track.
+
 ## [0.3.0b9] — 2026-08-15
 
 ### Fix — hook: malformed catalog rows can no longer kill a prompt's routing

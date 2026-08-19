@@ -209,28 +209,35 @@ const LIT_EM_QLONG_LEN: i64 = 14;
 const LIT_EM_PARSE_OFF: i64 = 1089;
 const LIT_EM_PARSE_LEN: i64 = 11;
 
-// AUTO-GENERATED literal blob #2 (gen_lit2.py). 128 bytes.
-// Env var name + bundle filenames + the catalog_size field fragments that the
-// getenv-wired tools/call success payload emits.
-const MCP_LIT2: [i64; 128] = [
+// AUTO-GENERATED literal blob #2 (gen_lit2.py). 122 bytes.
+// Env var name + native bundle filenames + the catalog_size field fragments
+// that the getenv-wired tools/call success payload emits.
+//
+// Plan U4(a): the constructed native bundle filenames declare their binary
+// format — "/encoder_weights.mnw" (MNW1) and "/route_table.cat" (MNC1),
+// replacing the format-incoherent "/encoder_weights.q16.bin" and
+// "/route_table.jsonl". The loader (src/loader.mind) probes the MNW1/MNC1
+// magic and fails closed on any other bytes; the Python runtime keeps its own
+// .jsonl / .q16.bin files untouched (no flag-day).
+const MCP_LIT2: [i64; 122] = [
     77,73,78,68,95,78,69,82,86,69,95,82,85,78,84,73,77,69,95,68,
-    73,82,47,101,110,99,111,100,101,114,95,119,101,105,103,104,116,115,46,113,
-    49,54,46,98,105,110,47,114,111,117,116,101,95,116,97,98,108,101,46,106,
-    115,111,110,108,93,44,92,34,99,97,116,97,108,111,103,95,115,105,122,101,
-    92,34,58,44,92,34,115,101,114,118,101,100,95,98,121,92,34,58,92,34,
-    105,110,45,112,114,111,99,101,115,115,32,40,110,97,116,105,118,101,41,92,
-    34,125,34,125,93,125,125,10,
+    73,82,47,101,110,99,111,100,101,114,95,119,101,105,103,104,116,115,46,109,
+    110,119,47,114,111,117,116,101,95,116,97,98,108,101,46,99,97,116,93,44,
+    92,34,99,97,116,97,108,111,103,95,115,105,122,101,92,34,58,44,92,34,
+    115,101,114,118,101,100,95,98,121,92,34,58,92,34,105,110,45,112,114,111,
+    99,101,115,115,32,40,110,97,116,105,118,101,41,92,34,125,34,125,93,125,
+    125,10,
 ];
 
 const L2_ENV_OFF: i64 = 0;
 const L2_ENV_LEN: i64 = 22;
 const L2_FMODEL_OFF: i64 = 22;
-const L2_FMODEL_LEN: i64 = 24;
-const L2_FCAT_OFF: i64 = 46;
-const L2_FCAT_LEN: i64 = 18;
-const L2_CC1_OFF: i64 = 64;
+const L2_FMODEL_LEN: i64 = 20;
+const L2_FCAT_OFF: i64 = 42;
+const L2_FCAT_LEN: i64 = 16;
+const L2_CC1_OFF: i64 = 58;
 const L2_CC1_LEN: i64 = 19;
-const L2_CC2_OFF: i64 = 83;
+const L2_CC2_OFF: i64 = 77;
 const L2_CC2_LEN: i64 = 45;
 
 // ---------------------------------------------------------------------------
@@ -771,11 +778,23 @@ fn mcp_route_compute(model_off: i64, model_len: i64, cat_off: i64, cat_len: i64,
 }
 
 // Resolve $MIND_NERVE_RUNTIME_DIR, construct the model + catalog bundle paths
-// (<dir>/encoder_weights.q16.bin, <dir>/route_table.jsonl — the loader probes
-// the native MNW1/MNC1 magic and fails closed on any other format), and route.
+// (<dir>/encoder_weights.mnw, <dir>/route_table.cat — the loader probes the
+// native MNW1/MNC1 magic and fails closed on any other format), and route.
 // Fails closed (unavailable payload) when the env var is unset (rt_getenv
 // returns RT_ERR_UNSUPPORTED = -2) or the constructed path would overflow.
 // No path is ever baked into the binary.
+//
+// deferred (plan U4(b)): no producer yet emits these native binary bundles
+// into a runtime dir — the current seeding pipeline (python/mind_nerve
+// installer/ensure via catalog-builder) writes the Python-runtime
+// route_table.jsonl + encoder_weights.q16.bin only. Until an MNC1 emit is
+// added to catalog-builder/build_index.py and an MNW1 emit mode to
+// tools/quantize_encoder_to_q16.py (both Python, byte-matching
+// tests/bit_identity/gen_fixtures.py's layout), native tools/call stays
+// fail-closed on real deployments. This is correctness-preserving: the loader
+// rejects absent/wrong-magic bytes; it is never a silently-wrong load.
+// upgrade path: land the two Python emitters + wire them into the seed step,
+// then flip nothing here — the filenames already declare the format.
 fn mcp_route_env(qbuf: i64, qlen: i64, k: i64, id_off: i64, id_len: i64) -> i64 {
     let namebuf: i64 = __mind_alloc(64);
     let mut i: i64 = 0;
@@ -798,13 +817,13 @@ fn mcp_route_env(qbuf: i64, qlen: i64, k: i64, id_off: i64, id_len: i64) -> i64 
     }
     let modelbuf: i64 = __mind_alloc(MCP_PATH_CAP);
     let catbuf: i64 = __mind_alloc(MCP_PATH_CAP);
-    // model = dir + "/encoder_weights.q16.bin"
+    // model = dir + "/encoder_weights.mnw"
     let mut mo: i64 = 0;
     let mut j: i64 = 0;
     while j < dirlen { __mind_store_i8(modelbuf + mo, __mind_load_i8(dirbuf + j) & 255); mo = mo + 1; j = j + 1; }
     let mut m: i64 = 0;
     while m < L2_FMODEL_LEN { __mind_store_i8(modelbuf + mo, MCP_LIT2[L2_FMODEL_OFF + m]); mo = mo + 1; m = m + 1; }
-    // catalog = dir + "/route_table.jsonl"
+    // catalog = dir + "/route_table.cat"
     let mut co: i64 = 0;
     j = 0;
     while j < dirlen { __mind_store_i8(catbuf + co, __mind_load_i8(dirbuf + j) & 255); co = co + 1; j = j + 1; }

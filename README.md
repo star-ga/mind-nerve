@@ -16,11 +16,11 @@ offering, mirroring the MIND compiler's licensing split.
 </p>
 
 <p align="center">
-  <a href="https://pypi.org/project/mind-nerve/"><img alt="PyPI" src="https://img.shields.io/pypi/v/mind-nerve.svg?include_prereleases&color=blue&style=flat-square"></a>
+  <a href="https://pypi.org/project/mind-nerve/"><img alt="PyPI" src="https://img.shields.io/pypi/v/mind-nerve.svg?color=blue&style=flat-square"></a>
   <a href="https://pypi.org/project/mind-nerve/"><img alt="Python versions" src="https://img.shields.io/pypi/pyversions/mind-nerve.svg?style=flat-square"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/License-Apache_2.0-blue?style=flat-square"></a>
   <a href="https://github.com/star-ga/mind-nerve/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/star-ga/mind-nerve/ci.yml?branch=main&style=flat-square&label=CI"></a>
-  <a href="https://github.com/star-ga/mind-nerve/releases"><img alt="Release" src="https://img.shields.io/github/v/release/star-ga/mind-nerve?include_prereleases&style=flat-square&color=green&label=Release"></a>
+  <a href="https://github.com/star-ga/mind-nerve/releases"><img alt="Release" src="https://img.shields.io/github/v/release/star-ga/mind-nerve?style=flat-square&color=green&label=Release"></a>
   <img alt="Deterministic" src="https://img.shields.io/badge/deterministic-Q16.16-brightgreen?style=flat-square">
   <a href="https://huggingface.co/star-ga/mind-nerve"><img alt="Hugging Face" src="https://img.shields.io/badge/weights-HuggingFace-FFD21E?style=flat-square"></a>
 </p>
@@ -110,14 +110,9 @@ the router transparently falls back to the pure-Python backend — same results,
 slightly slower per query, with a one-line notice on first use. The one-shot
 `mind-nerve route` CLI needs no daemon and is fully OS-agnostic.
 
-> **On the 0.3.0 beta line.** The current stable is `0.2.0`. The active beta
-> series (`0.3.0b*`) ships the rebuilt native runtime, the offline quantizer,
-> and the Phase 2 encoder rewire. To install the latest beta:
-> ```bash
-> pip install --pre mind-nerve
-> ```
-> Pre-release tags are PEP 440 `bN` suffixes; `--pre` is required because
-> pip skips pre-releases by default.
+> **Current stable is `0.3.0`.** It ships the rebuilt native runtime, the
+> offline quantizer, and the Phase 2 encoder rewire behind the plain install
+> above — no `--pre` flag needed.
 
 The first `route()` call auto-downloads the Phase-1 weights (~150 MB) from
 [`star-ga/mind-nerve`](https://huggingface.co/star-ga/mind-nerve)
@@ -308,10 +303,12 @@ deterministic: both backends break ties by ascending SHA-256(route_id),
 matching the spec contract — the Python scoring path
 (`python/mind_nerve/inference.py`) and the native Q16.16 top-K
 (`src/top_k.mind`) share the same score-descending,
-SHA-256(route_id)-ascending ordering. Cross-architecture
-(x86_64 / ARM64 CPU) identity of the ranking is verified on real hardware
-via the MIND Q16.16 cross-substrate proof. The authoritative
-design is [`spec/architecture.md`](spec/architecture.md).
+SHA-256(route_id)-ascending ordering. The underlying MIND Q16.16 substrate's
+cross-architecture (x86_64 / ARM64 CPU) identity is verified on real
+hardware; mind-nerve's own ranking pipeline reproduces the pinned x86_64
+reference today, and ARM64 reproduction of that same pipeline is the
+task #57 gate — not yet hardware-validated (see `docs/benchmarks.md` §1).
+The authoritative design is [`spec/architecture.md`](spec/architecture.md).
 
 That single design has two backends. Phase 1 is the one users install today.
 Phase 2 is being brought up incrementally and is not yet end-to-end.
@@ -341,30 +338,56 @@ The same drop-the-decoder + sliding-window encoder design, compiled to a
 native MIND Q16.16 fixed-point `cdylib` that ships inside the wheel and is
 the **default backend** (`MIND_NERVE_BACKEND=pytorch` selects the PyTorch
 fallback). Goals: remove the PyTorch dependency, close the ≤30 ms-on-CPU
-budget, and keep cross-architecture bit-identity across the shipped CPU
-backends (x86_64 and ARM64 byte-identity verified on real hardware).
-the open-source release ships CPU backends only; a GPU tier
-(CUDA/WebGPU) is reserved for a potential private/enterprise offering
-(scope decision 2026-08-15).
+budget, and reach cross-architecture bit-identity across the shipped CPU
+backends. The underlying MIND Q16.16 substrate is verified byte-identical
+on x86_64 (AVX2) and ARM64 (NEON) real hardware; mind-nerve's own
+encoder/route pipeline reproduces the pinned x86_64 reference today, and
+ARM64 reproduction of that pipeline is the task #57 gate — not yet
+hardware-validated. The open-source release ships CPU backends only; a
+GPU tier (CUDA/WebGPU) is reserved for a potential private/enterprise
+offering (scope decision 2026-08-15).
 
-Status, as of v0.3.0b9:
+The pure-MIND front end also ships a **native MCP server**
+(`src/mcp.mind`, compiled into the same binary): its JSON-RPC message
+framing (`initialize`, error shapes, notification suppression) is
+byte-identical to the Python `mind-nerve-mcp` server on the frozen golden
+transcript (`tests/harness/mcp_golden.sh`). `tools/call` on the native
+server is **fail-closed by default** with an explicit `unavailable` payload:
+the binary-bundle producer plumbing is landed and loader-round-trip tested,
+but the only bundle producible today uses placeholder zero embeddings (no
+256-dim trained checkpoint exists; the 384-dim BGE route table is
+incompatible with the native loader), which would rank by SHA-256 tie-break
+rather than relevance — so auto-seed is intentionally off until a real
+checkpoint lands (see the honest limits at the top of `src/mcp.mind`). The
+Python `mind-nerve-mcp` server remains the one that actually routes today.
+A native Windows PE build is declared in `Mind.toml`
+(`[targets.windows]`, cross-compiled via MinGW-w64) but is not yet
+CI-verified or distributed — Windows installs run the pure-Python
+fallback, same as the encoder path above.
+
+Status, as of v0.3.0:
 
 - ✅ A1.1–A1.4 — Q16.16 corpus, encoder kernels, C-ABI export surface, and
   the SHA-256 bit-identity harness scaffold all landed.
 - ✅ A1.5 — pure-MIND encoder `cdylib` builds and ships in the wheel. The
-  native **score path** (matmul against the 11,922-row route table)
-  measures **p50 14.4 ms / p95 15.1 ms** on a 4-core CPU — already inside
-  the Phase 2 budget for that stage of the pipeline.
+  native **score path** (matmul against the 11,922-row route table, now
+  the pure-MIND MT `__mind_blas_gemv_q16_mt`) measures **p50 ≈0.58 ms /
+  p95 ≈0.9 ms** across all 12 hardware threads (i7-5930K) — already
+  inside the Phase 2 budget for that stage of the pipeline.
 - ✅ Full `.mind` tree ported to mindc 0.10.2 (2026-08-15) — the 17-module
   kernel tree AND all 13 front-end files (sha256, q16_16, tokenizer,
   evidence, encoder_kernels, model, loader, inference, …) compile and
   execute, gated by the fail-closed `tests/mindc_gate.sh` (262
   exact-count tests + a native-ELF end-to-end harness byte-verified
   against CPython hashlib).
-- ✅ Cross-architecture bit-identity on the shipped backends:
-  x86_64 (AVX2) and ARM64 (NEON) CPU byte-identity is verified on real
-  hardware via the MIND Q16.16 cross-substrate proof. The open-source
-  release is CPU-only; no OSS GPU tier to validate.
+- ✅ x86_64 bit-identity: the native score path reproduces the pinned
+  x86_64 Q16.16 reference byte-for-byte (AVX2 == scalar oracle == the
+  pinned hash, `docs/benchmarks.md` §1). The underlying MIND Q16.16
+  substrate is separately verified byte-identical on x86_64 (AVX2) and
+  ARM64 (NEON) real hardware; ARM64 reproduction of **mind-nerve's own**
+  encoder/route pipeline against that same pinned hash is the task #57
+  gate and is **not yet hardware-validated**. The open-source release is
+  CPU-only; no OSS GPU tier to validate.
 
 ## Design constraints
 
@@ -376,8 +399,10 @@ Status, as of v0.3.0b9:
   backend since 0.3.0b9).
 - **Cross-architecture bit-identity** — same request on x86_64 and ARM64
   CPU returns the same top-K. Q16.16 fixed-point throughout, no IEEE-754
-  fallback in the inference path. Verified on real hardware for both
-  shipped CPU backends; there is no GPU backend (scope decision
+  fallback in the inference path. The underlying MIND Q16.16 substrate is
+  verified on real x86_64 + ARM64 hardware; mind-nerve's own pipeline is
+  verified on x86_64 today, with ARM64 reproduction gated on task #57
+  (not yet hardware-validated). There is no GPU backend (scope decision
   2026-08-15).
 - **No training-data leakage at inference** — the classifier reveals only
   route names, never the training corpora content.
@@ -387,7 +412,7 @@ Status, as of v0.3.0b9:
 
 ## Roadmap
 
-**Phase 1 (shipping)** — Public beta. Native Q16.16 encoder by default
+**Phase 1 (shipping)** — Native Q16.16 encoder by default
 (PyTorch fallback), HF-hosted weights, MCP + hooks integrations, 20
 installer targets, 96.06% top-5 accuracy on a 11,922-route catalog.
 
@@ -436,7 +461,7 @@ mind-nerve/
     mcp_server.py           `mind-nerve-mcp` MCP stdio server
     inference.py            PyTorch route() implementation
     discovery.py            route catalog discovery + atomic writes
-  src/                      pure-MIND implementation (Phase 2 target)
+  src/                      pure-MIND implementation (native front-end, shipped)
   spec/                     authoritative design documents
   tests/python/             unit tests for the wheel
   .github/workflows/        CI: ruff lint + build + smoke + pytest matrix
@@ -485,7 +510,7 @@ If mind-nerve helps your work, a citation is appreciated:
   title   = {mind-nerve: Intent-classification preselector for agent runtimes},
   year    = {2026},
   url     = {https://github.com/star-ga/mind-nerve},
-  version = {0.3.0-beta.1}
+  version = {0.3.0}
 }
 ```
 

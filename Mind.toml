@@ -1,6 +1,6 @@
 [package]
 name = "mind-nerve"
-version = "0.1.0-alpha.2"
+version = "0.3.0"
 authors = ["STARGA, Inc. <info@star.ga>"]
 description = "CPU-first intent-classification preselector for agent runtimes"
 license = "Apache-2.0"
@@ -23,30 +23,47 @@ license = "Apache-2.0"
 # spec/numerics.md for the per-op reduction-order contract.
 
 [mind]
-# STATUS (2026-08-10): the sources listed below are QUARANTINED under
-# src/dormant/ and tests/unit/dormant/ — they target a dialect no shipping
-# mindc ever accepted (see src/dormant/README.md for the per-file port
-# table). This manifest describes the PORT TARGET for the pure-MIND
-# migration, not a currently buildable configuration; the live CI gate for
-# the .mind tree is tests/mindc_gate.sh against mind/Mind.toml.
+# STATUS (2026-08-19): the sources listed below (src/*.mind) are LIVE — the
+# 13-file front-end port completed 2026-08-15 (all files compile, link, and
+# execute under mindc 0.10.2 project mode, zero JIT/launcher fallback: real
+# native-ELF `mind-nerve` binary + native MCP server). This manifest IS the
+# buildable configuration for that native front end. The pre-port dialect
+# these files were originally written against (never accepted by any
+# shipping mindc) is preserved as a historical archive at src/dormant/ and
+# tests/unit/dormant/ (see src/dormant/README.md) — that tree is NOT
+# referenced by this manifest and does not affect the live build. The CI
+# gate for this tree is tests/mindc_gate.sh (legs 3-15); the separate
+# mind/ kernel surface (luts + kernels + exports) is gated the same way
+# against mind/Mind.toml.
 #
-# Pins describe the port-target toolchain: mindc 0.10.2 is the first
-# release whose project-mode resolver name-checks fn bodies (mind#23) and
-# on which the mind/ kernel tree compiles clean (tests/mindc_gate.sh).
+# Pins describe the toolchain this manifest builds against: mindc 0.10.2 is
+# the first release whose project-mode resolver name-checks fn bodies
+# (mind#23) and on which this tree compiles clean (tests/mindc_gate.sh).
 mindc-min    = "0.10.2"
 mindc-max    = "0.11.0"
 spec-version = "1.0"
 
-# IR contract — mind-nerve compiles to mic@1 textual IR and is consumed
-# by mind-runtime via `libmind::ir::load`. The IR surface is stable
-# per docs/ir-stability.md upstream.
-ir-format     = "mic@1"
+# IR contract — mind-nerve's stdin wire protocol is the mic@2 text frame
+# (see cli/main.mind's WIRE PROTOCOL header and tests/bit_identity/README.md);
+# results are consumed by mind-runtime via `libmind::ir::load`. The IR
+# surface is stable per docs/ir-stability.md upstream.
+ir-format     = "mic@2"
 ir-consumer   = "mind-runtime >= 0.2.4"
 
 [determinism]
-# mind-nerve's load-bearing guarantee is bit-identical top-K outputs
-# across runs and across architectures (x86, ARM, CUDA, WebGPU, NPU).
-# Anything that breaks this is a Phase 1 ship-blocker.
+# mind-nerve's load-bearing guarantee is bit-identical top-K outputs across
+# runs and across architectures, scoped to what this OSS release actually
+# ships and gates: x86_64 CPU (verified) and ARM64 CPU (the underlying MIND
+# Q16.16 substrate is hardware-verified; mind-nerve's own encoder/route
+# pipeline reproducing that reference on ARM64 is the task #57 gate, not
+# yet closed — see ROADMAP.md and docs/benchmarks.md §1). CUDA/WebGPU/NPU
+# are NOT in OSS scope: no GPU/NPU emitter exists in this repo or in
+# ~/mind today, and per README.md's licensing split a GPU tier, if it ever
+# ships, is reserved for a potential private/enterprise line — see the
+# GPU-tier architecture constraint in ROADMAP.md (2026-08-17): any future
+# GPU tier emits MIND-native kernels through our own emitter, never a
+# CUDA/PTX lowering. Anything that breaks the x86_64 guarantee is a Phase 1
+# ship-blocker.
 fixed-point         = "Q16.16"
 weight-quantization = "INT8 (per-output-channel, Q16.16 scales)"
 reduction-order     = "Pinned by construction: every reduction is a sequential while-loop in the .mind source (no reassociation freedom)"

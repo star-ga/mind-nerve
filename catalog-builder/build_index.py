@@ -17,13 +17,16 @@ Intentionally a flat indexer at this stage — no content extraction yet.
 The Phase 1 catalog builder will read content and normalise per the
 schema in docs/catalog_and_training_plan.md.
 
-v2 binary emit (--output / --prior-file flags):
-  When --output is given the builder writes a v2 binary catalog (.bin) in
-  addition to the JSONL index. Embedding rows are pre-scaled by
-  max(0.5, 1 / sqrt(freq_r)) before INT8 quantisation (RFC-004). This is a
-  zero-runtime-cost pre-computation: the table is already scaled when loaded.
-  The catalog magic is MNC2 and the trailing PRIR prior block is written with
-  log(1 + freq_r) per route.
+MNC1 binary emit (--output / --prior-file flags):
+  When --output is given the builder ALSO writes an MNC1 binary catalog
+  (magic "MNC1", the wire format ``src/loader.mind``'s ``loader_parse_catalog``
+  actually accepts — see ``format/cat_v2.py``'s module docstring for the
+  byte-level layout) alongside the JSONL index. Embedding rows are pre-scaled
+  by max(0.5, 1 / sqrt(freq_r)) before quantisation (RFC-004) — a
+  zero-runtime-cost pre-computation, the table is already scaled when loaded.
+  When a --prior-file is given, the catalog is written as wire version 2
+  (inline route-prior, log(1 + freq_r) per route in Q16.16); otherwise
+  version 1 (no prior block).
 """
 
 from __future__ import annotations
@@ -194,46 +197,55 @@ def scale_embedding_q16(embedding: list[int], scale: float) -> list[int]:
     return out
 
 
-def emit_v2_catalog(
+def emit_mnc1_catalog(
     items: list[dict],
     prior_map: dict[str, float],
     output_path: Path,
 ) -> None:
-    """Write a v2 binary catalog to *output_path*.
+    """Write an MNC1 binary catalog to *output_path* — the wire format
+    ``src/loader.mind``'s ``loader_parse_catalog`` actually accepts (see
+    ``format/cat_v2.py``'s module docstring for the byte-level layout).
 
     ``items`` is the list of JSONL dicts already enriched with ``freq_r``.
     Embeddings are synthesised as zero vectors here — this function is
-    the emit skeleton; in the full training pipeline the real INT8 embeddings
-    would be supplied from the trained route table.  The v2 format, prior
-    block, and freq-adaptive scaling are exercised by the integration tests.
+    the emit skeleton; in the full training pipeline the real Q16.16
+    embeddings would be supplied from the trained route table. Wire version
+    2 (inline route-prior) is written when *prior_map* is non-empty;
+    otherwise version 1 (no prior block — the loader defaults every route's
+    prior to zero).
     """
-    from format.cat_v2 import encode_v2, freq_adaptive_scale  # local import
+    from format.cat_v2 import encode_mnc1, freq_adaptive_scale  # local import
 
-    routes: list[dict] = []
+    route_ids: list[bytes] = []
+    embeddings: list[list[int]] = []
+    external_ids: list[bytes] = []
     log_priors: list[float] = []
 
     for item in items:
         rid_hex: str = item.get("sha256", item.get("id", ""))
         # Derive a 32-byte route_id: SHA-256 of the rid hex string ensures
         # the route_id is exactly 32 bytes regardless of how the id was stored.
-        route_id_bytes = hashlib.sha256(rid_hex.encode()).digest()
+        route_ids.append(hashlib.sha256(rid_hex.encode()).digest())
+        external_ids.append(rid_hex.encode("utf-8"))
 
         freq_r = float(item.get("freq_r", 1.0))
         scale = freq_adaptive_scale(freq_r)
 
         # Embedding: zero vector as placeholder.  In production the trained
-        # INT8 embedding table is substituted here.
+        # Q16.16 embedding table is substituted here.
         base_emb = [0] * ROUTE_EMBEDDING_DIM
-        scaled_emb = scale_embedding_q16(base_emb, scale)
-
-        routes.append({"route_id": route_id_bytes, "embedding": scaled_emb})
+        embeddings.append(scale_embedding_q16(base_emb, scale))
 
         # log-prior: prefer the pre-computed prior map; fall back to computing
         # from the item's own freq_r.
-        lp = prior_map.get(rid_hex, math.log(1.0 + freq_r))
-        log_priors.append(lp)
+        log_priors.append(prior_map.get(rid_hex, math.log(1.0 + freq_r)))
 
-    catalog_bytes = encode_v2(routes, log_priors)
+    catalog_bytes = encode_mnc1(
+        route_ids,
+        embeddings,
+        external_ids,
+        log_priors=log_priors if prior_map else None,
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_bytes(catalog_bytes)
 
@@ -331,9 +343,9 @@ def main() -> None:
     if args.output is not None:
         # Import format module relative to this file's directory.
         sys.path.insert(0, str(Path(__file__).parent))
-        emit_v2_catalog(all_items, prior_map, args.output)
-        summary["v2_catalog"] = str(args.output)
-        summary["v2_routes"] = len(all_items)
+        emit_mnc1_catalog(all_items, prior_map, args.output)
+        summary["mnc1_catalog"] = str(args.output)
+        summary["mnc1_routes"] = len(all_items)
 
     print(json.dumps(summary, indent=2))
 

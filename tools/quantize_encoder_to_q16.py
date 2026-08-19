@@ -78,9 +78,11 @@ Total blob size = 95_380_480 + 12 * 14_195_712 = 265_729_024 bytes.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
+import struct
 import sys
 import time
 from pathlib import Path
@@ -437,6 +439,90 @@ def quantize_encoder(
     return meta
 
 
+# ---------------------------------------------------------------------------
+# MNW1 emit mode (U4b) — the native src/loader.mind weights bundle.
+#
+# ARCHITECTURE NOTE: this is a DIFFERENT encoder than the one quantized
+# above. ``build_encoder_blob``/``quantize_encoder`` target the Phase-1
+# BGE-small-en-v1.5 checkpoint (12 layers, hidden=384) consumed by the
+# legacy ``mn_encoder_encode`` C-ABI kernel and its flat Q16.16-int64 blob.
+# The native ``.mind`` loader (``src/loader.mind``'s ``loader_parse_weights``)
+# expects a different, smaller architecture instead: ``ENCODER_LAYERS=2``,
+# ``ENCODER_HIDDEN=256``, ``VOCAB_SIZE=32768`` (``src/lib.mind``), with
+# per-output-channel INT8 weights + Q16.16 scales (not a flat int64 blob).
+#
+# deferred: no trained checkpoint exists yet for that 2-layer/256-hidden
+# architecture — ``build_mnw1_placeholder_bundle`` below emits a
+# DETERMINISTIC, loader-ACCEPTED placeholder (zero weights, identity
+# layer-norm/scale) so the MNW1 wire format and the seeding pipeline can be
+# built, wired, and tested end-to-end today. Upgrade path: once a real
+# 2-layer/256-hidden checkpoint exists, replace the placeholder body with a
+# real per-channel INT8 quantizer (mirroring ``quantize_array``'s approach)
+# fed from that checkpoint's state dict — the MNW1 container/header code
+# below does not need to change.
+# ---------------------------------------------------------------------------
+
+MNW1_MAGIC: bytes = b"MNW1"
+MNW1_VERSION_1: int = 1  # non-groupwise scales (one per output channel)
+
+# Native-loader architecture constants — mirror src/lib.mind exactly. A
+# mismatch trips LD_ERR_SHAPE in loader_parse_weights.
+NATIVE_ENCODER_LAYERS: int = 2
+NATIVE_ENCODER_HIDDEN: int = 256
+NATIVE_VOCAB_SIZE: int = 32768
+NATIVE_Q16_ONE: int = 1 << 16  # Q16.16 representation of 1.0
+
+
+def _opaque_hash32(label: str) -> bytes:
+    """A fixed 32-byte value for the (opaque, unverified) model/tokenizer
+    hash fields — ``MODEL_HASH_BIND_ENABLED == 0`` in src/lib.mind, so the
+    loader copies these bytes out without recomputing or checking them."""
+    return hashlib.sha256(label.encode("utf-8")).digest()
+
+
+def build_mnw1_placeholder_bundle(
+    *,
+    model_hash_label: str = "mind-nerve/native-encoder/bootstrap-model",
+    tokenizer_hash_label: str = "mind-nerve/native-encoder/bootstrap-tokenizer",
+) -> bytes:
+    """Build a deterministic, loader-accepted MNW1 placeholder weights bundle.
+
+    See the module comment above this section: no trained checkpoint exists
+    yet for the native 2-layer/256-hidden architecture. Every weight is
+    zero, every scale / layer-norm gain is the Q16.16 identity (65536),
+    every bias / residual-gate is zero, and the token-embedding table is
+    zero. The bundle is byte-identical on every call (same labels) and
+    parses ``LD_OK`` through ``src/loader.mind``'s ``loader_parse_weights``.
+    """
+    h = NATIVE_ENCODER_HIDDEN
+    scale_row = struct.pack("<i", NATIVE_Q16_ONE) * h  # h channels, all 1.0
+    gain_row = struct.pack("<i", NATIVE_Q16_ONE) * h  # h channels, all 1.0
+    zero_row = b"\x00\x00\x00\x00" * h  # h zeros (bias / residual-gate)
+    zero_int8_matrix = b"\x00" * (h * h)  # one zeroed h*h INT8 matrix
+
+    buf = bytearray()
+    buf += MNW1_MAGIC
+    buf += struct.pack("<H", MNW1_VERSION_1)
+    buf += struct.pack("<H", 0)
+    buf += _opaque_hash32(model_hash_label)
+    buf += _opaque_hash32(tokenizer_hash_label)
+    buf += struct.pack("<I", NATIVE_ENCODER_LAYERS)
+    buf += struct.pack("<I", h)
+
+    for _ in range(NATIVE_ENCODER_LAYERS):
+        buf += zero_int8_matrix * 4  # wq, wk, wv, wo
+        buf += scale_row * 4  # one Q16.16 scale per output channel, x4 matrices
+        buf += gain_row  # ln_gain (identity)
+        buf += zero_row  # ln_bias
+        buf += zero_row  # residual_gate
+
+    buf += gain_row  # final_ln_gain (identity)
+    buf += zero_row  # final_ln_bias
+    buf += bytes(NATIVE_VOCAB_SIZE * h * 4)  # token_embedding, all zero (~32 MiB)
+
+    return bytes(buf)
+
+
 def resolve_default_output_dir() -> Path:
     """Default ``--output`` dir: ``$MIND_NERVE_RUNTIME_DIR`` or the user runtime dir.
 
@@ -463,8 +549,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ap.add_argument(
         "--checkpoint",
-        required=True,
-        help="Path to the checkpoint directory containing model.safetensors.",
+        default=None,
+        help=(
+            "Path to the checkpoint directory containing model.safetensors. "
+            "Required unless --emit-mnw1-placeholder is set."
+        ),
     )
     ap.add_argument(
         "--output",
@@ -479,12 +568,50 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print the meta JSON to stdout without writing any file.",
     )
+    ap.add_argument(
+        "--emit-mnw1-placeholder",
+        action="store_true",
+        help=(
+            "Write a deterministic MNW1 placeholder weights bundle "
+            "(encoder_weights.mnw, src/loader.mind's native format) instead "
+            "of quantizing a checkpoint. No trained checkpoint exists yet "
+            "for the native 2-layer/256-hidden architecture; see "
+            "build_mnw1_placeholder_bundle's docstring."
+        ),
+    )
     return ap
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = build_parser()
     args = ap.parse_args(argv)
+
+    if args.emit_mnw1_placeholder:
+        output_dir = Path(args.output).expanduser() if args.output else resolve_default_output_dir()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        bundle = build_mnw1_placeholder_bundle()
+        result = {
+            "byte_size": len(bundle),
+            "sha256": hashlib.sha256(bundle).hexdigest(),
+            "kind": "mind_nerve.quantize.mnw1_placeholder",
+        }
+        if args.dry_run:
+            print(json.dumps(result, indent=2, sort_keys=False))
+            return 0
+        out_path = output_dir / "encoder_weights.mnw"
+        tmp_path = out_path.with_suffix(".mnw.tmp")
+        tmp_path.write_bytes(bundle)
+        os.replace(tmp_path, out_path)
+        result["path"] = str(out_path)
+        print(json.dumps(result, indent=2, sort_keys=False))
+        return 0
+
+    if not args.checkpoint:
+        print(
+            json.dumps({"error": "--checkpoint is required unless --emit-mnw1-placeholder is set"}),
+            file=sys.stderr,
+        )
+        return 2
 
     checkpoint_dir = Path(args.checkpoint).expanduser()
     output_dir = Path(args.output).expanduser() if args.output else resolve_default_output_dir()

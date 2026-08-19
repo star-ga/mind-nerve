@@ -338,6 +338,22 @@ def _seed_from_hf(target: Path) -> None:
         else:
             shutil.copy2(item, dst)
 
+    # U4b: the native (src/loader.mind) binary-bundle producer —
+    # route_table.cat (MNC1) + encoder_weights.mnw (MNW1) — is deliberately
+    # NOT auto-seeded here. The only bundle producible today uses PLACEHOLDER
+    # zero embeddings: no 256-dim trained checkpoint exists yet, and the
+    # shipped 384-dim BGE route table is incompatible with the native loader's
+    # 2-layer/256-dim contract. A seeded placeholder bundle would make native
+    # tools/call return structurally-valid but zero-ranked routes (ranked only
+    # by the loader's SHA-256 tie-break, not relevance) — misleading, and
+    # worse than the honest fail-closed default. So native tools/call stays
+    # fail-closed until a real checkpoint lands; the producer→loader plumbing
+    # is exercised via the explicit `mind-nerve seed-native-bundle` dev command
+    # (cli.py) and its round-trip test.
+    # upgrade path: when a 256-dim MNW1 checkpoint + matching MNC1 embeddings
+    # exist, re-enable auto-seed here via
+    # native_bundle.write_native_bundle_from_route_table(target).
+
 
 def _resolve_runtime_dir(runtime_dir: str | None = None) -> Path:
     """Return a Path to a valid mind-nerve runtime directory.

@@ -47,6 +47,7 @@ node_modules/
 /research/
 /AUDITS/
 /.internal/
+docs/plans/
 
 # autoresearch per-iteration artifacts
 /run.log

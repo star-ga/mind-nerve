@@ -4,6 +4,132 @@ All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](htt
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-08-19
+
+Stable release, finalizing the `0.3.0b1`–`0.3.0b10` beta line. Headline:
+mind-nerve ships a real pure-MIND native front end — a native-ELF binary
+and a native MCP server, not just the Python wheel's bundled encoder
+`cdylib`. This entry consolidates the native front-end (`56ca3cb`) and the
+`0.3.0b10` score-path/bundle work below it into one release note; see the
+`[0.3.0b*]` entries in this file for the full beta-by-beta history.
+
+### Feat — pure-MIND ELF-native front-end + native MCP server (headline)
+
+The mind-nerve kernel tree and all 13 front-end `.mind` modules now
+compile and link into a real native ELF binary on mindc 0.10.2 with zero
+JIT/launcher fallback (`56ca3cb`).
+
+- **Native MCP server** (`src/mcp.mind`): a pure-MIND stdio JSON-RPC MCP
+  server compiled into the same binary. Message framing (`initialize`,
+  error shapes `{id,code}`, notification suppression) is byte-identical to
+  the Python `mcp_server.py` on the gated subset, verified against a
+  frozen golden transcript (`tests/harness/mcp_golden.sh`). Ranking runs
+  in-process — no daemon socket.
+- **Windows (PE) host-shim variant**: `mind/runtime/nerve_rt_shims_win.c`
+  defines all nine `__mind_nerve_rt_*` symbols (incl. `getenv`) and forces
+  binary-mode stdio so the attestation frame stays byte-identical across
+  substrates. Declared as `[targets.windows]` in `Mind.toml`, cross-built
+  from Linux via the MinGW-w64 sysroot.
+- **Loader hardening**: `src/loader.mind` now reads a versioned
+  catalog/weights header (v1/v2; reserved bytes must be zero; unknown
+  versions rejected) with allocation-bomb DoS caps — 64 MiB catalog /
+  256 MiB weights / 65536 routes — enforced *before* allocation.
+- **Route-id uniqueness is O(n log n)**: `src/loader.mind` replaced the
+  O(n²) route-id uniqueness scan with a merge-sort over an index copy plus
+  an adjacent-pair check; a ~2 MB catalog could previously pin a core for
+  ~a minute. Loaded rows keep file order, so the catalog bytes and
+  canonical hash are unchanged.
+- **UTF-8 Windows compatibility**: UTF-8-explicit text I/O across the
+  Python surface (Windows defaults to cp1252, which raised on UTF-8
+  skill/config content), TOML path backslash-escaping, and discovery
+  path-separator normalization so nested skills classify correctly on
+  Windows.
+
+### Fix — 10 findings closed alongside the native front end (`56ca3cb`)
+
+1. **JSON-RPC id overflow (MCP_ID_CAP)**: an unbounded id echoed verbatim
+   into the 16 KiB response buffer was an overflow reachable on the first
+   stdin line. An over-long id now echoes `null` (a legal id); guarded by
+   a pathological-id line in the golden transcript.
+2. **Loader allocation-bomb DoS**: the versioned v1/v2 header's caps (64
+   MiB catalog / 256 MiB weights / 65536 routes) are checked before any
+   allocation happens, not after.
+3. **O(n²) route-id uniqueness scan**: replaced with the O(n log n)
+   merge-sort described above — closes a core-pinning DoS on a
+   pathologically large catalog.
+4. **Unbounded `n_rows` on the embedder surface**: `mind/exports/c_abi.mind`
+   now bounds `n_rows` before the packed-catalog allocations it drives.
+5. **Windows UTF-8 crash**: text I/O across the Python surface is now
+   UTF-8-explicit; Windows' cp1252 default previously raised on UTF-8
+   skill/config content.
+6. **TOML path escaping on Windows**: Windows paths are now
+   backslash-escaped before being written into TOML.
+7. **Nested-skill misclassification on Windows**: discovery
+   path-separator normalization so nested skills classify correctly on
+   Windows (was POSIX-separator-only).
+8. **Installer runtime-dir pin on an empty dir**: `installer.py` pins
+   `MIND_NERVE_RUNTIME_DIR` only when the runtime dir is actually
+   populated (matching the TypeScript installer) — a fresh install (and
+   the Windows in-process MCP fallback) no longer crashes on a
+   not-yet-seeded dir; the pin is also now scoped to the mind-nerve entry
+   instead of leaking globally.
+9. **Duplicate MCP server blocks on re-install**: `installer.py` now
+   collapses duplicate MCP server blocks so re-running install is
+   idempotent and self-heals a corrupted config.
+10. **Partial route table silently accepted**: `discovery.py` now refuses
+    to load a route table when only one of the two on-disk files
+    (`route_table.jsonl` / `route_table.npy`) is present, instead of
+    silently discarding the surviving table.
+
+Gates: mindc byte-identity 19/19 modules + 262 module tests; MCP golden
+3/3; bit-identity 9/9 (regenerated fixtures reproduce the goldens); Python
+mypy/ruff/bandit clean + 484 tests; TypeScript installer 372 tests.
+
+### Perf — scoring path is pure-MIND MT gemv; legacy C score-path retired (U2)
+
+The score path runs the deterministic `__mind_blas_gemv_q16_mt` (MT Q16.16
+gemv + persistent thread pool). Retired the now-dead score-path symbols
+from `mind/runtime/blas_shims_i64.c` (nm caller-free proof; encode-path
+matmul/qkt/attnv kept). Measured on U1 (i7-5930K, 12 threads): score
+**p50 ≈0.58 ms / p95 ≈0.9 ms** on the 11,922-route catalog. On a fair
+equal-thread-count comparison (both sides on all 12 hardware threads) it
+beats numpy+OpenBLAS at p50 (≥1.4×) and is ~10× lower at the p95 tail;
+byte-identical run-to-run and cross-substrate by construction — the
+load-bearing property a float BLAS cannot offer.
+
+### Native `mcp` bundle format + producer plumbing (U4a + U4b)
+
+`src/mcp.mind` constructs `route_table.cat` (MNC1) + `encoder_weights.mnw`
+(MNW1) instead of format-incoherent `.jsonl`/`.q16.bin` (U4a). The binary
+producer — the `catalog-builder` MNC1 writer + a `native_bundle` seed module
+— landed and is byte-verified against the loader's round trip (U4b). But see
+Known limitations: it can only emit placeholder embeddings today, so native
+`tools/call` stays fail-closed by default and auto-seed is intentionally off.
+
+### Known limitations
+
+- **Native `tools/call` is fail-closed by default.** Its routing path is
+  fully wired (getenv-resolved model/catalog paths → tokenize → load → infer
+  → format) and the binary-bundle producer (U4b) is landed and
+  loader-round-trip tested. But the only bundle producible today uses
+  **placeholder zero embeddings** — no 256-dim trained checkpoint exists, and
+  the shipped 384-dim BGE route table is incompatible with the native loader's
+  2-layer/256-dim contract — which would rank routes by SHA-256 tie-break, not
+  relevance. So auto-seed is intentionally OFF and `tools/call` returns an
+  explicit `unavailable` payload until a real checkpoint lands; the placeholder
+  producer is reachable only via the `mind-nerve seed-native-bundle` dev
+  command (which warns loudly). The Python `mind-nerve-mcp` server is the real
+  router.
+- **Windows runs the pure-Python fallback.** A native Windows PE target is
+  declared in `Mind.toml` (`[targets.windows]`, MinGW-w64 cross-compile) —
+  the native ELF binary is not a PE binary and is not what ships on
+  Windows today; Windows installs use the pure-Python wheel path.
+- **int8 routing tier deferred to the roadmap.** Q16.16 stays the default
+  router (best-in-world for a *deterministic* router at 2× under the p95
+  budget); a two-stage-exact int8 tier (coarse-scan → Q16.16 rescore,
+  recall@16 100%) is gated on a `gemv_i8` SIMD intrinsic maturing in the
+  `mind` compiler. See `ROADMAP.md` Phase 2 SOTA-track.
+
 ## [0.3.0b10] — 2026-08-19
 
 ### Perf — scoring path is pure-MIND MT gemv; legacy C score-path retired (U2)
@@ -11,16 +137,18 @@ All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](htt
 The score path runs the deterministic `__mind_blas_gemv_q16_mt` (MT Q16.16 gemv
 + persistent thread pool). Retired the now-dead score-path symbols from
 `mind/runtime/blas_shims_i64.c` (nm caller-free proof; encode-path matmul/qkt/attnv
-kept). Measured on U1: score p95 **1.10 ms** on the 11,922-route catalog (2× under
-the 2 ms budget), **~1.5× faster than 1-thread numpy+OpenBLAS**, deterministic +
-cross-substrate byte-identical.
+kept). Measured on U1: score p95 **≈1.1 ms** on the 11,922-route catalog (2× under
+the 2 ms budget); on a fair equal-thread comparison it beats numpy+OpenBLAS at p50
+(≥1.4×) and is far lower at the p95 tail (see `[0.3.0]` / `docs/benchmarks.md` for
+the corrected fair-comparison numbers), deterministic + cross-substrate byte-identical.
 
 ### Fix — native `mcp` bundle filenames declare their format (U4a)
 
 `src/mcp.mind` constructs `route_table.cat` (MNC1) + `encoder_weights.mnw` (MNW1)
 instead of format-incoherent `.jsonl`/`.q16.bin`; native `tools/call` still
-fails-closed on real dirs until the binary-catalog producer lands (tracked; the
-Python MCP server routes today).
+fails-closed on real dirs (superseded — see `[0.3.0]`: the producer since landed
+but is placeholder-only, so `tools/call` stays fail-closed by default). The
+Python MCP server routes today.
 
 ### Roadmap — deterministic int8 routing tier (deferred)
 
@@ -448,7 +576,11 @@ within run-to-run noise at T=64 / T=256. Thesis-pure goal met: zero
 C-shim dependency in the encoder linear matmul path. vs MIND's own
 prior path.
 
-## [Unreleased] — v0.3.0 preparation
+The increments below (#228, #236 inc 1-5, the criterion bench harness, the
+A1.5 mind-blas score-path SIMD rewire, the A1.5 pure-MIND LUT port #218,
+and the Phase 6.2 offline quantizer) are the preparatory work this release
+built on top of; re-homed here (was a stray second `[Unreleased]` header)
+since they shipped as part of reaching 0.3.0b7, not as a separate release.
 
 ### Fix — native tokenize truncates to model max_seq_length (#228)
 

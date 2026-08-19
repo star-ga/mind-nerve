@@ -48,18 +48,28 @@ Three blockers were raised 2026-05-14. Status after the Phase 1 alpha sprint:
    native runtime bundled inside the wheel. The Phase-1 PyTorch
    inference path published in this repository works without it.
 
-**Release status (2026-08-15):** `v0.3.0b9` is the current PyPI public
-(beta series: wheel + sdist live at
-[pypi.org/project/mind-nerve/](https://pypi.org/project/mind-nerve/)).
-Weights on Hugging Face under Apache-2.0
+**Release status (2026-08-19):** `v0.3.0` is the current PyPI stable
+release (wheel + sdist live at
+[pypi.org/project/mind-nerve/](https://pypi.org/project/mind-nerve/)),
+finalizing the `0.3.0b1`–`0.3.0b10` beta line — `0.3.0b10` was the final
+beta tag before the stable cut. Weights on Hugging Face under Apache-2.0
 (`star-ga/mind-nerve`). Since beta.2 the repo has shipped the integrations
 hook subsystem (per-prompt routing hook + structural skills-dir projection
 + npy-aligned hygiene), the **`mind-nerve acquire` subsystem** (curated
 external skill/agent/MCP discovery → quarantine → deterministic fail-closed
 static vetting → hash-manifested hub install → live daemon reindex; see
-[docs/acquisition.md](docs/acquisition.md)), and hook hardening (malformed
+[docs/acquisition.md](docs/acquisition.md)), hook hardening (malformed
 catalog rows can no longer kill a prompt's routing; the SessionStart banner
-is throttled). The PyTorch-based inference path remains
+is throttled), and — landed across `0.3.0b9`/`0.3.0b10` — the **pure-MIND
+native front-end**: a real native-ELF `mind-nerve` binary (kernel tree +
+all 13 front-end `.mind` modules compiled and linked, zero JIT/launcher
+fallback), a native MCP server (`src/mcp.mind`, byte-identical JSON-RPC
+framing to the Python server on the golden transcript, `tools/call`
+fail-closed by default — the binary-bundle producer landed but emits
+placeholder embeddings only, so native routing stays gated on a real
+256-dim checkpoint; the Python server is the real router), and the
+`__mind_blas_gemv_q16_mt` MT Q16.16 score path that replaced the legacy C
+score-path shim. The PyTorch-based inference path remains
 the trial surface that drives adoption; Phase-2 native MIND inference +
 cross-arch bit-identity + p95 ≤ 30 ms remain on the deferred list below,
 but the upstream `mindc` blockers underneath that list have moved — see
@@ -363,9 +373,10 @@ Q16.16 in flight, INT8 weights, cross-arch bit-identity, 30 ms p95).
 
 **Decision 2026-08-19 (Fable-measured): Q16.16 stays the default router; int8 is a
 future edge/batch tier, landed when the mind compiler matures.** Measured on U1:
-the Q16.16 score path is p95 ~1.10 ms (2× under the 2 ms budget) and ~1.5× faster
-than 1-thread numpy+OpenBLAS — already best-in-world for a *deterministic* router,
-with the full wedge numpy/pytorch cannot offer. Raw int8 flips top-1 on 1.7–3.3%
+the Q16.16 MT-gemv score path is p95 ≈0.9 ms (2× under the 2 ms budget) and, on a
+fair equal-thread-count comparison, beats numpy+OpenBLAS at p50 and is far lower at
+the p95 tail (see `docs/benchmarks.md`) — already best-in-world for a *deterministic*
+router, with the full wedge numpy/pytorch cannot offer. Raw int8 flips top-1 on 1.7–3.3%
 of queries (mis-routes), so it cannot be the default; but a **two-stage exact**
 design (int8 coarse-scan → exact Q16.16 rescore of a Δ-bounded candidate set) is
 bit-identical top-k (recall@16 = 100% on 3,000 queries) and keeps the wedge.
@@ -682,8 +693,9 @@ always matches the installed version** — the CLI serves the guide, not the pro
 > component as each MIND replacement is byte-proven against them — the Python
 > tree is the migration oracle and survives exactly until each proof lands,
 > never longer. Distribution becomes a single native binary per platform
-> (guiding constraint #3); the PyPI Python series ends at v0.3.0b9, with the
-> pure-MIND line shipping as binary releases.
+> (guiding constraint #3); the PyPI Python series ends at v0.3.0 — the
+> beta line ran through `0.3.0b10` before the stable finalize — with the
+> pure-MIND line shipping as binary releases thereafter.
 
 Once the `mind` toolchain self-hosts (the open-core compiler builds itself byte-identically),
 this repository's **TypeScript + Python** implementation is migrated to **pure, executing MIND**, so the whole

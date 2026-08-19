@@ -1,57 +1,66 @@
-"""Catalog v2 binary format encoder/decoder.
+"""Catalog binary format encoder/decoder — MNC1, the PORTED wire format.
 
-v2 layout (backward-compatible extension of the v1 MNC1 format):
+U4b (2026-08-19): this module used to implement a "v2" format (magic
+``MNC2`` + a trailing ``PRIR`` prior block) that was never accepted by any
+shipping loader — ``src/loader.mind``'s ``loader_parse_catalog`` (the only
+real reader) requires a u16 version + u16 reserved header, a canonical
+SHA-256 catalog hash at offset 16, and a UTF-8 external-id trailer, none of
+which the old ``MNC2`` branch produced. That branch is retired; this module
+now implements ``MNC1``, the format the ``.mind`` loader actually reads,
+matching ``tests/bit_identity/gen_fixtures.py``'s ``build_catalog_bin``
+byte-for-byte. The Q16.16 codec and the RFC-004 frequency-adaptive scale
+helper are unchanged (kept verbatim) — only the container format changed.
 
-  [0:4]    magic "MNC2"                       (version discriminant)
-  [4:8]    route_count  u32 LE
-  per route  (same byte layout as v1 per-route block):
-    [0:32]  route_id       32-byte SHA-256
-    [32:36] embedding_dim  u32 LE (always ROUTE_EMBEDDING_DIM = 256)
-    [36:36+256*4]  embedding  256 × i32 LE (INT8-quantised, pre-scaled)
+MNC1 layout (little-endian throughout; see ``src/loader.mind``
+``loader_parse_catalog`` and its module docstring for the authoritative
+byte-level spec):
 
-  [tail]  prior block  (new in v2)
-    magic_tail  "PRIR"  4 bytes
-    count       u32 LE  (must equal route_count)
-    route_count × i32 LE  Q16.16 log-prior values
+  [0:4]    magic "MNC1"
+  [4:6]    u16 version           (1 = no route-prior; 2 = inline route-prior)
+  [6:8]    u16 reserved          (MUST be zero)
+  [8:12]   u32 num_routes
+  [12:16]  u32 embedding_dim     (== ROUTE_EMBEDDING_DIM == 256)
+  [16:48]  32-byte canonical catalog hash (see ``catalog_preimage_and_hash``)
+  [48:..]  route_ids             num_routes * 32 bytes (unique; A3 gate)
+  [..]     embeddings            num_routes * 256 * i32-LE (Q16.16)
+  (v2 only) route_prior          num_routes * i32-LE Q16.16 log-prior
+  [..]     external-id trailer per route: u16-LE len + len UTF-8 bytes
+  [len-4:] u32-LE trailer_off    (== start of the trailer)
 
-  The prior block is always present in v2. Its size is route_count * 4 bytes.
-  v1 readers that probe the total length and find the extra tail will
-  either ignore it or fail gracefully — the v1 magic "MNC1" is never written
-  by this module, so true v1 files are unaffected.
-
-Backward-compatibility contract:
-  - v1 files (magic "MNC1") load via ``decode_v1()`` in this module or via
-    the existing fixture loader; they are never modified.
-  - ``decode_any()`` dispatches on magic and returns a uniform dict.
-  - The v2 prior block starts at offset 8 + route_count * ROUTE_BLOCK_BYTES
-    and is identified by the "PRIR" sentinel before accessing any prior data.
-
-Q16.16 encoding for the prior column:
-  value = log(1 + freq_r)  as float
-  encoded = round(value * 65536)  clamped to i32 range
+Canonical catalog hash preimage (rebuilt from the FILE bytes, route order
+0..num_routes, NOT sorted), per route ``s``:
+  u32-LE 32 || id[s] (32) || u32-LE (edim*4) || embedding row bytes (edim*4)
+  || (u32-LE 4 || route_prior[s] (4))     -- only when version == 2
+SHA-256 of the concatenation is the 32-byte value written at offset 16.
 """
 
 from __future__ import annotations
 
+import hashlib
 import struct
 from typing import Any
 
-MAGIC_V1: bytes = b"MNC1"
-MAGIC_V2: bytes = b"MNC2"
-MAGIC_PRIOR: bytes = b"PRIR"
+MAGIC_MNC1: bytes = b"MNC1"
 
 ROUTE_ID_BYTES: int = 32
+# Embedding dimensionality — must match ROUTE_EMBEDDING_DIM in src/lib.mind.
 EMBEDDING_DIM: int = 256
-EMBED_FIELD_BYTES: int = 4  # u32 LE dim prefix
-ROUTE_BLOCK_BYTES: int = ROUTE_ID_BYTES + EMBED_FIELD_BYTES + EMBEDDING_DIM * 4  # 1060
-PRIOR_SENTINEL_BYTES: int = 4
-PRIOR_COUNT_BYTES: int = 4
-PRIOR_VALUE_BYTES: int = 4  # i32 LE per route
+HEADER_BYTES: int = 48  # magic(4) + version(2) + reserved(2) + n(4) + dim(4) + hash(32)
+
+# Wire versions accepted by src/loader.mind's loader_parse_catalog.
+CAT_VERSION_1: int = 1  # no route-prior block
+CAT_VERSION_2: int = 2  # inline route-prior block
 
 Q16_FRAC_BITS: int = 16
 Q16_SCALE: int = 1 << Q16_FRAC_BITS  # 65536
 I32_MAX: int = 2_147_483_647
 I32_MIN: int = -2_147_483_648
+
+
+# ---------------------------------------------------------------------------
+# Q16.16 codec (kept verbatim from the retired module — unrelated to the
+# container format change).
+# ---------------------------------------------------------------------------
 
 
 def float_to_q16(value: float) -> int:
@@ -79,128 +88,214 @@ def freq_adaptive_scale(freq_r: float) -> float:
     return max(0.5, 1.0 / math.sqrt(freq_r))
 
 
-def encode_prior_block(log_priors: list[float]) -> bytes:
-    """Encode the trailing prior block: PRIR + count + route_count Q16.16 values."""
-    n = len(log_priors)
-    parts = [MAGIC_PRIOR, struct.pack("<I", n)]
-    for lp in log_priors:
-        parts.append(struct.pack("<i", float_to_q16(lp)))
-    return b"".join(parts)
+def _clamp_i32(value: int) -> int:
+    return max(I32_MIN, min(I32_MAX, int(value)))
 
 
-def decode_prior_block(data: bytes, route_count: int) -> list[float]:
-    """Decode the trailing prior block from v2 catalog bytes.
-
-    Raises ``ValueError`` if the sentinel or count is invalid.
-    """
-    expected_tail = PRIOR_SENTINEL_BYTES + PRIOR_COUNT_BYTES + route_count * PRIOR_VALUE_BYTES
-    if len(data) < expected_tail:
-        raise ValueError(f"prior block too short: need {expected_tail} bytes, got {len(data)}")
-    tail = data[-expected_tail:]
-    sentinel = tail[:PRIOR_SENTINEL_BYTES]
-    if sentinel != MAGIC_PRIOR:
-        raise ValueError(
-            f"prior block sentinel mismatch: expected {MAGIC_PRIOR!r}, got {sentinel!r}"
-        )
-    (count,) = struct.unpack_from("<I", tail, PRIOR_SENTINEL_BYTES)
-    if count != route_count:
-        raise ValueError(f"prior block route count {count} != catalog route count {route_count}")
-    offset = PRIOR_SENTINEL_BYTES + PRIOR_COUNT_BYTES
-    return [
-        q16_to_float(struct.unpack_from("<i", tail, offset + i * PRIOR_VALUE_BYTES)[0])
-        for i in range(count)
-    ]
+# ---------------------------------------------------------------------------
+# Canonical catalog hash — mirrors loader_parse_catalog's preimage exactly.
+# ---------------------------------------------------------------------------
 
 
-def encode_v2(
-    routes: list[dict[str, Any]],
-    log_priors: list[float],
+def catalog_preimage_and_hash(
+    route_ids: list[bytes],
+    emb_rows: list[bytes],
+    prior_rows: list[bytes] | None = None,
 ) -> bytes:
-    """Encode a v2 catalog blob.
-
-    ``routes`` is a list of dicts with keys ``route_id`` (bytes, 32) and
-    ``embedding`` (list[int], 256 pre-scaled INT8-quantised Q16.16 values).
-    ``log_priors`` must have the same length as ``routes``.
-
-    Raises ``ValueError`` on shape mismatches.
+    """Recompute the canonical MNC1 catalog hash exactly as ``loader_parse_catalog``
+    does (``src/loader.mind``). ``emb_rows`` and ``prior_rows`` are already-packed
+    little-endian byte strings (256*4 bytes and 4 bytes respectively) — the
+    preimage is built from the same bytes the caller is about to write, so the
+    hash can never drift from the emitted payload.
     """
-    if len(routes) != len(log_priors):
-        raise ValueError(
-            f"routes ({len(routes)}) and log_priors ({len(log_priors)}) must have equal length"
-        )
-    parts: list[bytes] = [MAGIC_V2, struct.pack("<I", len(routes))]
-    for r in routes:
-        rid: bytes = r["route_id"]
+    if len(emb_rows) != len(route_ids):
+        raise ValueError("route_ids and emb_rows must have equal length")
+    if prior_rows is not None and len(prior_rows) != len(route_ids):
+        raise ValueError("prior_rows must have the same length as route_ids")
+    edim_bytes = EMBEDDING_DIM * 4
+    h = hashlib.sha256()
+    for i, rid in enumerate(route_ids):
         if len(rid) != ROUTE_ID_BYTES:
             raise ValueError(f"route_id must be {ROUTE_ID_BYTES} bytes, got {len(rid)}")
-        emb: list[int] = r["embedding"]
-        if len(emb) != EMBEDDING_DIM:
-            raise ValueError(f"embedding must have {EMBEDDING_DIM} values, got {len(emb)}")
-        parts.append(rid)
-        parts.append(struct.pack("<I", EMBEDDING_DIM))
-        parts.extend(struct.pack("<i", v) for v in emb)
-    # Trailing prior block
-    parts.append(encode_prior_block(log_priors))
-    return b"".join(parts)
+        h.update(struct.pack("<I", ROUTE_ID_BYTES))
+        h.update(rid)
+        h.update(struct.pack("<I", edim_bytes))
+        h.update(emb_rows[i])
+        if prior_rows is not None:
+            h.update(struct.pack("<I", 4))
+            h.update(prior_rows[i])
+    return h.digest()
 
 
-def decode_v1(data: bytes) -> dict[str, Any]:
-    """Decode a v1 catalog binary (magic MNC1).
+# ---------------------------------------------------------------------------
+# Encoder
+# ---------------------------------------------------------------------------
 
-    Returns ``{"version": 1, "route_count": N, "routes": [...]}``.
-    Each route dict has keys ``route_id`` (bytes) and ``embedding`` (list[int]).
+
+def encode_mnc1(
+    route_ids: list[bytes],
+    embeddings: list[list[int]],
+    external_ids: list[bytes],
+    *,
+    log_priors: list[float] | None = None,
+) -> bytes:
+    """Encode a catalog to the MNC1 wire format ``src/loader.mind`` accepts.
+
+    ``route_ids`` — 32-byte SHA-256 ids, one per route, file order (the order
+    the loader's A3 uniqueness scan and canonical hash both use).
+    ``embeddings`` — one length-``EMBEDDING_DIM`` list of Q16.16 i32 values
+    per route.
+    ``external_ids`` — one UTF-8-encoded external id per route, written to
+    the trailer (validated by the loader; never re-hashed).
+    ``log_priors`` — optional, one float per route. When given, the wire
+    version is 2 (inline route-prior) and each value is written as a Q16.16
+    i32 via :func:`float_to_q16`; when omitted, version 1 is written and the
+    loader defaults every route's prior to zero.
     """
-    if len(data) < 8:
-        raise ValueError("catalog too short for v1 header")
-    magic = data[:4]
-    if magic != MAGIC_V1:
-        raise ValueError(f"expected MNC1 magic, got {magic!r}")
-    (route_count,) = struct.unpack_from("<I", data, 4)
-    routes = _decode_route_blocks(data, 8, route_count)
-    return {"version": 1, "route_count": route_count, "routes": routes}
+    n = len(route_ids)
+    if len(embeddings) != n or len(external_ids) != n:
+        raise ValueError("route_ids, embeddings, external_ids must have equal length")
+    if log_priors is not None and len(log_priors) != n:
+        raise ValueError("log_priors must have the same length as route_ids")
+
+    version = CAT_VERSION_2 if log_priors is not None else CAT_VERSION_1
+    ids_section = b"".join(route_ids)
+    for rid in route_ids:
+        if len(rid) != ROUTE_ID_BYTES:
+            raise ValueError(f"route_id must be {ROUTE_ID_BYTES} bytes, got {len(rid)}")
+
+    emb_rows: list[bytes] = []
+    for row in embeddings:
+        if len(row) != EMBEDDING_DIM:
+            raise ValueError(f"embedding must have {EMBEDDING_DIM} values, got {len(row)}")
+        emb_rows.append(b"".join(struct.pack("<i", _clamp_i32(v)) for v in row))
+    emb_section = b"".join(emb_rows)
+
+    prior_rows: list[bytes] | None = None
+    prior_section = b""
+    if log_priors is not None:
+        prior_rows = [struct.pack("<i", float_to_q16(lp)) for lp in log_priors]
+        prior_section = b"".join(prior_rows)
+
+    chash = catalog_preimage_and_hash(route_ids, emb_rows, prior_rows)
+
+    trailer = bytearray()
+    for ext in external_ids:
+        if len(ext) > 0xFFFF:
+            raise ValueError("external id exceeds the u16 trailer length field")
+        trailer.extend(struct.pack("<H", len(ext)))
+        trailer.extend(ext)
+
+    trailer_off = HEADER_BYTES + len(ids_section) + len(emb_section) + len(prior_section)
+
+    buf = bytearray()
+    buf.extend(MAGIC_MNC1)
+    buf.extend(struct.pack("<H", version))
+    buf.extend(struct.pack("<H", 0))
+    buf.extend(struct.pack("<I", n))
+    buf.extend(struct.pack("<I", EMBEDDING_DIM))
+    buf.extend(chash)
+    buf.extend(ids_section)
+    buf.extend(emb_section)
+    buf.extend(prior_section)
+    buf.extend(trailer)
+    buf.extend(struct.pack("<I", trailer_off))
+    return bytes(buf)
 
 
-def decode_v2(data: bytes) -> dict[str, Any]:
-    """Decode a v2 catalog binary (magic MNC2).
+# ---------------------------------------------------------------------------
+# Decoder — pure-Python reference implementation, mirroring
+# loader_parse_catalog's gates exactly. Used by tests and by producers that
+# want to self-verify a bundle before writing it.
+# ---------------------------------------------------------------------------
 
-    Returns ``{"version": 2, "route_count": N, "routes": [...], "log_priors": [...]}``.
+
+def decode_mnc1(data: bytes) -> dict[str, Any]:
+    """Decode + fully validate an MNC1 catalog blob (mirrors every
+    ``loader_parse_catalog`` gate: magic, version, reserved, hash, trailer).
+
+    Returns ``{"version", "route_count", "routes": [{"route_id",
+    "embedding", "external_id"}], "log_priors" (v2 only)}``. Raises
+    ``ValueError`` with a message naming the failed gate.
     """
-    if len(data) < 8:
-        raise ValueError("catalog too short for v2 header")
-    magic = data[:4]
-    if magic != MAGIC_V2:
-        raise ValueError(f"expected MNC2 magic, got {magic!r}")
-    (route_count,) = struct.unpack_from("<I", data, 4)
-    routes = _decode_route_blocks(data, 8, route_count)
-    log_priors = decode_prior_block(data, route_count)
-    return {"version": 2, "route_count": route_count, "routes": routes, "log_priors": log_priors}
+    if len(data) < HEADER_BYTES:
+        raise ValueError("catalog too short for MNC1 header")
+    if data[:4] != MAGIC_MNC1:
+        raise ValueError(f"expected MNC1 magic, got {data[:4]!r}")
+    (version,) = struct.unpack_from("<H", data, 4)
+    if version not in (CAT_VERSION_1, CAT_VERSION_2):
+        raise ValueError(f"unsupported version {version} (loader accepts 1 or 2)")
+    has_prior = version == CAT_VERSION_2
+    (reserved,) = struct.unpack_from("<H", data, 6)
+    if reserved != 0:
+        raise ValueError(f"reserved field must be zero, got {reserved}")
+    (num_routes,) = struct.unpack_from("<I", data, 8)
+    (embedding_dim,) = struct.unpack_from("<I", data, 12)
+    if embedding_dim != EMBEDDING_DIM:
+        raise ValueError(f"embedding_dim {embedding_dim} != {EMBEDDING_DIM}")
+    file_hash = data[16:48]
 
+    ids_off = HEADER_BYTES
+    ids_end = ids_off + num_routes * ROUTE_ID_BYTES
+    if len(data) < ids_end:
+        raise ValueError("catalog truncated in route_ids section")
+    route_ids = [data[ids_off + i * 32 : ids_off + i * 32 + 32] for i in range(num_routes)]
 
-def decode_any(data: bytes) -> dict[str, Any]:
-    """Dispatch on magic byte and decode v1 or v2 catalog."""
-    if len(data) < 4:
-        raise ValueError("catalog blob too short to probe magic")
-    magic = data[:4]
-    if magic == MAGIC_V1:
-        return decode_v1(data)
-    if magic == MAGIC_V2:
-        return decode_v2(data)
-    raise ValueError(f"unrecognised catalog magic {magic!r}")
+    emb_off = ids_end
+    emb_bytes = num_routes * EMBEDDING_DIM * 4
+    emb_end = emb_off + emb_bytes
+    if len(data) < emb_end:
+        raise ValueError("catalog truncated in embeddings section")
+    emb_rows = [
+        data[emb_off + i * EMBEDDING_DIM * 4 : emb_off + (i + 1) * EMBEDDING_DIM * 4]
+        for i in range(num_routes)
+    ]
+    embeddings = [list(struct.unpack(f"<{EMBEDDING_DIM}i", row)) for row in emb_rows]
 
+    prior_off = emb_end
+    prior_rows: list[bytes] | None = None
+    log_priors: list[float] | None = None
+    prior_end = prior_off
+    if has_prior:
+        prior_bytes = num_routes * 4
+        prior_end = prior_off + prior_bytes
+        if len(data) < prior_end:
+            raise ValueError("catalog truncated in route_prior section")
+        prior_rows = [data[prior_off + i * 4 : prior_off + i * 4 + 4] for i in range(num_routes)]
+        log_priors = [q16_to_float(struct.unpack("<i", pr)[0]) for pr in prior_rows]
 
-def _decode_route_blocks(data: bytes, offset: int, route_count: int) -> list[dict[str, Any]]:
-    """Parse route_count sequential route blocks starting at ``offset``."""
-    routes: list[dict[str, Any]] = []
-    for _ in range(route_count):
-        if offset + ROUTE_BLOCK_BYTES > len(data):
-            raise ValueError("catalog data truncated in route block")
-        rid = data[offset : offset + ROUTE_ID_BYTES]
-        offset += ROUTE_ID_BYTES
-        (dim,) = struct.unpack_from("<I", data, offset)
-        offset += EMBED_FIELD_BYTES
-        if dim != EMBEDDING_DIM:
-            raise ValueError(f"unexpected embedding dim {dim}")
-        emb = list(struct.unpack_from(f"<{EMBEDDING_DIM}i", data, offset))
-        offset += EMBEDDING_DIM * 4
-        routes.append({"route_id": rid, "embedding": emb})
-    return routes
+    recomputed = catalog_preimage_and_hash(route_ids, emb_rows, prior_rows)
+    if recomputed != file_hash:
+        raise ValueError("canonical catalog hash mismatch")
+
+    if len(data) < prior_end + 4:
+        raise ValueError("catalog truncated before trailer pointer")
+    (trailer_off,) = struct.unpack_from("<I", data, len(data) - 4)
+    if trailer_off != prior_end:
+        raise ValueError(f"trailer_off {trailer_off} != expected {prior_end}")
+
+    cursor = trailer_off
+    trailer_field = len(data) - 4
+    external_ids: list[bytes] = []
+    for _ in range(num_routes):
+        if cursor + 2 > trailer_field:
+            raise ValueError("catalog truncated in external-id trailer")
+        (elen,) = struct.unpack_from("<H", data, cursor)
+        cursor += 2
+        if cursor + elen > trailer_field:
+            raise ValueError("catalog truncated in external-id trailer")
+        ext = data[cursor : cursor + elen]
+        ext.decode("utf-8")  # raises UnicodeDecodeError on invalid UTF-8
+        external_ids.append(ext)
+        cursor += elen
+    if cursor != trailer_field:
+        raise ValueError("external-id trailer does not end exactly at trailer_off pointer")
+
+    routes = [
+        {"route_id": route_ids[i], "embedding": embeddings[i], "external_id": external_ids[i]}
+        for i in range(num_routes)
+    ]
+    result: dict[str, Any] = {"version": version, "route_count": num_routes, "routes": routes}
+    if log_priors is not None:
+        result["log_priors"] = log_priors
+    return result

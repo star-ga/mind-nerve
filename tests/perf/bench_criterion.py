@@ -1,12 +1,19 @@
-"""Criterion speed bench — score-only, head-to-head against BLAS.
+"""Criterion speed bench — score-only, MT-gemv regression gate.
 
-Single-thread, warm, synthetic 11,922 × 384 Q16.16 catalog + 1000 queries
-(64 distinct, cycled). Measures the score-only path for every backend that
-is runnable today:
+Warm, synthetic 11,922 × 384 Q16.16 catalog + 1000 queries (64 distinct,
+cycled). The live score path (``mn_encoder_score``) unconditionally calls
+the multithreaded ``__mind_blas_gemv_q16_mt`` intrinsic — it spawns
+``sysconf(_SC_NPROCESSORS_ONLN)`` owner-computes threads and does NOT read
+the avx2/scalar dispatch flag (verified in ``mind/exports/c_abi.mind``). So
+the two "mind" rows below now measure the SAME MT kernel (see the deferred
+marker in ``_run``). For the FAIR equal-thread head-to-head vs numpy, see
+``docs/benchmarks.md`` + ``tests/perf/_fair_headto.py``; this file's job is
+the MT-score p95 regression gate, not the numpy comparison.
 
-  * MIND + mind-blas-A (AVX2)  — the live path (``MIND_NERVE_BLAS=1``)
-  * MIND + scalar (oracle)     — forced via the test-only dispatch hook
-  * numpy + BLAS reference     — idealised f32 lower bound
+  * MIND MT-gemv (score)       — the live path, ``__mind_blas_gemv_q16_mt``
+  * MIND MT-gemv (dup probe)   — same kernel; dispatch-availability probe
+  * numpy + BLAS (1-thread)    — numpy's best-case single-thread reference
+                                 (PINNED via threadpoolctl; never unpinned)
   * pytorch (if importable)    — optional; skipped cleanly if unavailable
 
 Encode-path and end-to-end are **deliberately out of scope** here: they are
@@ -18,8 +25,9 @@ Outputs:
   * ``bench_criterion.json`` next to this file (machine-readable)
   * a human-readable table to stdout
 
-Gate (pytest entry point only): hard-fail iff mind-blas-A p95 > 2.0 ms.
-This is a regression detector — the expected steady state is ~1.6 ms.
+Gate (pytest entry point only): hard-fail iff MT-gemv score p95 > 2.0 ms.
+This is a regression detector — the expected steady state is ~0.9 ms p95
+(MT gemv); the 2.0 ms hard gate keeps margin for shared-host jitter.
 
 Run modes:
   * ``pytest tests/perf/bench_criterion.py``        (gated; self-skips under
@@ -30,6 +38,7 @@ Run modes:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sys
 import time
@@ -38,6 +47,16 @@ from typing import Any
 
 import numpy as np
 import pytest
+
+# Pinning the numpy/BLAS baseline to a stated thread count is mandatory: an
+# UNPINNED OpenBLAS baseline runs at the default (all-core) thread count and
+# yields a non-reproducible, unfair figure — the exact mechanism that
+# fabricated an inflated speedup before. Best-effort import; the result row
+# records the thread count actually used so no fair-comparison claim is faked.
+try:
+    from threadpoolctl import threadpool_limits
+except Exception:  # noqa: BLE001 — pin is best-effort; label reflects reality
+    threadpool_limits = None
 
 # Make ``_bench_common`` importable both under pytest (no tests-package
 # __init__) and as a standalone ``python tests/perf/bench_criterion.py``.
@@ -133,25 +152,39 @@ def _measure_numpy(
     catalog: np.ndarray,
     queries: list[np.ndarray],
 ) -> dict[str, Any]:
-    """Idealised numpy+BLAS f32 score-only lower bound."""
+    """numpy+OpenBLAS f32 score-only reference, PINNED to 1 BLAS thread.
+
+    The MIND score path is fixed-thread MT (``sysconf(_SC_NPROCESSORS_ONLN)``)
+    and cannot be pinned to 1, so this is numpy at its best-case single-thread
+    config — a conservative reference (numpy's fastest, tightest tail), not an
+    apples-to-apples thread match. The pin is mandatory: an unpinned baseline
+    is non-reproducible and unfair.
+    """
     cat_f = catalog.astype(np.float32)
     qs_f = [q.astype(np.float32) for q in queries]
 
-    for i in range(_N_WARMUP):
-        _ = cat_f @ qs_f[i % len(qs_f)]
+    pin = (
+        threadpool_limits(limits=1, user_api="blas")
+        if threadpool_limits
+        else contextlib.nullcontext()
+    )
+    with pin:
+        for i in range(_N_WARMUP):
+            _ = cat_f @ qs_f[i % len(qs_f)]
 
-    samples_ms: list[float] = []
-    t_start = time.perf_counter()
-    for i in range(_N_MEASURE):
-        qv = qs_f[i % len(qs_f)]
-        t0 = time.perf_counter()
-        _ = cat_f @ qv
-        samples_ms.append((time.perf_counter() - t0) * 1000.0)
-    wall_s = time.perf_counter() - t_start
+        samples_ms: list[float] = []
+        t_start = time.perf_counter()
+        for i in range(_N_MEASURE):
+            qv = qs_f[i % len(qs_f)]
+            t0 = time.perf_counter()
+            _ = cat_f @ qv
+            samples_ms.append((time.perf_counter() - t0) * 1000.0)
+        wall_s = time.perf_counter() - t_start
 
     stats = _percentiles(samples_ms)
     stats["qps"] = round(_N_MEASURE / wall_s, 1)
     stats["samples"] = _N_MEASURE
+    stats["blas_threads"] = 1 if threadpool_limits else "unpinned(threadpoolctl absent)"
     return stats
 
 
@@ -201,6 +234,13 @@ def _run(rt: Any) -> dict[str, Any]:
         dispatch = _bind_blas_dispatch(rt)
 
         backends: dict[str, Any] = {}
+        # deferred: post-U2 mn_encoder_score unconditionally calls
+        # __mind_blas_gemv_q16_mt and does NOT read the avx2/scalar dispatch
+        # flag (verified in mind/exports/c_abi.mind), so these two rows measure
+        # the SAME MT kernel — the avx2=1/0 arg no longer changes rt.score.
+        # Kept as two rows to avoid renaming the CI perf-gate key
+        # ("mind_blas_a_avx2") under release pressure.
+        # upgrade path: collapse to one "mind_mt_score" row + repoint the gate.
         backends["mind_blas_a_avx2"] = _measure_native(rt, handle, catalog, queries, 1, dispatch)
         backends["mind_scalar_oracle"] = _measure_native(rt, handle, catalog, queries, 0, dispatch)
         backends["numpy_blas_ref"] = _measure_numpy(catalog, queries)
@@ -215,7 +255,7 @@ def _run(rt: Any) -> dict[str, Any]:
                 "queries": _N_MEASURE,
                 "distinct_queries": _N_DISTINCT_QUERIES,
                 "top_k": _TOP_K,
-                "threads": 1,
+                "threads": {"mind_score": "sysconf(_SC_NPROCESSORS_ONLN)", "numpy_ref": 1},
                 "scope": "score-only",
             },
             "backends": backends,
@@ -240,7 +280,7 @@ def _run(rt: Any) -> dict[str, Any]:
 def _print_table(report: dict[str, Any]) -> None:
     """Human-readable table to stdout."""
     print()
-    print("===== mind-nerve criterion speed bench (score-only, 1-thread, warm) =====")
+    print("===== mind-nerve criterion speed bench (score-only, MT gemv, warm) =====")
     w = report["workload"]
     print(
         f"  catalog {w['catalog_rows']}x{w['dim']} {w['dtype']} · "
@@ -251,10 +291,10 @@ def _print_table(report: dict[str, Any]) -> None:
     print(header)
     print("  " + "-" * (len(header) - 2))
     labels = {
-        "mind_blas_a_avx2": "MIND+mind-blas-A",
-        "mind_scalar_oracle": "MIND+scalar(oracle)",
-        "numpy_blas_ref": "numpy+BLAS(ref)",
-        "pytorch_cpu": "pytorch(cpu)",
+        "mind_blas_a_avx2": "MIND MT-gemv(score)",
+        "mind_scalar_oracle": "MIND MT-gemv(dup)",
+        "numpy_blas_ref": "numpy+BLAS(1t,ref)",
+        "pytorch_cpu": "pytorch(cpu,1t)",
     }
     for key, label in labels.items():
         b = report["backends"].get(key)

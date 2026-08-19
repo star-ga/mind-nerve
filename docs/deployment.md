@@ -224,5 +224,5 @@ sha256sum --check SHA256SUMS
 
 The repository's CI build job validates the public OSS surface (Python
 imports, lint, build, tests). The native runtime component bundled into
-production wheels is built and signed in a separate channel; see
-`LICENSE.md` for the dual-licensing details.
+production wheels is built and hash-manifested (SHA256SUMS) in a separate
+channel; see `LICENSE.md` for the dual-licensing details.

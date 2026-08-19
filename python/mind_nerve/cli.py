@@ -496,6 +496,41 @@ def cmd_acquire_install(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_seed_native_bundle(args: argparse.Namespace) -> int:
+    """Write a PLACEHOLDER native bundle — route_table.cat (MNC1) +
+    encoder_weights.mnw (MNW1) — into the runtime dir from its route_table.jsonl.
+
+    DEV / PLUMBING ONLY. The bundle uses zero placeholder embeddings (no
+    256-dim trained checkpoint exists yet; the shipped 384-dim BGE route table
+    is incompatible with the native loader's 2-layer/256-dim contract), so
+    native tools/call will LOAD it and return structurally-valid routes ranked
+    ONLY by the loader's SHA-256 tie-break — NOT by relevance. It is not a
+    substitute for the Python routing path, which is the real router. This
+    command exists to exercise the producer->loader round trip; native
+    tools/call is otherwise fail-closed by design until a real checkpoint lands.
+    """
+    from . import native_bundle
+    from .inference import _resolve_runtime_dir
+
+    rdir = _resolve_runtime_dir(args.runtime_dir)
+    print(
+        "mind-nerve: WARNING — writing a PLACEHOLDER native bundle (zero "
+        "embeddings). Native tools/call will return structurally-valid but "
+        "zero-ranked routes (SHA-256 tie-break, NOT relevance). Dev/plumbing "
+        "only — the Python routing path is the real router.",
+        file=sys.stderr,
+    )
+    result = native_bundle.write_native_bundle_from_route_table(rdir)
+    if result is None:
+        print(
+            json.dumps({"error": f"no route_table.jsonl in {rdir}; nothing to seed"}),
+            file=sys.stderr,
+        )
+        return 1
+    print(json.dumps(result, indent=2))
+    return 0
+
+
 def cmd_acquire_list(args: argparse.Namespace) -> int:
     from . import acquire
 
@@ -535,6 +570,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_info = sub.add_parser("info", help="Print runtime info as JSON")
     p_info.set_defaults(func=cmd_info)
+
+    p_seed_native = sub.add_parser(
+        "seed-native-bundle",
+        help="DEV: write a PLACEHOLDER native bundle (route_table.cat / "
+        "encoder_weights.mnw) — zero embeddings, ranking NOT meaningful; "
+        "native tools/call is fail-closed by design until a real checkpoint",
+    )
+    p_seed_native.set_defaults(func=cmd_seed_native_bundle)
 
     p_pre = sub.add_parser(
         "precompute-routes", help="(One-time) encode the catalog into route_table.npy"

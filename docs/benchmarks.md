@@ -20,48 +20,72 @@ pytest tests/perf/bench_criterion.py tests/perf/bench_efficiency.py
 ```
 
 All numbers below were measured on an i7-5930K (6-core / 12-thread,
-single-channel DDR4-2400, 64 GiB), single thread, warm, on a seeded synthetic
-catalog of 11,922 rows × 384 dims in Q16.16 fixed-point (i64 stride-8 heap
-layout, ≈36 MB), 1000 queries (64 distinct, cycled). The synthetic geometry
-mirrors the live catalog's value distribution; no externally unavailable
-checkpoint is required.
+single-channel DDR4-2400, 64 GiB), warm, on a seeded synthetic catalog of
+11,922 rows × 384 dims in Q16.16 fixed-point (i64 stride-8 heap layout,
+≈36 MB), scoring one query at a time (64 distinct queries, cycled, 2000
+timed samples). The synthetic geometry mirrors the live catalog's value
+distribution; no externally unavailable checkpoint is required.
+
+The production score path is the pure-MIND multithreaded Q16.16 GEMV
+intrinsic `__mind_blas_gemv_q16_mt` (`mn_encoder_score` in
+`mind/exports/c_abi.mind`). It spawns `sysconf(_SC_NPROCESSORS_ONLN)`
+owner-computes pthreads (**12 on this host — not env- or affinity-tunable**),
+so a *fair* head-to-head gives the numpy+OpenBLAS reference the **same 12
+threads** (`OPENBLAS_NUM_THREADS=12`). A MIND-multithread-vs-numpy-1-thread
+comparison would be unfair and is **not** the headline; the 1-thread numpy row
+is included only as a stable reference point.
 
 ## Speed bench (score-only)
 
+Fair, equal-thread-count comparison — both sides use all 12 hardware threads:
+
+| Backend (12 threads each) | p50 (ms) | p95 (ms) | p99 (ms) | QPS |
+|---|---:|---:|---:|---:|
+| MIND MT-gemv Q16.16 (`__mind_blas_gemv_q16_mt`) | 0.57–0.61 | 0.89–1.09 | 1.2–2.4 | ~1550–1610 |
+| numpy + OpenBLAS f32 mat-vec (12 threads) | 0.81–2.98¹ | 8.8–11.5¹ | 16–24¹ | ~260–450 |
+
+Stable reference (numpy pinned to 1 thread — **not** an apples-to-apples row,
+MIND is fixed at 12 threads):
+
 | Backend | p50 (ms) | p95 (ms) | p99 (ms) | QPS |
 |---|---:|---:|---:|---:|
-| MIND + mind-blas-A (AVX2) | 1.42 | 1.61 | 1.73 | ~696 |
-| MIND + scalar (oracle) | 1.69 | 1.94 | 2.13 | ~583 |
-| numpy + BLAS (idealised f32 reference) | 0.24 | 0.37–0.66¹ | ~3.2¹ | ~3000 |
-| pytorch CPU (single thread) | 1.03 | 1.24 | 1.33 | ~934 |
+| numpy + OpenBLAS f32 mat-vec (1 thread) | 1.22–1.36 | 1.53–1.68 | 1.7–2.3 | ~710–795 |
 
-Peak RSS over the run: ≈460–475 MiB.
+Peak RSS over the run: ≈460–475 MiB. Ranges are the spread across 3 repeated
+runs on a shared interactive host (`nice -n 15`).
 
-¹ The idealised BLAS reference is a tiny `(11922,384) @ (384,)` mat-vec; its
-upper-percentile latency is dominated by scheduler/allocator jitter and varies
-2–4× run to run. The stable comparison point is **p50**.
+¹ On this tiny `(11922,384) @ (384,)` mat-vec, OpenBLAS's dynamic multi-thread
+scheduler pays a dispatch cost that exceeds the work: at 12 threads its p50 is
+faster *sometimes* but its tail (p95 ≈ 9–11 ms) is an order of magnitude worse
+than MIND's, and it swings 2–4× run to run. The MIND owner-computes kernel has
+no dynamic scheduler, so its latency is tight and reproducible.
 
 ### Honest headline
 
-> **mind-blas-A reaches roughly 1/6 of the idealised numpy+BLAS score-only
-> path (p50 1.42 ms vs 0.24 ms) while preserving cross-arch Q16.16
-> bit-identity — a determinism property BLAS does not offer — and is 9.3×
-> faster than the prior pure-scalar reduction (15 ms → 1.61 ms p95).**
+> **On a fair equal-thread-count comparison (both sides on all 12 hardware
+> threads), the MIND MT-gemv Q16.16 score path runs at p50 ≈0.58 ms / p95
+> ≈0.9 ms — faster than numpy+OpenBLAS at p50 (≥1.4× in the best numpy run,
+> more when numpy's scheduler contends) and reproducibly ~10× lower at the
+> p95 tail — while producing byte-identical, thread-count-independent results
+> that a float BLAS structurally cannot.**
 
-This is **not** a "we beat BLAS" claim. We do not. The relevant facts are:
+The determinism is the load-bearing property, and it is *shown*, not asserted:
+two independent 12-thread runs of the score stream over the 100-query corpus
+hash identically —
+`65626584bdf4ae8b15e5bd2234fdbf62c0128423b01cea91906613f58ffb2491` twice — and
+the result is invariant to the thread count by construction (owner-computes,
+exact i64 accumulate). numpy's float reduction order is implementation- and
+thread-count-dependent and offers no such guarantee. The relevant facts:
 
-- **Regime.** The Q16.16 catalog uses an i64 stride-8 layout: ≈36 MB, which
-  saturates single-channel DDR4 bandwidth at roughly 1.6 ms p95 regardless of
-  how fast the inner reduction is. mind-blas-A is **memory-bandwidth-limited
-  in this layout**, not compute-limited. A future i32 stride-4 repack halves
-  the resident catalog and is expected to approach the ≈0.4 ms compute floor.
-- **The trade we actually make.** mind-blas-A gives up raw throughput against
-  a float BLAS GEMV in exchange for an integer-domain reduction whose result
-  is byte-identical across dispatch paths (and, by construction, across
-  architectures). The efficiency bench measures that property directly.
-- **No naive-vs-vectorized framing.** Every row above varies exactly one
-  axis (the backend) on the same workload, same vectorisation assumptions.
-  No scalar-vs-SIMD speedup is presented as a substrate finding.
+- **Why the tail matters.** A router's SLA is set by its tail, not its median.
+  MIND's p95 (~0.9 ms) is both lower and *stable*; numpy's 12-thread p95
+  (~9–11 ms) is dominated by BLAS thread-dispatch jitter on this small mat-vec.
+- **The trade we actually make.** MIND does an integer-domain Q16.16 reduction
+  whose result is byte-identical across dispatch paths and, by construction,
+  across architectures. The efficiency bench measures that property directly.
+- **Fairness discipline.** Every timed row varies exactly one axis (the
+  backend) on the same workload; the two sides are pinned to the same thread
+  count. No scalar-vs-SIMD or MT-vs-1T mismatch is presented as a finding.
 
 ### Encode path: PENDING
 
@@ -78,10 +102,12 @@ once the encode path is measurable on the real checkpoint.
 
 ### Regression gate
 
-Under pytest, the speed bench hard-fails iff mind-blas-A score-only
-**p95 > 2.0 ms**. This is a regression detector — the expected steady state
-is ≈1.6 ms. A failure means the AVX2 path is not engaged or a regression
-landed in the matmul shim.
+Under pytest, the speed bench hard-fails iff the score-only
+**p95 > 2.0 ms**. This is a regression detector — with the MT-gemv path the
+expected steady state is **≈0.9 ms p95** (well under the 2.0 ms gate; the gate
+threshold is intentionally left at 2.0 ms to absorb shared-host jitter). A
+failure means the multithreaded Q16.16 GEMV intrinsic is not engaged or a
+regression landed in the score path.
 
 ## Efficiency bench
 

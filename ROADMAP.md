@@ -893,3 +893,51 @@ naestro R76–R78; nothing here duplicates it. What is mind-nerve-specific is th
 aggregation and self-rating constraint above, which do not. Rating and eviction
 have no external prior art to lean on — the harness shape observed elsewhere is
 a debugging log, which rates nothing; the self-rating trap is ours to name.
+
+## Cross-chain evidence anchor — mind-nerve's leg (identity of an *intent→capability route*)
+
+> Cross-repo ecosystem milestone. The composite design lives in the `mind` roadmap
+> (Phase 19); this section records only mind-nerve's member contribution.
+>
+> **Status:** gap identified 2026-08-26 — not scoped, not scheduled.
+
+Six layers of the ecosystem each anchor a different "what survives transformation":
+`trace_hash` (artifact, `mind`), routing lineage (decision, Naestro), provenance chain
+(belief, mind-mem), I1–I15 + `spec_hash` (constraint, 512-mind), **the governed route
+table (intent→capability, here)**, and the session evidence log (structural health,
+arch-mind). Six roots, zero cross-links — nothing can prove the conjunction *"this
+binary, produced by this decision, under these constraints, consistent with these
+beliefs, **routed by this rule**, at this structural health."*
+
+**mind-nerve's member is the route digest** — which frozen catalog, which matched rule,
+and which model hash mapped the intent to the capability. Guiding constraint 5
+(*attestation on every inference*, no opt-out) already emits exactly these fields:
+request hash, model hash, result hash, plus the 2026-07-04 additive rationale fields
+(matched-rule id, priority, `rationale` string). **The member is a canonicalization of
+the existing attestation envelope, not new machinery.**
+
+- [ ] Canonical route-member preimage over `freeze_id` + model hash + matched-rule id.
+      No clock, no randomness, no map-iteration order — the 512-mind evidence-preimage
+      discipline applies verbatim.
+- [ ] **Absent encoding.** A compile with no routing decision above it must still
+      produce a valid anchor with this member explicitly recorded as absent — never
+      omitted, never zero-filled.
+- [ ] **Re-derivation, not assertion.** The verifier recomputes the member from the
+      attestation envelope; a supplied hash accepted on faith reduces the anchor to a
+      manifest.
+- [ ] Resolve the **catalog-identity seam**: the local governed table (2470 routes) and
+      the OSS catalog (`v1.1-oss`, 11,922 items, `freeze_id 1cd130fa…`) are different
+      route universes. The member must name *which* — an anchor that cannot distinguish
+      them attests nothing about what actually routed.
+
+**Why this member is cheap and worth having.** Constraint 2 (Q16.16 throughout,
+cross-arch bit-identity non-negotiable) means the routing score is already reproducible
+by construction. Of the six members this is among the least work, and it answers the
+question a reviewer actually asks about an agentic system: *why did it reach for that
+capability.*
+
+**Firewall (I13, inherited from 512-mind).** The anchor is an evidence artifact, never a
+score. Route-anchor coverage confers no authority — it must not be optimized against,
+and a well-anchored route is not thereby a better route. Keep it distinct from the
+rationale field: rationale explains *why this route matched*; the anchor records *that
+this route was in force*. Merging them turns evidence into a metric.

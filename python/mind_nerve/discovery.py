@@ -485,10 +485,27 @@ def scan(
     table_exists = (rdir / "route_table.npy").is_file() and (rdir / "route_table.jsonl").is_file()
     rt: Any = load_default_runtime(runtime_dir) if table_exists else None
     seen_ids = {m["sha256"] for m in rt.routes} if rt is not None else set()
+    # source_path -> row index, for UPSERT-on-edit. An edited file keeps its
+    # path but changes its sha256, so it is not "already indexed" and used to be
+    # APPENDED — leaving the pre-edit row in the table competing for the same
+    # top-K slots (and frequently outranking the fresh one). Indexing by path
+    # lets an edit REPLACE its row in place. Rows with no/empty source_path
+    # (programmatic add_route callers) are excluded: "" is not an identity.
+    path_to_row: dict[str, int] = {}
+    if rt is not None:
+        for _idx, _m in enumerate(rt.routes):
+            _sp = _m.get("source_path") or ""
+            if _sp:
+                # First occurrence wins: if the table still carries pre-existing
+                # duplicates, the upsert refreshes one and leaves the rest for
+                # the dedup tooling rather than silently picking an arbitrary row.
+                path_to_row.setdefault(_sp, _idx)
     if trusted is None:
         trusted = _is_trusted_dir(directory, rdir)
 
     new_items: list[dict[str, Any]] = []
+    # (row_index, item) for files already in the table whose content changed.
+    edited_items: list[tuple[int, dict[str, Any]]] = []
     skipped: dict[str, int] = {"already_indexed": 0, "license_excluded": 0, "unknown_excluded": 0}
 
     for item in _walk_dir(Path(directory), source_repo, trusted=trusted):
@@ -502,11 +519,21 @@ def scan(
         if bucket == "unknown" and not include_unknown:
             skipped["unknown_excluded"] += 1
             continue
+        # Same path, different content => an EDIT. Replace the row in place;
+        # appending would duplicate the file. Note this is reached only after
+        # the license gate, so an edit that introduces a disallowed license is
+        # excluded like any other item and its stale row is left untouched
+        # rather than being refreshed with content we just refused.
+        row = path_to_row.get(item.get("source_path") or "")
+        if row is not None:
+            edited_items.append((row, item))
+            continue
         new_items.append(item)
 
-    if not new_items:
+    if not new_items and not edited_items:
         return {
             "added": 0,
+            "updated": 0,
             "skipped": skipped,
             "total_routes_after": len(rt.routes) if rt is not None else 0,
             "trusted": trusted,
@@ -515,15 +542,20 @@ def scan(
     if dry_run:
         return {
             "would_add": len(new_items),
+            "would_update": len(edited_items),
             "names_preview": [i["name"] for i in new_items[:10]],
+            "names_update_preview": [i["name"] for _r, i in edited_items[:10]],
             "skipped": skipped,
             "dry_run": True,
         }
 
-    # Embed the new items using the same model the route table was built with.
+    # Embed new + edited items together using the same model the route table was
+    # built with, in one call so a single batch keeps them on one code path.
     # (_embed_texts tolerates rt=None — it resolves the reference model itself.)
-    texts = [i["_embedded_text"] for i in new_items]
-    new_emb = _embed_texts(rt, texts)
+    all_items = new_items + [i for _r, i in edited_items]
+    all_emb = _embed_texts(rt, [i["_embedded_text"] for i in all_items])
+    new_emb = all_emb[: len(new_items)]
+    edited_emb = all_emb[len(new_items) :]
 
     # Load raw table (rt.embeddings is the *normalised* in-memory copy). On a
     # fresh runtime dir there is no table yet → bootstrap from empty.
@@ -541,11 +573,33 @@ def scan(
         )
         raw_emb, meta = raw_emb[:n], [meta[i] for i in range(n)]
     new_meta_rows = [{k: v for k, v in i.items() if not k.startswith("_")} for i in new_items]
-    if raw_emb is None:
-        combined_emb = new_emb
+
+    # Apply edits IN PLACE first: row order is the npy row index, so replacing
+    # (rather than delete-and-append) keeps every other row's index stable.
+    combined_meta = list(meta)
+    updated = 0
+    appended_emb = [new_emb] if len(new_items) else []
+    # strict=: a length mismatch here means the embed batch desynced from the
+    # item list — a real bug that must crash, never silently truncate a row.
+    for (row, item), emb_row in zip(edited_items, edited_emb, strict=True):
+        meta_row = {k: v for k, v in item.items() if not k.startswith("_")}
+        if row < len(combined_meta):
+            combined_meta[row] = meta_row
+            raw_emb[row] = emb_row
+            updated += 1
+        else:
+            # The drift-heal above truncated the table past this index, so the
+            # row no longer exists. Append instead of writing out of bounds.
+            new_meta_rows.append(meta_row)
+            appended_emb.append(emb_row.reshape(1, -1))
+
+    if not new_meta_rows:
+        combined_emb = raw_emb
+    elif raw_emb is None:
+        combined_emb = np.concatenate(appended_emb, axis=0)
     else:
-        combined_emb = np.concatenate([raw_emb, new_emb], axis=0)
-    combined_meta = list(meta) + new_meta_rows
+        combined_emb = np.concatenate([raw_emb, *appended_emb], axis=0)
+    combined_meta = combined_meta + new_meta_rows
     _save_table_atomic(rdir, combined_emb, combined_meta)
 
     # Invalidate the in-memory cache so the next route() call reloads
@@ -553,9 +607,11 @@ def scan(
 
     return {
         "added": len(new_items),
+        "updated": updated,
         "skipped": skipped,
         "total_routes_after": len(combined_meta),
         "names_added": [i["name"] for i in new_items[:20]],
+        "names_updated": [i["name"] for _r, i in edited_items[:20]],
         "trusted": trusted,
     }
 

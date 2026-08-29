@@ -182,8 +182,31 @@ def serialize_binding_record(
 def deserialize_binding_record(buf: bytes) -> BindingRecord:
     """Parse a 200-byte wire-format record into a ``BindingRecord``.
 
-    Raises ``ValueError`` on length / magic / version mismatch. Does NOT
-    verify the signature — call :func:`application_verify_binding` for that.
+    Raises ``ValueError`` on length / magic / version / reserved mismatch.
+    Does NOT verify the signature — call :func:`application_verify_binding`
+    for that.
+
+    The ``reserved`` u16 at offset 6 MUST be zero, matching the same rule
+    already enforced by this repo's other two wire formats (MNW1's
+    ``loader_parse_weights`` header gate, mirrored in
+    ``native_bundle._validate_mnw1_header``, and the attestation envelope's
+    ``EV_ERR_RESERVED`` gate in ``src/evidence.mind``). Without it the two
+    bytes are free-form: they are outside the signed message (which covers
+    only ``SHA-256(mind_nerve_hash ++ mindllm_hash ++ nonce)``), so an
+    attacker could mint unbounded distinct 200-byte records — each with a
+    different ``chain_curr = SHA-256(record)`` — that all verify as ``ok``
+    under one signature.
+
+    deferred: the full fix is to bind magic/version/reserved into the signed
+    message itself, so the whole header is authenticated rather than merely
+    validated. Not done here because ``binding_message()`` is the wire
+    contract shared with ``integrations/mindllm_attestation.mind`` and
+    MindLLM — changing its preimage invalidates every existing signature.
+    Upgrade path: define ``VERSION = 2`` with
+    ``binding_message_v2 = SHA-256(magic ++ version_le ++ reserved ++
+    mind_nerve_hash ++ mindllm_hash ++ nonce)``, land it in the ``.mind``
+    spec and here together, and accept v1 preimages only while v1 records
+    are still in circulation.
     """
     if len(buf) != RECORD_SIZE:
         raise ValueError(f"BindingRecord must be {RECORD_SIZE} bytes, got {len(buf)}")
@@ -192,6 +215,9 @@ def deserialize_binding_record(buf: bytes) -> BindingRecord:
     (version,) = struct.unpack("<H", buf[4:6])
     if version != VERSION:
         raise ValueError(f"unsupported BindingRecord version: {version}")
+    (reserved,) = struct.unpack("<H", buf[6:8])
+    if reserved != 0:
+        raise ValueError(f"BindingRecord reserved field must be zero, got {reserved}")
     return BindingRecord(
         mind_nerve_hash=buf[8:40],
         mindllm_hash=buf[40:72],

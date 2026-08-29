@@ -251,6 +251,35 @@ def test_deserialize_binding_record_rejects_short_buffer() -> None:
         deserialize_binding_record(b"\x00" * 100)
 
 
+def test_deserialize_binding_record_rejects_nonzero_reserved() -> None:
+    """Reserved bytes 6-7 MUST be zero, as in the MNW1 and envelope formats.
+
+    The signed message covers only the three payload fields, so a non-zero
+    reserved field would be an unauthenticated free channel: the same
+    signature would validate an unbounded family of distinct 200-byte
+    records, each with its own SHA-256(record) chain value.
+    """
+    msg = binding_message(_MIND_NERVE_HASH, _MINDLLM_HASH, _NONCE)
+    sig = sign_binding(_PRIVATE_KEY, msg)
+    wire = bytearray(
+        serialize_binding_record(_MIND_NERVE_HASH, _MINDLLM_HASH, _NONCE, sig, _PUBLIC_KEY_BYTES)
+    )
+    assert bytes(wire[6:8]) == b"\x00\x00", "serializer must emit a zero reserved field"
+
+    wire[6] = 0xDE
+    wire[7] = 0xAD
+    with pytest.raises(ValueError, match="reserved field must be zero"):
+        deserialize_binding_record(bytes(wire))
+
+    # Every single-bit setting in the reserved field is rejected too — the
+    # gate is on the whole u16, not on one sentinel value.
+    for bit in range(16):
+        mutated = bytearray(wire)
+        mutated[6:8] = struct.pack("<H", 1 << bit)
+        with pytest.raises(ValueError, match="reserved field must be zero"):
+            deserialize_binding_record(bytes(mutated))
+
+
 # ---------------------------------------------------------------------------
 # H8: serialize_binding is deterministic
 # ---------------------------------------------------------------------------

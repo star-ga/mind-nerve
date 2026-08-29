@@ -4,6 +4,27 @@ All notable changes to mind-nerve. Format loosely follows [Keep a Changelog](htt
 
 ## [Unreleased]
 
+### Security — MNBA reserved-field gate
+
+- **`deserialize_binding_record()` now rejects a non-zero `reserved` u16**
+  (`python/mind_nerve/attestation.py`). The 200-byte `MNBA` BindingRecord
+  specifies `reserved = 0` at offset 6 and the serializer always emits
+  zeros, but the reader validated only length, magic and version. Because
+  the Ed25519 signature covers just
+  `SHA-256(mind_nerve_hash ++ mindllm_hash ++ nonce)`, those two bytes were
+  an unauthenticated free channel: a single valid signature admitted 65,536
+  distinct 200-byte records, each with its own
+  `chain_curr = SHA-256(record)`. Flipping them to `DE AD` previously
+  returned `{"result":"ok"}` with exit code 0 from
+  `mind-nerve attest verify`; it now returns `ParseError` and exit code 1.
+  This is the same rule the repo's other two wire formats already enforce
+  (`EV_ERR_RESERVED` in `src/evidence.mind`, and the MNW1 header gate in
+  `python/mind_nerve/native_bundle.py`). No change to the signed preimage,
+  the serializer, or any conforming record — records produced by
+  `serialize_binding_record()` are unaffected. Binding the full header into
+  the signed message is deferred to a `VERSION = 2` preimage; the upgrade
+  path is recorded in the `deserialize_binding_record()` docstring.
+
 ## [0.3.1] — 2026-08-19
 
 Security-hardening + documentation-honesty release. No behavior change to

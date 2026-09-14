@@ -14,6 +14,7 @@ HOOK = Path(__file__).parents[2] / "integrations" / "hook" / "mind-nerve-hook"
 SESSION_ENV_KEYS = (
     "MIND_NERVE_SESSION_ID",
     "CODEX_SESSION_ID",
+    "CODEX_THREAD_ID",
     "CLAUDE_SESSION_ID",
     "GEMINI_SESSION_ID",
     "CURSOR_SESSION_ID",
@@ -62,7 +63,7 @@ def _publish(ns: dict[str, object], tmp_path: Path, count: int) -> list[Path]:
 
 
 def test_active_session_lease_keeps_old_skill_path(monkeypatch, tmp_path):
-    ns = _load_hook(monkeypatch, tmp_path, "codex-session-1", "CODEX_SESSION_ID")
+    ns = _load_hook(monkeypatch, tmp_path, "codex-thread-1", "CODEX_THREAD_ID")
     targets = _publish(ns, tmp_path, 5)
 
     assert (targets[0] / "skill-0" / "SKILL.md").is_file()
@@ -116,3 +117,39 @@ def test_session_lease_has_a_generation_bound(monkeypatch, tmp_path):
     # The normal rolling retention and the bounded session lease may overlap
     # by the current generation, so the total is bounded by both policies.
     assert len(generation_dirs) <= ns["KEEP_GENERATIONS"] + 2
+
+
+def test_oversized_lease_is_reclaimed_before_gc(monkeypatch, tmp_path):
+    ns = _load_hook(monkeypatch, tmp_path, "oversized-session")
+    targets = _publish(ns, tmp_path, 5)
+    lease_file = next((targets[-1].parent / ".leases").glob("*.json"))
+    lease_file.write_text(
+        json.dumps({"version": 1, "generations": ["0" * 16] * 2000}),
+        encoding="utf-8",
+    )
+
+    protected = ns["_leased_generations"]()
+
+    assert protected == set()
+    assert not lease_file.exists()
+
+
+def test_old_lease_keys_are_bounded_during_gc_read(monkeypatch, tmp_path):
+    ns = _load_hook(monkeypatch, tmp_path, "legacy-lease", max_session_generations=3)
+    targets = _publish(ns, tmp_path, 6)
+    lease_file = next((targets[-1].parent / ".leases").glob("*.json"))
+    lease_file.write_text(
+        json.dumps({"version": 1, "generations": [target.name for target in targets]}),
+        encoding="utf-8",
+    )
+
+    protected = ns["_leased_generations"]()
+
+    assert protected == {target.name for target in targets[-3:]}
+
+
+def test_lease_ttl_has_a_bounded_upper_limit(monkeypatch, tmp_path):
+    monkeypatch.setenv("MIND_NERVE_GENERATION_LEASE_HOURS", "1000000")
+    ns = _load_hook(monkeypatch, tmp_path, "ttl-session")
+
+    assert ns["GENERATION_LEASE_TTL_S"] == 7 * 24 * 60 * 60

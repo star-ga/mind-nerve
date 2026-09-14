@@ -41,7 +41,8 @@ Configuration (all optional, all env):
   MIND_NERVE_PROJECT_MODE    'symlink' (default) | 'dir'
   MIND_NERVE_KEEP_GENERATIONS how many generation dirs to retain (default 3)
   MIND_NERVE_GENERATION_LEASE_HOURS how long an active session pins generations
-                             (default 24; bounded, renewed on each hook call)
+                             (default 24; capped at 168 hours, renewed on each
+                             hook call)
   MIND_NERVE_MAX_SESSION_GENERATIONS maximum generations pinned per session
                              (default 64; bounds disk retention)
   MIND_NERVE_CORE_SKILLS     ','-separated always-projected skills
@@ -249,10 +250,14 @@ KEEP_GENERATIONS = max(1, _env_int("MIND_NERVE_KEEP_GENERATIONS", 3))
 GENERATION_LEASE_TTL_S = max(
     60.0, _env_float("MIND_NERVE_GENERATION_LEASE_HOURS", 24.0) * 60.0 * 60.0
 )
+GENERATION_LEASE_TTL_S = min(7.0 * 24.0 * 60.0 * 60.0, GENERATION_LEASE_TTL_S)
 MAX_SESSION_GENERATIONS = max(
     KEEP_GENERATIONS, _env_int("MIND_NERVE_MAX_SESSION_GENERATIONS", 64)
 )
+MAX_SESSION_GENERATIONS = min(1024, MAX_SESSION_GENERATIONS)
 MAX_SESSION_LEASE_FILES = max(1, _env_int("MIND_NERVE_MAX_SESSION_LEASE_FILES", 128))
+MAX_SESSION_LEASE_FILES = min(1024, MAX_SESSION_LEASE_FILES)
+MAX_SESSION_LEASE_BYTES = 16 * 1024
 SOCKET_TIMEOUT = _env_float("MIND_NERVE_SOCKET_TIMEOUT", 2.0)
 CORE_ALWAYS_ON = tuple(
     _env_list("MIND_NERVE_CORE_SKILLS", ROUTER_NAME, ",")
@@ -823,6 +828,7 @@ _GENERATION_KEY_RE = re.compile(r"[0-9a-f]{16}")
 _SESSION_ENV_KEYS = (
     "MIND_NERVE_SESSION_ID",
     "CODEX_SESSION_ID",
+    "CODEX_THREAD_ID",
     "CLAUDE_SESSION_ID",
     "GEMINI_SESSION_ID",
     "CURSOR_SESSION_ID",
@@ -872,14 +878,18 @@ def _record_generation_lease(*keys: str) -> None:
         return
     generations: list[str] = []
     try:
-        if path.is_file() and time.time() - path.stat().st_mtime <= GENERATION_LEASE_TTL_S:
+        if (
+            path.is_file()
+            and path.stat().st_size <= MAX_SESSION_LEASE_BYTES
+            and time.time() - path.stat().st_mtime <= GENERATION_LEASE_TTL_S
+        ):
             loaded = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(loaded, dict) and isinstance(loaded.get("generations"), list):
                 generations = [
                     item
                     for item in loaded["generations"]
                     if isinstance(item, str) and _GENERATION_KEY_RE.fullmatch(item)
-                ]
+                ][-MAX_SESSION_GENERATIONS:]
     except (OSError, ValueError, TypeError):
         generations = []
     for key in valid:
@@ -916,13 +926,17 @@ def _leased_generations() -> set[str]:
             if now - path.stat().st_mtime > GENERATION_LEASE_TTL_S:
                 path.unlink(missing_ok=True)
                 continue
+            if path.stat().st_size > MAX_SESSION_LEASE_BYTES:
+                path.unlink(missing_ok=True)
+                continue
             loaded = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(loaded, dict) and isinstance(loaded.get("generations"), list):
-                protected.update(
+                valid = [
                     item
                     for item in loaded["generations"]
                     if isinstance(item, str) and _GENERATION_KEY_RE.fullmatch(item)
-                )
+                ]
+                protected.update(valid[-MAX_SESSION_GENERATIONS:])
         except (OSError, ValueError, TypeError):
             continue
     # A corrupt or abandoned lease must not accumulate forever. Keep the most

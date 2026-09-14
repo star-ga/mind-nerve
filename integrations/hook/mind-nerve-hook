@@ -257,7 +257,9 @@ MAX_SESSION_GENERATIONS = max(
 MAX_SESSION_GENERATIONS = min(1024, MAX_SESSION_GENERATIONS)
 MAX_SESSION_LEASE_FILES = max(1, _env_int("MIND_NERVE_MAX_SESSION_LEASE_FILES", 128))
 MAX_SESSION_LEASE_FILES = min(1024, MAX_SESSION_LEASE_FILES)
-MAX_SESSION_LEASE_BYTES = 16 * 1024
+# A full 1024-entry lease serializes to about 20 KiB. The reader's bound
+# must admit the writer's maximum, or valid large leases erase themselves.
+MAX_SESSION_LEASE_BYTES = 32 * 1024
 SOCKET_TIMEOUT = _env_float("MIND_NERVE_SOCKET_TIMEOUT", 2.0)
 CORE_ALWAYS_ON = tuple(
     _env_list("MIND_NERVE_CORE_SKILLS", ROUTER_NAME, ",")

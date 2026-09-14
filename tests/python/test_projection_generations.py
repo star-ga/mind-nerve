@@ -153,3 +153,12 @@ def test_lease_ttl_has_a_bounded_upper_limit(monkeypatch, tmp_path):
     ns = _load_hook(monkeypatch, tmp_path, "ttl-session")
 
     assert ns["GENERATION_LEASE_TTL_S"] == 7 * 24 * 60 * 60
+
+
+def test_maximum_written_lease_fits_reader_budget(monkeypatch, tmp_path):
+    ns = _load_hook(monkeypatch, tmp_path, "maximum-session", max_session_generations=1024)
+    keys = [f"{index:016x}" for index in range(1024)]
+    ns["_record_generation_lease"](*keys)
+    lease_path = ns["_lease_path"]()
+    assert lease_path.stat().st_size <= ns["MAX_SESSION_LEASE_BYTES"]
+    assert ns["_leased_generations"]() == set(keys)

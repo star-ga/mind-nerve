@@ -40,6 +40,10 @@ Configuration (all optional, all env):
   MIND_NERVE_INTENT_GATE     '0' disables the intent gate (default on)
   MIND_NERVE_PROJECT_MODE    'symlink' (default) | 'dir'
   MIND_NERVE_KEEP_GENERATIONS how many generation dirs to retain (default 3)
+  MIND_NERVE_GENERATION_LEASE_HOURS how long an active session pins generations
+                             (default 24; bounded, renewed on each hook call)
+  MIND_NERVE_MAX_SESSION_GENERATIONS maximum generations pinned per session
+                             (default 64; bounds disk retention)
   MIND_NERVE_CORE_SKILLS     ','-separated always-projected skills
   MIND_NERVE_SOCKET_TIMEOUT  seconds (default 2.0)
   MIND_NERVE_LOG             JSONL log path
@@ -242,6 +246,13 @@ SESSION_BANNER_MIN_INTERVAL_S = (
 )
 PROJECT_MODE = os.environ.get("MIND_NERVE_PROJECT_MODE", "symlink").strip().lower()
 KEEP_GENERATIONS = max(1, _env_int("MIND_NERVE_KEEP_GENERATIONS", 3))
+GENERATION_LEASE_TTL_S = max(
+    60.0, _env_float("MIND_NERVE_GENERATION_LEASE_HOURS", 24.0) * 60.0 * 60.0
+)
+MAX_SESSION_GENERATIONS = max(
+    KEEP_GENERATIONS, _env_int("MIND_NERVE_MAX_SESSION_GENERATIONS", 64)
+)
+MAX_SESSION_LEASE_FILES = max(1, _env_int("MIND_NERVE_MAX_SESSION_LEASE_FILES", 128))
 SOCKET_TIMEOUT = _env_float("MIND_NERVE_SOCKET_TIMEOUT", 2.0)
 CORE_ALWAYS_ON = tuple(
     _env_list("MIND_NERVE_CORE_SKILLS", ROUTER_NAME, ",")
@@ -808,6 +819,124 @@ def _gen_root() -> Path:
     return PROJECTED_DIR.parent / ".mind-nerve-gen"
 
 
+_GENERATION_KEY_RE = re.compile(r"[0-9a-f]{16}")
+_SESSION_ENV_KEYS = (
+    "MIND_NERVE_SESSION_ID",
+    "CODEX_SESSION_ID",
+    "CLAUDE_SESSION_ID",
+    "GEMINI_SESSION_ID",
+    "CURSOR_SESSION_ID",
+)
+
+
+def _session_key() -> str:
+    """Return a non-reversible key for the current CLI session, if known."""
+    for env_key in _SESSION_ENV_KEYS:
+        value = os.environ.get(env_key, "").strip()
+        if value:
+            return hashlib.sha256(
+                f"mind-nerve-session\0{env_key}\0{value}".encode("utf-8", "replace")
+            ).hexdigest()[:32]
+    return ""
+
+
+SESSION_KEY = _session_key()
+
+
+def _published_generation_key() -> str:
+    """Read the published generation key without following a stale target."""
+    if not PROJECTED_DIR.is_symlink():
+        return ""
+    try:
+        target = Path(os.readlink(PROJECTED_DIR))
+        if not target.is_absolute():
+            target = PROJECTED_DIR.parent / target
+        if target.parent != _gen_root() or not _GENERATION_KEY_RE.fullmatch(target.name):
+            return ""
+        return target.name
+    except OSError:
+        return ""
+
+
+def _lease_path() -> Path | None:
+    if not SESSION_KEY:
+        return None
+    return _gen_root() / ".leases" / f"{SESSION_KEY}.json"
+
+
+def _record_generation_lease(*keys: str) -> None:
+    """Pin recently used generations for this session with bounded metadata."""
+    path = _lease_path()
+    valid = [key for key in keys if _GENERATION_KEY_RE.fullmatch(key)]
+    if path is None or not valid:
+        return
+    generations: list[str] = []
+    try:
+        if path.is_file() and time.time() - path.stat().st_mtime <= GENERATION_LEASE_TTL_S:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict) and isinstance(loaded.get("generations"), list):
+                generations = [
+                    item
+                    for item in loaded["generations"]
+                    if isinstance(item, str) and _GENERATION_KEY_RE.fullmatch(item)
+                ]
+    except (OSError, ValueError, TypeError):
+        generations = []
+    for key in valid:
+        if key in generations:
+            generations.remove(key)
+        generations.append(key)
+    generations = generations[-MAX_SESSION_GENERATIONS:]
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}")
+        temporary.write_text(
+            json.dumps({"version": 1, "generations": generations}, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    except OSError:
+        try:
+            temporary.unlink()
+        except (NameError, OSError):
+            pass
+
+
+def _leased_generations() -> set[str]:
+    """Return live lease keys and expire old lease records."""
+    lease_root = _gen_root() / ".leases"
+    protected: set[str] = set()
+    try:
+        leases = [p for p in lease_root.iterdir() if p.is_file() and p.suffix == ".json"]
+    except OSError:
+        return protected
+    now = time.time()
+    for path in leases:
+        try:
+            if now - path.stat().st_mtime > GENERATION_LEASE_TTL_S:
+                path.unlink(missing_ok=True)
+                continue
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict) and isinstance(loaded.get("generations"), list):
+                protected.update(
+                    item
+                    for item in loaded["generations"]
+                    if isinstance(item, str) and _GENERATION_KEY_RE.fullmatch(item)
+                )
+        except (OSError, ValueError, TypeError):
+            continue
+    # A corrupt or abandoned lease must not accumulate forever. Keep the most
+    # recently touched bounded set; live leases are still honored above.
+    if len(leases) > MAX_SESSION_LEASE_FILES:
+        try:
+            leases.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            for stale in leases[MAX_SESSION_LEASE_FILES:]:
+                stale.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return protected
+
+
 def _populate_generation(gen_dir: Path, selected: list[tuple[str, Path]]) -> None:
     """Fill a fresh generation dir. Caller guarantees it does not exist."""
     gen_dir.mkdir(parents=True)
@@ -871,8 +1000,15 @@ def _gc_generations(keep: str) -> None:
         ]
     except Exception:
         return
+    leased = _leased_generations()
     entries.sort(key=lambda d: d.stat().st_mtime, reverse=True)
-    for stale in entries[KEEP_GENERATIONS - 1 :]:
+    retained = 0
+    for stale in entries:
+        if stale.name in leased:
+            continue
+        if retained < KEEP_GENERATIONS - 1:
+            retained += 1
+            continue
         shutil.rmtree(stale, ignore_errors=True)
 
 
@@ -898,11 +1034,13 @@ def write_projection(selected: list[tuple[str, Path]]) -> int:
     gen_dir = gen_root / key
     try:
         gen_root.mkdir(parents=True, exist_ok=True)
+        previous_key = _published_generation_key()
 
         # Zero-work path: already published and intact.
         if PROJECTED_DIR.is_symlink():
             try:
                 if os.readlink(PROJECTED_DIR) == str(gen_dir) and gen_dir.is_dir():
+                    _record_generation_lease(previous_key, key)
                     return sum(
                         1 for c in gen_dir.iterdir() if c.is_dir() or c.is_symlink()
                     )
@@ -934,6 +1072,7 @@ def write_projection(selected: list[tuple[str, Path]]) -> int:
         os.symlink(gen_dir, tmp_link)
         os.rename(tmp_link, PROJECTED_DIR)  # atomic publish
 
+        _record_generation_lease(previous_key, key)
         _gc_generations(key)
         return sum(1 for c in gen_dir.iterdir() if c.is_dir() or c.is_symlink())
     except Exception as e:

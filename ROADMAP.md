@@ -628,6 +628,113 @@ route rank.
   goes further (calibrated + excluded from the identity hash); theirs is raw and
   ungoverned. Confirms the direction, adds no new requirement.
 
+## Adaptive Routing Depth (design, 2026-09-03)
+
+Today `route()` spends **the same work on every query**. `_route_native`
+(`python/mind_nerve/inference.py:818`) encodes once, scores the full catalog with
+one MT-gemv, takes top-k, returns. A trivially unambiguous intent and a genuinely
+ambiguous multi-hop one cost identically: ~0.58 ms mean / ~0.97 ms p95 over
+11,922 rows x 384 dims. That is fast, but it is *flat* — there is no lever that
+spends more on the hard query and less on the easy one.
+
+**The proposal:** make routing depth a function of *decision confidence*, not a
+constant. Cheap queries resolve at depth 1. Only queries whose top-1/top-2 score
+margin is too narrow to be trusted pay for a second (and at most a third) pass
+over a progressively narrowed candidate set.
+
+### The rule must be a deterministic predicate, never a learned router
+
+The load-bearing constraint, and the reason this is not a copy:
+
+- **Exit predicate = Q16.16 integer margin threshold.** Continue iff
+  `(score[0] - score[1]) < DELTA_Q16` where `DELTA_Q16` is a compile-time
+  constant. Integer comparison on values already in Q16.16 — no float, no clock,
+  no learned parameter, no batch statistic.
+- **Depth is a pure function of the single query.** `depth(q)` depends only on
+  `q` and the frozen catalog. It must NOT depend on what else is being routed,
+  the wall clock, thread count, or a percentile over a batch.
+- **Bounded.** `MAX_DEPTH = 3`, fixed. Termination is structural, not empirical.
+- **Depth is a recorded quantity.** The realized depth, the margin at each exit
+  check, and the per-pass candidate-set digest are reported on `RouteResult` and
+  are reproducible. Two runs on two substrates agree on the depth as well as the
+  answer.
+
+### Why the batch-relative form is inadmissible for us
+
+Recent research on adaptive-depth computation offers two routing forms. The
+**better-performing** one selects the top-k items at each step against a
+**percentile threshold computed over all scores at that step**. Its own authors
+name the consequence: it suffers a **causality violation** and information
+leakage, requiring an auxiliary model or regularization loss to approximate at
+inference what it saw during training. The per-item alternative — commit each
+item to its own depth from its own score, with no cross-item statistic — is free
+of that leak and measurably weaker on their benchmark.
+
+Translated to our setting: a percentile threshold makes the depth assigned to one
+query a function of the *other queries in the batch*. The same intent routed alone
+and routed alongside nine others could take a different path and, at a tie, a
+different answer. **That is a determinism break, and it is disqualifying.** It
+would silently void the cross-substrate Q16.16 bit-identity contract that the
+SHA-256 tie-break in `_tie_key` exists to protect.
+
+So we take the token-choice *shape* (commit each item to its own depth from its
+own score, no cross-item statistic) and reject the expert-choice mechanism that
+the paper measures as stronger. We accept a possible quality ceiling in exchange
+for a property the paper's better variant structurally cannot have. Their
+adaptive depth is unauditable and batch-coupled; ours is a recorded, reproducible
+integer.
+
+### Relationship to the deferred int8 two-stage tier
+
+These are **orthogonal axes and must not be conflated**:
+
+- The int8 two-stage design (above) varies *precision* within a fixed single
+  decision — coarse int8 scan, then exact Q16.16 rescore of a Delta-bounded
+  candidate set. It is bit-identical top-k by construction (recall@16 = 100% on
+  3,000 queries) and costs the same on every query.
+- Adaptive depth varies *how many decisions* a query gets, based on that query's
+  own margin. It changes the work profile across queries.
+
+They compose — an int8 coarse pass is the natural depth-1 — but neither
+substitutes for the other, and adaptive depth does not depend on the int8 tier
+shipping.
+
+### Falsification gate (must pass before any implementation lands)
+
+This earns implementation only if it survives measurement. The honest null
+hypothesis is that the flat path is already fast enough and depth adds latency
+variance for nothing.
+
+1. **Margin must actually predict error.** Over the existing 3,000-query eval
+   set, bucket by top-1/top-2 Q16.16 margin and measure top-1 accuracy per
+   bucket. If low-margin queries are not measurably more often wrong, the
+   predicate is not a signal and the design is dead — record the negative result
+   and stop.
+2. **A second pass must actually fix them.** Of the low-margin queries that are
+   wrong at depth 1, what fraction does the narrowed second pass repair? If under
+   a few percent, the mechanism does not pay.
+3. **The p95 gate still holds.** `p95 <= 2.0 ms` on the score path is a hard
+   pytest gate. Adaptive depth spends *more* on the tail by construction, which
+   is exactly where the budget is tightest. Depth-3 p95 must stay under budget or
+   `MAX_DEPTH` drops to 2.
+4. **Bit-identity is unchanged.** Same query, same catalog, same answer AND same
+   realized depth on x86 and ARM. Any divergence retires the design.
+
+**Status: design, gated on gate 1.** No implementation until the margin/accuracy
+correlation is measured. Per the standing rule, a research proposal earns a
+roadmap entry only when an audit shows a gap it closes — the gap here (flat cost
+per query, no confidence-proportional effort) is real and measured; whether this
+mechanism closes it is not yet established.
+
+**Composes with:** the Calibrated Routing Confidence sidecar below — the margin
+this design thresholds on is the same quantity that sidecar calibrates. If both
+land, calibration informs `DELTA_Q16` selection offline; the runtime predicate
+stays a frozen integer constant, and the calibrated score stays excluded from any
+identity hash.
+
+**Provenance:** external construction recorded privately in governed memory +
+`mind-internal`; do NOT carry the citation into any public artifact.
+
 ## Repo-Stack Fingerprint as a Routing Feature (sidecar input)
 
 Today mind-nerve routes on **intent text only** — it doesn't look at *where the
@@ -941,3 +1048,92 @@ score. Route-anchor coverage confers no authority — it must not be optimized a
 and a well-anchored route is not thereby a better route. Keep it distinct from the
 rationale field: rationale explains *why this route matched*; the anchor records *that
 this route was in force*. Merging them turns evidence into a metric.
+
+## Typed routing answers and a real abstention: Choice/Score/Noul instead of one scalar (2026-09-20, Proposed)
+
+**Status: PROPOSED — source audited, our-side mapping NOT audited. Do not implement
+before the audit box at the bottom is discharged.**
+
+`mind_nerve_route` today answers every intent the same way: a ranked top-K with one
+scalar relevance score per skill. That single shape is asked to carry three different
+questions at once — *which* capability, *how well* it fits, and *whether this should
+route at all* — and it answers only the first well.
+
+Recent research on decision models for agentic systems splits exactly this surface into
+three question types, each with its own return shape: pick one option from a fixed set,
+rate the state on a rubric, and judge whether one statement is true. The claim worth
+taking is not the taxonomy for its own sake. It is that collapsing three question types
+into one scalar makes two distinct failure modes invisible.
+
+### What a typed answer would surface that the scalar hides
+
+**A broken option set reads as a normal answer.** The live route table has a known
+defect: ~2419 rows for ~1378 distinct hub skills, roughly 1040 of them a duplicated
+`source_path` (a `local` + `starga` pair of the same file). A ranked top-K over a
+universe where half the rows are twins still returns a confident-looking list — the
+duplication halves effective `top_k` silently. A selection over an explicit option set
+makes the option set itself a reviewable input, which is where that defect actually
+lives.
+
+**There is no way to say "none of these."** Every call returns a top-K. An intent with
+no good match in the hub gets the least-bad skill at some score, and the caller cannot
+distinguish "this is the right skill" from "this is the top of a flat distribution."
+The prior art's framing: a distribution concentrated on one option means a confident
+answer; a flat one means none of the options is a clear winner. That is a computable
+signal we currently discard.
+
+### The change
+
+- [ ] **Separate the route question from the abstention question.** Return the ranked
+      selection *and* a distinct judgement of whether the intent should route to the hub
+      at all. Two questions, two answers, not one score doing double duty.
+- [ ] **Return the distribution, not only the argmax.** The shape across candidates is
+      the abstention signal; discarding it is what forces the caller to threshold on a
+      scalar whose meaning varies by query.
+- [ ] **Deduplicate the option set before it is scored, not after.** Gated on the `.npy`
+      alignment check — `route_table.npy` is a row-index-aligned `[N,384]` float32
+      matrix, and a jsonl-only edit silently corrupts routing. Dedup is a *precondition*
+      of this entry, not a side effect of it.
+- [ ] **Explicit "no route" as a first-class answer,** with the caller free to proceed
+      unrouted. An abstention that the caller cannot act on is a log line, not a gate.
+
+### Firewall
+
+Confidence here is a **routing** signal, never an authority signal. A high-confidence
+route is not thereby a *better* route, and route confidence must not be optimized
+against or fed back as a quality metric — the same I13 non-causal discipline the
+cross-chain anchor section above already applies. Keep it distinct from the rationale
+field: rationale explains why a route matched; confidence describes how separated the
+candidates were.
+
+### What is NOT taken
+
+The hosted decision model itself. It is a network call to a closed-weight remote
+service in the decision path — structurally incompatible with offline operation and
+with reproducible routing. The Q16.16 constraint (cross-arch bit-identity,
+non-negotiable) is the whole reason routing scores are reproducible today; a remote
+probabilistic oracle would be the one non-reproducible node in the table.
+
+Also not taken: their reliability vocabulary. Their guarantee is that an answer is a
+valid member of the offered set — a schema property, not a correctness property. We can
+prove something narrower and harder, and should not borrow a word that overclaims.
+
+### AUDIT STATUS
+
+**Source side: AUDITED 2026-09-20.** The three question types, the returned probability
+distribution, the confidence-from-distribution-shape derivation, the 255-option ceiling,
+and the "flat distribution means no clear winner" reading were each read from the
+vendor's own published documentation, not from secondary coverage or a screenshot.
+
+**Correction to an earlier session claim:** an earlier read of this prior art asserted
+all three primitives return confidence. They do not — the boolean-style primitive
+returns a bare 0–1 value with no confidence field. Any design that assumes a uniform
+confidence return across all three question types is wrong.
+
+**Our side: NOT AUDITED.** Nobody has measured whether `mind_nerve_route` callers would
+act differently given an abstention, nor whether the duplicate-row defect actually
+changes returned rankings in practice (it is a structural argument, not a measurement).
+
+**Falsification condition.** If a measurement over real routing traffic shows that
+abstention would fire on under ~2% of intents, this entry is not worth the surface area
+— the scalar is adequate and this should be closed as declined, not left Proposed.

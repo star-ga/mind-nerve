@@ -969,7 +969,7 @@ more separable decision at each level than one flat top-K.
   among routed skills may only emit an id that exists in the table. An invented skill
   name becomes impossible rather than caught afterwards.
 - [ ] **Dedup is a prerequisite, not a side effect.** The live table's duplicated
-  `source_path` rows (the `local` + `starga` pairs noted above) must be resolved before
+  `source_path` rows (mostly a `local` + `starga` pair pointing at the same file) must be resolved before
   the tree is built; otherwise one skill occupies two leaves. The dedup stays gated on
   the `.npy` row-alignment check.
 

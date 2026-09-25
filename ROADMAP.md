@@ -941,3 +941,41 @@ score. Route-anchor coverage confers no authority — it must not be optimized a
 and a well-anchored route is not thereby a better route. Keep it distinct from the
 rationale field: rationale explains *why this route matched*; the anchor records *that
 this route was in force*. Merging them turns evidence into a metric.
+
+## Hierarchical routing over a skill tree, with output restricted to real skill ids (2026-09-24, Proposed)
+
+**Status: PROPOSED. Not audited on our side.**
+
+Routing is a pick-one-leaf-from-a-fixed-catalog problem: score the intent against ~1.3k
+hub skills, return the top-K. The catalog is flat. Every intent is scored against every
+row, and near-duplicate skills from different families compete directly.
+
+Recent research on structure-aware retrieval showed that routing down a document's
+outline (the most specific heading first, then the content under it) beats flat
+retrieval over the same content. The same shape applies to the catalog: a skill has a
+natural path (`domain > family > skill`), and routing down that path is a cheaper,
+more separable decision at each level than one flat top-K.
+
+### The change
+
+- [ ] **Build the tree.** Assign every hub skill a path (`security > web > ffuf`,
+  `mind > compiler > ssa`). Derived from existing frontmatter and directory layout where
+  possible, hand-assigned only where not. Stored beside the route table, never inside
+  the row-aligned `.npy`.
+- [ ] **Level-by-level routing, behind a flag.** Score the intent against domain nodes,
+  keep the top few, descend, and score leaves only inside the kept subtrees. Same Q16.16
+  deterministic scorer at every level. Flag off means today's flat top-K, byte-identical.
+- [ ] **Constrained output wherever a model picks the skill.** Any seat that chooses
+  among routed skills may only emit an id that exists in the table. An invented skill
+  name becomes impossible rather than caught afterwards.
+- [ ] **Dedup is a prerequisite, not a side effect.** The live table's duplicated
+  `source_path` rows (mostly a `local` + `starga` pair pointing at the same file) must be resolved before
+  the tree is built; otherwise one skill occupies two leaves. The dedup stays gated on
+  the `.npy` row-alignment check.
+
+### Falsification
+
+Replay a labelled set of real routing intents through flat and hierarchical routing.
+Keep the tree only if top-1 accuracy improves or holds while scored rows per query fall.
+If a wrong domain choice at the first level loses more correct answers than the flat
+scorer does, the tree is too lossy; fall back to using it as a boost, or decline.

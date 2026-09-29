@@ -1137,3 +1137,42 @@ changes returned rankings in practice (it is a structural argument, not a measur
 **Falsification condition.** If a measurement over real routing traffic shows that
 abstention would fire on under ~2% of intents, this entry is not worth the surface area
 — the scalar is adequate and this should be closed as declined, not left Proposed.
+
+## Signals, rules, selection: splitting the route decision into layers, and replaying policy changes before they ship (2026-09-28, Proposed)
+
+> Prior-art shape observed in recent open-source model-routing work. Ideas only —
+> no code, no dependency. Provenance lives in mind-internal.
+
+### 1. Three layers instead of one score
+
+Today a route is similarity score → answer. Split it:
+
+- **Signals** state facts about the intent and never decide: top-1 score, margin
+  to top-2, detected stack/language, whether the intent touches private data,
+  calling client.
+- **Rules** decide which skills are *eligible* from those facts (hard
+  predicates — e.g. a skill that needs bash is ineligible for a client without
+  it; a private-data intent is ineligible for skills that call out).
+- **Selection** ranks only the eligible set by similarity.
+
+The confidence sidecar and the narrow-margin second pass (both already on this
+roadmap) become signals; client-capability filtering (2026-09-20 entry) becomes
+rules. Each plugs in without touching the scoring, and the route answer can
+report which rule removed which candidate. Rules filter *around* the vector
+search and must not perturb row alignment of the `[N,384]` table.
+
+### 2. Replay a policy change against past traffic before it ships
+
+Before re-learning the table or changing a rule, replay recorded intents (the
+existing ~3,000-query eval set plus logged live routes) against the candidate
+table and diff the answers against the current one: how many top-1s changed,
+which ones, and whether eval accuracy moved. A re-learn that silently changes a
+large share of answers is held for review. This is the gate the duplicate-row
+dedup needs — it proves the dedup changed only what it meant to change.
+
+### Status
+
+Proposed; nothing built (training freeze). Replay (2) first — it is the safety
+net for everything else, including (1). Model/seat routing from the same review
+is in the naestro roadmap (R111), not here: mind-nerve routes to manifests,
+never binds seats.

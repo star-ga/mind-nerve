@@ -1305,6 +1305,26 @@ The catalog is internal. The 2026-06-12 operator decision (no public skills-DB
 surface, on-prem only, naestro R36) still holds; a public catalog would need a
 new decision and a terms review of every source.
 
+### 7. Implementation: pure MIND
+
+Non-negotiable 1 applies to the catalog exactly as it does to routing. Every new
+piece is `.mind` source compiled by `mindc`:
+
+- **Catalog store, row codec and tree hash** in MIND, reusing the existing
+  SHA-256 and loader code in `src/`. Rows serialize canonically, so the same
+  crawl input produces a byte-identical catalog on x86 and ARM.
+- **Rating** is Q16.16 fixed point, like the scorer. The versioned formula is a
+  MIND function with golden vectors; no IEEE-754 on this path either.
+- **Gap matching** runs on the native top-K path against catalog embeddings, the
+  same kernel the route table uses.
+- **Source adapters** parse registry JSON and SKILL.md frontmatter in MIND.
+  Network fetch is the one piece MIND cannot do in-tree today: it comes from
+  mind-parser (itself MIND) once its live-acquisition milestone lands. Until
+  then, the crawl does not start; there is no Python crawler to retire later.
+- **No new Python.** `python/mind_nerve/acquire.py` is the existing Phase 1
+  surface. Its nine sources are ported to the same MIND adapters as part of this
+  work, not extended in Python.
+
 ### Falsification
 
 Report the share of logged gaps the catalog closes (hit, acquired, then actually
@@ -1314,7 +1334,8 @@ formula is revised before any expansion.
 
 ### Status
 
-Proposed; nothing built. First slice: the registry adapter plus the tree-hash
-drift check, both small. The bulk crawl waits for R116 admission control. Fetch
+Proposed; nothing built. First slice, in MIND: the catalog row codec plus the
+tree-hash drift check (no network needed), then the registry adapter once
+mind-parser can fetch. The bulk crawl waits for R116 admission control. Fetch
 and extraction move to mind-parser once its live-acquisition milestone lands,
 so every catalog row carries a reproducible extraction record.

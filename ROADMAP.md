@@ -1214,3 +1214,107 @@ Proposed; nothing built (training freeze). Replay (2) first — it is the safety
 net for everything else, including (1). Model/seat routing from the same review
 is in the naestro roadmap (R111), not here: mind-nerve routes to manifests,
 never binds seats.
+
+## The open catalog: every public skill, agent and MCP server, rated (2026-10-03, Proposed)
+
+> Prior-art shape observed in a public skills registry and its install CLI. Ideas
+> only, no code, no dependency. Provenance lives in mind-internal.
+
+Today `acquire` pulls from nine curated sources, and the hub holds about 1,400
+skills. The public ecosystem is far larger and has no shared index anyone can
+trust: registries count installs, a few run scanners, none measure what a skill
+does after it is installed. The goal here is the largest catalog of agent
+artifacts (skills, agent definitions, MCP servers, plugin bundles), each with a
+rating built from separate, evidenced signals. It extends the Phase 0 catalog
+plan in `docs/catalog_and_training_plan.md`; it does not replace it.
+
+### 1. Two tables, never merged
+
+- **Route table (exists):** governed hub artifacts only, frozen, byte-identical.
+  Unchanged by anything in this entry.
+- **Catalog (new):** every artifact found anywhere. Catalog rows are never routed
+  to as executable instructions. The most a catalog row can produce is a
+  suggestion: "no hub skill fits; catalog item X looks relevant; acquire it?"
+  Acquiring still goes through quarantine, the fail-closed scan, the license gate
+  and the hash manifest.
+
+### 2. Sources
+
+Added to the existing nine, each a separate, rate-limited adapter:
+
+- A public skills registry with an open search API that returns id, source repo
+  and install count.
+- The SkillsMP index (currently only a separate CLI here).
+- GitHub code search for `filename:SKILL.md`, agent `.md` directories and plugin
+  marketplace manifests, then a git-tree lookup per repo to enumerate every
+  skill folder.
+- MCP registries (already partly covered) and npm / PyPI packages tagged as MCP
+  servers or agent skills.
+
+Crawling is polite and slow (days, not one run), honours each source's terms and
+rate limits, and runs under naestro's R116 admission control on the shared box.
+
+### 3. What a catalog row holds
+
+Id, source, repo, commit, a **tree hash of the skill folder** (changes when any
+file in it changes), name, description, kind, license, install count, stars,
+last push, outside scanner verdicts, our own scan verdict, and the date each
+field was observed. Full content is stored only for permissively licensed repos;
+for everything else, the metadata and a link.
+
+### 4. The rating: separate signals, not one magic number
+
+Each dimension is stored and shown separately, with its source and date:
+
+| Dimension | Source | Notes |
+|---|---|---|
+| Adoption | installs, stars | Popular is not safe; this never overrides the others |
+| Security | our fail-closed scan plus outside scanner verdicts | Ours is the deciding check |
+| License | SPDX detection | Unlicensed means "link only" |
+| Maintenance | last push, open-issue age, tree-hash churn | |
+| Quality | a static check of the SKILL.md (frontmatter, triggers, length, dead references), the same checks skill-improver runs on our own hub | |
+| Observed use | N1 aggregation (times projected vs. actually read) for artifacts we installed | Node-local only |
+
+A summary grade may be shown for humans, computed by a published, versioned
+formula over these dimensions. The N3 constraint above applies unchanged: no
+rating ever moves the score floor, reorders routing or evicts a route on its
+own. Federated, cross-node trust scores remain naestro's (R19); this catalog is
+one input to that scorer.
+
+### 5. The self-improvement loop
+
+1. **Gap detection.** A route below the confidence floor, or an abstention, is
+   logged as a gap (query hash only, never the prompt).
+2. **Catalog search.** Each gap is matched against the catalog. A hit becomes an
+   acquire proposal with its rating attached.
+3. **Draft when nothing exists.** No hit means skill-improver drafts a new hub
+   skill for the gap.
+4. **Upstream drift.** For every acquired skill, the tree hash is re-checked. A
+   change upstream triggers a re-scan and an update proposal, never a silent pull.
+5. **Better version found.** When a catalog item covers the same intent as a hub
+   skill and rates higher, skill-improver proposes a merge of what the hub
+   version is missing.
+
+Every step ends in a proposal. Approval follows naestro's R117 autonomy levels:
+crawling and rating run automatically, acquiring asks first, nothing is
+published.
+
+### 6. Scope boundary
+
+The catalog is internal. The 2026-06-12 operator decision (no public skills-DB
+surface, on-prem only, naestro R36) still holds; a public catalog would need a
+new decision and a terms review of every source.
+
+### Falsification
+
+Report the share of logged gaps the catalog closes (hit, acquired, then actually
+read) after 30 days. If acquired catalog items are read less often than hub
+skills at the same score, the rating is not predicting usefulness and the
+formula is revised before any expansion.
+
+### Status
+
+Proposed; nothing built. First slice: the registry adapter plus the tree-hash
+drift check, both small. The bulk crawl waits for R116 admission control. Fetch
+and extraction move to mind-parser once its live-acquisition milestone lands,
+so every catalog row carries a reproducible extraction record.

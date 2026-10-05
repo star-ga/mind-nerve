@@ -12,8 +12,8 @@
 //
 // SYNTAX
 //
-// `extern fn` is the same surface 512-mind uses for HSM + crypto host
-// primitives (see 512-mind/src/nexus_key.mind, key_management.mind).
+// `extern fn` is the same surface MIND-Law uses for HSM + crypto host
+// primitives (see mind-law/src/nexus_key.mind, key_management.mind).
 // mindc 0.2.4+ lowers extern fns to symbol references; mind-runtime
 // resolves them with native shims.
 //

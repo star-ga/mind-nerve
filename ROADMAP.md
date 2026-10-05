@@ -1010,7 +1010,7 @@ a debugging log, which rates nothing; the self-rating trap is ours to name.
 
 Six layers of the ecosystem each anchor a different "what survives transformation":
 `trace_hash` (artifact, `mind`), routing lineage (decision, Naestro), provenance chain
-(belief, mind-mem), I1–I15 + `spec_hash` (constraint, 512-mind), **the governed route
+(belief, mind-mem), I1–I15 + `spec_hash` (constraint, MIND-Law), **the governed route
 table (intent→capability, here)**, and the session evidence log (structural health,
 arch-mind). Six roots, zero cross-links — nothing can prove the conjunction *"this
 binary, produced by this decision, under these constraints, consistent with these
@@ -1024,7 +1024,7 @@ request hash, model hash, result hash, plus the 2026-07-04 additive rationale fi
 the existing attestation envelope, not new machinery.**
 
 - [ ] Canonical route-member preimage over `freeze_id` + model hash + matched-rule id.
-      No clock, no randomness, no map-iteration order — the 512-mind evidence-preimage
+      No clock, no randomness, no map-iteration order — the MIND-Law evidence-preimage
       discipline applies verbatim.
 - [ ] **Absent encoding.** A compile with no routing decision above it must still
       produce a valid anchor with this member explicitly recorded as absent — never
@@ -1043,7 +1043,7 @@ by construction. Of the six members this is among the least work, and it answers
 question a reviewer actually asks about an agentic system: *why did it reach for that
 capability.*
 
-**Firewall (I13, inherited from 512-mind).** The anchor is an evidence artifact, never a
+**Firewall (I13, inherited from MIND-Law).** The anchor is an evidence artifact, never a
 score. Route-anchor coverage confers no authority — it must not be optimized against,
 and a well-anchored route is not thereby a better route. Keep it distinct from the
 rationale field: rationale explains *why this route matched*; the anchor records *that

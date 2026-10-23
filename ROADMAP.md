@@ -1339,3 +1339,27 @@ tree-hash drift check (no network needed), then the registry adapter once
 mind-parser can fetch. The bulk crawl waits for R116 admission control. Fetch
 and extraction move to mind-parser once its live-acquisition milestone lands,
 so every catalog row carries a reproducible extraction record.
+
+
+---
+
+## Byte-Level Distillation Research Track (2026-10-23)
+
+**Owner:** STARGA, Inc.  
+**Status:** Proposed; no implementation or performance claims.  
+**Research:** K. Marathe et al., *Breaking the Token Ceiling: Distilling Smaller, Stronger Byte Models* (2026), https://arxiv.org/abs/2609.12303
+
+This paper studies decoder-only byte versus token models and token-teacher-to-byte-student supervision via approximate Marginalize-It and exact End-of-Token (EOT). Raw bytes are not synonymous with byte-level BPE. Paper-specific scaling estimates do not constitute STARGA results.
+
+### Project scope
+
+Benchmark matched-compute intent classifiers: existing byte-BPE, raw-byte encoder trained on hard labels, and raw-byte encoder distilled from a strong teacher. Verify that the current 32 placeholder merges are not represented as a trained 32K vocabulary. Measure Unicode and tool-name robustness, exact tool routing, abstention, p95 latency, and deterministic output. Keep existing encoder as default until a measured win.
+
+### Validation, dependencies and release gates
+
+- Verify full teacher-vocabulary byte-prefix probabilities against exhaustive small-vocabulary oracles, including EOT mass, UTF-8 multibyte strings, shared prefixes and token endings. Top-k truncation must not be called exact.
+- Compare token and byte baselines with matched data, compute, model capability and honest serving-cost accounting. Report bytes-per-byte, quality, p50/p95 latency per output character, peak memory and reproducibility.
+- Preserve existing public APIs, admission/governance gates and determinism contracts by default; use feature flags. Revert or defer when benefits are not established.
+- Dependency order: mind-inference reference -> mind-nerve benchmark -> MindLLM optional dispatch -> naestro/mind-mem pilots; mind-flow orchestrates experiments and mind/mind-runtime implement only proven optimizations.
+
+**Attribution:** STARGA, Inc. Research source is cited above. No software-development co-authors are designated.

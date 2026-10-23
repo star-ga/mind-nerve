@@ -1363,3 +1363,27 @@ Benchmark matched-compute intent classifiers: existing byte-BPE, raw-byte encode
 - Dependency order: mind-inference reference -> mind-nerve benchmark -> MindLLM optional dispatch -> naestro/mind-mem pilots; mind-flow orchestrates experiments and mind/mind-runtime implement only proven optimizations.
 
 **Attribution:** STARGA, Inc. Research source is cited above. No software-development co-authors are designated.
+
+
+---
+
+## Verified Engineering Delivery Research (2026-10-23)
+
+**Owner:** STARGA, Inc.  
+**Status:** Proposed; not shipped or independently benchmarked.  
+**Competitive reference:** https://sun-asterisk.us/takumi/ — learn from engineering workflow patterns; no copying of restricted assets.
+
+### Repository-specific work
+
+Risk/cost/confidence-weighted engineering agent/tool routing with abstention; routing predictions cannot grant permission.
+
+### Cross-project gates
+
+- Canonical requirement and scope contract with permitted actions, named authority, expiry, budgets, impacted code and required tests.
+- Requirement -> symbols -> commit -> independently executed test evidence -> build artifact -> release decision; missing evidence fails closed. Implementer may not approve its own work.
+- Record signed evidence and offline replay verification where supported; never overclaim cryptographic guarantees or deployed status.
+- Evaluate prohibited-action prevention, missing-gate rejection, trace precision/recall, escaped defects, cost per accepted task and verification repeatability using held-out changes.
+- P0: authorization, independent CI and provenance. P1: cross-repo impact, bounded autonomous repair, cost routing and memory. P2: modernization parity testing and an enterprise control plane.
+- Ownership: Naestro OS mission UI/control; mind-flow DAG execution; mind-law authorization; mind-ci independent gates; mind-codegraph impact; mind-mem decisions; mind-predict calibration. Keep interfaces explicit and avoid duplicate engines.
+
+**Attribution:** STARGA, Inc. No additional software co-authors.

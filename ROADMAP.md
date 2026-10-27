@@ -1387,3 +1387,11 @@ Risk/cost/confidence-weighted engineering agent/tool routing with abstention; ro
 - Ownership: Naestro OS mission UI/control; mind-flow DAG execution; mind-law authorization; mind-ci independent gates; mind-codegraph impact; mind-mem decisions; mind-predict calibration. Keep interfaces explicit and avoid duplicate engines.
 
 **Attribution:** STARGA, Inc. No additional software co-authors.
+
+## Frontier scientific computation
+
+Status: proposed; not implemented, not release-qualified (2026-10-26).
+
+Scope: multi-day scientific observability, event tracing, cancellation, budget alarms and deterministic handoff.
+
+Acceptance: preserve existing release blockers and ownership. Freeze small published exact symbolic problems before implementation. Require results that a checker distinct from the solver can verify (model agreement is not proof), false-result mutants, deterministic replay, interruption recovery, immutable provenance with exact dependency identities, measured compute cost and reproducible baseline comparisons. No capability claim beyond what is reproduced here.

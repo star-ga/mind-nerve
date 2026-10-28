@@ -1395,3 +1395,30 @@ Status: proposed; not implemented, not release-qualified (2026-10-26).
 Scope: multi-day scientific observability, event tracing, cancellation, budget alarms and deterministic handoff.
 
 Acceptance: preserve existing release blockers and ownership. Freeze small published exact symbolic problems before implementation. Require results that a checker distinct from the solver can verify (model agreement is not proof), false-result mutants, deterministic replay, interruption recovery, immutable provenance with exact dependency identities, measured compute cost and reproducible baseline comparisons. No capability claim beyond what is reproduced here.
+
+---
+
+## MIND-writing task routing and measured accuracy (2026-10-28)
+
+**Owner:** STARGA, Inc.  
+**Status:** Proposed; not implemented, no accuracy claim. Live probe of the local route table on 2026-10-28 (four MIND-writing intents, not a measurement): the MIND authoring skill was in the top 5 for three of four; no compile-check gate skill and no benchmark-track skill exists yet, so neither route can be served. No labelled MIND-writing eval set exists in this repo.
+
+Scope: mind-nerve routes intents. It does not write, compile or grade MIND code. The gate and benchmark skills live in the skill hub and the compiler. Route predictions never grant permission.
+
+### 1. Compile-check gate route for MIND-writing intents
+
+- **What:** An intent to write, port or edit MIND source routes to the MIND authoring skill and to a compile-check gate skill. The gate skill writes, runs the compiler check, fixes the diagnostics and repeats until the file compiles or its round budget is spent. Build the gate skill first; this item covers the route.
+- **Why:** Compiler feedback during generation is the lever recent research finds most effective for languages with little public training code, and the router is the only place that can make it the default first step.
+- **Done when:** the gate skill is in the route table; on the eval set in item 3, write, port and edit intents place it in the top 5 for at least 95% of held-out cases; non-MIND intents place it in the top 5 for at most 2%.
+
+### 2. Benchmark-track route
+
+- **What:** Intents to run, extend or report the MIND benchmark track route to the benchmark-track skill, not to the authoring skill.
+- **Why:** Running a benchmark and writing code need different tools; a shared route inflates both.
+- **Done when:** the benchmark-track skill exists; on the eval set, benchmark intents rank it first in at least 90% of cases, and writing intents rank it first in at most 5%.
+
+### 3. Measured routing accuracy on MIND-writing intents
+
+- **What:** A hand-labelled, held-out set of at least 200 intents covering write, port, fix-diagnostic, project setup, benchmark and non-MIND negatives. A fixed script reports top-1, top-5 and abstention rate. The script refuses to run unless `MIND_NERVE_RUNTIME_DIR` points at the curated table; without it the router serves the generic public catalog and the number measures the wrong thing. The result file records the seed, the eval-set hash and the table hash.
+- **Why:** No accuracy figure exists for MIND-writing intents, so the routes in items 1 and 2 cannot be checked.
+- **Done when:** the script runs locally or in CI with a committed result file; the MIND slice is reported beside the existing targets in `spec/quality_targets.md` (top-5 at least 92%), or a lower target is written down with the reason.

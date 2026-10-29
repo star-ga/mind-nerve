@@ -1540,3 +1540,16 @@ differs; for an encoder layer it also prints the layer and window index.
   which either side crashed or wrote no trace reports "unverified", never an empty diff.
 - **Status:** Proposed. Extends the bit-identity harness; no change to its existing gate. An
   architecture audit verdict is required before implementation.
+
+<!-- MIND-NUMERICAL-OPTIMIZATION-REVIEW:BEGIN -->
+## Numerical optimization — proposed review (2026-10-29)
+- [ ] Compare reference training SGD/momentum/AdamW for the Q16.16 intent preselector; pin quantization loss and CPU vs ARM deterministic inference.
+- [ ] Apply relevant methods from GD, SGD, momentum, Adam/AdamW, L-BFGS, BFGS, Newton-CG, SQP, interior-point and Nelder–Mead only after a benchmarked workload-specific review. Numerical optimizer methods are not compiler code-generation passes.
+<!-- MIND-NUMERICAL-OPTIMIZATION-REVIEW:END -->
+
+<!-- MIND-ANALYTIC-INEQUALITIES-REVIEW:BEGIN -->
+## Analytic inequalities — proposed review (2026-10-29)
+- [ ] Research input perturbation norm bounds via triangle, Cauchy–Schwarz and Hölder, with independently measured classifier stability and no unproven certification claims.
+- [ ] Select as needed from Young, triangle, Markov, Chebyshev, Cauchy–Schwarz, AM–GM, Minkowski, Grönwall, Hölder, Poincaré, Sobolev and Jensen; formally enumerate domains, hypotheses, numeric profiles, counterexamples and boundary cases.
+- [ ] No implementation or proof claim yet; preserve existing correctness, determinism, and release acceptance gates.
+<!-- MIND-ANALYTIC-INEQUALITIES-REVIEW:END -->

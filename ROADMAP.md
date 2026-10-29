@@ -1347,7 +1347,6 @@ so every catalog row carries a reproducible extraction record.
 
 **Owner:** STARGA, Inc.  
 **Status:** Proposed; no implementation or performance claims.  
-**Research:** K. Marathe et al., *Breaking the Token Ceiling: Distilling Smaller, Stronger Byte Models* (2026), https://arxiv.org/abs/2609.12303
 
 This paper studies decoder-only byte versus token models and token-teacher-to-byte-student supervision via approximate Marginalize-It and exact End-of-Token (EOT). Raw bytes are not synonymous with byte-level BPE. Paper-specific scaling estimates do not constitute STARGA results.
 
@@ -1371,7 +1370,6 @@ Benchmark matched-compute intent classifiers: existing byte-BPE, raw-byte encode
 
 **Owner:** STARGA, Inc.  
 **Status:** Proposed; not shipped or independently benchmarked.  
-**Competitive reference:** https://sun-asterisk.us/takumi/ — learn from engineering workflow patterns; no copying of restricted assets.
 
 ### Repository-specific work
 

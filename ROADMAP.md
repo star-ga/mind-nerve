@@ -1422,3 +1422,123 @@ Scope: mind-nerve routes intents. It does not write, compile or grade MIND code.
 - **What:** A hand-labelled, held-out set of at least 200 intents covering write, port, fix-diagnostic, project setup, benchmark and non-MIND negatives. A fixed script reports top-1, top-5 and abstention rate. The script refuses to run unless `MIND_NERVE_RUNTIME_DIR` points at the curated table; without it the router serves the generic public catalog and the number measures the wrong thing. The result file records the seed, the eval-set hash and the table hash.
 - **Why:** No accuracy figure exists for MIND-writing intents, so the routes in items 1 and 2 cannot be checked.
 - **Done when:** the script runs locally or in CI with a committed result file; the MIND slice is reported beside the existing targets in `spec/quality_targets.md` (top-5 at least 92%), or a lower target is written down with the reason.
+
+---
+
+## A plain-retrieval baseline beside every routing number, and a rule that gates defaults on it (2026-10-28, Proposed)
+
+**Owner:** STARGA, Inc.  
+**Status:** Proposed; nothing built, and no published number changes.
+
+Recent research reports that plain retrieval over unprocessed text matched or beat most
+purpose-built systems on the benchmarks those systems were built for. Our routing numbers have
+no such control. Live state, checked 2026-10-28 on origin/main `d0524ba`: the 96.06% top-5
+figure (README, `docs/model_card.md`) is the trained encoder on the v1.1-oss held-out eval
+queries against 11,922 routes, and `spec/quality_targets.md` cites sentence-transformer
+baselines only as public figures that are not directly comparable. No row reports a plain
+retriever on the same queries, so a reader cannot tell what training, the per-route prior or
+any Phase 2 switch adds over that control. This entry adds the control and a rule that uses it.
+The decision rule is the one in the mind-mem roadmap entry "A plain-retrieval baseline beside
+every memory number, and a rule that gates defaults on it".
+
+### Deliverables (all `.mind`, tested with `mindc test`)
+
+1. **Two baseline rows, fixed before any run.** (a) Lexical: BM25 over the same route text the
+   route table is built from, with k1 and b in one config file, IDF from a pinned Q16.16 table
+   and integer term counts. (b) Dense: the untuned base embedding model the encoder is trained
+   from, quantized to Q16.16 and run through the same native encoder path, cosine top-K over
+   the same route text, with no per-route prior, stride gating, frequency scaling or policy
+   overlay. Both rank in the total order (score descending, route id ascending). The config
+   hash goes into every result row.
+2. **Scored on exactly what we report.** The v1.1-oss held-out eval queries behind the 96.06%
+   figure; the MIND-writing intent set from the entry above once it exists; the held-out
+   real-traffic set in `docs/catalog_and_training_plan.md` once curated. Top-1, top-5, top-10
+   and, where the router abstains, the abstention rate, with the same catalog, the same `top_k`
+   and the same route-table hash as the number they sit beside.
+3. **Published next to every routing number.** The README Highlights table,
+   `docs/model_card.md` and `spec/quality_targets.md` carry both baseline rows from the same
+   run, each with its config hash and route-table hash.
+4. **Default-gate rule.** No Phase 2 switch (per-route prior, adaptive stride, frequency
+   scaling, head drop masks, L1 similarity), new checkpoint or routing mode (hierarchical
+   routing, the int8 two-stage tier, a byte-level encoder) becomes a default unless it beats
+   both baseline rows on the same queries, catalog and `top_k`.
+   - Decision rule: paired per query on "gold route in the top 5". b counts queries the
+     candidate gets and the baseline misses, c the reverse. The candidate wins only if the
+     one-sided exact binomial probability of at least b successes in n = b + c trials at
+     p = 1/2 is below 0.05, decided exactly as 20 · Σ C(n, k) for k = b..n < 2^n in
+     multi-limb integer arithmetic. b, c and ties are published. No post-hoc subset, and no
+     second attempt on the same queries after a loss.
+   - The per-item gates already written in Phase 2 still apply; where one is stricter, the
+     stricter one applies.
+   - A change that cannot alter the ranked list (attestation and evidence fields, rationale
+     strings) is judged on byte-identity of the ranked list over the eval set instead.
+   - Failing the rule leaves the switch available and off by default, with the measurement
+     recorded.
+
+### Measurement
+
+One result file per run: per-query hit or miss for the candidate and each baseline row, b, c,
+the exact tail as numerator and 2^n, the verdict, the config hashes, the eval-set hash, the
+route-table hash and the `mindc` version.
+
+### Acceptance gate
+
+- Unit tests cover BM25 term counting and the IDF table lookup on a fixed fixture, the
+  tie-break order, the top-k cut, and decision-rule verdicts at, just above and just below the
+  threshold for small n and for n = 1,000.
+- Baseline rankings and verdicts are byte-identical on x86_64 and ARM64 for the fixture.
+- Mutations that must turn a test red: swap b and c; drop the route-id tie-break; replace the
+  exact tail with a normal approximation on a case where the two disagree; let the dense
+  baseline use the per-route prior.
+- Positive controls: the dense baseline with every query cut to its first token must fail the
+  rule against the full dense baseline; a baseline compared with itself reports b = c = 0 and
+  no win.
+- A MIND check over the README, model card and quality-targets tables fails when a routing
+  number has no baseline rows from the same run.
+- A run in which either side crashed or scored zero queries reports "unverified", never a
+  verdict.
+
+### Falsification condition
+
+If the trained encoder does not beat both baseline rows under the rule on the v1.1-oss eval
+set, that is published as measured, the accuracy headline is narrowed to say so, and the claim
+rests on latency, determinism and the attestation envelope.
+
+- **Status:** Proposed. An architecture audit verdict is required before implementation.
+
+---
+
+## Stage-by-stage trace for the native routing path (2026-10-28, Proposed)
+
+**Owner:** STARGA, Inc.  
+**Status:** Proposed; nothing built.
+
+The bit-identity harness (`tests/bit_identity/`) compares one masked SHA-256 of the final output
+frame per fixture. When it fails, it says the backends disagree, not where. Add a trace mode:
+for each fixture, each stage of the routing path writes one hash of its ordered output (token
+ids, embedding lookup, each encoder layer's output per window, pooling, the route score vector,
+the per-route prior when it is on, the top-K list after the SHA-256 tie-break, and the
+attestation envelope with the timestamp and architecture fields masked as the harness already
+masks them). A `trace-diff` command compares two trace files and prints the first stage that
+differs; for an encoder layer it also prints the layer and window index.
+
+- **Why it fits.** Cross-arch bit-identity is guiding constraint 2. A per-stage hash is the
+  cheapest way to prove it across machines (a few dozen hashes per fixture instead of tensors)
+  and the fastest way to localize a disagreement to the stage a fix is made in. It also serves
+  the pure-MIND migration: when a ported leg's final bytes differ from the last build that
+  agreed, the trace of the two builds names the first stage that moved.
+- **Deliverable (all `.mind`, tested with `mindc test`):** `--trace <file>` on the native router,
+  writing the stage-hash list in a fixed binary layout; `trace-diff` over two trace files; a CI
+  leg that runs the existing fixtures on x86_64 and ARM64 with tracing on and fails on the first
+  difference; golden trace files committed beside `tests/bit_identity/fixtures/expected/`.
+- **Measurement:** per fixture, the stage count, the first differing stage or "identical", and
+  the trace overhead against the same run with tracing off.
+- **Acceptance gate:** one Q16.16 unit added to one weight of encoder layer L is reported by
+  `trace-diff` as a layer-L difference and nothing earlier, for at least two values of L; an
+  unperturbed build gives an empty diff; positive control: the final masked frame hash also
+  differs under the perturbation, and a fixture where it does not is reported as not covering
+  that layer. With tracing off, the output frame is byte-identical to a build without the trace
+  code and the off path adds no syscall or per-stage work (measured, not assumed). A run in
+  which either side crashed or wrote no trace reports "unverified", never an empty diff.
+- **Status:** Proposed. Extends the bit-identity harness; no change to its existing gate. An
+  architecture audit verdict is required before implementation.

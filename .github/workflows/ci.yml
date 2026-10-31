@@ -309,25 +309,33 @@ jobs:
       # native codegen: without the mlir-build feature every module falls
       # back to embedded-source objects and the leg necessarily fails
       # (codex audit 2026-08, #21). mlir-build also needs the MLIR toolchain
-      # on PATH — the mlir-20-tools/libmlir-20/clang-20 install from Ubuntu
-      # noble universe (the tools package alone does not pull in the
-      # libMLIR shared library that mlir-opt links against).
+      # on PATH — the mlir-20-tools/libmlir-20-dev/clang-20 install from
+      # Ubuntu noble universe. The tools package alone does not pull in the
+      # libMLIR shared library that mlir-opt links against; the -dev package
+      # places libMLIR.so in /usr/lib/llvm-20/lib/ where mlir-opt's RPATH
+      # looks. LD_LIBRARY_PATH covers the runtime .so in the multiarch dir.
       - name: Install MLIR toolchain (Ubuntu 24.04 LLVM 20)
         run: |
           ok=0
           for attempt in 1 2 3 4 5; do
             sudo apt-get update || true
-            if sudo apt-get install -y --fix-missing mlir-20-tools libmlir-20 clang-20; then ok=1; break; fi
+            if sudo apt-get install -y --fix-missing mlir-20-tools libmlir-20-dev clang-20; then ok=1; break; fi
             echo "apt attempt $attempt failed (mirror outage?); retry in $((attempt * 20))s"
             sleep $((attempt * 20))
           done
           [ "$ok" = 1 ] || { echo "MLIR toolchain unavailable after 5 attempts"; exit 1; }
           echo "/usr/lib/llvm-20/bin" >> "$GITHUB_PATH"
+          echo "/usr/lib/llvm-20/lib" >> "$GITHUB_PATH"
+          echo "LD_LIBRARY_PATH=/usr/lib/llvm-20/lib:/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+          sudo ldconfig
       - name: Verify MLIR toolchain on PATH
         run: |
-          mlir-opt --version | head -1
-          mlir-translate --version | head -1
-          clang --version | head -1
+          mlir-opt --version > /tmp/mlir-ver.txt
+          head -1 /tmp/mlir-ver.txt
+          mlir-translate --version > /tmp/mlir-tr-ver.txt
+          head -1 /tmp/mlir-tr-ver.txt
+          clang --version > /tmp/clang-ver.txt
+          head -1 /tmp/clang-ver.txt
       - name: Build mindc
         working-directory: mind-compiler
         run: cargo build --release --features "std-surface cross-module-imports mlir-build" --bin mindc --lib

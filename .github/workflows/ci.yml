@@ -309,14 +309,15 @@ jobs:
       # native codegen: without the mlir-build feature every module falls
       # back to embedded-source objects and the leg necessarily fails
       # (codex audit 2026-08, #21). mlir-build also needs the MLIR toolchain
-      # on PATH — same mlir-20-tools/clang-20 install the mind repo's own CI
-      # uses on ubuntu-latest (LLVM 20 from noble universe).
+      # on PATH — the mlir-20-tools/libmlir-20/clang-20 install from Ubuntu
+      # noble universe (the tools package alone does not pull in the
+      # libMLIR shared library that mlir-opt links against).
       - name: Install MLIR toolchain (Ubuntu 24.04 LLVM 20)
         run: |
           ok=0
           for attempt in 1 2 3 4 5; do
             sudo apt-get update || true
-            if sudo apt-get install -y --fix-missing mlir-20-tools clang-20; then ok=1; break; fi
+            if sudo apt-get install -y --fix-missing mlir-20-tools libmlir-20 clang-20; then ok=1; break; fi
             echo "apt attempt $attempt failed (mirror outage?); retry in $((attempt * 20))s"
             sleep $((attempt * 20))
           done

@@ -308,7 +308,7 @@ jobs:
       # The gate's native-symbol leg (nm on target/obj/*.o) requires REAL
       # native codegen: without the mlir-build feature every module falls
       # back to embedded-source objects and the leg necessarily fails
-      # (codex audit 2026-08, #21). mlir-build also needs the MLIR toolchain
+      # (external audit 2026-08, #21). mlir-build also needs the MLIR toolchain
       # on PATH — same mlir-20-tools/clang-20 install the mind repo's own CI
       # uses on ubuntu-latest (LLVM 20 from noble universe).
       - name: Install MLIR toolchain (Ubuntu 24.04 LLVM 20)

@@ -308,7 +308,7 @@ jobs:
       # The gate's native-symbol leg (nm on target/obj/*.o) requires REAL
       # native codegen: without the mlir-build feature every module falls
       # back to embedded-source objects and the leg necessarily fails
-      # (codex audit 2026-08, #21). mlir-build also needs the MLIR toolchain
+      # (external audit 2026-08, #21). mlir-build also needs the MLIR toolchain
       # on PATH — same mlir-20-tools/clang-20 install the mind repo's own CI
       # uses on ubuntu-latest (LLVM 20 from noble universe).
       - name: Install MLIR toolchain (Ubuntu 24.04 LLVM 20)
@@ -601,3 +601,17 @@ jobs:
           print(f"determinism-gate PASS: {len(r1)} queries x {len(r1[0]['hashes'])} positions "
                 f"= {real} real hashes, byte-identical across 2 fresh processes")
           PY
+
+  arch-mind:
+    name: arch-mind governance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Checkout pinned governance toolchain
+        uses: actions/checkout@v7
+        with:
+          repository: star-ga/arch-mind
+          ref: fea599ec4d3695cb39754d0fd5dcc1f1fb101dab
+          path: .arch-mind-tool
+      - name: arch-mind gate (fail-closed)
+        run: ARCH_MIND="$PWD/.arch-mind-tool/bin/arch-mind" bash scripts/arch_gate.sh

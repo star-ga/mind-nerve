@@ -605,13 +605,36 @@ jobs:
   arch-mind:
     name: arch-mind governance
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
     steps:
       - uses: actions/checkout@v7
-      - name: Checkout pinned governance toolchain
-        uses: actions/checkout@v7
-        with:
-          repository: star-ga/arch-mind
-          ref: fea599ec4d3695cb39754d0fd5dcc1f1fb101dab
-          path: .arch-mind-tool
+      - name: Pull the pinned scanner
+        env:
+          IMAGE: ghcr.io/star-ga/arch-mind@sha256:IMAGE_DIGEST
+          SCANNER_ROOT: .arch-mind-tool
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker pull "$IMAGE"
+          root="$SCANNER_ROOT"
+          rm -rf "$root"
+          mkdir -p "$root"
+          cid="$(docker create "$IMAGE")"
+          docker cp "$cid:/opt/arch-mind/." "$root/"
+          docker rm "$cid"
+          uid="$(id -u)"
+          gid="$(id -g)"
+          cat > "$root/bin/arch-mind" << EOF
+          #!/bin/bash
+          set -euo pipefail
+          exec docker run --rm --user ${uid}:${gid} -e PYTHONDONTWRITEBYTECODE=1 -e HOME=/tmp -v "\$PWD:\$PWD" -v /tmp:/tmp -w "\$PWD" "$IMAGE" "\$@"
+          EOF
+          chmod 0755 "$root/bin/arch-mind"
+          test -s "$root/tools/arch_mind_cli.py"
+          test -s "$root/tools/mind_reflect.py"
+          test -s "$root/tools/rules_engine.py"
+          test -x "$root/sidecar/target/release/arch-mind-sidecar"
       - name: arch-mind gate (fail-closed)
         run: ARCH_MIND="$PWD/.arch-mind-tool/bin/arch-mind" bash scripts/arch_gate.sh

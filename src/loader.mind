@@ -14,7 +14,7 @@
 //   - Result<..., LoaderError> becomes the signed LD_ERR_* return
 //     convention below; gate ORDER is preserved exactly from the dormant
 //     parsers.
-//   - RouteCatalog becomes a 5-slot handle table (LOADER_CAT_* below):
+//   - RouteCatalog becomes a 5-slot handle table (LOADER_CAT_* in src/lib.mind):
 //     [num_routes, ids (n*32 bytes), embeddings (n*256 i64 lanes),
 //      route_prior (n i64 lanes), hash (32 bytes)]. All buffers are freshly
 //     allocated by the parser; the caller owns them.
@@ -75,14 +75,6 @@ pub const GROUP_SIZE: i64 = 32;
 pub const MAX_CATALOG_BYTES: i64 = 67108864;   // 64 MiB
 pub const MAX_WEIGHTS_BYTES: i64 = 268435456;  // 256 MiB
 pub const MAX_ROUTES:        i64 = 65536;       // >> 4400/12k real catalogs
-
-// Catalog handle slot layout (single source of truth).
-pub const LOADER_CAT_SLOTS: i64 = 5;
-pub const LOADER_CAT_N:     i64 = 0;
-pub const LOADER_CAT_IDS:   i64 = 1;
-pub const LOADER_CAT_EMB:   i64 = 2;
-pub const LOADER_CAT_PRIOR: i64 = 3;
-pub const LOADER_CAT_HASH:  i64 = 4;
 
 // Manifest entry record: 5 i64 lanes per entry —
 // [name_addr, name_len, rows, cols, hash_addr].

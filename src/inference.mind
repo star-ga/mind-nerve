@@ -42,7 +42,6 @@ import src.tokenizer;
 import src.model;
 import src.evidence;
 import src.chain_log;
-import src.loader;
 
 // InferenceError, flattened to negative return codes.
 pub const INF_ERR_INVALID_K:       i64 = -1;

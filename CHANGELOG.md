@@ -282,7 +282,7 @@ Python MCP server routes today.
 
 ### Roadmap — deterministic int8 routing tier (deferred)
 
-Fable-measured decision: Q16.16 stays the default router (perfect precision +
+measured decision: Q16.16 stays the default router (perfect precision +
 wedge, already best-in-world for a deterministic router). int8 is a future
 edge/batch tier via a two-stage-exact design (int8 coarse-scan → Q16.16 rescore,
 recall@16 100%), gated on a `gemv_i8` SIMD intrinsic maturing in the mind compiler.
@@ -315,7 +315,7 @@ restores always-show). The skill projection still runs on every SessionStart
 
 ### Fix — audit sweep (2026-08-10 CI-mirror)
 
-### Fix — acquire security-audit hardening, round 2 (codex audit, 2026-08)
+### Fix — acquire security-audit hardening, round 2 (external audit, 2026-08)
 
 Six further findings against acquire/security_scan, all fixed with
 regression tests:
@@ -563,7 +563,7 @@ keeps the reference formula verbatim (suspected 2^16-fold scale error —
 decision belongs to the checkpoint pipeline); dormant
 `preselect_pre_tokenized` intentionally lacks the model-hash pin.
 
-### Fix — pre-release cross-CLI audit, round 3 (grok + claude-fable + codex, 2026-08)
+### Fix — pre-release audit, round 3 (external audit, 2026-08)
 
 Three independent CLI auditors reviewed the full changeset; all returned
 BLOCK. 24 distinct findings fixed across two passes, each with a

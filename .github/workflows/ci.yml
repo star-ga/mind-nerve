@@ -308,7 +308,7 @@ jobs:
       # The gate's native-symbol leg (nm on target/obj/*.o) requires REAL
       # native codegen: without the mlir-build feature every module falls
       # back to embedded-source objects and the leg necessarily fails
-      # (codex audit 2026-08, #21). mlir-build also needs the MLIR toolchain
+      # (external audit 2026-08, #21). mlir-build also needs the MLIR toolchain
       # on PATH — the mlir-20-tools/libmlir-20-dev/clang-20 install from
       # Ubuntu noble universe. The tools package alone does not pull in the
       # libMLIR shared library that mlir-opt links against; the -dev package
@@ -610,3 +610,45 @@ jobs:
           print(f"determinism-gate PASS: {len(r1)} queries x {len(r1[0]['hashes'])} positions "
                 f"= {real} real hashes, byte-identical across 2 fresh processes")
           PY
+
+  arch-mind:
+    # Fork pull requests never reach the private scanner image.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    name: arch-mind governance
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v7
+      - name: Pull the pinned scanner
+        env:
+          IMAGE: ghcr.io/star-ga/arch-mind@sha256:c63d54d8f2aa9914402f8c8b37381438ebfb2189f383052de722b44377e7772d
+          SCANNER_ROOT: ${{ runner.temp }}/arch-mind-scanner
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker pull "$IMAGE"
+          root="$SCANNER_ROOT"
+          case "$root" in "$GITHUB_WORKSPACE"|"$GITHUB_WORKSPACE"/*)
+            echo "::error::scanner root must sit outside the checkout"; exit 1;;
+          esac
+          rm -rf "$root"
+          mkdir -p "$root"
+          cid="$(docker create "$IMAGE")"
+          docker cp "$cid:/opt/arch-mind/." "$root/"
+          docker rm "$cid"
+          uid="$(id -u)"
+          gid="$(id -g)"
+          cat > "$root/bin/arch-mind" << EOF
+          #!/bin/bash
+          set -euo pipefail
+          exec docker run --rm --user ${uid}:${gid} -e PYTHONDONTWRITEBYTECODE=1 -e HOME=/tmp -v "\$PWD:\$PWD" -v /tmp:/tmp -w "\$PWD" "$IMAGE" "\$@"
+          EOF
+          chmod 0755 "$root/bin/arch-mind"
+          test -s "$root/tools/arch_mind_cli.py"
+          test -s "$root/tools/mind_reflect.py"
+          test -s "$root/tools/rules_engine.py"
+          test -x "$root/sidecar/target/release/arch-mind-sidecar"
+      - name: arch-mind gate (fail-closed)
+        run: ARCH_MIND="$RUNNER_TEMP/arch-mind-scanner/bin/arch-mind" bash scripts/arch_gate.sh

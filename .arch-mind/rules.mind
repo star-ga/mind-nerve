@@ -39,10 +39,14 @@ module mind_nerve_rules {
     [arch_rule(equality_q16, ge)]
     const EQUALITY_FLOOR: i32 = 3800
 
-    // Currently 10000 (shallow dependency depth). Floor leaves headroom for
-    // legitimate layering growth.
+    // Longest path after the layout-only loader edge is removed:
+    // cli.main -> mcp -> inference -> model -> encoder_kernels -> q16_16 -> LUT.
+    // The score steps by 1000. 4000 is that path with zero headroom: 3000
+    // would re-admit the removed inference -> loader edge. The old 7000 was
+    // the zero-edge reading (longest path 1), so this floor was re-derived
+    // from the measured chain by an architecture ruling on 2026-11-01.
     [arch_rule(depth_q16, ge)]
-    const DEPTH_FLOOR: i32 = 7000
+    const DEPTH_FLOOR: i32 = 4000
 
     // Currently 10000 — DEGENERATE: the sidecar resolves 0 inter-module import
     // edges for this package layout, so the intra/total ratio clamps to max.

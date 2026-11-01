@@ -1,8 +1,6 @@
 # Roadmap
 
-Phased delivery plan. Bandwidth gates each phase against ARC-AGI-3 close
-(2026-11-01) and mind-mem v4 retry2e completion; revise dates against those
-anchors as they slip.
+Phased delivery plan. Dates are revised as the work they depend on lands or slips.
 
 ## Guiding constraints
 
@@ -1343,48 +1341,144 @@ so every catalog row carries a reproducible extraction record.
 
 ---
 
-## Byte-Level Distillation Research Track (2026-10-23)
+## Raw-byte student encoder distilled from the shipped encoder (2026-10-23, Proposed)
 
 **Owner:** STARGA, Inc.  
-**Status:** Proposed; no implementation or performance claims.  
+**Status:** Proposed. Nothing built. An architecture audit verdict is required before implementation.
 
-This paper studies decoder-only byte versus token models and token-teacher-to-byte-student supervision via approximate Marginalize-It and exact End-of-Token (EOT). Raw bytes are not synonymous with byte-level BPE. Paper-specific scaling estimates do not constitute STARGA results.
+The native encoder tokenizes with the base model's English WordPiece vocabulary (`mind/kernels/wordpiece.mind` over `mind/luts/vocab_wp.mind`). The byte-level BPE in `src/tokenizer.mind` is not on the request path, and it still ships 32 placeholder merges instead of a trained table. The `tokenizer_hash` in the attestation envelope is copied from the weight-file header (`src/loader.mind`), not recomputed from the tokenizer that ran.
 
-### Project scope
+Recent research reports that a byte-level student supervised by a token-level teacher can be smaller and stronger than the teacher. A raw-byte encoder has no vocabulary to outgrow. That makes it a candidate for the Phase 2 Tier-1 and Tier-3 multilingual gates, and for tool names and identifiers that a subword vocabulary splits badly.
 
-Benchmark matched-compute intent classifiers: existing byte-BPE, raw-byte encoder trained on hard labels, and raw-byte encoder distilled from a strong teacher. Verify that the current 32 placeholder merges are not represented as a trained 32K vocabulary. Measure Unicode and tool-name robustness, exact tool routing, abstention, p95 latency, and deterministic output. Keep existing encoder as default until a measured win.
+### Deliverable (all `.mind`, trained by the Phase 2 native-MIND trainer; no Python)
 
-### Validation, dependencies and release gates
+1. Four students with the same layer count, width and training steps, trained on the Phase 1 corpus in the same data order:
+   (a) WordPiece input with hard route labels (the matched control);
+   (b) byte-level BPE input using the trained merge table from the native BPE trainer, with hard route labels;
+   (c) raw UTF-8 bytes 0..255 as token ids, with hard route labels;
+   (d) raw bytes with hard labels plus a soft target: the shipped encoder's Q16.16 route-score distribution over the in-batch routes, precomputed by the native path and pinned by hash.
+2. The byte input path feeds the existing sliding-window encoder kernels. It has no merge table or vocabulary file.
+3. For student (b), the trained merge table from the native BPE trainer replaces the 32 placeholder merges in `src/tokenizer.mind`.
+4. Each student's weight file carries the `tokenizer_hash` of the tokenizer it runs: the WordPiece tables, the trained BPE merges, or the identity byte map. The student's loader recomputes that hash and refuses a weight file whose header disagrees.
+5. Each student sits behind an off-by-default switch. With the switch off, the binary's output is byte-identical to today.
 
-- Verify full teacher-vocabulary byte-prefix probabilities against exhaustive small-vocabulary oracles, including EOT mass, UTF-8 multibyte strings, shared prefixes and token endings. Top-k truncation must not be called exact.
-- Compare token and byte baselines with matched data, compute, model capability and honest serving-cost accounting. Report bytes-per-byte, quality, p50/p95 latency per output character, peak memory and reproducibility.
-- Preserve existing public APIs, admission/governance gates and determinism contracts by default; use feature flags. Revert or defer when benefits are not established.
-- Dependency order: mind-inference reference -> mind-nerve benchmark -> MindLLM optional dispatch -> naestro/mind-mem pilots; mind-flow orchestrates experiments and mind/mind-runtime implement only proven optimizations.
+### Measurement
 
-**Attribution:** STARGA, Inc. Research source is cited above. No software-development co-authors are designated.
+There are three eval sets:
+
+- the v1.1-oss held-out queries;
+- the Tier-1 multilingual sets, once they exist;
+- a frozen, hand-labelled identifier and tool-name set (hash recorded).
+
+Each set is scored in aggregate only. Nobody reads eval items one by one.
+
+Reported per student:
+
+- top-1, top-5, top-10, MRR and abstention rate;
+- p50 and p95 latency on the baseline runner class;
+- peak memory and mean sequence length per query;
+- training wall time;
+- x86_64 and ARM64 output hashes.
+
+Teacher scores are never computed on an eval query. The trainer refuses any row whose hash is in an eval set.
+
+### Acceptance gate
+
+- A student becomes the default only if it meets all of these on the held-out set:
+  - it beats the shipped encoder and both rows of the plain-retrieval baseline under the default-gate rule in the entry "A plain-retrieval baseline beside every routing number";
+  - top-5 is at least max(shipped, 96.06%);
+  - p95 stays at or below 30 ms (guiding constraint 4);
+  - it lowers no other reported metric.
+- Student outputs are byte-identical on x86_64 and ARM64 for the bit-identity fixtures.
+- Unit tests of the byte path cover multibyte UTF-8, invalid UTF-8, empty input and truncation at the window limit.
+- Positive control: with the soft-target weight set to zero, student (d) is byte-identical to student (c) (same seed, same order).
+- Mutations that must turn a test red:
+  - swap the teacher scores of two routes in the distillation fixture;
+  - drop UTF-8 continuation bytes on the multilingual fixture;
+  - change one BPE merge without updating the weight-file header (the loader must refuse it);
+  - insert one eval-query row into the training set (the contamination check must refuse it).
+
+### Falsification
+
+If neither byte student beats students (a) and (b) on the held-out multilingual and identifier sets with p95 at or below 30 ms, tokenization is not the bottleneck. The switches stay off, and the measurement is recorded beside the shipped numbers.
+
+### Status
+
+Proposed. Nothing built.
+
+- Depends on the Phase 2 native-MIND trainer (Hard prerequisite 2) and the native BPE trainer.
+- Through them, it depends on CRX-09 (the pinned i64 division and shift contract) and CRX-02 (`mindc test --backend native`) for the trainer KATs.
+- Tests that read the corpus file need CRX-55 (a MIND program reading a file under `mindc test`).
+- Ordered after the plain-retrieval default-gate rule.
+
+An architecture audit verdict is required before implementation.
 
 
 ---
 
-## Verified Engineering Delivery Research (2026-10-23)
+## Risk- and cost-aware routing with abstention (2026-10-23, Proposed)
 
 **Owner:** STARGA, Inc.  
-**Status:** Proposed; not shipped or independently benchmarked.  
+**Status:** Proposed. Nothing built. An architecture audit verdict is required before implementation.
 
-### Repository-specific work
+This is mind-nerve's slice of verified engineering delivery.
 
-Risk/cost/confidence-weighted engineering agent/tool routing with abstention; routing predictions cannot grant permission.
+Agents, tools and MCP servers differ in risk (read-only, writes local files, network, credentials, destructive) and in declared cost class (local and free, metered external call, long-running job). When an intent could go to more than one of them, the route answer must carry that difference, and a weak match must say so instead of presenting a risky route as a confident one.
 
-### Cross-project gates
+A route is advice. It never grants permission; the host's authorization layer decides. Requirement contracts, test evidence and release decisions stay with the host's governance layer. Live model seats, quotas and per-token prices stay outside mind-nerve ("mind-nerve routes to manifests, never binds seats").
 
-- Canonical requirement and scope contract with permitted actions, named authority, expiry, budgets, impacted code and required tests.
-- Requirement -> symbols -> commit -> independently executed test evidence -> build artifact -> release decision; missing evidence fails closed. Implementer may not approve its own work.
-- Record signed evidence and offline replay verification where supported; never overclaim cryptographic guarantees or deployed status.
-- Evaluate prohibited-action prevention, missing-gate rejection, trace precision/recall, escaped defects, cost per accepted task and verification repeatability using held-out changes.
-- P0: authorization, independent CI and provenance. P1: cross-repo impact, bounded autonomous repair, cost routing and memory. P2: modernization parity testing and an enterprise control plane.
-- Ownership: Naestro OS mission UI/control; mind-flow DAG execution; mind-law authorization; mind-ci independent gates; mind-codegraph impact; mind-mem decisions; mind-predict calibration. Keep interfaces explicit and avoid duplicate engines.
+This entry builds on "Calibrated Routing Confidence", "Typed routing answers and a real abstention" and "Signals, rules, selection" above. It adds no new engine.
 
-**Attribution:** STARGA, Inc. No additional software co-authors.
+### Deliverable (all `.mind`)
+
+1. Two catalog fields per route: a risk class and a declared cost class. The MIND port of the catalog builder derives both from each manifest's declared permissions and declared cost and binds them into the route-table hash. Neither field ever changes a similarity score.
+2. Both fields become signals in the signal layer, each used by one rule:
+   - a route whose risk class is above the caller's declared risk ceiling is ineligible;
+   - a route whose cost class is above the caller's declared cost ceiling is ineligible.
+   The answer's `rationale` names the rule that removed the route (guiding constraint 5).
+3. The typed abstention judgement is returned beside the ranked eligible list.
+   - It is computed from the deterministic score distribution over the eligible set: the top-1 score and its margin to top-2, against a floor fixed before the run.
+   - It is never computed from the calibrated confidence sidecar, which stays outside every identity hash.
+4. With no ceiling declared, the ranked list is byte-identical to today.
+5. Before the rules ship, the policy replay in "Signals, rules, selection" runs them against the recorded intents. It reports how many top-1 answers changed, and which ones.
+
+### Measurement
+
+Measured on the held-out intent set and on a hand-labelled risk-and-cost fixture (hash recorded, scored in aggregate only):
+
+- the share of answers that name a route above either ceiling (target 0);
+- abstention precision and recall against hand labels;
+- top-1 and top-5 on intents whose gold route is within both ceilings;
+- p95 latency.
+
+### Acceptance gate
+
+- Positive controls:
+  - a fixture whose top similarity match is a destructive-class route, queried with a read-only ceiling, returns the next eligible route and names the rule;
+  - a fixture whose top match is a metered route, queried with a free-only cost ceiling, does the same.
+- Mutations that must turn a test red:
+  - remove the risk-ceiling check;
+  - remove the cost-ceiling check;
+  - let the risk class or the cost class change the score;
+  - set the abstention floor to zero on the low-margin fixture;
+  - omit the rule id from the rationale;
+  - change one manifest's risk class without rebuilding the table (hash mismatch).
+- Sidecar independence: perturbing the calibration curve must leave the abstention judgement and the ranked list byte-identical. A build that reads the sidecar fails this test.
+- With both ceilings off, the ranked list is byte-identical to today over the eval set on x86_64 and ARM64.
+- A change that lowers top-1 or top-5 on within-ceiling intents, or raises p95 above 30 ms, is rejected even if it removes risky routes.
+
+### Falsification
+
+If a ceiling removes the gold route on intents whose gold route is labelled within that ceiling, the derived classes disagree with the manifests. They are re-derived and re-checked before the rule ships.
+
+### Status
+
+Proposed. Nothing built.
+
+- The catalog fields are added in the MIND port of the catalog builder, never in the Python catalog-builder.
+- Tests that read manifests need CRX-55 (a MIND program reading a file under `mindc test`) or CRX-02 (`mindc test --backend native`). Until then they run on in-memory fixtures.
+
+An architecture audit verdict is required before implementation.
 
 ## Frontier scientific computation
 
@@ -1396,30 +1490,75 @@ Acceptance: preserve existing release blockers and ownership. Freeze small publi
 
 ---
 
-## MIND-writing task routing and measured accuracy (2026-10-28)
+## MIND-writing task routing and measured accuracy (2026-10-28, Proposed)
 
 **Owner:** STARGA, Inc.  
-**Status:** Proposed; not implemented, no accuracy claim. Live probe of the local route table on 2026-10-28 (four MIND-writing intents, not a measurement): the MIND authoring skill was in the top 5 for three of four; no compile-check gate skill and no benchmark-track skill exists yet, so neither route can be served. No labelled MIND-writing eval set exists in this repo.
+**Status:** Proposed. Nothing built. An architecture audit verdict is required before implementation.
+
+A live probe of the local route table on 2026-10-28 used four MIND-writing intents and is not a measurement. The MIND authoring skill was in the top 5 for three of the four. No compile-check gate skill and no benchmark-track skill exists yet, so neither route can be served. No labelled MIND-writing eval set exists in this repo.
 
 Scope: mind-nerve routes intents. It does not write, compile or grade MIND code. The gate and benchmark skills live in the skill hub and the compiler. Route predictions never grant permission.
 
-### 1. Compile-check gate route for MIND-writing intents
+### Deliverable (all `.mind`)
 
-- **What:** An intent to write, port or edit MIND source routes to the MIND authoring skill and to a compile-check gate skill. The gate skill writes, runs the compiler check, fixes the diagnostics and repeats until the file compiles or its round budget is spent. Build the gate skill first; this item covers the route.
-- **Why:** Compiler feedback during generation is the lever recent research finds most effective for languages with little public training code, and the router is the only place that can make it the default first step.
-- **Done when:** the gate skill is in the route table; on the eval set in item 3, write, port and edit intents place it in the top 5 for at least 95% of held-out cases; non-MIND intents place it in the top 5 for at most 2%.
+1. **Compile-check gate route.** An intent to write, port or edit MIND source routes to the MIND authoring skill and to a compile-check gate skill. The gate skill writes the file, runs the compiler check, fixes the diagnostics, and repeats until the file compiles or its round budget is spent.
+   - The gate skill is built first, in the skill hub. This item covers only the route.
+   - Recent research finds compiler feedback during generation the most effective lever for languages with little public training code. The router is the only place that can make it the default first step.
+2. **Benchmark-track route.** Intents to run, extend or report the MIND benchmark track route to the benchmark-track skill, not to the authoring skill. Running a benchmark and writing code need different tools, and a shared route inflates both.
+3. **Eval set.** At least 400 hand-labelled intents covering write, port, fix-diagnostic, project setup, benchmark and non-MIND negatives. At least a quarter of them are negatives.
+   - Before any skill description or route text is written, the set is split once into dev and held-out by the low bit of the SHA-256 of each intent text, and the hash of the split file is committed.
+   - Skill descriptions, triggers and route text are written and tuned against dev only. Hard negatives are mined from dev only.
+   - Held-out is scored only in aggregate. Nobody reads held-out items one by one.
+   - No held-out intent, no paraphrase of one, and no phrasing template taken from one enters a skill description, route text, prior, rule or training row.
+4. **Eval command.** `mind-nerve eval` in the native binary, written in MIND, reads the eval set and the route table through the existing loader. It reports top-1, top-5, MRR and abstention rate, using the MIND port of the exact-rational eval metrics.
+   - It refuses to run unless `MIND_NERVE_RUNTIME_DIR` points at the curated table, because the generic public catalog measures the wrong thing. The refusal exits non-zero and names the variable.
+   - Until native routing is the served path (native route parity), the same run also scores the served path through the parity job, and the two results must agree.
+   - The result file records the eval-set hash, the split hash, the route-table hash and the `mindc` version.
+   - No Python or shell script is added.
 
-### 2. Benchmark-track route
+### Measurement
 
-- **What:** Intents to run, extend or report the MIND benchmark track route to the benchmark-track skill, not to the authoring skill.
-- **Why:** Running a benchmark and writing code need different tools; a shared route inflates both.
-- **Done when:** the benchmark-track skill exists; on the eval set, benchmark intents rank it first in at least 90% of cases, and writing intents rank it first in at most 5%.
+Each run reports the following on the full set, dev and held-out:
 
-### 3. Measured routing accuracy on MIND-writing intents
+- top-1, top-5, MRR and abstention rate, per intent class;
+- the share of non-MIND intents that place the gate skill in the top 5;
+- the v1.1-oss held-out top-1 and top-5 on the same table, so a MIND-specific change cannot quietly lower the general number.
 
-- **What:** A hand-labelled, held-out set of at least 200 intents covering write, port, fix-diagnostic, project setup, benchmark and non-MIND negatives. A fixed script reports top-1, top-5 and abstention rate. The script refuses to run unless `MIND_NERVE_RUNTIME_DIR` points at the curated table; without it the router serves the generic public catalog and the number measures the wrong thing. The result file records the seed, the eval-set hash and the table hash.
-- **Why:** No accuracy figure exists for MIND-writing intents, so the routes in items 1 and 2 cannot be checked.
-- **Done when:** the script runs locally or in CI with a committed result file; the MIND slice is reported beside the existing targets in `spec/quality_targets.md` (top-5 at least 92%), or a lower target is written down with the reason.
+A large gap between dev and held-out is reported as overfitting, never hidden.
+
+### Acceptance gate
+
+- Item 1: on held-out, write, port and edit intents place the gate skill in the top 5 at least 95% of the time. Non-MIND intents place it in the top 5 at most 2% of the time.
+- Item 2: on held-out, benchmark intents rank the benchmark-track skill first at least 90% of the time. Writing intents rank it first at most 5% of the time.
+- MIND-slice target: on held-out, the MIND slice reaches top-5 of at least 92%, the Phase 1 target in `spec/quality_targets.md`.
+  - If it falls short, a work package raises it until it holds, using route text written from dev-split failure patterns and hard negatives mined from dev.
+  - The target is not lowered.
+- No regression: a change is rejected if it raises the MIND slice while lowering the v1.1-oss held-out top-1 or top-5, or while pushing p95 above 30 ms.
+- Positive controls:
+  - on a committed 10-intent smoke fixture with the gate skill present, every write intent places the gate skill in the top 5;
+  - pointing `MIND_NERVE_RUNTIME_DIR` at the public catalog makes the command refuse with a non-zero exit that names the variable.
+- Mutations that must turn a check red:
+  - remove the gate-skill row from the fixture table;
+  - swap the labels of the benchmark and write intents;
+  - change one byte of the eval set (hash mismatch);
+  - change one byte of the split file (hash mismatch);
+  - compute top-5 as top-6.
+- A run in which the router crashed, or scored zero intents, reports "unverified", never a number.
+
+### Falsification
+
+If held-out results for item 1 fall below the bar while dev results clear it by a wide margin, the descriptions are fitted to the dev phrasing. That is reported as overfitting. The descriptions are then rewritten from the general mechanism, not from dev items.
+
+### Status
+
+Proposed. Nothing built.
+
+- Depends on the compile-check gate skill and the benchmark-track skill in the skill hub.
+- Depends on the MIND port of the eval metrics.
+- Depends on native route parity before the native number alone is reported.
+- Unit tests of the eval reader need CRX-55 (a MIND program reading a file under `mindc test`) or CRX-02 (`mindc test --backend native`). Until then they run on in-memory fixtures.
+
+An architecture audit verdict is required before implementation.
 
 ---
 
@@ -1495,14 +1634,20 @@ route-table hash and the `mindc` version.
   number has no baseline rows from the same run.
 - A run in which either side crashed or scored zero queries reports "unverified", never a
   verdict.
+- No regression: a change is rejected if it raises the MIND slice while lowering the
+  v1.1-oss held-out top-1 or top-5, or while pushing p95 above 30 ms.
 
 ### Falsification condition
 
 If the trained encoder does not beat both baseline rows under the rule on the v1.1-oss eval
-set, that is published as measured, the accuracy headline is narrowed to say so, and the claim
-rests on latency, determinism and the attestation envelope.
+set, that is published as measured, and a work package raises the code until it holds. The
+target is not lowered.
 
-- **Status:** Proposed. An architecture audit verdict is required before implementation.
+- **Status:** Proposed. Nothing built.
+  - Depends on CRX-30 (std/bigint) or the in-repo multi-limb interim for the exact binomial arithmetic.
+  - Depends on CRX-55 or CRX-02 for tests that read the eval set.
+  - Depends on the MIND port of the encoder quantizer.
+  An architecture audit verdict is required before implementation.
 
 ---
 
@@ -1525,10 +1670,15 @@ differs; for an encoder layer it also prints the layer and window index.
   and the fastest way to localize a disagreement to the stage a fix is made in. It also serves
   the pure-MIND migration: when a ported leg's final bytes differ from the last build that
   agreed, the trace of the two builds names the first stage that moved.
-- **Deliverable (all `.mind`, tested with `mindc test`):** `--trace <file>` on the native router,
-  writing the stage-hash list in a fixed binary layout; `trace-diff` over two trace files; a CI
-  leg that runs the existing fixtures on x86_64 and ARM64 with tracing on and fails on the first
-  difference; golden trace files committed beside `tests/bit_identity/fixtures/expected/`.
+- **Deliverable (all `.mind`, tested with `mindc test`):** `--trace` on the native router,
+  which appends the stage-hash list to stdout as one length-prefixed frame after the output
+  frame, in a fixed binary layout. mind-nerve still never writes to the filesystem: the
+  runtime FFI has no write primitive by design. The harness redirects the trace frame to a
+  file and keeps hashing the output frame only, so its existing gate is unchanged.
+  `trace-diff` is a subcommand of the same binary. It reads the two trace files through the
+  existing read-file primitive. The CI leg follows the MIND port of the bit-identity harness
+  and its ARM64 line; today the harness is `tests/bit_identity/run.sh` plus Python, and CI has
+  no ARM64 runner.
 - **Measurement:** per fixture, the stage count, the first differing stage or "identical", and
   the trace overhead against the same run with tracing off.
 - **Acceptance gate:** one Q16.16 unit added to one weight of encoder layer L is reported by
@@ -1538,5 +1688,129 @@ differs; for an encoder layer it also prints the layer and window index.
   that layer. With tracing off, the output frame is byte-identical to a build without the trace
   code and the off path adds no syscall or per-stage work (measured, not assumed). A run in
   which either side crashed or wrote no trace reports "unverified", never an empty diff.
-- **Status:** Proposed. Extends the bit-identity harness; no change to its existing gate. An
-  architecture audit verdict is required before implementation.
+  Mutations that must turn a test red:
+  - `trace-diff` reports the last differing stage instead of the first;
+  - the envelope mask also masks the result-hash field;
+  - two adjacent stages swap places in the trace layout;
+  - the trace frame is emitted with tracing off.
+  The trace-off byte-identity baseline is a build of the newest commit that has no trace code,
+  never HEAD.
+- **Falsification:** The stage boundaries are wrong if either of these happens:
+  - a perturbation at encoder layer L is reported at any stage other than layer L, on a
+    fixture that covers L;
+  - fixing the stage the trace names leaves the final-frame difference in place.
+  If so, the layout is revised before the CI leg becomes required.
+- **Status:** Proposed. Nothing built.
+  - Extends the bit-identity harness with no change to its existing gate.
+  - Depends on the MIND port of the bit-identity harness with an ARM64 CI line.
+  - Unit tests that read trace files need CRX-55 (a MIND program reading a file under
+    `mindc test`) or CRX-02 (`mindc test --backend native`). Until then they run on in-memory
+    buffers.
+  An architecture audit verdict is required before implementation.
+
+---
+
+
+## Quantization gap of the shipped Q16.16 encoder, measured per routing decision (2026-10-29, Proposed)
+
+**Owner:** STARGA, Inc.  
+**Status:** Proposed. Nothing built. An architecture audit verdict is required before implementation.
+
+The shipped encoder is trained in floating point and rounded to Q16.16 by the encoder quantizer. Today the gap is reported as cosine and top-5 overlap between the reference and the native path. Nothing reports how many routing decisions the rounding flips, or how close the flipped queries were.
+
+The native-MIND trainer removes the gap by training in the serving arithmetic. Until it passes its cutover gate, every shipped checkpoint carries the gap, so it is measured on each one. Determinism is claimed for the Q16.16 inference path only, never for a reference training run.
+
+### Deliverable (all `.mind`)
+
+1. The MIND port of the overlap bench reports three things per checkpoint:
+   - the share of eval queries whose top-1 route differs between the reference and the Q16.16 path;
+   - the share whose top-5 set differs;
+   - the reference top-1-to-top-2 margin of every flipped query.
+2. The model card publishes these numbers beside the accuracy figures for each checkpoint the reference trainer produces, until the native trainer's cutover gate holds.
+3. Cross-architecture identity of the Q16.16 path stays with the existing bit-identity harness and its ARM64 line. This item adds no second harness.
+
+### Measurement
+
+Per checkpoint, on the v1.1-oss eval queries (full set, dev and held-out):
+
+- top-1 flip rate and top-5 set-change rate;
+- the margin histogram of flipped queries;
+- top-1 and top-5 of each path.
+
+### Acceptance gate
+
+- Positive controls:
+  - a fixture query with a known small margin is flipped by perturbing one Q16.16 weight, and the bench reports that flip;
+  - the reference compared with itself reports zero flips.
+- Mutations that must turn a test red:
+  - compare top-6 instead of top-5;
+  - drop the route-id tie-break;
+  - read the dev split where held-out is reported.
+- A run that crashed or scored zero queries reports "unverified", never a number.
+
+### Falsification
+
+If the top-1 flip rate is zero on held-out for every checkpoint while top-5 overlap is below 100%, the decision view adds nothing beyond overlap. The item then folds into the overlap bench output.
+
+### Status
+
+Proposed. Nothing built.
+
+- Depends on the MIND ports of the overlap bench and the encoder quantizer.
+- File-reading tests need CRX-55 or CRX-02.
+- The optimizer choice stays with the native-trainer design and its cutover gate.
+
+An architecture audit verdict is required before implementation.
+
+---
+
+## Optimizer arithmetic for the native Q16.16 trainer: fixed-point Adam against SGD with momentum (2026-10-31, Proposed)
+
+**Owner:** STARGA, Inc.  
+**Status:** Proposed; nothing built, and no published number changes.
+
+Phase 2 replaces the external Phase 1 trainer with the native-MIND trainer (`mind-train`), and its exit criteria require reproducibility on identical (corpus, config, seed) tuples. A trainer that runs in the same Q16.16 arithmetic as the inference path needs an optimizer whose state survives that arithmetic, and that choice has not been measured.
+
+Adam keeps a running mean of squared gradients and adds (1 − β2)·g² to it each step. In Q16.16 with round-to-nearest, that increment becomes zero whenever it is below half a unit (2^-17). With the usual β2 = 0.999 this happens for every |g| below about 0.09, and g² alone already vanishes below about 0.003. From then on, epsilon alone sets the step size. Gradients that small are normal late in fine-tuning. SGD with momentum keeps no squared state, so it does not have this failure. This entry measures both optimizers before either becomes the trainer default.
+
+### Deliverables (all `.mind`, tested with `mindc test`)
+
+1. **One optimizer module with two optimizers behind one interface:** SGD with momentum, and Adam with decoupled weight decay.
+   - The second moment is held in a declared wider format (Q32.32). This lowers the underflow threshold (to about |g| < 2^-11.5 at β2 = 0.999) but does not remove it, which is why the counters below exist.
+   - Bias-correction factors come from committed integer tables indexed by step, never from a runtime power.
+   - The square root in the update is an integer square root with a stated rounding rule.
+   - Rounding is round-half-even.
+   - The per-parameter update and the gradient accumulation run in a fixed order.
+   - Weight decay is applied separately from the gradient, at a fixed position relative to the update.
+   - If the compiler roadmap's proposed `std::optim` package exists when this is built, the module is written as that package's fixed-point profile rather than a local copy.
+2. **Arithmetic counters in every run record, per step:**
+   - parameters whose second-moment increment (1 − β2)·g² rounds to zero in the moment format while the gradient is nonzero;
+   - saturated updates;
+   - clipped gradients.
+3. **Matched comparison:** both optimizers train on the frozen training split with the same seed, batch order, step budget and learning-rate schedule. Both are scored on the v1.1-oss held-out eval queries with top-1, top-5, top-10 and MRR.
+
+### Measurement
+
+One run record per optimizer: the four scores, the step count, the counters above, the config hash, the corpus hash and the `mindc` version. Wall time goes to a separate log, so the record itself can be compared byte for byte.
+
+### Acceptance gate
+
+- Known-answer tests: one SGD-momentum step and one Adam step on a four-parameter fixture match an exact rational reference computed by hand, within the stated rounding.
+- Two runs give byte-identical run records, and x86_64 and ARM64 give byte-identical run records.
+- Mutations that must turn a test red:
+  - the second moment stored in Q16.16 instead of the wide format (the underflow counter on a fixture with gradients of 2^-9 goes nonzero);
+  - bias correction removed (the known-answer test fails);
+  - gradient accumulation order reversed (the byte-identity test fails).
+- Positive control: on the 2^-9 fixture, the second-moment increment underflows in Q16.16 and does not underflow in the wide format.
+- Decision rule: the trainer default is the optimizer that wins under the paired exact binomial rule of "A plain-retrieval baseline beside every routing number, and a rule that gates defaults on it", on the held-out queries. A tie keeps SGD with momentum, which holds less state. The native trainer becomes the default only if the winner is no worse than the shipped checkpoint on every one of held-out top-1, top-5, top-10 and MRR.
+- Fairness: selection uses the training split only, and trainer code contains no eval-set query id, route id or phrasing.
+
+### Falsification condition
+
+- If neither optimizer reaches the shipped checkpoint's held-out top-5 at the step budget, the native trainer stays opt-in, the external reference trainer stays the default as Phase 1 allows, and the gap is published.
+- If Adam's underflow counter stays at zero in plain Q16.16 on real gradients, the wide-format requirement is dropped as unneeded.
+
+- **Status:** Proposed. Nothing built. Depends on the Phase 2 native trainer (`mind-train`) computing gradients in MIND, and on two open compiler requests:
+  - a MIND program must be able to read the frozen corpus and checkpoint files under `mindc test` and `mindc run`;
+  - `mindc test` must run on the native backend, for the cross-arch claim.
+  An architecture audit verdict is required before implementation.

@@ -78,6 +78,16 @@ pub const VOCAB_SIZE:            i64 = 32768;
 pub const MAX_REQUEST_TOKENS:    i64 = 1024;
 pub const ROUTE_EMBEDDING_DIM:   i64 = 256;  // tied to ENCODER_HIDDEN
 pub const DEFAULT_TOP_K:         i64 = 5;
+
+// Catalog handle slot layout (single source of truth).
+// Lives here, not in the loader, so the scoring core can read the slots
+// without importing the I/O layer.
+pub const LOADER_CAT_SLOTS: i64 = 5;
+pub const LOADER_CAT_N:     i64 = 0;
+pub const LOADER_CAT_IDS:   i64 = 1;
+pub const LOADER_CAT_EMB:   i64 = 2;
+pub const LOADER_CAT_PRIOR: i64 = 3;
+pub const LOADER_CAT_HASH:  i64 = 4;
 pub const MAX_TOP_K:             i64 = 64;
 
 // Weight storage discipline (dormant u8). Inference path uses INT8 weights

@@ -43,8 +43,8 @@ module mind_nerve_rules {
     // cli.main -> mcp -> inference -> model -> encoder_kernels -> q16_16 -> LUT.
     // The score steps by 1000. 4000 is that path with zero headroom: 3000
     // would re-admit the removed inference -> loader edge. The old 7000 was
-    // the zero-edge reading (longest path 1). Re-derived in
-    // MINDNERVE_DEPTH_FLOOR_RULING_20261101.
+    // the zero-edge reading (longest path 1), so this floor was re-derived
+    // from the measured chain by an architecture ruling on 2026-11-01.
     [arch_rule(depth_q16, ge)]
     const DEPTH_FLOOR: i32 = 4000
 

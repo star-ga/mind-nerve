@@ -592,6 +592,13 @@ applied to a detection target instead of a routing target.
 - Tool execution. Routing only; the host calls the chosen tool itself.
 - Multi-modal input. Text in, route IDs out. Audio / image routing is a
   separate question handled by separate models (mind-voice, future).
+- A general decision engine (ruled 2026-11-06). Every answer, including the typed
+  answers and the abstention in "Typed routing answers and a real abstention", is over
+  mind-nerve's own route table. Questions whose options the caller writes at call time
+  belong to the host's decision layer, which can call mind-nerve for the catalog part.
+  Why: the route table is embedded offline and frozen, so caller-written options would
+  need a query-time encoder pass per option, a second model contract and a second
+  calibration set, none of which the routing gates cover.
 
 ## Coordination with sibling repositories
 

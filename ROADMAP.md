@@ -1,5 +1,7 @@
 # Roadmap
 
+> Naming (2026-11-10): the MIND-Law extensions E1–E6 were numbered I10–I15 (E*n* is the former I(*n*+9)); the code and wire ids stay 10 to 15. 512 defines seven canonical conditions. I1–I9 are MIND-Law's implementation of them. Extensions are MIND-Law's own and are not part of 512.
+
 Phased delivery plan. Dates are revised as the work they depend on lands or slips.
 
 ## Guiding constraints
@@ -1015,7 +1017,7 @@ a debugging log, which rates nothing; the self-rating trap is ours to name.
 
 Six layers of the ecosystem each anchor a different "what survives transformation":
 `trace_hash` (artifact, `mind`), routing lineage (decision, Naestro), provenance chain
-(belief, mind-mem), I1–I15 + `spec_hash` (constraint, MIND-Law), **the governed route
+(belief, mind-mem), I1–I9 and E1–E6 + `spec_hash` (constraint, MIND-Law), **the governed route
 table (intent→capability, here)**, and the session evidence log (structural health,
 arch-mind). Six roots, zero cross-links — nothing can prove the conjunction *"this
 binary, produced by this decision, under these constraints, consistent with these
@@ -1048,7 +1050,7 @@ by construction. Of the six members this is among the least work, and it answers
 question a reviewer actually asks about an agentic system: *why did it reach for that
 capability.*
 
-**Firewall (I13, inherited from MIND-Law).** The anchor is an evidence artifact, never a
+**Firewall (E4, inherited from MIND-Law).** The anchor is an evidence artifact, never a
 score. Route-anchor coverage confers no authority — it must not be optimized against,
 and a well-anchored route is not thereby a better route. Keep it distinct from the
 rationale field: rationale explains *why this route matched*; the anchor records *that
@@ -1106,7 +1108,7 @@ signal we currently discard.
 
 Confidence here is a **routing** signal, never an authority signal. A high-confidence
 route is not thereby a *better* route, and route confidence must not be optimized
-against or fed back as a quality metric — the same I13 non-causal discipline the
+against or fed back as a quality metric — the same E4 non-causal discipline the
 cross-chain anchor section above already applies. Keep it distinct from the rationale
 field: rationale explains why a route matched; confidence describes how separated the
 candidates were.

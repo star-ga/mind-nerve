@@ -1823,3 +1823,78 @@ One run record per optimizer: the four scores, the step count, the counters abov
   - a MIND program must be able to read the frozen corpus and checkpoint files under `mindc test` and `mindc run`;
   - `mindc test` must run on the native backend, for the cross-arch claim.
   An architecture audit verdict is required before implementation.
+
+---
+
+## Live-call checks against the exact full scan, distinct routes in every top K, and caller trace context (2026-11-16, Proposed)
+
+**Owner:** STARGA, Inc.  
+**Status:** Proposed; nothing built, and no published number changes.
+
+The held-out eval figure, the plain-retrieval baseline entry above and the two-stage exactness
+proof all run on a fixed query set against a fixed table. None of them looks at a deployed table
+on real calls. Two failures can only show up there:
+
+- **Duplicate rows.** A deployed table can hold two rows that point at the same skill file, for
+  example after the same skill is learned from two directories. Each duplicate takes a slot, so a
+  call asked for `top_k` routes returns fewer distinct skills. A labelled eval set built on a clean
+  table cannot see this.
+- **Approximate modes on real traffic.** The int8 two-stage tier, hierarchical routing and the
+  Phase 2 switches can be exact on the eval set and still differ on the queries a deployment
+  actually gets.
+
+### Deliverables (all `.mind`, tested with `mindc test`)
+
+1. **Exact-scan replay.** An offline command reads a sample of route calls that the caller recorded
+   (query text, served list, route-table hash). mind-nerve still writes no files; recording is the
+   caller's job. For each call it recomputes the exact full scan: every row of the same table, the
+   same scoring in Q16.16, the same total order (score descending, route id ascending).
+2. **Three numbers per sample, fixed before any run.**
+   - Overlap@K between the served list and the exact list, averaged over calls.
+   - Distinct routes in the served top K, counted by the skill a row points at, against the `top_k`
+     asked for.
+   - The chance row: the expected overlap@K of K distinct routes drawn uniformly from the table,
+     computed exactly, not sampled.
+3. **Same table on both sides.** A call whose recorded table hash differs from the table being
+   scanned is reported as "unverified", never as a miss.
+4. **Observability only.** The numbers are reported. They never change a ranked list and never gate
+   a call.
+
+### Caller trace context
+
+A caller may send a W3C trace id with a route call (a `traceparent` value in the MCP request's
+`_meta` object or in the daemon request). mind-nerve validates it and returns it in the response
+envelope, outside every attested and hashed field, so the caller can join the route call to its
+own trace. A missing or malformed value is dropped, never echoed.
+
+### Measurement
+
+One result file per sample: per call, the overlap, the distinct count, the chance value and the
+table hash; the sample totals; the `mindc` version.
+
+### Acceptance gate
+
+- On a fixture table with one skill stored under two rows, a query that ranks both rows in the top
+  K reports a distinct count of K - 1. The same fixture without the duplicate reports K.
+- With every approximate mode off, the served list and the exact scan agree on every fixture call
+  (overlap@K = 1).
+- Positive control: a ranking with the score order reversed scores at or below the chance row.
+- The chance row equals the exact expectation on the fixtures.
+- With and without a trace id, the attested bytes and the ranked list are byte-identical.
+  Mutation: include the trace id in a hashed field; the test must go red.
+- With no trace id sent, the output frame is byte-identical to a build without this code, and the
+  off path adds no per-call work.
+- A sample in which no call could be replayed reports "unverified", never a number.
+
+### Falsification condition
+
+If an approximate mode's live overlap@K falls below its eval-set overlap beyond the sample's 95%
+interval, the eval set does not represent the deployment, and that mode stays off by default until
+the eval set is fixed.
+
+- **Status:** Proposed. Nothing built.
+  - Tests that read recorded calls need CRX-55 or CRX-02, as for the entries above. Until then
+    they run on in-memory buffers.
+  - The trace-context field is a response-envelope field with no hash coverage; its layout needs
+    the architecture audit.
+  An architecture audit verdict is required before implementation.

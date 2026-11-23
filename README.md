@@ -513,6 +513,12 @@ mind-nerve ships under a **dual license**:
 Full split is documented in [`LICENSE.md`](LICENSE.md). For commercial
 enquiries, contact [`license@star.ga`](mailto:license@star.ga).
 
+## Community
+
+- **Discussions:** <https://github.com/star-ga/mind/discussions> — questions,
+  ideas and help for mind-nerve and the wider MIND ecosystem.
+- **Discord:** <https://mindlang.dev/discord> — the MindLang community server.
+
 ## Governance and support
 
 - **Contributing:** [`CONTRIBUTING.md`](CONTRIBUTING.md) — build, test, and PR flow.

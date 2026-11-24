@@ -1898,3 +1898,41 @@ the eval set is fixed.
   - The trace-context field is a response-envelope field with no hash coverage; its layout needs
     the architecture audit.
   An architecture audit verdict is required before implementation.
+
+## Hidden-gold test for the abstention answer, and a row-order test (2026-11-23, Proposed)
+
+**Owner:** STARGA, Inc.  
+**Status:** Proposed; nothing built, and no published number changes.
+
+"Typed routing answers and a real abstention" and "Risk- and cost-aware routing with abstention" above plan a "no route" answer. Both measure it only against hand labels, and the first says its own side is not audited. Hand labels are slow to make, so the set stays small. A caller that applies a fixed score floor today has no number that shows the floor separates "no skill fits" from "a skill fits".
+
+This entry adds a test that needs no new labels. Every held-out intent with a gold route already gives two cases: one where the right skill is in the table, and one where it is not.
+
+### Deliverables (all `.mind`, tested with `mindc test`)
+
+1. **Hidden-gold copies.** For each held-out intent with a gold route, the eval command scores the intent twice: against the full table, and against the same table with every row of the gold skill removed. Rows are removed by the skill file they point at, never by row index, so a duplicate row of the same skill cannot answer in its place. Both copies use the same Q16.16 scoring and the same total order (score descending, route id ascending).
+2. **Discrimination number.** For each candidate abstention signal, fixed before the run (the top-1 score, and the margin from top-1 to top-2), the command reports N = 2 x AUC - 1. AUC is the share of pairs in which the copy without its gold skill gets the stronger "no route" signal than a copy with it, with ties counted as half. The count is exact integer arithmetic. N is 0 at chance and 1 when the signal always separates the two cases.
+3. **The floor, measured.** At the floor fixed before the run, the command reports how many hidden-gold copies abstain (recall) and how many full-table copies abstain (false abstentions).
+4. **Duplicate rows, measured.** The command also removes only one row of each gold skill that has two rows, and counts how often the other row still takes top-1. This turns the duplicate-row argument in the entries above into a number.
+5. **Row-order test.** The route table is rebuilt in 12 row orders fixed before the run. The ranked list for every eval intent must be byte-identical by route id in all 12. The command also reports how many ties fall at the top-K cut.
+6. **Observability only.** None of these numbers changes a ranked list or gates a call. This extends `mind-nerve eval` from "MIND-writing task routing and measured accuracy" above and adds no new engine.
+
+### Acceptance gate
+
+- Positive control: on a fixture where each gold skill wins by a clear margin, N = 1.
+- Chance control: a constant abstention signal gives N = 0 exactly.
+- Mutations that must turn a test red:
+  - remove the gold by row index instead of by skill file (a duplicate row survives);
+  - count ties as wins;
+  - drop the route-id tie-break (the row-order test fails);
+  - let the hidden-gold copy read the full table.
+- When the command is not run, routing output is byte-identical to a build without this code, and the call path does no extra work.
+
+### Falsification condition
+
+If the best candidate signal gives N below 0.5 on the held-out set, the deterministic score distribution cannot tell "no skill fits" from "a skill fits". The abstention entries above then need a different signal before they ship.
+
+- **Status:** Proposed. Nothing built.
+  - Needs the eval set and the `mind-nerve eval` command from the entry above.
+  - Tests that read the eval set need CRX-55 or CRX-02, as for the entries above. Until then they run on in-memory fixtures.
+  An architecture audit verdict is required before implementation.

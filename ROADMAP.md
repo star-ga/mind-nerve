@@ -1913,19 +1913,22 @@ This entry adds a test that needs no new labels. Every held-out intent with a go
 1. **Hidden-gold copies.** For each held-out intent with a gold route, the eval command scores the intent twice: against the full table, and against the same table with every row of the gold skill removed. Rows are removed by the skill file they point at, never by row index, so a duplicate row of the same skill cannot answer in its place. Both copies use the same Q16.16 scoring and the same total order (score descending, route id ascending).
 2. **Discrimination number.** For each candidate abstention signal, fixed before the run (the top-1 score, and the margin from top-1 to top-2), the command reports N = 2 x AUC - 1. AUC is the share of pairs in which the copy without its gold skill gets the stronger "no route" signal than a copy with it, with ties counted as half. The count is exact integer arithmetic. N is 0 at chance and 1 when the signal always separates the two cases.
 3. **The floor, measured.** At the floor fixed before the run, the command reports how many hidden-gold copies abstain (recall) and how many full-table copies abstain (false abstentions).
-4. **Duplicate rows, measured.** The command also removes only one row of each gold skill that has two rows, and counts how often the other row still takes top-1. This turns the duplicate-row argument in the entries above into a number.
-5. **Row-order test.** The route table is rebuilt in 12 row orders fixed before the run. The ranked list for every eval intent must be byte-identical by route id in all 12. The command also reports how many ties fall at the top-K cut.
-6. **Observability only.** None of these numbers changes a ranked list or gates a call. This extends `mind-nerve eval` from "MIND-writing task routing and measured accuracy" above and adds no new engine.
+4. **Near-miss set.** Hidden-gold copies test a request whose skill is missing. They do not test a request that only looks like a skill's trigger. A small hand-written set does that: 8 categories fixed before the run, at least 20 intents each, for example the same word in another domain, a question about a skill instead of a request for it, a negated request, and a step next to what a skill does but outside it. The gold answer of every near-miss intent is "no route", so the labels are cheap. The command reports N for near-miss intents against full-table copies, and the false-route count at the fixed floor, per category and in total.
+5. **Duplicate rows, measured.** The command also removes only one row of each gold skill that has two rows, and counts how often the other row still takes top-1. This turns the duplicate-row argument in the entries above into a number.
+6. **Row-order test.** The route table is rebuilt in 12 row orders fixed before the run. The ranked list for every eval intent must be byte-identical by route id in all 12. The command also reports how many ties fall at the top-K cut.
+7. **Observability only.** None of these numbers changes a ranked list or gates a call. This extends `mind-nerve eval` from "MIND-writing task routing and measured accuracy" above and adds no new engine.
 
 ### Acceptance gate
 
 - Positive control: on a fixture where each gold skill wins by a clear margin, N = 1.
 - Chance control: a constant abstention signal gives N = 0 exactly.
+- Near-miss control: on a fixture with one near-miss intent that scores above the floor, the false-route count is 1. With the floor raised above its score, the count is 0.
 - Mutations that must turn a test red:
   - remove the gold by row index instead of by skill file (a duplicate row survives);
   - count ties as wins;
   - drop the route-id tie-break (the row-order test fails);
   - let the hidden-gold copy read the full table.
+  - count a near-miss intent that clears the floor as an abstention.
 - When the command is not run, routing output is byte-identical to a build without this code, and the call path does no extra work.
 
 ### Falsification condition

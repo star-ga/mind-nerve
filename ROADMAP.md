@@ -1940,8 +1940,8 @@ If the best candidate signal gives N below 0.5 on the held-out set, the determin
   - Tests that read the eval set need CRX-55 or CRX-02, as for the entries above. Until then they run on in-memory fixtures.
   An architecture audit verdict is required before implementation.
 
-## Deferred adaptive recurrent memory refinement (2026-11-28)
+## Deferred load-aware adaptive routing study (2026-11-28)
 
 Study bounded adaptive computation routing using measured queue load, uncertainty and latency budgets; deterministic tie-break, cancellation and replay. Compare fixed and adaptive routing on public fixtures, with fairness and starvation checks.
 
-Based on recent research (verify claims, revision and artifact rights before reproduction). Provenance lives in mind-internal. BACKLOG/NOT_RUN; existing priorities and owner gates unchanged. No implementation, training, deployment or spend authorized.
+Based on recent research (verify claims, revision and artifact rights before reproduction). BACKLOG/NOT_RUN; existing priorities and owner gates unchanged. No implementation, training, deployment or spend authorized.

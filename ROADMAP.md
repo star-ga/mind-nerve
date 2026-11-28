@@ -1944,4 +1944,4 @@ If the best candidate signal gives N below 0.5 on the held-out set, the determin
 
 Study bounded adaptive computation routing using measured queue load, uncertainty and latency budgets; deterministic tie-break, cancellation and replay. Compare fixed and adaptive routing on public fixtures, with fairness and starvation checks.
 
-Reference: https://arxiv.org/abs/2611.32802 (verify claims, revision and artifact rights before reproduction). BACKLOG/NOT_RUN; existing priorities and owner gates unchanged. No implementation, training, deployment or spend authorized.
+Based on recent research (verify claims, revision and artifact rights before reproduction). Provenance lives in mind-internal. BACKLOG/NOT_RUN; existing priorities and owner gates unchanged. No implementation, training, deployment or spend authorized.

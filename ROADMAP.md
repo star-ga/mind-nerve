@@ -739,8 +739,8 @@ land, calibration informs `DELTA_Q16` selection offline; the runtime predicate
 stays a frozen integer constant, and the calibrated score stays excluded from any
 identity hash.
 
-**Provenance:** external construction recorded privately in governed memory +
-`mind-internal`; do NOT carry the citation into any public artifact.
+**Provenance:** external construction recorded privately in governed memory;
+do NOT carry the citation into any public artifact.
 
 ## Repo-Stack Fingerprint as a Routing Feature (sidecar input)
 
@@ -1186,7 +1186,7 @@ scorer does, the tree is too lossy; fall back to using it as a boost, or decline
 ## Signals, rules, selection: splitting the route decision into layers, and replaying policy changes before they ship (2026-09-28, Proposed)
 
 > Prior-art shape observed in recent open-source model-routing work. Ideas only —
-> no code, no dependency. Provenance lives in mind-internal.
+> no code, no dependency.
 
 ### 1. Three layers instead of one score
 
@@ -1225,7 +1225,7 @@ never binds seats.
 ## The open catalog: every public skill, agent and MCP server, rated (2026-10-03, Proposed)
 
 > Prior-art shape observed in a public skills registry and its install CLI. Ideas
-> only, no code, no dependency. Provenance lives in mind-internal.
+> only, no code, no dependency.
 
 Today `acquire` pulls from nine curated sources, and the hub holds about 1,400
 skills. The public ecosystem is far larger and has no shared index anyone can
